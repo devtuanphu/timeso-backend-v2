@@ -27,16 +27,29 @@ export class ZaloService implements OnModuleInit {
     
     if (!existingToken) {
       this.logger.warn('⚠️ Chưa có Zalo token. Để sử dụng ZNS, hãy gọi GET /zalo/oauth-url và authorize trong browser.');
-    } else {
-      // Kiểm tra token còn hạn không
-      const now = new Date();
-      const refreshTokenValid = existingToken.refreshTokenExpiresAt.getTime() > now.getTime();
-      
-      if (!refreshTokenValid) {
-        this.logger.warn('⚠️ Zalo refresh token đã hết hạn. Cần authorize lại qua GET /zalo/oauth-url');
-      } else {
-        this.logger.log('✅ Zalo token đã tồn tại và còn hạn');
+      return;
+    }
+
+    const now = new Date();
+    const refreshTokenValid = existingToken.refreshTokenExpiresAt.getTime() > now.getTime();
+    
+    if (!refreshTokenValid) {
+      this.logger.warn('⚠️ Zalo refresh token đã hết hạn. Cần authorize lại qua GET /zalo/oauth-url');
+      return;
+    }
+
+    // Proactive refresh: nếu access token hết hạn hoặc sắp hết (< 1 giờ), refresh ngay khi khởi động
+    const bufferTime = 60 * 60 * 1000; // 1 giờ
+    if (existingToken.accessTokenExpiresAt.getTime() - bufferTime <= now.getTime()) {
+      this.logger.log('🔄 Access token sắp/đã hết hạn, đang proactive refresh...');
+      try {
+        await this.refreshAccessToken(existingToken);
+        this.logger.log('✅ Proactive refresh thành công. ZNS sẵn sàng.');
+      } catch (error) {
+        this.logger.error('❌ Proactive refresh thất bại:', error.message);
       }
+    } else {
+      this.logger.log('✅ Zalo token còn hạn. ZNS sẵn sàng.');
     }
   }
 
@@ -127,10 +140,11 @@ export class ZaloService implements OnModuleInit {
   }
 
   /**
-   * Scheduled job: Tự động refresh token mỗi tuần (Chủ nhật 3h sáng)
-   * Đảm bảo refresh_token không bao giờ hết hạn nếu server đang chạy
+   * Scheduled job: Tự động refresh token MỖI 12 GIỜ
+   * Đảm bảo refresh_token luôn được renew (Zalo cấp refresh token mới mỗi lần refresh)
+   * Nếu server chạy liên tục, token sẽ KHÔNG BAO GIỜ hết hạn
    */
-  @Cron(CronExpression.EVERY_WEEK)
+  @Cron('0 */12 * * *') // Mỗi 12 giờ (0h và 12h trưa)
   async keepAliveToken() {
     this.logger.log('⏰ [Cron] Bắt đầu keep-alive token...');
     
@@ -152,7 +166,7 @@ export class ZaloService implements OnModuleInit {
         return;
       }
 
-      // Force refresh token để lấy token mới
+      // Force refresh token để lấy cả access_token + refresh_token mới
       await this.refreshAccessToken(tokenRecord);
       this.logger.log('✅ [Cron] Keep-alive token thành công. Token mới đã được lưu.');
     } catch (error) {
@@ -180,11 +194,9 @@ export class ZaloService implements OnModuleInit {
   }
 
   /**
-   * Gửi OTP qua ZNS
+   * Gửi OTP qua ZNS (có retry tự động khi token hết hạn)
    */
   async sendOtp(phone: string, otp: string, type: 'register' | 'forgot-password' = 'register') {
-    const accessToken = await this.getValidAccessToken();
-    
     const templateId = type === 'register'
       ? this.configService.get('ZALO_ZNS_REGISTER_TEMPLATE_ID')
       : this.configService.get('ZALO_ZNS_FORGOT_TEMPLATE_ID');
@@ -192,37 +204,73 @@ export class ZaloService implements OnModuleInit {
     // Format số điện thoại: bỏ đầu 0, thêm 84
     const formattedPhone = this.formatPhoneNumber(phone);
 
-    try {
-      const response = await firstValueFrom(
-        this.httpService.post(
-          'https://business.openapi.zalo.me/message/template',
-          {
-            phone: formattedPhone,
-            template_id: templateId,
-            template_data: {
-              otp: otp,
-            },
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json',
-              'access_token': accessToken,
-            },
-          },
-        ),
-      );
+    // Retry logic: nếu lần đầu fail do token, force refresh rồi retry 1 lần
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const accessToken = await this.getValidAccessToken();
 
-      this.logger.log(`ZNS sent to ${formattedPhone}: ${JSON.stringify(response.data)}`);
-      
-      if (response.data.error !== 0) {
-        throw new Error(`ZNS Error: ${response.data.message}`);
+        const response = await firstValueFrom(
+          this.httpService.post(
+            'https://business.openapi.zalo.me/message/template',
+            {
+              phone: formattedPhone,
+              template_id: templateId,
+              template_data: {
+                otp: otp,
+              },
+            },
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'access_token': accessToken,
+              },
+            },
+          ),
+        );
+
+        this.logger.log(`ZNS sent to ${formattedPhone}: ${JSON.stringify(response.data)}`);
+
+        // Zalo trả error code trong body (không phải HTTP error)
+        if (response.data.error !== 0) {
+          const errCode = response.data.error;
+          // Error -124 = access token invalid, -216 = token expired
+          if ((errCode === -124 || errCode === -216) && attempt === 1) {
+            this.logger.warn(`ZNS token error (code: ${errCode}), đang force refresh và retry...`);
+            await this.forceRefreshToken();
+            continue; // retry
+          }
+          throw new Error(`ZNS Error (code: ${errCode}): ${response.data.message}`);
+        }
+
+        return response.data;
+      } catch (error) {
+        if (attempt === 1 && error.message?.includes('token')) {
+          this.logger.warn('ZNS lỗi token, đang force refresh và retry...');
+          try {
+            await this.forceRefreshToken();
+            continue; // retry
+          } catch (refreshError) {
+            this.logger.error('Force refresh cũng thất bại:', refreshError.message);
+          }
+        }
+        this.logger.error('Lỗi gửi ZNS:', error.response?.data || error.message);
+        throw error;
       }
-
-      return response.data;
-    } catch (error) {
-      this.logger.error('Lỗi gửi ZNS:', error.response?.data || error.message);
-      throw error;
     }
+  }
+
+  /**
+   * Force refresh token (dùng cho retry logic)
+   */
+  private async forceRefreshToken(): Promise<void> {
+    const tokenRecord = await this.zaloTokenRepository.findOne({
+      where: {},
+      order: { updatedAt: 'DESC' },
+    });
+    if (!tokenRecord) {
+      throw new Error('Không có token để refresh');
+    }
+    await this.refreshAccessToken(tokenRecord);
   }
 
   /**

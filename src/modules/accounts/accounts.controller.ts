@@ -32,6 +32,13 @@ export class AccountsController {
     return this.accountsService.findById(user.userId);
   }
 
+  @Get('employee-stores')
+  @ApiOperation({ summary: 'Lấy danh sách cửa hàng đang làm việc', description: 'Trả về danh sách cửa hàng mà nhân viên được gán vào (không bao gồm đã nghỉ việc)' })
+  @ApiResponse({ status: 200, description: 'Thành công' })
+  async getEmployeeStores(@GetUser() user: any) {
+    return this.accountsService.getEmployeeStores(user.userId);
+  }
+
   @Post('avatar')
   @UseInterceptors(FileInterceptor('file', multerConfig))
   @ApiConsumes('multipart/form-data')

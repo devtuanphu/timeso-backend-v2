@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { Account } from './entities/account.entity';
 import { AccountIdentityDocument } from './entities/account-identity-document.entity';
 import { AccountFinance } from './entities/account-finance.entity';
+import { EmployeeProfile, EmploymentStatus } from '../stores/entities/employee-profile.entity';
 import * as bcrypt from 'bcrypt';
 
 @Injectable()
@@ -15,6 +16,8 @@ export class AccountsService {
     private readonly identityDocRepository: Repository<AccountIdentityDocument>,
     @InjectRepository(AccountFinance)
     private readonly financeRepository: Repository<AccountFinance>,
+    @InjectRepository(EmployeeProfile)
+    private readonly employeeProfileRepository: Repository<EmployeeProfile>,
   ) {}
 
   async create(data: Partial<Account>) {
@@ -108,5 +111,27 @@ export class AccountsService {
 
     if (!account || !account.passwordHash) return false;
     return bcrypt.compare(password, account.passwordHash);
+  }
+
+  /**
+   * Get all stores where user is an active employee
+   */
+  async getEmployeeStores(accountId: string) {
+    const profiles = await this.employeeProfileRepository.find({
+      where: { accountId },
+      relations: ['store'],
+    });
+
+    return profiles
+      .filter(p => p.employmentStatus !== EmploymentStatus.TERMINATED)
+      .map(p => ({
+        employeeProfileId: p.id,
+        storeId: p.storeId,
+        storeName: p.store?.name || '',
+        storeAvatar: p.store?.avatarUrl || null,
+        employmentStatus: p.employmentStatus,
+        workingStatus: p.workingStatus,
+        joinedAt: p.joinedAt,
+      }));
   }
 }

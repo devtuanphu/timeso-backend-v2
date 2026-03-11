@@ -2,6 +2,7 @@ import { Entity, Column, OneToOne, OneToMany } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { AccountIdentityDocument } from './account-identity-document.entity';
 import { AccountFinance } from './account-finance.entity';
+import { EmployeeProfile } from '../../stores/entities/employee-profile.entity';
 
 export enum AccountStatus {
   ACTIVE = 'active',
@@ -60,4 +61,7 @@ export class Account extends BaseEntity {
 
   @OneToOne(() => AccountFinance, (finance) => finance.account)
   finance: AccountFinance;
+
+  @OneToMany(() => EmployeeProfile, (profile) => profile.account)
+  employeeProfiles: EmployeeProfile[];
 }

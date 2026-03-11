@@ -5,6 +5,7 @@ import { AccountIdentityDocument } from './entities/account-identity-document.en
 import { AccountFinance } from './entities/account-finance.entity';
 import { AccountRefreshToken } from './entities/account-refresh-token.entity';
 import { AccountOtp } from './entities/account-otp.entity';
+import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
 import { AccountsService } from './accounts.service';
 import { AccountsController } from './accounts.controller';
 
@@ -16,6 +17,7 @@ import { AccountsController } from './accounts.controller';
       AccountFinance,
       AccountRefreshToken,
       AccountOtp,
+      EmployeeProfile,
     ]),
   ],
   providers: [AccountsService],
