@@ -108,11 +108,24 @@ export class ZaloService implements OnModuleInit {
         ),
       );
 
-      const { access_token, refresh_token, expires_in } = response.data;
-      this.logger.log(`Zalo refresh response: access_token=${!!access_token}, refresh_token=${!!refresh_token}, expires_in=${expires_in} (type: ${typeof expires_in})`);
+      const data = response.data;
+      const { access_token, refresh_token, expires_in } = data;
+      this.logger.log(`Zalo refresh response: access_token=${!!access_token}, refresh_token=${!!refresh_token}, expires_in=${expires_in}`);
+
+      // Zalo trả error trong body (HTTP 200 nhưng error code < 0)
+      if (data.error && data.error < 0) {
+        this.logger.error(`Zalo API error: code=${data.error}, ${data.error_name || data.error_description}`);
+        // -14014 = Invalid refresh token → token đã chết, mark expired để cron không retry
+        if (data.error === -14014 || data.error_name === 'Invalid refresh token.') {
+          await this.markTokenExpired(tokenRecord);
+        }
+        throw new Error(`Zalo token bị từ chối (${data.error}): ${data.error_name || 'Unknown'}. Cần authorize lại qua GET /api/zalo/oauth-url`);
+      }
 
       if (!access_token || !refresh_token) {
-        throw new Error(`Zalo trả về token không hợp lệ: ${JSON.stringify(response.data)}`);
+        // Nếu không có token trong response, cũng coi như dead
+        await this.markTokenExpired(tokenRecord);
+        throw new Error(`Zalo trả về token không hợp lệ: ${JSON.stringify(data)}`);
       }
 
       // expires_in có thể là number hoặc string, dùng Number() thay parseInt()
@@ -131,13 +144,23 @@ export class ZaloService implements OnModuleInit {
       );
 
       await this.zaloTokenRepository.save(tokenRecord);
-      this.logger.log('Refresh token thành công');
+      this.logger.log('✅ Refresh token thành công');
 
       return access_token;
     } catch (error) {
       this.logger.error('Lỗi refresh token:', error.response?.data || error.message);
-      throw new Error('Không thể refresh Zalo token. Vui lòng authorize lại.');
+      throw new Error('Không thể refresh Zalo token. Vui lòng authorize lại qua GET /api/zalo/oauth-url');
     }
+  }
+
+  /**
+   * Đánh dấu token đã chết trong DB → cron sẽ không retry nữa
+   */
+  private async markTokenExpired(tokenRecord: ZaloToken): Promise<void> {
+    this.logger.warn('🔴 Đánh dấu Zalo token đã hết hạn trong DB (cron sẽ dừng retry)');
+    tokenRecord.refreshTokenExpiresAt = new Date(0); // epoch = expired
+    tokenRecord.accessTokenExpiresAt = new Date(0);
+    await this.zaloTokenRepository.save(tokenRecord);
   }
 
   /**

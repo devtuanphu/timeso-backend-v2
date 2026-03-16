@@ -20,6 +20,12 @@ export class StoreTimekeepingSetting extends BaseEntity {
   @Column({ name: 'require_location', default: true })
   requireLocation: boolean;
 
+  @Column({ name: 'attendance_radius', type: 'int', default: 50, comment: 'Khoảng cách chấm công tối đa (mét)' })
+  attendanceRadius: number;
+
+  @Column({ name: 'require_qr_scan', default: true, comment: 'Bắt buộc quét QR cửa hàng khi chấm công' })
+  requireQrScan: boolean;
+
   @Column({ type: 'simple-array', name: 'location_exception_emp_ids', nullable: true })
   locationExceptionEmployeeIds: string[];
 

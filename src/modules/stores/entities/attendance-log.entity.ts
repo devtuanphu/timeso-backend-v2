@@ -68,4 +68,21 @@ export class AttendanceLog extends BaseEntity {
 
   @Column({ name: 'device_info', nullable: true })
   deviceInfo: string;
+
+  // -- GPS Check-in/out location --
+  @Column({ name: 'checkin_latitude', type: 'decimal', precision: 10, scale: 7, nullable: true })
+  checkinLatitude: number;
+
+  @Column({ name: 'checkin_longitude', type: 'decimal', precision: 10, scale: 7, nullable: true })
+  checkinLongitude: number;
+
+  @Column({
+    name: 'checkin_distance',
+    type: 'decimal',
+    precision: 10,
+    scale: 2,
+    nullable: true,
+    comment: 'Distance in meters from store location at check-in/out',
+  })
+  checkinDistance: number;
 }

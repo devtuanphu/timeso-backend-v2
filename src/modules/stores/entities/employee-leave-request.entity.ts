@@ -15,6 +15,9 @@ export enum LeaveType {
   PERSONAL = 'PERSONAL', // Việc riêng
   VACATION = 'VACATION', // Nghỉ phép năm
   UNPAID = 'UNPAID', // Nghỉ không lương
+  LATE = 'LATE', // Xin đi trễ
+  EARLY = 'EARLY', // Xin về sớm
+  OVERTIME = 'OVERTIME', // Xin tăng ca
   OTHER = 'OTHER',
 }
 

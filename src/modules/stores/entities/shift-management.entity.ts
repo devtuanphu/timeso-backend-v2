@@ -23,10 +23,11 @@ export enum WorkCycleStatus {
 }
 
 export enum ShiftAssignmentStatus {
-  PENDING = 'PENDING',
-  CONFIRMED = 'CONFIRMED',
-  COMPLETED = 'COMPLETED',
-  CANCELLED = 'CANCELLED',
+  PENDING = 'PENDING',       // Employee registered, waiting for owner approval
+  APPROVED = 'APPROVED',     // Approved by owner or auto-approved (owner assign), ready for check-in
+  CONFIRMED = 'CONFIRMED',   // Checked in
+  COMPLETED = 'COMPLETED',   // Checked out
+  CANCELLED = 'CANCELLED',   // Rejected or cancelled
 }
 
 export enum ShiftSwapStatus {
@@ -216,6 +217,16 @@ export class ShiftAssignment extends BaseEntity {
 
     @Column({ name: 'check_out_face_url', nullable: true })
     checkOutFaceUrl: string;
+
+    @Column({
+      name: 'shift_earnings',
+      type: 'decimal',
+      precision: 12,
+      scale: 2,
+      nullable: true,
+      comment: 'Calculated earnings for this shift based on contract type',
+    })
+    shiftEarnings: number;
 }
 
 @Entity('shift_swaps')

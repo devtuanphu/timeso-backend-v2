@@ -80,6 +80,7 @@ import { StorePaymentAccount } from './entities/store-payment-account.entity';
 import { StoresService } from './stores.service';
 import { StoresCronService } from './stores-cron.service';
 import { StoresController } from './stores.controller';
+import { StoresPublicController } from './stores-public.controller';
 import { AccountsModule } from '../accounts/accounts.module';
 import { MailModule } from '../mail/mail.module';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -165,7 +166,7 @@ import { FaceRecognitionService } from './face-recognition.service';
     MailModule,
     ScheduleModule.forRoot(),
   ],
-  controllers: [StoresController],
+  controllers: [StoresController, StoresPublicController],
   providers: [StoresService, StoresCronService, FaceRecognitionService],
   exports: [StoresService],
 })

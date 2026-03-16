@@ -15,6 +15,7 @@ import {
   NotFoundException,
   UnauthorizedException,
   Req,
+  Res,
   BadRequestException,
 } from '@nestjs/common';
 import {
@@ -452,6 +453,64 @@ export class StoresController {
   @ApiOperation({ summary: 'Ẩn nhiệm vụ KPI' })
   async hideKpiTask(@Param('id') id: string) {
     return this.storesService.hideKpiTask(id);
+  }
+
+  // Orders detail routes (MUST be above @Get(':id') to avoid route collision)
+  @Get('orders/:orderId')
+  @ApiOperation({
+    summary: 'Xem chi tiết đơn hàng',
+    description: 'Lấy thông tin tài chính và danh sách món trong đơn',
+  })
+  async getOrderById(@Param('orderId') orderId: string) {
+    return this.storesService.getOrderById(orderId);
+  }
+
+  @Put('orders/:orderId/status')
+  @ApiOperation({
+    summary: 'Cập nhật trạng thái đơn hàng',
+    description: 'Ví dụ: Chuyển từ PENDING sang COMPLETED hoặc CANCELLED',
+  })
+  async updateOrderStatus(
+    @Param('orderId') orderId: string,
+    @Body('status') status: any,
+  ) {
+    return this.storesService.updateOrderStatus(orderId, status);
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // Google Maps Proxy API (key stays server-side)
+  // MUST be above @Get(':id') to avoid route collision
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Get('maps/geocode')
+  @ApiOperation({
+    summary: 'Reverse geocode (lat/lng → address)',
+    description: 'Proxy API — Google Maps key stays server-side',
+  })
+  async geocodeReverse(
+    @Query('lat') lat: string,
+    @Query('lng') lng: string,
+  ) {
+    if (!lat || !lng) throw new BadRequestException('lat and lng are required');
+    return this.storesService.geocodeReverse(parseFloat(lat), parseFloat(lng));
+  }
+
+  @Get('maps/places')
+  @ApiOperation({
+    summary: 'Search places by query',
+    description: 'Proxy API — Google Maps key stays server-side',
+  })
+  async searchPlaces(
+    @Query('query') query: string,
+    @Query('lat') lat?: string,
+    @Query('lng') lng?: string,
+  ) {
+    if (!query) throw new BadRequestException('query is required');
+    return this.storesService.searchPlaces(
+      query,
+      lat ? parseFloat(lat) : undefined,
+      lng ? parseFloat(lng) : undefined,
+    );
   }
 
   @Get(':id')
@@ -1424,6 +1483,23 @@ export class StoresController {
     return this.storesService.deleteShiftSlot(slotId);
   }
 
+  // ==================== STORE SHIFT SLOTS (Staff App Calendar) ====================
+
+  @Get(':id/store-shift-slots')
+  @ApiOperation({
+    summary: 'Lấy tất cả shift slots của cửa hàng (cho staff app lịch ca)',
+    description: 'Trả về tất cả slots với workShift info, assignments, capacity. Dùng cho staff app hiển thị lịch ca cửa hàng.',
+  })
+  @ApiQuery({ name: 'startDate', required: false, description: 'YYYY-MM-DD' })
+  @ApiQuery({ name: 'endDate', required: false, description: 'YYYY-MM-DD' })
+  async getStoreShiftSlots(
+    @Param('id') storeId: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.storesService.getStoreShiftSlots(storeId, startDate, endDate);
+  }
+
   // ==================== SHIFT ASSIGNMENT MANAGEMENT ====================
 
   @Post('shift-slots/:slotId/register')
@@ -1434,9 +1510,9 @@ export class StoresController {
   @ApiResponse({ status: 201, description: 'Đăng ký thành công' })
   async registerToShiftSlot(
     @Param('slotId') slotId: string,
-    @Body() body: { employeeId: string; note?: string },
+    @Body() body: { employeeId: string; note?: string; isOwnerAssign?: boolean },
   ) {
-    return this.storesService.registerToShiftSlot(slotId, body.employeeId, body.note);
+    return this.storesService.registerToShiftSlot(slotId, body.employeeId, body.note, body.isOwnerAssign || false);
   }
 
   @Get(':id/shift-assignments')
@@ -1880,6 +1956,42 @@ export class StoresController {
   })
   async createPayroll(@Param('id') id: string, @Body() body: any) {
     return this.storesService.createPayroll(id, body);
+  }
+
+  @Post(':id/payrolls/generate')
+  @ApiOperation({
+    summary: 'Tạo bảng lương tự động từ dữ liệu chấm công',
+    description: 'Aggregate ShiftAssignment, tính lương, áp dụng thưởng/phạt từ payroll rules',
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Bảng lương đã tạo thành công',
+    type: PayrollResponseDto,
+  })
+  async generatePayroll(
+    @Param('id') id: string,
+    @Body() body: { date?: string },
+  ) {
+    const date = body.date ? new Date(body.date) : undefined;
+    return this.storesService.createMonthlyPayrollForStore(id, date);
+  }
+
+  @Post(':id/payrolls/recalculate')
+  @ApiOperation({
+    summary: 'Tính lại bảng lương từ dữ liệu chấm công',
+    description: 'Xóa bảng lương cũ và tính lại từ đầu dựa trên dữ liệu chấm công thực tế',
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Bảng lương đã tính lại thành công',
+    type: PayrollResponseDto,
+  })
+  async recalculatePayroll(
+    @Param('id') id: string,
+    @Body() body: { date?: string },
+  ) {
+    const date = body.date ? new Date(body.date) : undefined;
+    return this.storesService.recalculatePayroll(id, date);
   }
 
   @Get(':id/payrolls')
@@ -2671,26 +2783,7 @@ export class StoresController {
     return this.storesService.getOrders(id, query);
   }
 
-  @Get('orders/:orderId')
-  @ApiOperation({
-    summary: 'Xem chi tiết đơn hàng',
-    description: 'Lấy thông tin tài chính và danh sách món trong đơn',
-  })
-  async getOrderById(@Param('orderId') orderId: string) {
-    return this.storesService.getOrderById(orderId);
-  }
 
-  @Put('orders/:orderId/status')
-  @ApiOperation({
-    summary: 'Cập nhật trạng thái đơn hàng',
-    description: 'Ví dụ: Chuyển từ PENDING sang COMPLETED hoặc CANCELLED',
-  })
-  async updateOrderStatus(
-    @Param('orderId') orderId: string,
-    @Body('status') status: any,
-  ) {
-    return this.storesService.updateOrderStatus(orderId, status);
-  }
 
   @Get(':id/revenue-report')
   @ApiOperation({
@@ -3009,26 +3102,71 @@ export class StoresController {
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   @Post('shift-assignments/:id/check-in')
-  @ApiOperation({ summary: 'Check-in ca làm việc bằng xác thực khuôn mặt' })
+  @ApiOperation({ summary: 'Check-in ca làm việc (3 bước: QR → GPS → Face)' })
   @UseInterceptors(FileInterceptor('photo', multerConfig))
   async checkIn(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
+    @Body() body: { latitude?: string; longitude?: string; qrStoreId?: string },
   ) {
     if (!photo) throw new BadRequestException('Photo is required');
-    return this.storesService.checkInWithFace(id, photo.buffer);
+    // multerConfig uses diskStorage → file.buffer is undefined, read from file.path
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fsLib = require('fs');
+    const imageBuffer = photo.buffer || (photo.path ? fsLib.readFileSync(photo.path) : null);
+    if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
+    const result = await this.storesService.checkInWithFace(id, imageBuffer, {
+      latitude: body.latitude ? parseFloat(body.latitude) : undefined,
+      longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+      qrStoreId: body.qrStoreId,
+    });
+    // Clean up temp file
+    if (photo.path) try { fsLib.unlinkSync(photo.path); } catch (_e) { /* ignore */ }
+    return result;
   }
 
   @Post('shift-assignments/:id/check-out')
-  @ApiOperation({ summary: 'Check-out ca làm việc bằng xác thực khuôn mặt' })
+  @ApiOperation({ summary: 'Check-out ca làm việc (3 bước: QR → GPS → Face)' })
   @UseInterceptors(FileInterceptor('photo', multerConfig))
   async checkOut(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
+    @Body() body: { latitude?: string; longitude?: string; qrStoreId?: string },
   ) {
     if (!photo) throw new BadRequestException('Photo is required');
-    return this.storesService.checkOutWithFace(id, photo.buffer);
+    // multerConfig uses diskStorage → file.buffer is undefined, read from file.path
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fsLib = require('fs');
+    const imageBuffer = photo.buffer || (photo.path ? fsLib.readFileSync(photo.path) : null);
+    if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
+    const result = await this.storesService.checkOutWithFace(id, imageBuffer, {
+      latitude: body.latitude ? parseFloat(body.latitude) : undefined,
+      longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+      qrStoreId: body.qrStoreId,
+    });
+    // Clean up temp file
+    if (photo.path) try { fsLib.unlinkSync(photo.path); } catch (_e) { /* ignore */ }
+    return result;
   }
+
+  @Put(':id/location')
+  @ApiOperation({
+    summary: 'Cập nhật vị trí cửa hàng',
+    description: 'Chủ cửa hàng chọn vị trí trên bản đồ. Tự động tạo QR code nếu chưa có.',
+  })
+  async updateStoreLocation(
+    @Param('id') id: string,
+    @Body() body: { latitude: number; longitude: number },
+  ) {
+    return this.storesService.updateStoreLocation(id, body.latitude, body.longitude);
+  }
+
+  @Post(':id/qr-code')
+  @ApiOperation({ summary: 'Tạo/tái tạo mã QR cửa hàng' })
+  async generateStoreQR(@Param('id') id: string) {
+    return this.storesService.generateStoreQR(id);
+  }
+
 
   @Post('employees/:employeeId/face-registration')
   @ApiOperation({ summary: 'Đăng ký khuôn mặt nhân viên (Face ID style)' })

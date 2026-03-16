@@ -42,7 +42,13 @@ export class AuthService {
 
   async login(user: any, appType: AppType = AppType.OWNER_APP) {
     if (user.status === 'unverified') {
-      throw new UnauthorizedException('Tài khoản chưa được xác thực. Vui lòng kiểm tra email.');
+      // Trả về thông tin để frontend chuyển sang màn xác thực
+      // OTP sẽ chỉ được gửi khi user bấm nút "Gửi OTP" trên màn xác thực
+      return {
+        requiresVerification: true,
+        message: 'Tài khoản chưa được xác thực. Vui lòng xác thực để hoàn tất đăng ký.',
+        phone: user.phone,
+      };
     }
 
     const payload = { email: user.email, sub: user.id };
