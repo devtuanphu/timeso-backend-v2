@@ -16,20 +16,20 @@ export enum Gender {
 
 export class RegisterDto {
   @IsString()
-  @IsNotEmpty({ message: 'Họ và tên không được để trống' })
-  fullName: string;
+  @IsOptional()
+  fullName?: string;
 
   @IsEnum(Gender, { message: 'Giới tính không hợp lệ' })
   @IsOptional()
   gender?: Gender;
 
   @IsDateString({}, { message: 'Ngày sinh không đúng định dạng' })
-  @IsNotEmpty({ message: 'Ngày sinh không được để trống' })
-  birthday: string;
+  @IsOptional()
+  birthday?: string;
 
   @IsEmail({}, { message: 'Email không hợp lệ' })
-  @IsNotEmpty({ message: 'Email không được để trống' })
-  email: string;
+  @IsOptional()
+  email?: string;
 
   @IsString()
   @IsNotEmpty({ message: 'Số điện thoại không được để trống' })
