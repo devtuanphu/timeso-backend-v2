@@ -1,224 +1,202 @@
 #!/bin/bash
 # ============================================================
-#  TEST FACE REGISTRATION — chạy trực tiếp trên server VPS
-#  Copy toàn bộ file này lên server rồi chạy: bash test-face-registration.sh
+#  TEST FACE REGISTRATION — Chạy trên server VPS
+#  Usage: bash scripts/test-face-registration.sh
 # ============================================================
 
-set -e
-
-# ─── CONFIG ─── Thay đổi cho phù hợp
-API_BASE="http://localhost:3000/api"   # Gọi nội bộ, bypass nginx
-TEST_EMAIL="testface_$(date +%s)@test.com"
-TEST_PHONE="09$(shuf -i 10000000-99999999 -n 1)"
-TEST_PASSWORD="Test@12345"
-TEST_NAME="Test FaceReg $(date +%H%M%S)"
+API_BASE="http://localhost:3000/api"
 
 echo "============================================"
 echo "  🧪 TEST FACE REGISTRATION ENDPOINT"
 echo "============================================"
 echo ""
-echo "📧 Email:    $TEST_EMAIL"
-echo "📱 Phone:    $TEST_PHONE"
-echo "🔑 Password: $TEST_PASSWORD"
+
+# ─── Hàm parse JSON đơn giản (không cần jq) ───
+parse_json() {
+  local key="$1"
+  local json="$2"
+  echo "$json" | grep -o "\"$key\":\"[^\"]*\"" | head -1 | cut -d'"' -f4
+}
+
+# ─── STEP 1: Đăng nhập ───
+echo "━━━ STEP 1: Đăng nhập lấy JWT Token ━━━"
+echo ""
+read -p "📱 Nhập email hoặc SĐT: " LOGIN_ID
+read -s -p "🔑 Nhập mật khẩu: " LOGIN_PASS
+echo ""
 echo ""
 
-# ─── STEP 1: Đăng ký tài khoản owner ───
-echo "━━━ STEP 1: Đăng ký tài khoản Owner ━━━"
-REGISTER_RESULT=$(curl -s -X POST "$API_BASE/auth/register" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"fullName\": \"$TEST_NAME\",
-    \"email\": \"$TEST_EMAIL\",
-    \"phone\": \"$TEST_PHONE\",
-    \"password\": \"$TEST_PASSWORD\",
-    \"gender\": \"male\",
-    \"birthday\": \"1995-01-15\"
-  }")
-echo "Response: $REGISTER_RESULT"
-echo ""
-
-# ─── STEP 2: Đăng nhập (bỏ qua OTP verify — dev mode) ───
-echo "━━━ STEP 2: Đăng nhập lấy JWT Token ━━━"
+echo "Đang đăng nhập..."
 LOGIN_RESULT=$(curl -s -X POST "$API_BASE/auth/login" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"emailOrPhone\": \"$TEST_PHONE\",
-    \"password\": \"$TEST_PASSWORD\",
-    \"appType\": \"OWNER_APP\"
-  }")
-echo "Response (truncated): $(echo $LOGIN_RESULT | head -c 500)"
-echo ""
+  -d "{\"emailOrPhone\":\"$LOGIN_ID\",\"password\":\"$LOGIN_PASS\",\"appType\":\"OWNER_APP\"}")
 
-# Trích JWT token
-TOKEN=$(echo "$LOGIN_RESULT" | grep -o '"accessToken":"[^"]*"' | head -1 | cut -d'"' -f4)
+TOKEN=$(parse_json "accessToken" "$LOGIN_RESULT")
 if [ -z "$TOKEN" ]; then
-  # Thử format khác
-  TOKEN=$(echo "$LOGIN_RESULT" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
+  TOKEN=$(parse_json "access_token" "$LOGIN_RESULT")
 fi
 
 if [ -z "$TOKEN" ]; then
-  echo "❌ Không lấy được JWT token. Có thể tài khoản chưa verify OTP."
-  echo ""
-  echo "=== THỬ ĐĂNG NHẬP VỚI TÀI KHOẢN CÓ SẴN ==="
-  echo "Nhập emailOrPhone của tài khoản đã có (hoặc Ctrl+C để thoát):"
-  read -p "emailOrPhone: " EXISTING_LOGIN
-  read -p "password: " EXISTING_PASS
-  
-  LOGIN_RESULT=$(curl -s -X POST "$API_BASE/auth/login" \
-    -H "Content-Type: application/json" \
-    -d "{
-      \"emailOrPhone\": \"$EXISTING_LOGIN\",
-      \"password\": \"$EXISTING_PASS\",
-      \"appType\": \"OWNER_APP\"
-    }")
-  echo "Response: $(echo $LOGIN_RESULT | head -c 500)"
-  
-  TOKEN=$(echo "$LOGIN_RESULT" | grep -o '"accessToken":"[^"]*"' | head -1 | cut -d'"' -f4)
-  if [ -z "$TOKEN" ]; then
-    TOKEN=$(echo "$LOGIN_RESULT" | grep -o '"access_token":"[^"]*"' | head -1 | cut -d'"' -f4)
-  fi
-  
-  if [ -z "$TOKEN" ]; then
-    echo "❌ Vẫn không có token. Dừng test."
-    exit 1
-  fi
+  echo "❌ Đăng nhập thất bại!"
+  echo "Response: $LOGIN_RESULT"
+  exit 1
 fi
-
-echo "✅ Token: ${TOKEN:0:50}..."
+echo "✅ Đăng nhập thành công!"
+echo "Token: ${TOKEN:0:40}..."
 echo ""
 
-# ─── STEP 3: Tạo store ───
-echo "━━━ STEP 3: Tạo cửa hàng test ━━━"
-STORE_RESULT=$(curl -s -X POST "$API_BASE/stores" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"name\": \"Test Store FaceReg\",
-    \"phone\": \"$TEST_PHONE\",
-    \"address\": \"123 Test Street\"
-  }")
-echo "Response: $(echo $STORE_RESULT | head -c 500)"
+# ─── STEP 2: Lấy danh sách Store ───
+echo "━━━ STEP 2: Lấy Store ID ━━━"
+STORES_RESULT=$(curl -s -X GET "$API_BASE/stores" \
+  -H "Authorization: Bearer $TOKEN")
+
+# Hiển thị danh sách store
+echo "Stores Response (500 chars): $(echo $STORES_RESULT | head -c 500)"
 echo ""
 
-STORE_ID=$(echo "$STORE_RESULT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+STORE_ID=$(parse_json "id" "$STORES_RESULT")
 if [ -z "$STORE_ID" ]; then
-  echo "⚠️  Không tạo được store mới. Thử lấy store đã có..."
-  STORES_LIST=$(curl -s -X GET "$API_BASE/stores" \
-    -H "Authorization: Bearer $TOKEN")
-  STORE_ID=$(echo "$STORES_LIST" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-  echo "Store ID từ list: $STORE_ID"
+  echo "⚠️  Không tìm thấy store nào. Tạo store mới..."
+  CREATE_STORE=$(curl -s -X POST "$API_BASE/stores" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\":\"Test Store\",\"phone\":\"0900000000\",\"address\":\"123 Test\"}")
+  echo "Create store response: $CREATE_STORE"
+  STORE_ID=$(parse_json "id" "$CREATE_STORE")
+fi
+
+if [ -z "$STORE_ID" ]; then
+  read -p "Nhập Store ID thủ công: " STORE_ID
 fi
 
 echo "✅ Store ID: $STORE_ID"
 echo ""
 
-# ─── STEP 4: Tạo nhân viên ───
-echo "━━━ STEP 4: Tạo nhân viên test ━━━"
-EMP_EMAIL="emp_$(date +%s)@test.com"
-EMP_PHONE="08$(shuf -i 10000000-99999999 -n 1)"
+# ─── STEP 3: Lấy danh sách Employee ───
+echo "━━━ STEP 3: Lấy Employee ID ━━━"
+EMP_RESULT=$(curl -s -X GET "$API_BASE/stores/$STORE_ID/employees" \
+  -H "Authorization: Bearer $TOKEN")
 
-EMPLOYEE_RESULT=$(curl -s -X POST "$API_BASE/stores/employees/manual" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"storeId\": \"$STORE_ID\",
-    \"fullName\": \"Nhân viên Test Face\",
-    \"phone\": \"$EMP_PHONE\",
-    \"email\": \"$EMP_EMAIL\",
-    \"birthday\": \"2000-05-20\",
-    \"gender\": \"male\"
-  }")
-echo "Response: $(echo $EMPLOYEE_RESULT | head -c 500)"
+echo "Employees (500 chars): $(echo $EMP_RESULT | head -c 500)"
 echo ""
 
-EMPLOYEE_ID=$(echo "$EMPLOYEE_RESULT" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+EMPLOYEE_ID=$(parse_json "id" "$EMP_RESULT")
 if [ -z "$EMPLOYEE_ID" ]; then
-  echo "⚠️  Không tạo được nhân viên. Thử lấy từ store..."
-  EMP_LIST=$(curl -s -X GET "$API_BASE/stores/$STORE_ID/employees" \
-    -H "Authorization: Bearer $TOKEN")
-  EMPLOYEE_ID=$(echo "$EMP_LIST" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
-  echo "Employee ID từ list: $EMPLOYEE_ID"
+  echo "⚠️  Không tìm thấy nhân viên nào."
+  read -p "Nhập Employee Profile ID thủ công: " EMPLOYEE_ID
 fi
 
 echo "✅ Employee ID: $EMPLOYEE_ID"
 echo ""
 
-# ─── STEP 5: Tạo ảnh test giả lập khuôn mặt ───
-echo "━━━ STEP 5: Tạo ảnh test ━━━"
+# ─── STEP 4: Tạo ảnh test ───
+echo "━━━ STEP 4: Tạo ảnh test ━━━"
+# Tạo ảnh JPEG nhỏ nhất có thể (1x1 pixel)
+# Đây là binary JPEG hợp lệ, base64 encoded
+echo "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkS
+Ew8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJ
+CQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy
+MjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEA
+AAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIh
+MUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JygQ" | base64 -d > /tmp/face_test_1.jpg 2>/dev/null
 
-# Thử dùng ImageMagick nếu có, nếu không thì tải ảnh mẫu
-if command -v convert &> /dev/null; then
-  convert -size 640x480 xc:white \
-    -fill gray -draw "circle 320,200 320,300" \
-    -fill black -draw "circle 290,180 290,190" \
-    -fill black -draw "circle 350,180 350,190" \
-    /tmp/face_front.jpg
-  cp /tmp/face_front.jpg /tmp/face_left.jpg
-  cp /tmp/face_front.jpg /tmp/face_right.jpg
-  echo "✅ Tạo ảnh test bằng ImageMagick"
-else
+# Nếu base64 decode thất bại, tạo file nhỏ
+if [ ! -s /tmp/face_test_1.jpg ]; then
   # Tải ảnh mẫu từ internet
-  curl -s -o /tmp/face_front.jpg "https://picsum.photos/640/480" || echo "placeholder" > /tmp/face_front.jpg
-  cp /tmp/face_front.jpg /tmp/face_left.jpg
-  cp /tmp/face_front.jpg /tmp/face_right.jpg
-  echo "✅ Tạo ảnh test (placeholder)"
+  curl -s -L -o /tmp/face_test_1.jpg "https://thispersondoesnotexist.com" 2>/dev/null
 fi
 
-ls -la /tmp/face_*.jpg
+# Nếu vẫn không có, tạo file dummy
+if [ ! -s /tmp/face_test_1.jpg ]; then
+  printf '\xff\xd8\xff\xe0\x00\x10JFIF' > /tmp/face_test_1.jpg
+  dd if=/dev/urandom bs=1024 count=10 >> /tmp/face_test_1.jpg 2>/dev/null
+fi
+
+cp /tmp/face_test_1.jpg /tmp/face_test_2.jpg
+cp /tmp/face_test_1.jpg /tmp/face_test_3.jpg
+echo "✅ Ảnh test đã tạo:"
+ls -la /tmp/face_test_*.jpg
 echo ""
 
-# ─── STEP 6: GỌI FACE REGISTRATION API ───
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  🎯 STEP 6: TEST FACE REGISTRATION API"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+# ─── STEP 5: GỌI FACE REGISTRATION (MAIN TEST) ───
 echo ""
-echo "URL: $API_BASE/stores/employees/$EMPLOYEE_ID/face-registration"
-echo "Store ID: $STORE_ID"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  🎯 STEP 5: TEST FACE REGISTRATION API"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+echo "POST $API_BASE/stores/employees/$EMPLOYEE_ID/face-registration"
+echo "  storeId=$STORE_ID"
+echo "  photos: 3 files"
 echo ""
 
-FACE_RESULT=$(curl -v -X POST \
-  "$API_BASE/stores/employees/$EMPLOYEE_ID/face-registration" \
+# Dùng curl -v để xem TOÀN BỘ HTTP headers + response
+HTTP_CODE=$(curl -s -o /tmp/face_response.txt -w "%{http_code}" \
+  -X POST "$API_BASE/stores/employees/$EMPLOYEE_ID/face-registration" \
   -H "Authorization: Bearer $TOKEN" \
   -F "storeId=$STORE_ID" \
-  -F "photos=@/tmp/face_front.jpg" \
-  -F "photos=@/tmp/face_left.jpg" \
-  -F "photos=@/tmp/face_right.jpg" \
-  2>&1)
+  -F "photos=@/tmp/face_test_1.jpg" \
+  -F "photos=@/tmp/face_test_2.jpg" \
+  -F "photos=@/tmp/face_test_3.jpg")
+
+RESPONSE_BODY=$(cat /tmp/face_response.txt)
+
+echo "━━━ KẾT QUẢ ━━━"
+echo ""
+echo "📡 HTTP Status Code: $HTTP_CODE"
+echo ""
+echo "📦 Response Body:"
+echo "$RESPONSE_BODY" | head -c 2000
+echo ""
+echo ""
+
+# Phân tích
+echo "━━━ PHÂN TÍCH ━━━"
+case "$HTTP_CODE" in
+  200|201)
+    echo "✅ THÀNH CÔNG! Backend nhận và xử lý được request."
+    if echo "$RESPONSE_BODY" | grep -q "faceDescriptors"; then
+      echo "   Face descriptors đã được trích xuất thành công."
+    elif echo "$RESPONSE_BODY" | grep -q "faces detected"; then
+      echo "   ⚠️ Không phát hiện đủ khuôn mặt (ảnh test không có mặt thật — bình thường)"
+    fi
+    ;;
+  400)
+    echo "⚠️  BAD REQUEST (400) — Server nhận request nhưng dữ liệu không hợp lệ."
+    echo "   Có thể: ảnh test không có khuôn mặt, thiếu field, v.v."
+    echo "   → Backend HOẠT ĐỘNG. Lỗi trên app có thể do nguyên nhân khác."
+    ;;
+  401)
+    echo "❌ UNAUTHORIZED (401) — JWT Token không hợp lệ hoặc hết hạn."
+    echo "   → Kiểm tra token refresh trên app nhân viên."
+    ;;
+  404)
+    echo "❌ NOT FOUND (404) — Route không tồn tại."
+    echo "   → Kiểm tra URL endpoint."
+    ;;
+  413)
+    echo "❌ ENTITY TOO LARGE (413) — File upload quá lớn."
+    ;;
+  500)
+    echo "❌ INTERNAL SERVER ERROR (500) — Backend crash khi xử lý!"
+    echo "   → Kiểm tra: pm2 logs time-backend-v2 --lines 30"
+    ;;
+  502)
+    echo "❌ BAD GATEWAY (502) — NestJS không phản hồi."
+    ;;
+  000|"")
+    echo "❌ KHÔNG CÓ RESPONSE — Server không chạy hoặc port sai."
+    echo "   → Kiểm tra: pm2 status"
+    ;;
+  *)
+    echo "❓ HTTP $HTTP_CODE — Kiểm tra response body ở trên."
+    ;;
+esac
 
 echo ""
-echo "━━━ FULL RESPONSE (curl -v) ━━━"
-echo "$FACE_RESULT"
-echo ""
-
-# Phân tích kết quả
-HTTP_CODE=$(echo "$FACE_RESULT" | grep "< HTTP/" | tail -1 | awk '{print $3}')
-echo ""
-echo "============================================"
-echo "  📊 KẾT QUẢ"
-echo "============================================"
-echo "HTTP Status: $HTTP_CODE"
-
-if echo "$FACE_RESULT" | grep -q "faceDescriptors"; then
-  echo "✅ FACE REGISTRATION THÀNH CÔNG!"
-elif echo "$FACE_RESULT" | grep -q "faces detected"; then
-  echo "⚠️  Backend nhận request nhưng không detect được face (ảnh test không có mặt thật)"
-  echo "   → Backend hoạt động đúng! Lỗi trên app là do vấn đề khác."
-elif echo "$FACE_RESULT" | grep -q "401\|Unauthorized"; then
-  echo "❌ LỖI 401 — Token không hợp lệ hoặc hết hạn"
-elif echo "$FACE_RESULT" | grep -q "500\|Internal Server Error"; then
-  echo "❌ LỖI 500 — Backend crash khi xử lý"
-elif echo "$FACE_RESULT" | grep -q "413\|Entity Too Large"; then
-  echo "❌ LỖI 413 — File quá lớn"
-elif echo "$FACE_RESULT" | grep -q "404\|Not Found"; then
-  echo "❌ LỖI 404 — Route không tồn tại"
-else
-  echo "❓ Kết quả không xác định, đọc response ở trên"
-fi
-
-echo ""
-echo "━━━ KIỂM TRA PM2 LOGS NGAY SAU KHI CHẠY ━━━"
-echo "Chạy: pm2 logs time-backend-v2 --lines 20"
+echo "━━━ PM2 LOGS (20 dòng gần nhất) ━━━"
+pm2 logs time-backend-v2 --lines 20 --nostream 2>/dev/null || echo "(không lấy được PM2 logs)"
 echo ""
 
 # Cleanup
-rm -f /tmp/face_front.jpg /tmp/face_left.jpg /tmp/face_right.jpg
+rm -f /tmp/face_test_*.jpg /tmp/face_response.txt
+echo "🧹 Cleanup done."
