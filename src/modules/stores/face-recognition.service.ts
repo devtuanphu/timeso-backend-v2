@@ -1,13 +1,8 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 /* eslint-disable @typescript-eslint/no-require-imports */
-// Load native TensorFlow C++ backend BEFORE face-api.js (10-20x faster)
-try {
-  require('@tensorflow/tfjs-node');
-} catch (e) {
-  console.warn('⚠️ @tensorflow/tfjs-node not available, using JS backend (slower)');
-}
 const faceapi = require('face-api.js');
 const canvas = require('canvas');
+const sharp = require('sharp');
 /* eslint-enable @typescript-eslint/no-require-imports */
 import * as path from 'path';
 import * as fs from 'fs';
@@ -71,23 +66,25 @@ export class FaceRecognitionService implements OnModuleInit {
   }
 
   /**
-   * Resize image buffer to target size using canvas
+   * Resize image buffer using sharp (native libvips, 10-50x faster than canvas)
+   * Returns a canvas object ready for face-api.js
    */
   private async resizeImage(imageBuffer: Buffer, maxSize = 320): Promise<any> {
-    const img = await canvas.loadImage(imageBuffer);
-    let { width, height } = img;
+    const t = Date.now();
 
-    if (width > maxSize || height > maxSize) {
-      const scale = maxSize / Math.max(width, height);
-      width = Math.round(width * scale);
-      height = Math.round(height * scale);
-    }
+    // Sharp: decode + resize in native C++ (milliseconds vs seconds)
+    const resizedBuffer = await sharp(imageBuffer)
+      .resize(maxSize, maxSize, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 })
+      .toBuffer();
 
-    const resizedCanvas = canvas.createCanvas(width, height);
+    // Load small resized buffer into canvas for face-api.js
+    const img = await canvas.loadImage(resizedBuffer);
+    const resizedCanvas = canvas.createCanvas(img.width, img.height);
     const ctx = resizedCanvas.getContext('2d');
-    ctx.drawImage(img, 0, 0, width, height);
+    ctx.drawImage(img, 0, 0);
 
-    this.logger.log(`📐 Resized: ${img.width}x${img.height} → ${width}x${height}`);
+    this.logger.log(`📐 Resized: → ${img.width}x${img.height} (sharp ${Date.now() - t}ms)`);
     return resizedCanvas;
   }
 
