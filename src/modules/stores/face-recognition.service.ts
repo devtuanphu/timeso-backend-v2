@@ -54,6 +54,7 @@ export class FaceRecognitionService implements OnModuleInit {
 
   /**
    * Extract 128-dim face descriptor from an image buffer
+   * Resize to 640px first for performance (camera sends 4000x3000px)
    */
   async extractDescriptor(imageBuffer: Buffer): Promise<Float32Array | null> {
     if (!this.modelsLoaded) {
@@ -63,8 +64,24 @@ export class FaceRecognitionService implements OnModuleInit {
 
     try {
       const img = await canvas.loadImage(imageBuffer);
+
+      // Resize to 640px max width for fast processing
+      const MAX_SIZE = 640;
+      let { width, height } = img;
+      if (width > MAX_SIZE || height > MAX_SIZE) {
+        const scale = MAX_SIZE / Math.max(width, height);
+        width = Math.round(width * scale);
+        height = Math.round(height * scale);
+      }
+
+      const resizedCanvas = canvas.createCanvas(width, height);
+      const ctx = resizedCanvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+
+      this.logger.log(`📐 Resized image: ${img.width}x${img.height} → ${width}x${height}`);
+
       const detection = await faceapi
-        .detectSingleFace(img as any)
+        .detectSingleFace(resizedCanvas as any)
         .withFaceLandmarks()
         .withFaceDescriptor();
 
