@@ -1,5 +1,11 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 /* eslint-disable @typescript-eslint/no-require-imports */
+// Load native TensorFlow C++ backend BEFORE face-api.js (10-20x faster)
+try {
+  require('@tensorflow/tfjs-node');
+} catch (e) {
+  console.warn('⚠️ @tensorflow/tfjs-node not available, using JS backend (slower)');
+}
 const faceapi = require('face-api.js');
 const canvas = require('canvas');
 /* eslint-enable @typescript-eslint/no-require-imports */
