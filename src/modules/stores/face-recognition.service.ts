@@ -90,7 +90,7 @@ export class FaceRecognitionService implements OnModuleInit {
 
   /**
    * Extract 128-dim face descriptor from an image buffer
-   * Uses tinyFaceDetector (10x faster) + resize to 320px
+   * Uses ssdMobilenetv1 (accurate) + sharp resize to 640px
    */
   async extractDescriptor(imageBuffer: Buffer): Promise<Float32Array | null> {
     if (!this.modelsLoaded) {
@@ -100,14 +100,11 @@ export class FaceRecognitionService implements OnModuleInit {
 
     try {
       const startTime = Date.now();
-      const resizedCanvas = await this.resizeImage(imageBuffer, 320);
+      const resizedCanvas = await this.resizeImage(imageBuffer, 640);
 
       const detection = await faceapi
-        .detectSingleFace(resizedCanvas as any, new faceapi.TinyFaceDetectorOptions({
-          inputSize: 320,
-          scoreThreshold: 0.3,
-        }))
-        .withFaceLandmarks(true) // true = use tiny landmarks
+        .detectSingleFace(resizedCanvas as any)
+        .withFaceLandmarks()
         .withFaceDescriptor();
 
       const elapsed = Date.now() - startTime;
