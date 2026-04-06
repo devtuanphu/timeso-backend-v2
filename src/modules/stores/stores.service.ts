@@ -8725,6 +8725,7 @@ export class StoresService {
   }
 
   async registerFace(employeeProfileId: string, storeId: string, imageBuffers: Buffer[]) {
+    const startTime = Date.now();
     console.log(`🔵 [FaceRegistration] START — employee=${employeeProfileId}, store=${storeId}, images=${imageBuffers.length}`);
 
     if (imageBuffers.length < 3) {
@@ -8732,9 +8733,11 @@ export class StoresService {
       throw new BadRequestException('At least 3 face images required');
     }
 
+    const t1 = Date.now();
     console.log(`🔍 [FaceRegistration] Extracting face descriptors from ${imageBuffers.length} images...`);
     const result = await this.faceRecognitionService.registerFace(imageBuffers);
-    console.log(`🔍 [FaceRegistration] Result: ${result.successCount} faces detected, ${result.failedCount} failed, ${result.descriptors.length} descriptors (each ${result.descriptors[0]?.length || 0}-dim)`);
+    const extractTime = Date.now() - t1;
+    console.log(`🔍 [FaceRegistration] Result: ${result.successCount} faces detected, ${result.failedCount} failed — took ${extractTime}ms`);
 
     if (result.successCount < 3) {
       console.warn(`❌ [FaceRegistration] Only ${result.successCount}/3 faces detected — REJECTED`);
@@ -8760,7 +8763,8 @@ export class StoresService {
     });
 
     const saved = await this.employeeFaceRepository.save(face);
-    console.log(`✅ [FaceRegistration] SUCCESS — faceId=${saved.id}, descriptors=${saved.faceDescriptors?.length}, isActive=${saved.isActive}`);
+    const totalTime = Date.now() - startTime;
+    console.log(`✅ [FaceRegistration] SUCCESS — faceId=${saved.id}, descriptors=${saved.faceDescriptors?.length} — TOTAL ${totalTime}ms`);
 
     return saved;
   }
