@@ -1,15 +1,25 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-/* eslint-disable @typescript-eslint/no-require-imports */
-const faceapi = require('face-api.js');
-const canvas = require('canvas');
-const sharp = require('sharp');
-/* eslint-enable @typescript-eslint/no-require-imports */
 import * as path from 'path';
 import * as fs from 'fs';
 
+/* eslint-disable @typescript-eslint/no-require-imports */
+// Load native TensorFlow C++ backend FIRST (10-20x faster than pure JS)
+let tfBackend = 'cpu-js';
+try {
+  require('@tensorflow/tfjs-node');
+  tfBackend = 'tfjs-node (C++)';
+} catch {
+  console.warn('⚠️ @tensorflow/tfjs-node not loaded, using slow JS backend');
+}
+
+// Use @vladmandic/face-api (modern fork, compatible with tfjs-node)
+const faceapi = require('@vladmandic/face-api');
+const canvas = require('canvas');
+/* eslint-enable @typescript-eslint/no-require-imports */
+
 // Polyfill for Node.js environment
 const { Canvas, Image, ImageData } = canvas;
-(faceapi as any).env.monkeyPatch({ Canvas, Image, ImageData } as any);
+faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
 export interface FaceMatchResult {
   matched: boolean;
@@ -28,7 +38,6 @@ export class FaceRecognitionService implements OnModuleInit {
 
   /**
    * Load face-api.js neural network models
-   * Dùng tinyFaceDetector + landmark68Tiny → nhanh gấp 10x so với ssdMobilenetv1
    */
   async loadModels(): Promise<void> {
     if (this.modelsLoaded) return;
@@ -36,123 +45,77 @@ export class FaceRecognitionService implements OnModuleInit {
     const modelsPath = path.join(process.cwd(), 'models');
 
     if (!fs.existsSync(modelsPath)) {
-      this.logger.warn(`Models directory not found at ${modelsPath}. Face recognition will not work.`);
+      this.logger.warn(`Models directory not found at ${modelsPath}.`);
       return;
     }
 
     try {
-      this.logger.log('Loading face-api.js models (tiny + recognition)...');
+      this.logger.log(`Loading face models... (backend: ${tfBackend})`);
 
-      // TinyFaceDetector: ~190KB vs ssdMobilenetv1: ~5.6MB → 10x faster
-      await faceapi.nets.tinyFaceDetector.loadFromDisk(modelsPath);
-      // Tiny landmarks: ~350KB vs full: ~350KB (same)
-      await faceapi.nets.faceLandmark68TinyNet.loadFromDisk(modelsPath);
-      // Recognition net: ~6.4MB (same, needed for 128-dim descriptor)
+      await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelsPath);
+      await faceapi.nets.faceLandmark68Net.loadFromDisk(modelsPath);
       await faceapi.nets.faceRecognitionNet.loadFromDisk(modelsPath);
 
-      // Also load ssdMobilenetv1 + full landmarks as fallback for check-in
-      try {
-        await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelsPath);
-        await faceapi.nets.faceLandmark68Net.loadFromDisk(modelsPath);
-      } catch {
-        this.logger.warn('SSD MobileNet fallback models not loaded');
-      }
-
       this.modelsLoaded = true;
-      this.logger.log('Face-api.js models loaded successfully ✅');
+      this.logger.log(`Face models loaded ✅ (backend: ${tfBackend})`);
     } catch (error) {
-      this.logger.error('Failed to load face-api.js models:', error);
+      this.logger.error('Failed to load face models:', error);
     }
   }
 
   /**
-   * Resize image buffer using sharp (native libvips, 10-50x faster than canvas)
-   * Returns a canvas object ready for face-api.js
-   */
-  private async resizeImage(imageBuffer: Buffer, maxSize = 320): Promise<any> {
-    const t = Date.now();
-
-    // Sharp: decode + resize in native C++ (milliseconds vs seconds)
-    const resizedBuffer = await sharp(imageBuffer)
-      .resize(maxSize, maxSize, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 80 })
-      .toBuffer();
-
-    // Load small resized buffer into canvas for face-api.js
-    const img = await canvas.loadImage(resizedBuffer);
-    const resizedCanvas = canvas.createCanvas(img.width, img.height);
-    const ctx = resizedCanvas.getContext('2d');
-    ctx.drawImage(img, 0, 0);
-
-    this.logger.log(`📐 Resized: → ${img.width}x${img.height} (sharp ${Date.now() - t}ms)`);
-    return resizedCanvas;
-  }
-
-  /**
    * Extract 128-dim face descriptor from an image buffer
-   * Uses ssdMobilenetv1 (accurate) + sharp resize to 640px
+   * Resize to 640px using canvas for consistent quality
    */
   async extractDescriptor(imageBuffer: Buffer): Promise<Float32Array | null> {
     if (!this.modelsLoaded) {
-      this.logger.warn('Models not loaded, cannot extract descriptor');
+      this.logger.warn('Models not loaded');
       return null;
     }
 
     try {
       const startTime = Date.now();
-      const resizedCanvas = await this.resizeImage(imageBuffer, 640);
 
+      // Decode + resize using canvas (consistent quality for face detection)
+      const img = await canvas.loadImage(imageBuffer);
+      const MAX_SIZE = 640;
+      let w = img.width;
+      let h = img.height;
+      if (w > MAX_SIZE || h > MAX_SIZE) {
+        const scale = MAX_SIZE / Math.max(w, h);
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      const resizedCanvas = canvas.createCanvas(w, h);
+      resizedCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+      const resizeTime = Date.now() - startTime;
+
+      // Face detection + descriptor extraction
+      const detectStart = Date.now();
       const detection = await faceapi
-        .detectSingleFace(resizedCanvas as any)
+        .detectSingleFace(resizedCanvas)
         .withFaceLandmarks()
         .withFaceDescriptor();
 
-      const elapsed = Date.now() - startTime;
-      this.logger.log(`⏱️ Face detection took ${elapsed}ms`);
+      const detectTime = Date.now() - detectStart;
+      const totalTime = Date.now() - startTime;
+      this.logger.log(`⏱️ resize=${resizeTime}ms detect=${detectTime}ms total=${totalTime}ms (${img.width}x${img.height}→${w}x${h})`);
 
       if (!detection) {
-        this.logger.warn('No face detected in image');
+        this.logger.warn('No face detected');
         return null;
       }
 
       return detection.descriptor;
     } catch (error) {
-      this.logger.error('Error extracting face descriptor:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Extract descriptor using SSD MobileNet (more accurate, for check-in/out)
-   */
-  async extractDescriptorAccurate(imageBuffer: Buffer): Promise<Float32Array | null> {
-    if (!this.modelsLoaded) {
-      return null;
-    }
-
-    try {
-      const resizedCanvas = await this.resizeImage(imageBuffer, 640);
-
-      const detection = await faceapi
-        .detectSingleFace(resizedCanvas as any)
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-
-      if (!detection) {
-        this.logger.warn('No face detected in image (accurate mode)');
-        return null;
-      }
-
-      return detection.descriptor;
-    } catch (error) {
-      this.logger.error('Error extracting face descriptor (accurate):', error);
+      this.logger.error('Error extracting descriptor:', error);
       return null;
     }
   }
 
   /**
    * Compare a face descriptor against stored descriptors
-   * @returns Match result with distance (lower = better, < 0.6 = match)
    */
   compareFaces(
     descriptor: Float32Array,
@@ -184,8 +147,7 @@ export class FaceRecognitionService implements OnModuleInit {
   }
 
   /**
-   * Register face from multiple image buffers
-   * Uses Promise.all for PARALLEL processing (3x faster)
+   * Register face from multiple image buffers (sequential to avoid CPU contention)
    */
   async registerFace(imageBuffers: Buffer[]): Promise<{
     descriptors: number[][];
@@ -193,16 +155,13 @@ export class FaceRecognitionService implements OnModuleInit {
     failedCount: number;
   }> {
     const startTime = Date.now();
-
-    // Process all images in PARALLEL instead of sequential
-    const results = await Promise.all(
-      imageBuffers.map(buffer => this.extractDescriptor(buffer))
-    );
-
     const descriptors: number[][] = [];
     let failedCount = 0;
 
-    for (const descriptor of results) {
+    // Sequential processing — single CPU thread, parallel gives no benefit
+    for (let i = 0; i < imageBuffers.length; i++) {
+      this.logger.log(`🔄 Processing image ${i + 1}/${imageBuffers.length}...`);
+      const descriptor = await this.extractDescriptor(imageBuffers[i]);
       if (descriptor) {
         descriptors.push(Array.from(descriptor));
       } else {
@@ -210,19 +169,12 @@ export class FaceRecognitionService implements OnModuleInit {
       }
     }
 
-    const elapsed = Date.now() - startTime;
-    this.logger.log(`⏱️ Total registration took ${elapsed}ms for ${imageBuffers.length} images`);
+    const totalTime = Date.now() - startTime;
+    this.logger.log(`⏱️ Registration total: ${totalTime}ms (${descriptors.length} success, ${failedCount} failed)`);
 
-    return {
-      descriptors,
-      successCount: descriptors.length,
-      failedCount,
-    };
+    return { descriptors, successCount: descriptors.length, failedCount };
   }
 
-  /**
-   * Check if models are loaded and ready
-   */
   isReady(): boolean {
     return this.modelsLoaded;
   }
