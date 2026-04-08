@@ -1,0 +1,108 @@
+﻿  console.warn
+    ÔÜá´©Å @tensorflow/tfjs-node not loaded, using slow JS backend
+
+    [0m [90m 14 |[39m     require([32m'@tensorflow/tfjs-node'[39m)[33m;[39m
+     [90m 15 |[39m   } [36mcatch[39m {
+    [31m[1m>[22m[39m[90m 16 |[39m     console[33m.[39mwarn([32m'ÔÜá´©Å @tensorflow/tfjs-node not loaded, using slow JS backend'[39m)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 17 |[39m   }
+     [90m 18 |[39m
+     [90m 19 |[39m   [90m// Use @vladmandic/face-api (modern fork, compatible with tfjs-node)[39m[0m
+
+      at Object.<anonymous> (modules/stores/face-recognition.service.ts:16:13)
+      at Object.<anonymous> (modules/stores/stores.service.ts:43:1)
+      at Object.<anonymous> (modules/stores/work-shift.spec.ts:11:1)
+
+  console.warn
+    ÔÜá´©Å Face recognition dependencies not available (canvas/face-api). Face features disabled. The specified module could not be found.
+    \\?\D:\timeso-src\timeso-backend\node_modules\@tensorflow\tfjs-node\lib\napi-v8\tfjs_binding.node
+
+    [0m [90m 26 |[39m   faceApiAvailable [33m=[39m [36mtrue[39m[33m;[39m
+     [90m 27 |[39m } [36mcatch[39m (err) {
+    [31m[1m>[22m[39m[90m 28 |[39m   console[33m.[39mwarn([32m'ÔÜá´©Å Face recognition dependencies not available (canvas/face-api). Face features disabled.'[39m[33m,[39m (err [36mas[39m [33mError[39m)[33m?[39m[33m.[39mmessage)[33m;[39m
+     [90m    |[39m           [31m[1m^[22m[39m
+     [90m 29 |[39m }
+     [90m 30 |[39m [90m/* eslint-enable @typescript-eslint/no-require-imports */[39m
+     [90m 31 |[39m[0m
+
+      at Object.<anonymous> (modules/stores/face-recognition.service.ts:28:11)
+      at Object.<anonymous> (modules/stores/stores.service.ts:43:1)
+      at Object.<anonymous> (modules/stores/work-shift.spec.ts:11:1)
+
+npx : PASS 
+src/modules/stores/work-shift.spec.ts
+At line:1 char:1
++ npx jest 
+src/modules/stores/work-shift.spec.ts 
+--no-cache --verbose 2 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified:  
+   (PASS src/module...k-shift.spec.ts:Strin  
+  g) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandE 
+   rror
+ 
+  Work Shift & Cycle Management
+    createWorkShift
+      ÔêÜ should create a work shift with 
+correct storeId (25 ms)
+      ÔêÜ should create multiple shifts for 
+same store (9 ms)
+    getWorkShifts
+      ÔêÜ should return only active shifts 
+(8 ms)
+      ÔêÜ should return empty array when no 
+shifts (9 ms)
+    updateWorkShift
+      ÔêÜ should update and return updated 
+entity (7 ms)
+      ÔêÜ should throw NotFoundException 
+when shift not found (78 ms)
+    getActiveCycle
+      ÔêÜ should return active cycle with 
+relations (12 ms)
+      ÔêÜ should return null when no active 
+cycle (5 ms)
+    createWorkCycle
+      ÔêÜ should reject if active cycle 
+exists (6 ms)
+      ÔêÜ should create WEEKLY cycle with 
+endDate = startDate + 6 days (12 ms)
+      ÔêÜ should create DAILY cycle with 
+endDate = startDate (5 ms)
+      ÔêÜ should create INDEFINITE cycle 
+with endDate = null (6 ms)
+      ÔêÜ should generate slots when 
+workShiftIds provided (8 ms)
+      ÔêÜ should create templates for 
+INDEFINITE cycle (5 ms)
+    getWorkCycles
+      ÔêÜ should return all cycles ordered 
+by createdAt DESC (8 ms)
+    stopWorkCycle
+      ÔêÜ should stop cycle immediately (6 
+ms)
+      ÔêÜ should schedule stop (5 ms)
+      ÔêÜ should throw NotFoundException if 
+cycle missing (9 ms)
+      ÔêÜ should throw BadRequestException 
+if cycle not ACTIVE (5 ms)
+    Full Flow: Shifts ÔåÆ Cycle ÔåÆ Stop ÔåÆ 
+New Cycle
+      ÔêÜ should complete entire lifecycle 
+(12 ms)
+    Edge Cases
+      ÔêÜ should calculate MONTHLY endDate 
+correctly (March ÔåÆ 31 days) (6 ms)
+      ÔêÜ should handle February (28 days, 
+non-leap year) (7 ms)
+      ÔêÜ should reject creating cycle with 
+error message (8 ms)
+
+Test Suites: 1 passed, 1 total
+Tests:       23 passed, 23 total
+Snapshots:   0 total
+Time:        2.598 s
+Ran all test suites matching 
+src/modules/stores/work-shift.spec.ts.

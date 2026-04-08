@@ -1,0 +1,3761 @@
+﻿  console.warn
+    ÔÜá´©Å @tensorflow/tfjs-node not loaded, using slow JS backend
+
+    [0m [90m 14 |[39m     require([32m'@tensorflow/tfjs-node'[39m)[33m;[39m
+     [90m 15 |[39m   } [36mcatch[39m {
+    [31m[1m>[22m[39m[90m 16 |[39m     console[33m.[39mwarn([32m'ÔÜá´©Å @tensorflow/tfjs-node not loaded, using slow JS backend'[39m)[33m;[39m
+     [90m    |[39m             [31m[1m^[22m[39m
+     [90m 17 |[39m   }
+     [90m 18 |[39m
+     [90m 19 |[39m   [90m// Use @vladmandic/face-api (modern fork, compatible with tfjs-node)[39m[0m
+
+      at Object.<anonymous> (modules/stores/face-recognition.service.ts:16:13)
+      at Object.<anonymous> (modules/stores/stores.service.ts:43:1)
+      at Object.<anonymous> (modules/stores/work-shift.spec.ts:8:1)
+
+  console.warn
+    ÔÜá´©Å Face recognition dependencies not available (canvas/face-api). Face features disabled. The specified module could not be found.
+    \\?\D:\timeso-src\timeso-backend\node_modules\@tensorflow\tfjs-node\lib\napi-v8\tfjs_binding.node
+
+    [0m [90m 26 |[39m   faceApiAvailable [33m=[39m [36mtrue[39m[33m;[39m
+     [90m 27 |[39m } [36mcatch[39m (err) {
+    [31m[1m>[22m[39m[90m 28 |[39m   console[33m.[39mwarn([32m'ÔÜá´©Å Face recognition dependencies not available (canvas/face-api). Face features disabled.'[39m[33m,[39m (err [36mas[39m [33mError[39m)[33m?[39m[33m.[39mmessage)[33m;[39m
+     [90m    |[39m           [31m[1m^[22m[39m
+     [90m 29 |[39m }
+     [90m 30 |[39m [90m/* eslint-enable @typescript-eslint/no-require-imports */[39m
+     [90m 31 |[39m[0m
+
+      at Object.<anonymous> (modules/stores/face-recognition.service.ts:28:11)
+      at Object.<anonymous> (modules/stores/stores.service.ts:43:1)
+      at Object.<anonymous> (modules/stores/work-shift.spec.ts:8:1)
+
+npx : FAIL 
+src/modules/stores/work-shift.spec.ts
+At line:1 char:1
++ npx jest 
+src/modules/stores/work-shift.spec.ts 
+--no-cache --verbose 2 ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified:  
+   (FAIL src/module...k-shift.spec.ts:Strin  
+  g) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandE 
+   rror
+ 
+  Work Shift & Cycle Management
+    createWorkShift
+      ├ù should create a work shift with 
+correct storeId (23 ms)
+      ├ù should create multiple shifts for 
+same store (8 ms)
+    getWorkShifts
+      ├ù should return only active shifts 
+for a store (6 ms)
+      ├ù should return empty array when no 
+shifts exist (7 ms)
+    updateWorkShift
+      ├ù should update shift name and return 
+updated entity (5 ms)
+      ├ù should throw NotFoundException when 
+shift does not exist (9 ms)
+      ├ù should throw NotFoundException when 
+shift belongs to different store (6 ms)
+    getActiveCycle
+      ├ù should return active cycle with 
+relations (5 ms)
+      ├ù should return null when no active 
+cycle (8 ms)
+    createWorkCycle
+      ├ù should throw BadRequestException if 
+an active cycle already exists (5 ms)
+      ├ù should create WEEKLY cycle with 
+auto-calculated endDate (6 ms)
+      ├ù should create DAILY cycle with 
+endDate = startDate (7 ms)
+      ├ù should create INDEFINITE cycle with 
+endDate = null (4 ms)
+      ├ù should auto-generate slots when 
+workShiftIds provided for WEEKLY (7 ms)
+      ├ù should create templates for 
+INDEFINITE cycle (5 ms)
+    getWorkCycles
+      ├ù should return all cycles ordered by 
+createdAt DESC (5 ms)
+    stopWorkCycle
+      ├ù should stop cycle immediately (8 ms)
+      ├ù should schedule stop with 
+scheduledStopAt (5 ms)
+      ├ù should throw NotFoundException if 
+cycle does not exist (8 ms)
+      ├ù should throw BadRequestException if 
+cycle is not ACTIVE (5 ms)
+    Full Flow: Create Shifts ÔåÆ Create 
+Cycle ÔåÆ Stop Cycle
+      ├ù should complete the full work shift 
+lifecycle (6 ms)
+    Edge Cases
+      ├ù should calculate MONTHLY endDate 
+correctly (8 ms)
+      ├ù should handle February correctly 
+for MONTHLY cycle (6 ms)
+      ├ù should reject creating cycle when 
+one is already active (5 ms)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkShift ÔÇ║ should create a work 
+shift with correct storeId
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkShift ÔÇ║ should create multiple 
+shifts for same store
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+getWorkShifts ÔÇ║ should return only active 
+shifts for a store
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+getWorkShifts ÔÇ║ should return empty array 
+when no shifts exist
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+updateWorkShift ÔÇ║ should update shift name 
+and return updated entity
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+updateWorkShift ÔÇ║ should throw 
+NotFoundException when shift does not exist
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+updateWorkShift ÔÇ║ should throw 
+NotFoundException when shift belongs to 
+different store
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+getActiveCycle ÔÇ║ should return active 
+cycle with relations
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+getActiveCycle ÔÇ║ should return null when 
+no active cycle
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should throw 
+BadRequestException if an active cycle 
+already exists
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should create WEEKLY 
+cycle with auto-calculated endDate
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should create DAILY 
+cycle with endDate = startDate
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should create INDEFINITE 
+cycle with endDate = null
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should auto-generate 
+slots when workShiftIds provided for WEEKLY
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+createWorkCycle ÔÇ║ should create templates 
+for INDEFINITE cycle
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+getWorkCycles ÔÇ║ should return all cycles 
+ordered by createdAt DESC
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+stopWorkCycle ÔÇ║ should stop cycle 
+immediately
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+stopWorkCycle ÔÇ║ should schedule stop with 
+scheduledStopAt
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+stopWorkCycle ÔÇ║ should throw 
+NotFoundException if cycle does not exist
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ 
+stopWorkCycle ÔÇ║ should throw 
+BadRequestException if cycle is not ACTIVE
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ Full 
+Flow: Create Shifts ÔåÆ Create Cycle ÔåÆ 
+Stop Cycle ÔÇ║ should complete the full work 
+shift lifecycle
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ Edge 
+Cases ÔÇ║ should calculate MONTHLY endDate 
+correctly
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ Edge 
+Cases ÔÇ║ should handle February correctly 
+for MONTHLY cycle
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+  ÔùÅ Work Shift & Cycle Management ÔÇ║ Edge 
+Cases ÔÇ║ should reject creating cycle when 
+one is already active
+
+    Nest can't resolve dependencies of the 
+StoresService (StoreRepository, 
+StoreEmployeeTypeRepository, 
+StoreRoleRepository, 
+EmployeeProfileRepository, 
+EmployeeProfileRoleRepository, 
+EmployeeContractRepository, 
+WorkShiftRepository, AssetRepository, 
+ProductRepository, AssetUnitRepository, 
+ProductUnitRepository, 
+MonthlyPayrollRepository, 
+SalaryConfigRepository, 
+EmployeeSalaryRepository, KpiTypeRepository, 
+AssetCategoryRepository, 
+AssetStatusRepository, 
+ProductCategoryRepository, 
+ProductStatusRepository, 
+EmployeeKpiRepository, KpiUnitRepository, 
+KpiPeriodRepository, KpiTaskRepository, 
+DailyEmployeeReportRepository, 
+EmployeeMonthlySummaryRepository, 
+StoreEventRepository, 
+StockTransactionRepository, 
+StockTransactionDetailRepository, 
+WorkCycleRepository, ShiftSlotRepository, 
+ShiftAssignmentRepository, 
+ShiftSwapRepository, 
+ServiceCategoryRepository, 
+ServiceItemRepository, 
+ServiceItemRecipeRepository, 
+OrderRepository, OrderItemRepository, 
+EmployeePerformanceRepository, 
+EmployeeLeaveRequestRepository, 
+EmployeeAssetAssignmentRepository, 
+EmployeeTerminationReasonRepository, 
+StoreProbationSettingRepository, 
+StoreSkillRepository, 
+StorePayrollPaymentHistoryRepository, 
+SalaryFundHistoryRepository, 
+SalaryAdvanceRequestRepository, 
+SalaryAdjustmentRepository, 
+SalaryAdjustmentReasonRepository, 
+EmployeePaymentHistoryRepository, 
+StorePaymentAccountRepository, 
+KpiApprovalRequestRepository, 
+InventoryReportRepository, 
+AssetExportTypeRepository, 
+ProductExportTypeRepository, 
+StoreApprovalSettingRepository, 
+StoreTimekeepingSettingRepository, 
+StorePayrollSettingRepository, 
+StorePayrollRuleRepository, 
+StorePayrollIncrementRuleRepository, 
+AccountIdentityDocumentRepository, 
+StoreInternalRuleRepository, 
+StorePermissionConfigRepository, 
+StoreShiftConfigRepository, 
+CycleShiftTemplateRepository, 
+AccountFinanceRepository, 
+FeedbackRepository, EmployeeFaceRepository, 
+AttendanceLogRepository, ?, 
+FaceRecognitionService). Please make sure 
+that the argument AccountsService at index 
+[68] is available in the RootTestModule 
+context.
+
+    Potential solutions:
+    - Is RootTestModule a valid NestJS 
+module?
+    - If AccountsService is a provider, is 
+it part of the current RootTestModule?
+    - If AccountsService is exported from a 
+separate @Module, is that module imported 
+within RootTestModule?
+      @Module({
+        imports: [ /* the Module containing 
+AccountsService */ ]
+      })
+
+    For more common dependency resolution 
+issues, see: 
+https://docs.nestjs.com/faq/common-errors
+
+    [0m [90m 106 |[39m     repos 
+[33m=[39m mockRepos[33m;[39m
+     [90m 107 |[39m
+    [31m[1m>[22m[39m[90m 108 |[39m     
+[36mconst[39m module[33m:[39m 
+[33mTestingModule[39m [33m=[39m 
+[36mawait[39m [33mTest[39m[33m.[39mcrea
+teTestingModule({
+     [90m     |[39m                        
+           [31m[1m^[22m[39m
+     [90m 109 |[39m       
+providers[33m:[39m [
+     [90m 110 |[39m         
+[33mStoresService[39m[33m,[39m
+     [90m 111 |[39m         
+[33m...[39mproviders[33m,[39m[0m
+
+      at TestingInjector.lookupComponentInPar
+entModules (../node_modules/@nestjs/core/inje
+ctor/injector.js:290:19)
+      at 
+TestingInjector.resolveComponentWrapper (../n
+ode_modules/@nestjs/testing/testing-injector.
+js:19:45)
+      at resolveParam (../node_modules/@nestj
+s/core/injector/injector.js:140:38)
+          at async Promise.all (index 68)
+      at 
+TestingInjector.resolveConstructorParams (../
+node_modules/@nestjs/core/injector/injector.j
+s:169:27)
+      at TestingInjector.loadInstance (../nod
+e_modules/@nestjs/core/injector/injector.js:7
+5:13)
+      at TestingInjector.loadProvider (../nod
+e_modules/@nestjs/core/injector/injector.js:1
+03:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:56:13
+          at async Promise.all (index 3)
+      at TestingInstanceLoader.createInstance
+sOfProviders (../node_modules/@nestjs/core/in
+jector/instance-loader.js:55:9)
+      at ../node_modules/@nestjs/core/injecto
+r/instance-loader.js:40:13
+          at async Promise.all (index 1)
+      at 
+TestingInstanceLoader.createInstances (../nod
+e_modules/@nestjs/core/injector/instance-load
+er.js:39:9)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/core
+/injector/instance-loader.js:22:13)
+      at TestingInstanceLoader.createInstance
+sOfDependencies (../node_modules/@nestjs/test
+ing/testing-instance-loader.js:9:9)
+      at TestingModuleBuilder.createInstances
+OfDependencies (../node_modules/@nestjs/testi
+ng/testing-module.builder.js:118:9)
+      at TestingModuleBuilder.compile (../nod
+e_modules/@nestjs/testing/testing-module.buil
+der.js:74:9)
+      at Object.<anonymous> 
+(modules/stores/work-shift.spec.ts:108:35)
+
+Test Suites: 1 failed, 1 total
+Tests:       24 failed, 24 total
+Snapshots:   0 total
+Time:        2.665 s
+Ran all test suites matching 
+src/modules/stores/work-shift.spec.ts.

@@ -3,23 +3,31 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 /* eslint-disable @typescript-eslint/no-require-imports */
-// Load native TensorFlow C++ backend FIRST (10-20x faster than pure JS)
-let tfBackend = 'cpu-js';
+// Gracefully load optional native AI dependencies
+let faceapi: any = null;
+let canvas: any = null;
+let faceApiAvailable = false;
+
 try {
-  require('@tensorflow/tfjs-node');
-  tfBackend = 'tfjs-node (C++)';
-} catch {
-  console.warn('⚠️ @tensorflow/tfjs-node not loaded, using slow JS backend');
+  // Load native TensorFlow C++ backend FIRST (10-20x faster than pure JS)
+  try {
+    require('@tensorflow/tfjs-node');
+  } catch {
+    console.warn('⚠️ @tensorflow/tfjs-node not loaded, using slow JS backend');
+  }
+
+  // Use @vladmandic/face-api (modern fork, compatible with tfjs-node)
+  faceapi = require('@vladmandic/face-api');
+  canvas = require('canvas');
+
+  // Polyfill for Node.js environment
+  const { Canvas, Image, ImageData } = canvas;
+  faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
+  faceApiAvailable = true;
+} catch (err) {
+  console.warn('⚠️ Face recognition dependencies not available (canvas/face-api). Face features disabled.', (err as Error)?.message);
 }
-
-// Use @vladmandic/face-api (modern fork, compatible with tfjs-node)
-const faceapi = require('@vladmandic/face-api');
-const canvas = require('canvas');
 /* eslint-enable @typescript-eslint/no-require-imports */
-
-// Polyfill for Node.js environment
-const { Canvas, Image, ImageData } = canvas;
-faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
 
 export interface FaceMatchResult {
   matched: boolean;
@@ -33,6 +41,10 @@ export class FaceRecognitionService implements OnModuleInit {
   private modelsLoaded = false;
 
   async onModuleInit() {
+    if (!faceApiAvailable) {
+      this.logger.warn('Face recognition dependencies not available. Service disabled.');
+      return;
+    }
     await this.loadModels();
   }
 
@@ -40,7 +52,7 @@ export class FaceRecognitionService implements OnModuleInit {
    * Load face-api.js neural network models
    */
   async loadModels(): Promise<void> {
-    if (this.modelsLoaded) return;
+    if (this.modelsLoaded || !faceApiAvailable) return;
 
     const modelsPath = path.join(process.cwd(), 'models');
 
@@ -50,14 +62,14 @@ export class FaceRecognitionService implements OnModuleInit {
     }
 
     try {
-      this.logger.log(`Loading face models... (backend: ${tfBackend})`);
+      this.logger.log(`Loading face models...`);
 
       await faceapi.nets.ssdMobilenetv1.loadFromDisk(modelsPath);
       await faceapi.nets.faceLandmark68Net.loadFromDisk(modelsPath);
       await faceapi.nets.faceRecognitionNet.loadFromDisk(modelsPath);
 
       this.modelsLoaded = true;
-      this.logger.log(`Face models loaded ✅ (backend: ${tfBackend})`);
+      this.logger.log(`Face models loaded ✅`);
     } catch (error) {
       this.logger.error('Failed to load face models:', error);
     }
@@ -68,8 +80,8 @@ export class FaceRecognitionService implements OnModuleInit {
    * Resize to 640px using canvas for consistent quality
    */
   async extractDescriptor(imageBuffer: Buffer): Promise<Float32Array | null> {
-    if (!this.modelsLoaded) {
-      this.logger.warn('Models not loaded');
+    if (!this.modelsLoaded || !faceApiAvailable) {
+      this.logger.warn('Face recognition not available');
       return null;
     }
 
@@ -122,7 +134,7 @@ export class FaceRecognitionService implements OnModuleInit {
     storedDescriptors: number[][],
     threshold = 0.6,
   ): FaceMatchResult {
-    if (!storedDescriptors || storedDescriptors.length === 0) {
+    if (!faceApiAvailable || !storedDescriptors || storedDescriptors.length === 0) {
       return { matched: false, distance: Infinity, bestMatchIndex: -1 };
     }
 
@@ -154,6 +166,11 @@ export class FaceRecognitionService implements OnModuleInit {
     successCount: number;
     failedCount: number;
   }> {
+    if (!faceApiAvailable || !this.modelsLoaded) {
+      this.logger.warn('Face recognition not available for registration');
+      return { descriptors: [], successCount: 0, failedCount: imageBuffers.length };
+    }
+
     const startTime = Date.now();
     const descriptors: number[][] = [];
     let failedCount = 0;
@@ -176,6 +193,7 @@ export class FaceRecognitionService implements OnModuleInit {
   }
 
   isReady(): boolean {
-    return this.modelsLoaded;
+    return this.modelsLoaded && faceApiAvailable;
   }
 }
+

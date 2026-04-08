@@ -8100,13 +8100,27 @@ export class StoresService {
       relations: ['account'],
     });
 
+    // Tier calculation based on score ranges
+    const getTier = (score: number) => {
+      if (score >= 90) return { title: 'Visionary', badgeText: 'Tiên Phong Cải Tiến', tier: 'TIEN_PHONG' };
+      if (score >= 60) return { title: 'Innovator', badgeText: 'Đồng Hành Sáng Tạo', tier: 'DONG_HANH' };
+      if (score >= 40) return { title: 'Architech', badgeText: 'Đóng Góp Tâm Huyết', tier: 'TAM_HUYET' };
+      if (score >= 20) return { title: 'Builder', badgeText: 'Tiềm Năng Đổi Mới', tier: 'TIEM_NANG' };
+      return { title: 'Contributor', badgeText: 'Khởi Đầu Cùng Bạn', tier: 'KHOI_DAU' };
+    };
+
     const leaderboard = profiles
-      .map((p: any) => ({
-        id: p.id,
-        name: p.account?.name || 'Nhân viên',
-        score: Number(((countMap[p.id] || 0) * 10).toFixed(1)), // 10 points per feedback
-        avatar: p.account?.avatar || null,
-      }))
+      .map((p: any) => {
+        const score = Number(((countMap[p.id] || 0) * 10).toFixed(1));
+        const tier = getTier(score);
+        return {
+          id: p.id,
+          name: p.account?.name || 'Nhân viên',
+          score,
+          avatar: p.account?.avatar || null,
+          ...tier,
+        };
+      })
       .sort((a, b) => b.score - a.score);
 
     return {
