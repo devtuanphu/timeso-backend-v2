@@ -2868,6 +2868,54 @@ export class StoresController {
     return this.storesService.getRevenueReport(id, start, end);
   }
 
+  @Get(':id/top-employees-report')
+  @ApiOperation({
+    summary: 'Báo cáo nhân viên xuất sắc nhất',
+  })
+  @ApiQuery({ name: 'startDate', required: false })
+  @ApiQuery({ name: 'endDate', required: false })
+  async getTopEmployeesReport(
+    @Param('id') id: string,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+  ) {
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(end.getDate() - 30));
+    return this.storesService.getTopEmployeesReport(id, start, end);
+  }
+
+  @Get(':id/shift-efficiency-report')
+  @ApiOperation({
+    summary: 'Báo cáo ca làm việc hiệu quả nhất',
+  })
+  @ApiQuery({ name: 'startDate', required: false })
+  @ApiQuery({ name: 'endDate', required: false })
+  async getShiftEfficiencyReport(
+    @Param('id') id: string,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+  ) {
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(end.getDate() - 30));
+    return this.storesService.getShiftEfficiencyReport(id, start, end);
+  }
+
+  @Get(':id/losing-money-report')
+  @ApiOperation({
+    summary: 'Báo cáo dịch vụ huỷ nhiều nhất',
+  })
+  @ApiQuery({ name: 'startDate', required: false })
+  @ApiQuery({ name: 'endDate', required: false })
+  async getLosingMoneyReport(
+    @Param('id') id: string,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+  ) {
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(end.getDate() - 30));
+    return this.storesService.getLosingMoneyReport(id, start, end);
+  }
+
   // Salary Adjustments
   @Post('salary-adjustments')
   @ApiOperation({ summary: 'Tạo phiếu điều chỉnh lương (tăng/giảm)' })
