@@ -527,6 +527,36 @@ export class StoresController {
     return this.storesService.findById(id);
   }
 
+  @Put(':id')
+  @UseInterceptors(FileInterceptor('avatar', multerConfig))
+  @ApiConsumes('multipart/form-data')
+  @ApiOperation({
+    summary: 'Cập nhật thông tin cửa hàng',
+    description: 'Chủ sở hữu hoặc Quản lý cập nhật thông tin cửa hàng (bao gồm ảnh đại diện)',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Cửa hàng đã được cập nhật thành công',
+    type: StoreResponseDto,
+  })
+  async updateStore(
+    @Param('id') id: string,
+    @Body() body: any,
+    @UploadedFile() file?: Express.Multer.File
+  ) {
+    const storeData: any = { ...body };
+    
+    // Handle avatar upload
+    if (file) {
+      storeData.avatarUrl = `/uploads/${file.filename}`;
+    }
+    
+    // Remove the avatar field from body to avoid TypeORM errors
+    delete storeData.avatar;
+    
+    return this.storesService.updateStore(id, storeData);
+  }
+
   // Employee Types
   @Post(':id/employee-types')
   @ApiOperation({

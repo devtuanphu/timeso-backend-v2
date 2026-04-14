@@ -335,6 +335,34 @@ export class StoresService {
   }
 
 
+  async updateStore(id: string, data: Partial<Store>) {
+    const store = await this.findById(id);
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    
+    // Auto-geocode address if changed
+    try {
+      if (data.addressLine || data.ward || data.city) {
+        const fullAddress = [data.addressLine || store.addressLine, data.ward || store.ward, data.city || store.city]
+          .filter(Boolean)
+          .join(', ');
+
+        if (fullAddress) {
+          const geocodeResult = await this.searchPlaces(fullAddress);
+          if (geocodeResult.results?.length > 0) {
+            const firstResult = geocodeResult.results[0];
+            data.latitude = firstResult.lat;
+            data.longitude = firstResult.lng;
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.warn(`[UpdateStore] Auto-geocode failed: ${err?.message || err}`);
+    }
+
+    await this.storeRepository.update(id, data);
+    return this.findById(id);
+  }
+
   async createDefaultProbationSetting(storeId: string) {
     const DEFAULT_ATTENDANCE_CHECKLIST = [
       { label: 'Đi làm đúng giờ [Bắt buộc]', targetValue: 28, unit: 'ngày / tháng', checked: true, hidden: false },
