@@ -55,6 +55,13 @@ export class CreateWorkCycleDto {
   @IsNotEmpty()
   startDate: string;
 
+  @ApiPropertyOptional({
+    description: 'Ngày kết thúc (YYYY-MM-DD). Nếu không truyền, sẽ tự động tính theo cycleType.',
+  })
+  @IsOptional()
+  @IsString()
+  endDate?: string;
+
   @ApiPropertyOptional({ 
     description: 'Danh sách slot ca (cho DAILY, WEEKLY, MONTHLY). Nếu không truyền, sẽ dựa vào workShiftIds để tạo tự động.',
     type: [ShiftSlotInputDto],

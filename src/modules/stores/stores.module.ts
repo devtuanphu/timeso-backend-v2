@@ -76,9 +76,13 @@ import { SalaryAdjustment } from './entities/salary-adjustment.entity';
 import { SalaryAdjustmentReason } from './entities/salary-adjustment-reason.entity';
 import { EmployeePaymentHistory } from './entities/employee-payment-history.entity';
 import { StorePaymentAccount } from './entities/store-payment-account.entity';
+import { ShiftChangeRequest } from './entities/shift-change-request.entity';
+import { BonusWorkRequest } from './entities/bonus-work-request.entity';
+import { CronLock } from './entities/cron-lock.entity';
 
 import { StoresService } from './stores.service';
 import { StoresCronService } from './stores-cron.service';
+import { DistributedLockService } from './distributed-lock.service';
 import { StoresController } from './stores.controller';
 import { StoresPublicController } from './stores-public.controller';
 import { AccountsModule } from '../accounts/accounts.module';
@@ -157,7 +161,9 @@ import { FaceRecognitionService } from './face-recognition.service';
 
       ProductExportType,
       Feedback,
-
+      ShiftChangeRequest,
+      BonusWorkRequest,
+      CronLock,
     ]),
 
 
@@ -167,7 +173,7 @@ import { FaceRecognitionService } from './face-recognition.service';
     ScheduleModule.forRoot(),
   ],
   controllers: [StoresController, StoresPublicController],
-  providers: [StoresService, StoresCronService, FaceRecognitionService],
-  exports: [StoresService],
+  providers: [StoresService, StoresCronService, DistributedLockService, FaceRecognitionService],
+  exports: [StoresService, DistributedLockService],
 })
 export class StoresModule {}

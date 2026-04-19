@@ -64,6 +64,8 @@ import { StoreInternalRule } from './entities/store-internal-rule.entity';
 import { StorePermissionConfig } from './entities/store-permission-config.entity';
 import { StoreShiftConfig } from './entities/store-shift-config.entity';
 import { Feedback } from './entities/feedback.entity';
+import { ShiftChangeRequest } from './entities/shift-change-request.entity';
+import { BonusWorkRequest } from './entities/bonus-work-request.entity';
 
 let AccountIdentityDocument: any;
 let AccountFinance: any;
@@ -122,6 +124,7 @@ const ENTITIES = [
   AccountIdentityDocument, StoreInternalRule, StorePermissionConfig,
   StoreShiftConfig, CycleShiftTemplate, AccountFinance, Feedback,
   EmployeeFace, AttendanceLog,
+  ShiftChangeRequest, BonusWorkRequest,
 ];
 
 describe('Store Reports Module', () => {

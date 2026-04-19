@@ -105,6 +105,8 @@ import {
 import { CreateSalaryConfigDto, UpdateSalaryConfigDto } from './dto/salary-config.dto';
 import { CreateSalaryAdjustmentDto, SalaryAdjustmentResponseDto } from './dto/salary-adjustment.dto';
 import { ConfigStatus } from './entities/salary-config.entity';
+import { ShiftChangeRequestStatus } from './entities/shift-change-request.entity';
+import { BonusWorkRequestStatus } from './entities/bonus-work-request.entity';
 import { AssignAssetDto, ReturnAssetDto, ExchangeAssetDto, ReassignAssetDto } from './dto/employee-asset.dto';
 import {
   FileFieldsInterceptor,
@@ -3470,6 +3472,155 @@ export class StoresController {
     },
   ) {
     return this.storesService.requestKpiAiSuggestion(body);
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // SHIFT CHANGE REQUESTS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Post('shift-change-requests')
+  @ApiOperation({ summary: 'Gửi yêu cầu đổi ca' })
+  @ApiResponse({ status: 201, description: 'Yêu cầu đổi ca đã được gửi' })
+  async createShiftChangeRequest(
+    @Body() body: {
+      storeId: string;
+      employeeProfileId: string;
+      currentShiftId?: string;
+      requestedShiftId?: string;
+      requestDate: string;
+      reason?: string;
+      attachments?: string[];
+    },
+  ) {
+    return this.storesService.createShiftChangeRequest(body);
+  }
+
+  @Get('shift-change-requests')
+  @ApiOperation({ summary: 'Lấy danh sách yêu cầu đổi ca' })
+  @ApiQuery({ name: 'storeId', required: false })
+  @ApiQuery({ name: 'employeeProfileId', required: false })
+  @ApiQuery({ name: 'status', required: false })
+  async getShiftChangeRequests(
+    @Query('storeId') storeId?: string,
+    @Query('employeeProfileId') employeeProfileId?: string,
+    @Query('status') status?: string,
+  ) {
+    if (employeeProfileId) {
+      return this.storesService.getShiftChangeRequestsByEmployee(employeeProfileId);
+    }
+    if (storeId) {
+      return this.storesService.getShiftChangeRequestsByStore(
+        storeId,
+        status as ShiftChangeRequestStatus | undefined,
+      );
+    }
+    return [];
+  }
+
+  @Patch('shift-change-requests/:id/approve')
+  @ApiOperation({ summary: 'Phê duyệt yêu cầu đổi ca' })
+  async approveShiftChangeRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.approveShiftChangeRequest(id, profile?.id);
+  }
+
+  @Patch('shift-change-requests/:id/reject')
+  @ApiOperation({ summary: 'Từ chối yêu cầu đổi ca' })
+  async rejectShiftChangeRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+    @Body() body: { reason?: string },
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.rejectShiftChangeRequest(id, profile?.id, body.reason);
+  }
+
+  @Patch('shift-change-requests/:id/cancel')
+  @ApiOperation({ summary: 'Hủy yêu cầu đổi ca' })
+  async cancelShiftChangeRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.cancelShiftChangeRequest(id, profile?.id);
+  }
+
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  // BONUS WORK REQUESTS
+  // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  @Post('bonus-work-requests')
+  @ApiOperation({ summary: 'Gửi yêu cầu bổ sung công' })
+  @ApiResponse({ status: 201, description: 'Yêu cầu bổ sung công đã được gửi' })
+  async createBonusWorkRequest(
+    @Body() body: {
+      storeId: string;
+      employeeProfileId: string;
+      shiftSlotId?: string | null;
+      requestDate: string;
+      startTime?: string;
+      endTime?: string;
+      reason?: string;
+      attachments?: string[];
+    },
+  ) {
+    return this.storesService.createBonusWorkRequest(body);
+  }
+
+  @Get('bonus-work-requests')
+  @ApiOperation({ summary: 'Lấy danh sách yêu cầu bổ sung công' })
+  @ApiQuery({ name: 'storeId', required: false })
+  @ApiQuery({ name: 'employeeProfileId', required: false })
+  @ApiQuery({ name: 'status', required: false })
+  async getBonusWorkRequests(
+    @Query('storeId') storeId?: string,
+    @Query('employeeProfileId') employeeProfileId?: string,
+    @Query('status') status?: string,
+  ) {
+    if (employeeProfileId) {
+      return this.storesService.getBonusWorkRequestsByEmployee(employeeProfileId);
+    }
+    if (storeId) {
+      return this.storesService.getBonusWorkRequestsByStore(
+        storeId,
+        status as BonusWorkRequestStatus | undefined,
+      );
+    }
+    return [];
+  }
+
+  @Patch('bonus-work-requests/:id/approve')
+  @ApiOperation({ summary: 'Phê duyệt yêu cầu bổ sung công' })
+  async approveBonusWorkRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.approveBonusWorkRequest(id, profile?.id);
+  }
+
+  @Patch('bonus-work-requests/:id/reject')
+  @ApiOperation({ summary: 'Từ chối yêu cầu bổ sung công' })
+  async rejectBonusWorkRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+    @Body() body: { reason?: string },
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.rejectBonusWorkRequest(id, profile?.id, body.reason);
+  }
+
+  @Patch('bonus-work-requests/:id/cancel')
+  @ApiOperation({ summary: 'Hủy yêu cầu bổ sung công' })
+  async cancelBonusWorkRequest(
+    @Param('id') id: string,
+    @GetUser() user: any,
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    return this.storesService.cancelBonusWorkRequest(id, profile?.id);
   }
 }
 

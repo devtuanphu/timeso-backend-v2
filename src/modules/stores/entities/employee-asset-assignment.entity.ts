@@ -46,7 +46,7 @@ export class EmployeeAssetAssignment extends BaseEntity {
   dueDate: Date | null;
 
   @Column({ name: 'assigned_by_id', nullable: true })
-  assignedById: string;
+  assignedById: string | null;
 
   @ManyToOne(() => EmployeeProfile, { onDelete: 'SET NULL' })
   @JoinColumn({ name: 'assigned_by_id' })

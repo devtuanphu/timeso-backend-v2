@@ -17,7 +17,8 @@ export enum WeekDay {
 
 export enum TimekeepingRequirement {
   LOCATION_QR_GPS_FACEID = 'LOCATION_QR_GPS_FACEID', // Có vị trí (QR + GPS + FaceID)
-  // Future options can be added here
+  GPS_ONLY = 'GPS_ONLY', // Chỉ GPS
+  QR_ONLY = 'QR_ONLY', // Chỉ QR
 }
 
 // --- ENTITY ---

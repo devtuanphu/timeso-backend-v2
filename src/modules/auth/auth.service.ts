@@ -156,7 +156,6 @@ export class AuthService {
         return {
           message: 'Đăng ký thành công, nhưng không thể gửi OTP qua Zalo. Vui lòng thử lại.',
           phone: data.phone,
-          otp_debug: otpCode, // Chỉ dùng lúc dev
         };
       }
     } catch (error) {
@@ -245,7 +244,7 @@ export class AuthService {
       // } else {
       //   await this.mailService.sendPasswordResetOtp(user.email, user.fullName, otpCode);
       // }
-      return { message: 'Lỗi gửi OTP qua Zalo.', phone: user.phone, otp_debug: otpCode };
+      return { message: 'Lỗi gửi OTP qua Zalo. Vui lòng thử lại.', phone: user.phone };
     }
   }
 
@@ -278,7 +277,7 @@ export class AuthService {
       console.error('Failed to send ZNS:', error);
       // Fallback email nếu cần
       // await this.mailService.sendPasswordResetOtp(user.email, user.fullName, otpCode);
-      return { message: 'Lỗi gửi OTP. Vui lòng thử lại.', phone: user.phone, otp_debug: otpCode };
+      return { message: 'Lỗi gửi OTP. Vui lòng thử lại.', phone: user.phone };
     }
   }
 
