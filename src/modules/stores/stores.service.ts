@@ -2344,18 +2344,35 @@ export class StoresService {
       order: { workDate: 'ASC' },
     });
 
-    return slots.map(slot => ({
-      ...slot,
-      currentCount: slot.assignments?.length || 0,
-      isFull: (slot.assignments?.length || 0) >= slot.maxStaff,
-    }));
+    return slots.map(slot => {
+      const result: any = {
+        ...slot,
+        currentCount: slot.assignments?.length || 0,
+        isFull: (slot.assignments?.length || 0) >= slot.maxStaff,
+        // Ưu tiên slot-specific time, fallback sang workShift time
+        effectiveStartTime: slot.startTime || slot.workShift?.startTime,
+        effectiveEndTime: slot.endTime || slot.workShift?.endTime,
+      };
+      return result;
+    });
   }
 
-  async updateShiftSlot(slotId: string, data: Partial<ShiftSlot>) {
-    await this.shiftSlotRepository.update(slotId, data);
+  async updateShiftSlot(slotId: string, data: { 
+    startTime?: string; 
+    endTime?: string; 
+    maxStaff?: number; 
+    note?: string 
+  }) {
+    const updateData: Partial<ShiftSlot> = {};
+    if (data.startTime !== undefined) updateData.startTime = data.startTime;
+    if (data.endTime !== undefined) updateData.endTime = data.endTime;
+    if (data.maxStaff !== undefined) updateData.maxStaff = data.maxStaff;
+    if (data.note !== undefined) updateData.note = data.note;
+
+    await this.shiftSlotRepository.update(slotId, updateData);
     return this.shiftSlotRepository.findOne({
       where: { id: slotId },
-      relations: ['workShift', 'assignments'],
+      relations: ['workShift', 'assignments', 'assignments.employee'],
     });
   }
 

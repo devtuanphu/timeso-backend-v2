@@ -153,6 +153,12 @@ export class ShiftSlot extends BaseEntity {
     @Column({ name: 'work_date', type: 'date' })
     workDate: string;
 
+    @Column({ name: 'start_time', type: 'time', nullable: true })
+    startTime?: string;
+
+    @Column({ name: 'end_time', type: 'time', nullable: true })
+    endTime?: string;
+
     @Column({ name: 'max_staff', type: 'int', default: 1 })
     maxStaff: number;
 
