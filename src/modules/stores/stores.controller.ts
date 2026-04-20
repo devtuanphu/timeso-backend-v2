@@ -97,6 +97,7 @@ import {
   UpdateStorePayrollPaymentDto,
   StorePayrollPaymentResponseDto,
   PayrollMonthlySummaryResponseDto,
+  MonthlySalaryFundResponseDto,
   EmployeePersonalInfoResponseDto,
   UpdatePersonalInfoDto,
 } from './dto/store-response.dto';
@@ -182,6 +183,14 @@ export class StoresController {
   })
   async findAll(@GetUser() user: any) {
     return this.storesService.findAllByOwner(user.userId);
+  }
+
+  @Get('monthly-salary-fund')
+  @ApiOperation({ summary: 'Lấy tổng quỹ lương và dự kiến cần trả của tất cả stores theo tháng' })
+  @ApiQuery({ name: 'date', required: true, example: '04/2026', description: 'Tháng cần lấy báo cáo (MM/YYYY)' })
+  @ApiResponse({ status: 200, type: MonthlySalaryFundResponseDto })
+  async getMonthlySalaryFund(@GetUser() user: any, @Query('date') date: string) {
+    return this.storesService.getMonthlySalaryFund(user.userId, date);
   }
 
   @Get('staff')

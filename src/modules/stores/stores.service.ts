@@ -3974,7 +3974,7 @@ export class StoresService {
 
   async updateSalaryFund(storeId: string, dateStr: string, salaryFund: number, userId?: string) {
     if (!dateStr) throw new BadRequestException('Vui lòng cung cấp ngày tháng (date)');
-    
+
     let date: Date;
     if (dateStr.includes('/')) {
       const [month, year] = dateStr.split('/').map(Number);
@@ -4003,7 +4003,6 @@ export class StoresService {
 
     const savedPayroll = await this.payrollRepository.save(payroll);
 
-    // Save history
     if (oldValue !== salaryFund) {
       const history = this.salaryFundHistoryRepository.create({
         storeId,
@@ -4017,6 +4016,87 @@ export class StoresService {
     }
 
     return savedPayroll;
+  }
+
+  /**
+   * Lấy tổng quỹ lương và dự kiến cần trả của TẤT CẢ stores theo tháng.
+   * Tự động tạo MonthlyPayroll nếu chưa có.
+   */
+  async getMonthlySalaryFund(ownerAccountId: string, dateStr: string) {
+    let date: Date;
+    if (dateStr.includes('/')) {
+      const [month, year] = dateStr.split('/').map(Number);
+      date = new Date(year, month - 1, 1);
+    } else {
+      date = new Date(dateStr);
+    }
+    const month = new Date(date.getFullYear(), date.getMonth(), 1);
+
+    // Lấy tất cả stores của owner
+    const stores = await this.storeRepository.find({
+      where: { ownerAccountId, status: StoreStatus.ACTIVE },
+    });
+
+    if (stores.length === 0) {
+      return {
+        totalBudget: 0,
+        totalExpectedPayroll: 0,
+        totalRemainingBudget: 0,
+        month: dateStr,
+        storeCount: 0,
+        stores: [],
+      };
+    }
+
+    const storePayrolls: any[] = [];
+    let totalBudget = 0;
+    let totalExpectedPayroll = 0;
+
+    for (const store of stores) {
+      let payroll = await this.payrollRepository.findOne({
+        where: { storeId: store.id, month },
+      });
+
+      // Auto-create MonthlyPayroll nếu chưa có (với salaryFund = 0)
+      if (!payroll) {
+        payroll = this.payrollRepository.create({
+          storeId: store.id,
+          month,
+          salaryFund: 0,
+          estimatedPayment: 0,
+          totalBonus: 0,
+          totalPenalty: 0,
+          totalOvertime: 0,
+          totalPendingApproval: 0,
+          totalApproved: 0,
+        });
+        payroll = await this.payrollRepository.save(payroll);
+      }
+
+      const salaryFund = Number(payroll.salaryFund || 0);
+      const estimatedPayment = Number(payroll.estimatedPayment || 0);
+      const remainingBudget = salaryFund - estimatedPayment;
+
+      totalBudget += salaryFund;
+      totalExpectedPayroll += estimatedPayment;
+
+      storePayrolls.push({
+        storeId: store.id,
+        storeName: store.name,
+        salaryFund,
+        estimatedPayment,
+        remainingBudget,
+      });
+    }
+
+    return {
+      totalBudget,
+      totalExpectedPayroll,
+      totalRemainingBudget: totalBudget - totalExpectedPayroll,
+      month: dateStr,
+      storeCount: stores.length,
+      stores: storePayrolls,
+    };
   }
 
   async getSalaryFundHistory(storeId: string, dateStr?: string) {

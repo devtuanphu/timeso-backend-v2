@@ -1189,4 +1189,41 @@ export class UpdatePersonalInfoDto {
   backImage?: any;
 }
 
+export class MonthlySalaryFundStoreDto {
+  @ApiProperty()
+  storeId: string;
+
+  @ApiProperty()
+  storeName: string;
+
+  @ApiProperty()
+  salaryFund: number;
+
+  @ApiProperty()
+  estimatedPayment: number;
+
+  @ApiProperty()
+  remainingBudget: number;
+}
+
+export class MonthlySalaryFundResponseDto {
+  @ApiProperty()
+  totalBudget: number;
+
+  @ApiProperty()
+  totalExpectedPayroll: number;
+
+  @ApiProperty()
+  totalRemainingBudget: number;
+
+  @ApiProperty()
+  month: string;
+
+  @ApiProperty()
+  storeCount: number;
+
+  @ApiProperty({ type: [MonthlySalaryFundStoreDto] })
+  stores: MonthlySalaryFundStoreDto[];
+}
+
 
