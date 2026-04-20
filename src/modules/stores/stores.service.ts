@@ -3760,6 +3760,32 @@ export class StoresService {
       this.payrollRepository.findOne({ where: { storeId, month: prevMonth } }),
     ]);
 
+    // 1b. Tính salaryFundTotalStore (tổng tất cả stores cùng owner)
+    let salaryFundTotalStore = 0;
+    let estimatedPaymentTotalStore = 0;
+    try {
+      const store = await this.storeRepository.findOne({ where: { id: storeId } });
+      if (store) {
+        const allOwnerStores = await this.storeRepository.find({
+          where: { ownerAccountId: store.ownerAccountId, status: StoreStatus.ACTIVE },
+        });
+        const storeIds = allOwnerStores.map((s) => s.id);
+        const allPayrolls = await this.payrollRepository.find({
+          where: { storeId: In(storeIds), month: currentMonth },
+        });
+        salaryFundTotalStore = allPayrolls.reduce(
+          (sum, p) => sum + Number(p.salaryFund || 0),
+          0,
+        );
+        estimatedPaymentTotalStore = allPayrolls.reduce(
+          (sum, p) => sum + Number(p.estimatedPayment || 0),
+          0,
+        );
+      }
+    } catch (e) {
+      console.warn('[getPayrollSummary] Error calculating salaryFundTotalStore:', e);
+    }
+
     // 2. Fetch payment history for current month
     const paymentHistory = await this.paymentHistoryRepository.find({
       where: { storeId, month: currentMonth },
@@ -3809,6 +3835,8 @@ export class StoresService {
       totalApproved,
       totalPendingApproval,
       salaryFund: Number(currentPayroll?.salaryFund || 0),
+      salaryFundTotalStore,
+      estimatedPaymentTotalStore,
       paymentHistory,
     };
   }
@@ -4023,6 +4051,8 @@ export class StoresService {
    * Tự động tạo MonthlyPayroll nếu chưa có.
    */
   async getMonthlySalaryFund(ownerAccountId: string, dateStr: string) {
+    console.log(`[getMonthlySalaryFund] owner=${ownerAccountId}, dateStr=${dateStr}`);
+
     let date: Date;
     if (dateStr.includes('/')) {
       const [month, year] = dateStr.split('/').map(Number);
@@ -4036,6 +4066,8 @@ export class StoresService {
     const stores = await this.storeRepository.find({
       where: { ownerAccountId, status: StoreStatus.ACTIVE },
     });
+
+    console.log(`[getMonthlySalaryFund] found ${stores.length} stores`);
 
     if (stores.length === 0) {
       return {

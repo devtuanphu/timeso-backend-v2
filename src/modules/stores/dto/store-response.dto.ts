@@ -182,6 +182,12 @@ export class PayrollMonthlySummaryResponseDto {
   @ApiProperty()
   salaryFund: number;
 
+  @ApiProperty({ description: 'Tổng quỹ lương tất cả stores cùng owner' })
+  salaryFundTotalStore: number;
+
+  @ApiProperty({ description: 'Tổng dự kiến chi trả tất cả stores cùng owner' })
+  estimatedPaymentTotalStore: number;
+
   @ApiProperty({ type: [StorePayrollPaymentResponseDto] })
   paymentHistory: StorePayrollPaymentResponseDto[];
 }
