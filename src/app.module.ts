@@ -11,6 +11,7 @@ import { MailModule } from './modules/mail/mail.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { DevicesModule } from './modules/devices/devices.module';
 import { ChatGroupsModule } from './modules/chat-groups/chat-groups.module';
+import { AiReportsModule } from './modules/ai-reports/ai-reports.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'path';
 
@@ -41,6 +42,7 @@ import { join } from 'path';
     AccountsModule,
     AuthModule,
     StoresModule,
+    AiReportsModule,
     MailModule,
     NotificationsModule,
     DevicesModule,

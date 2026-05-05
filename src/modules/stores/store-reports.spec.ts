@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { AccountsService } from '../accounts/accounts.service';
@@ -30,15 +31,26 @@ import { KpiTask } from './entities/kpi-task.entity';
 import { DailyEmployeeReport } from './entities/daily-employee-report.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { StoreEvent } from './entities/store-event.entity';
-import { StockTransaction, StockTransactionDetail } from './entities/stock-transaction.entity';
 import {
-  WorkCycle, ShiftSlot, ShiftAssignment, ShiftSwap, CycleShiftTemplate,
+  StockTransaction,
+  StockTransactionDetail,
+} from './entities/stock-transaction.entity';
+import {
+  WorkCycle,
+  ShiftSlot,
+  ShiftAssignment,
+  ShiftSwap,
+  CycleShiftTemplate,
 } from './entities/shift-management.entity';
 import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
 import { AttendanceLog } from './entities/attendance-log.entity';
 import { EmployeeAssetAssignment } from './entities/employee-asset-assignment.entity';
-import { ServiceCategory, ServiceItem, ServiceItemRecipe } from './entities/service-item.entity';
+import {
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+} from './entities/service-item.entity';
 import { Order, OrderItem } from './entities/order.entity';
 import { EmployeePerformance } from './entities/employee-performance.entity';
 import { EmployeeTerminationReason } from './entities/employee-termination-reason.entity';
@@ -70,12 +82,14 @@ import { BonusWorkRequest } from './entities/bonus-work-request.entity';
 let AccountIdentityDocument: any;
 let AccountFinance: any;
 try {
-  AccountIdentityDocument = require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
+  AccountIdentityDocument =
+    require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
 } catch {
   AccountIdentityDocument = class AccountIdentityDocument {};
 }
 try {
-  AccountFinance = require('../accounts/entities/account-finance.entity').AccountFinance;
+  AccountFinance =
+    require('../accounts/entities/account-finance.entity').AccountFinance;
 } catch {
   AccountFinance = class AccountFinance {};
 }
@@ -85,7 +99,9 @@ function mockRepo() {
     find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(null),
     create: jest.fn((d) => ({ id: 'gen-id', ...d })),
-    save: jest.fn((e) => Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e })),
+    save: jest.fn((e) =>
+      Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e }),
+    ),
     createQueryBuilder: jest.fn(() => {
       const qb: any = {};
       qb.where = jest.fn().mockReturnValue(qb);
@@ -107,24 +123,76 @@ function mockRepo() {
 }
 
 const ENTITIES = [
-  Store, StoreEmployeeType, StoreRole, EmployeeProfile, EmployeeProfileRole,
-  EmployeeContract, WorkShift, Asset, Product, AssetUnit, ProductUnit,
-  MonthlyPayroll, SalaryConfig, EmployeeSalary, KpiType, AssetCategory,
-  AssetStatus, ProductCategory, ProductStatus, EmployeeKpi, KpiUnit, KpiPeriod,
-  KpiTask, DailyEmployeeReport, EmployeeMonthlySummary, StoreEvent,
-  StockTransaction, StockTransactionDetail, WorkCycle, ShiftSlot, ShiftAssignment,
-  ShiftSwap, ServiceCategory, ServiceItem, ServiceItemRecipe, Order, OrderItem,
-  EmployeePerformance, EmployeeLeaveRequest, EmployeeAssetAssignment,
-  EmployeeTerminationReason, StoreProbationSetting, StoreSkill,
-  StorePayrollPaymentHistory, SalaryFundHistory, SalaryAdvanceRequest,
-  SalaryAdjustment, SalaryAdjustmentReason, EmployeePaymentHistory,
-  StorePaymentAccount, KpiApprovalRequest, InventoryReport, AssetExportType,
-  ProductExportType, StoreApprovalSetting, StoreTimekeepingSetting,
-  StorePayrollSetting, StorePayrollRule, StorePayrollIncrementRule,
-  AccountIdentityDocument, StoreInternalRule, StorePermissionConfig,
-  StoreShiftConfig, CycleShiftTemplate, AccountFinance, Feedback,
-  EmployeeFace, AttendanceLog,
-  ShiftChangeRequest, BonusWorkRequest,
+  Store,
+  StoreEmployeeType,
+  StoreRole,
+  EmployeeProfile,
+  EmployeeProfileRole,
+  EmployeeContract,
+  WorkShift,
+  Asset,
+  Product,
+  AssetUnit,
+  ProductUnit,
+  MonthlyPayroll,
+  SalaryConfig,
+  EmployeeSalary,
+  KpiType,
+  AssetCategory,
+  AssetStatus,
+  ProductCategory,
+  ProductStatus,
+  EmployeeKpi,
+  KpiUnit,
+  KpiPeriod,
+  KpiTask,
+  DailyEmployeeReport,
+  EmployeeMonthlySummary,
+  StoreEvent,
+  StockTransaction,
+  StockTransactionDetail,
+  WorkCycle,
+  ShiftSlot,
+  ShiftAssignment,
+  ShiftSwap,
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+  Order,
+  OrderItem,
+  EmployeePerformance,
+  EmployeeLeaveRequest,
+  EmployeeAssetAssignment,
+  EmployeeTerminationReason,
+  StoreProbationSetting,
+  StoreSkill,
+  StorePayrollPaymentHistory,
+  SalaryFundHistory,
+  SalaryAdvanceRequest,
+  SalaryAdjustment,
+  SalaryAdjustmentReason,
+  EmployeePaymentHistory,
+  StorePaymentAccount,
+  KpiApprovalRequest,
+  InventoryReport,
+  AssetExportType,
+  ProductExportType,
+  StoreApprovalSetting,
+  StoreTimekeepingSetting,
+  StorePayrollSetting,
+  StorePayrollRule,
+  StorePayrollIncrementRule,
+  AccountIdentityDocument,
+  StoreInternalRule,
+  StorePermissionConfig,
+  StoreShiftConfig,
+  CycleShiftTemplate,
+  AccountFinance,
+  Feedback,
+  EmployeeFace,
+  AttendanceLog,
+  ShiftChangeRequest,
+  BonusWorkRequest,
 ];
 
 describe('Store Reports Module', () => {
@@ -160,6 +228,30 @@ describe('Store Reports Module', () => {
             isReady: jest.fn().mockReturnValue(false),
           },
         },
+        {
+          provide: DataSource,
+          useValue: {
+            transaction: jest.fn(async (cb) =>
+              cb({
+                find: jest.fn().mockResolvedValue([]),
+                findOne: jest.fn().mockResolvedValue(null),
+                create: jest.fn((entity: any, data: any) => ({
+                  id: 'tx-gen',
+                  ...data,
+                })),
+                save: jest.fn((e: any) =>
+                  Promise.resolve({
+                    id: 'tx-gen',
+                    ...(Array.isArray(e) ? e[0] : e),
+                  }),
+                ),
+                delete: jest.fn().mockResolvedValue({ affected: 1 }),
+                update: jest.fn().mockResolvedValue({ affected: 1 }),
+                decrement: jest.fn().mockResolvedValue({ affected: 1 }),
+              }),
+            ),
+          },
+        },
       ],
     }).compile();
 
@@ -179,7 +271,7 @@ describe('Store Reports Module', () => {
         totalTax: '10000',
         totalOrders: '5',
         successOrders: '4',
-        failedOrders: '1'
+        failedOrders: '1',
       };
 
       const mockDaily = [
@@ -191,8 +283,8 @@ describe('Store Reports Module', () => {
           tax: '10000',
           totalOrders: '5',
           successOrders: '4',
-          failedOrders: '1'
-        }
+          failedOrders: '1',
+        },
       ];
 
       const qbStore = {
@@ -203,9 +295,12 @@ describe('Store Reports Module', () => {
         groupBy: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
         getRawOne: jest.fn().mockResolvedValueOnce(mockSummary),
-        getRawMany: jest.fn().mockResolvedValueOnce(mockDaily).mockResolvedValueOnce([]), // day breakdown and byType
+        getRawMany: jest
+          .fn()
+          .mockResolvedValueOnce(mockDaily)
+          .mockResolvedValueOnce([]), // day breakdown and byType
       };
-      
+
       orderRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
 
       // orderItemRepo setup for top items
@@ -218,25 +313,37 @@ describe('Store Reports Module', () => {
         groupBy: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
         limit: jest.fn().mockReturnThis(),
-        getRawMany: jest.fn().mockResolvedValue([
-          { name: 'Haircut', totalQuantity: '10', totalRevenue: '50000' }
-        ]),
+        getRawMany: jest
+          .fn()
+          .mockResolvedValue([
+            { name: 'Haircut', totalQuantity: '10', totalRevenue: '50000' },
+          ]),
       };
-      orderItemRepo.createQueryBuilder.mockImplementation(() => qbItemStore as any);
+      orderItemRepo.createQueryBuilder.mockImplementation(
+        () => qbItemStore as any,
+      );
 
-      const result = await service.getRevenueReport('store-1', new Date(), new Date());
+      const result = await service.getRevenueReport(
+        'store-1',
+        new Date(),
+        new Date(),
+      );
 
       expect(result).toBeDefined();
       expect(result.summary.totalRevenue).toBe(100000);
       expect(result.summary.totalProfit).toBe(40000); // 100000 - 50000 - 10000
       expect(result.daily.length).toBe(1);
       expect(result.insight).toContain('Tín hiệu tốt');
-      expect(result.topItems[0]).toEqual({ name: 'Haircut', quantity: 10, revenue: 50000 });
-      expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(3); 
+      expect(result.topItems[0]).toEqual({
+        name: 'Haircut',
+        quantity: 10,
+        revenue: 50000,
+      });
+      expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(3);
     });
-    
+
     it('should handle zero data scenarios (no orders)', async () => {
-       const qbStore = {
+      const qbStore = {
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         select: jest.fn().mockReturnThis(),
@@ -249,7 +356,11 @@ describe('Store Reports Module', () => {
       orderRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
       orderItemRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
 
-      const result = await service.getRevenueReport('store-1', new Date(), new Date());
+      const result = await service.getRevenueReport(
+        'store-1',
+        new Date(),
+        new Date(),
+      );
       expect(result.summary.totalRevenue).toBe(0);
       expect(result.summary.totalProfit).toBe(0);
       expect(result.insight).toContain('Chưa có giao dịch nào');
@@ -259,7 +370,13 @@ describe('Store Reports Module', () => {
   describe('getTopEmployeesReport', () => {
     it('should aggregate employee revenue', async () => {
       const mockResult = [
-        { employeeId: 'emp1', fullName: 'Alice', avatarUrl: 'link', totalRevenue: '200000', totalOrders: '10' }
+        {
+          employeeId: 'emp1',
+          fullName: 'Alice',
+          avatarUrl: 'link',
+          totalRevenue: '200000',
+          totalOrders: '10',
+        },
       ];
 
       const qbStore = {
@@ -269,13 +386,18 @@ describe('Store Reports Module', () => {
         select: jest.fn().mockReturnThis(),
         addSelect: jest.fn().mockReturnThis(),
         groupBy: jest.fn().mockReturnThis(),
+        addGroupBy: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
         limit: jest.fn().mockReturnThis(),
         getRawMany: jest.fn().mockResolvedValue(mockResult),
       };
       orderRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
 
-      const result = await service.getTopEmployeesReport('store-1', new Date(), new Date());
+      const result = await service.getTopEmployeesReport(
+        'store-1',
+        new Date(),
+        new Date(),
+      );
 
       expect(result).toHaveLength(1);
       expect(result[0].employeeId).toBe('emp1');
@@ -291,8 +413,8 @@ describe('Store Reports Module', () => {
         {
           shift: 'Ca sáng',
           revenue: '500000',
-          orders: '5'
-        }
+          orders: '5',
+        },
       ];
 
       const qbStore = {
@@ -307,7 +429,11 @@ describe('Store Reports Module', () => {
       };
       orderRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
 
-      const result = await service.getShiftEfficiencyReport('store-1', new Date(), new Date());
+      const result = await service.getShiftEfficiencyReport(
+        'store-1',
+        new Date(),
+        new Date(),
+      );
 
       expect(result.details).toHaveLength(1);
       expect(result.details[0].shiftName).toBe('Ca sáng');
@@ -323,8 +449,8 @@ describe('Store Reports Module', () => {
         {
           name: 'Facial massage',
           totalQuantity: '2',
-          lostRevenue: '2000'
-        }
+          lostRevenue: '2000',
+        },
       ];
 
       const qbStore = {
@@ -338,16 +464,22 @@ describe('Store Reports Module', () => {
         limit: jest.fn().mockReturnThis(),
         getRawMany: jest.fn().mockResolvedValue(mockResult),
       };
-      
+
       orderItemRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
 
-      const result = await service.getLosingMoneyReport('store-1', new Date(), new Date());
+      const result = await service.getLosingMoneyReport(
+        'store-1',
+        new Date(),
+        new Date(),
+      );
 
       expect(result).toHaveLength(1);
       expect(result[0].name).toBe('Facial massage');
       expect(result[0].cancelledQuantity).toBe(2);
       expect(result[0].lostRevenue).toBe(2000);
-      expect(qbStore.groupBy).toHaveBeenCalledWith("item.\"itemSnapshot\"->>'name'");
+      expect(qbStore.groupBy).toHaveBeenCalledWith(
+        'item."itemSnapshot"->>\'name\'',
+      );
       expect(qbStore.addSelect).toHaveBeenCalled();
     });
   });

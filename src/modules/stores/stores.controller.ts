@@ -2957,6 +2957,38 @@ export class StoresController {
     return this.storesService.getLosingMoneyReport(id, start, end);
   }
 
+  @Get(':id/order-statistics')
+  @ApiOperation({
+    summary: 'Thống kê đơn hàng theo kỳ (Dashboard)',
+    description: 'Lấy thống kê đơn hàng theo tuần/tháng/năm kèm so sánh với kỳ trước',
+  })
+  @ApiQuery({ name: 'period', required: true, enum: ['week', 'month', 'year'] })
+  @ApiQuery({ name: 'date', required: false, description: 'Ngày tham chiếu (YYYY-MM-DD)' })
+  async getOrderStatistics(
+    @Param('id') id: string,
+    @Query('period') period: 'week' | 'month' | 'year',
+    @Query('date') date?: string,
+  ) {
+    return this.storesService.getOrderStatistics(id, period, date);
+  }
+
+  @Get(':id/expense-report')
+  @ApiOperation({
+    summary: 'Báo cáo chi phí',
+    description: 'Lấy chi phí vật tư, nhân sự và so sánh với doanh thu',
+  })
+  @ApiQuery({ name: 'startDate', required: false, description: 'Ngày bắt đầu (YYYY-MM-DD)' })
+  @ApiQuery({ name: 'endDate', required: false, description: 'Ngày kết thúc (YYYY-MM-DD)' })
+  async getExpenseReport(
+    @Param('id') id: string,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+  ) {
+    const end = endDate ? new Date(endDate) : new Date();
+    const start = startDate ? new Date(startDate) : new Date(new Date().setDate(end.getDate() - 30));
+    return this.storesService.getExpenseReport(id, start, end);
+  }
+
   // Salary Adjustments
   @Post('salary-adjustments')
   @ApiOperation({ summary: 'Tạo phiếu điều chỉnh lương (tăng/giảm)' })

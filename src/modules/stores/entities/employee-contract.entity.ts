@@ -31,7 +31,12 @@ export class EmployeeContract extends BaseEntity {
   @Column({ name: 'end_date', type: 'date', nullable: true })
   endDate: Date;
 
-  @Column({ name: 'duration_months', type: 'int', nullable: true, comment: 'Thời hạn hợp đồng (tháng)' })
+  @Column({
+    name: 'duration_months',
+    type: 'int',
+    nullable: true,
+    comment: 'Thời hạn hợp đồng (tháng)',
+  })
   durationMonths: number;
 
   @Column({
@@ -50,6 +55,7 @@ export class EmployeeContract extends BaseEntity {
     name: 'payment_type',
     type: 'enum',
     enum: PaymentType,
+    nullable: true,
   })
   paymentType: PaymentType;
 
