@@ -3104,6 +3104,24 @@ export class StoresService {
           `[getShiftAssignments] DEBUG raw[${i}]: id=${allRaw[i].id}, slotId=${allRaw[i].shiftSlotId}, status=${allRaw[i].status}`,
         );
       }
+
+      // Debug 4: resolve the slot and cycle for each raw assignment
+      for (let i = 0; i < Math.min(allRaw.length, 5); i++) {
+        const a = allRaw[i];
+        const slot = await this.shiftSlotRepository.findOne({
+          where: { id: a.shiftSlotId },
+          relations: ['cycle'],
+        });
+        if (slot) {
+          console.log(
+            `[getShiftAssignments] DEBUG resolved[${i}]: slotId=${slot.id}, slot.cycleId=${slot.cycleId}, cycle.storeId=${slot.cycle?.storeId}, wantedStoreId=${storeId}`,
+          );
+        } else {
+          console.log(
+            `[getShiftAssignments] DEBUG resolved[${i}]: slot NOT FOUND for slotId=${a.shiftSlotId}`,
+          );
+        }
+      }
     } catch (e) {
       console.log(`[getShiftAssignments] Debug query error: ${e.message}`);
     }
