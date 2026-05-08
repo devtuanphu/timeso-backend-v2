@@ -3070,10 +3070,28 @@ export class StoresService {
     console.log(
       `[getShiftAssignments] storeId=${storeId}, filters=${JSON.stringify(filters)}, rawCount=${result.length}`,
     );
+    // Debug: count all assignments for this store grouped by status
+    try {
+      const allQb = this.shiftAssignmentRepository
+        .createQueryBuilder('assignment')
+        .leftJoin('assignment.shiftSlot', 'slot')
+        .leftJoin('slot.cycle', 'cycle')
+        .where('cycle.storeId = :storeId', { storeId });
+      const allResults = await allQb.getMany();
+      const statusCounts: Record<string, number> = {};
+      for (const a of allResults) {
+        statusCounts[a.status] = (statusCounts[a.status] || 0) + 1;
+      }
+      console.log(
+        `[getShiftAssignments] All for storeId: total=${allResults.length}, byStatus=${JSON.stringify(statusCounts)}`,
+      );
+    } catch (e) {
+      console.log(`[getShiftAssignments] Debug query error: ${e.message}`);
+    }
     for (let i = 0; i < Math.min(result.length, 3); i++) {
       const a = result[i];
       console.log(
-        `[getShiftAssignments] item[${i}]: id=${a.id}, status=${a.status}, slotCycleId=${a.shiftSlot?.cycleId}, cycleStoreId=${a.shiftSlot?.cycle?.storeId}`,
+        `[getShiftAssignments] item[${i}]: id=${a.id}, status=${a.status}`,
       );
     }
     return result;
