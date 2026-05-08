@@ -152,13 +152,11 @@ export class AiReportsController {
     description: 'Độ chi tiết: hour, day, week',
   })
   async getRevenueTrend(
-    @Param('id') storeId: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
     @Query('granularity') granularity: 'hour' | 'day' | 'week' = 'day',
   ) {
     return this.aiReportsService.getRevenueTrend(
-      storeId,
       startDate,
       endDate,
       granularity,
@@ -186,13 +184,11 @@ export class AiReportsController {
     description: 'Sắp xếp theo: revenue, profit, quantity',
   })
   async getProductPerformance(
-    @Param('id') storeId: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
     @Query('sortBy') sortBy: 'revenue' | 'profit' | 'quantity' = 'revenue',
   ) {
     return this.aiReportsService.getProductPerformance(
-      storeId,
       startDate,
       endDate,
       sortBy,
@@ -220,72 +216,6 @@ export class AiReportsController {
     @Query('endDate') endDate: string,
   ) {
     return this.aiReportsService.getShiftPerformance(
-      storeId,
-      startDate,
-      endDate,
-    );
-  }
-
-  @Get(':id/ai-reports/analysis-summary')
-  @ApiOperation({
-    summary: 'AI Phân tích tổng hợp',
-    description:
-      'Lấy dữ liệu tổng hợp cho AnalysisDrawer: nhân viên xuất sắc, ca hiệu quả, món huỷ nhiều',
-  })
-  async getAIAnalysisSummary(@Param('id') storeId: string) {
-    return this.aiReportsService.getAIAnalysisSummary(storeId);
-  }
-
-  @Get(':id/ai-reports/employee-ranking')
-  @ApiOperation({
-    summary: 'Bảng xếp hạng nhân viên',
-    description:
-      'Lấy danh sách xếp hạng nhân viên theo doanh thu, giờ làm, hiệu suất',
-  })
-  @ApiQuery({
-    name: 'startDate',
-    required: false,
-    description: 'Ngày bắt đầu (YYYY-MM-DD)',
-  })
-  @ApiQuery({
-    name: 'endDate',
-    required: false,
-    description: 'Ngày kết thúc (YYYY-MM-DD)',
-  })
-  async getEmployeeRanking(
-    @Param('id') storeId: string,
-    @Query('startDate') startDate?: string,
-    @Query('endDate') endDate?: string,
-  ) {
-    return this.aiReportsService.getEmployeeRankingReport(
-      storeId,
-      startDate,
-      endDate,
-    );
-  }
-
-  @Get(':id/ai-reports/shift-performance-report')
-  @ApiOperation({
-    summary: 'Báo cáo hiệu suất ca',
-    description:
-      'Lấy dữ liệu hiệu suất theo ca làm việc với chi tiết từng ngày',
-  })
-  @ApiQuery({
-    name: 'startDate',
-    required: false,
-    description: 'Ngày bắt đầu (YYYY-MM-DD)',
-  })
-  @ApiQuery({
-    name: 'endDate',
-    required: false,
-    description: 'Ngày kết thúc (YYYY-MM-DD)',
-  })
-  async getShiftPerformanceReport(
-    @Param('id') storeId: string,
-    @Query('startDate') startDate?: string,
-    @Query('endDate') endDate?: string,
-  ) {
-    return this.aiReportsService.getShiftPerformanceReport(
       storeId,
       startDate,
       endDate,
