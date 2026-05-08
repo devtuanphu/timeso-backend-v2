@@ -3052,9 +3052,7 @@ export class StoresService {
       .leftJoinAndSelect('slot.cycle', 'cycle')
       .leftJoinAndSelect('assignment.employee', 'employee')
       .leftJoinAndSelect('employee.account', 'account')
-      .where('(cycle.storeId = :storeId OR slot.storeId = :storeId)', {
-        storeId,
-      })
+      .where('cycle.storeId = :storeId', { storeId })
       .orderBy('assignment.createdAt', 'DESC');
 
     if (filters.cycleId) {
@@ -3064,7 +3062,11 @@ export class StoresService {
       qb.andWhere('assignment.status = :status', { status: filters.status });
     }
 
-    return qb.getMany();
+    const result = qb.getMany();
+    console.log(
+      `[getShiftAssignments] storeId=${storeId}, filters=${JSON.stringify(filters)}, count=${(await result).length}`,
+    );
+    return result;
   }
 
   async updateAssignmentStatus(
