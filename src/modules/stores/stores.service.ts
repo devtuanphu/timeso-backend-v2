@@ -3072,19 +3072,38 @@ export class StoresService {
     );
     // Debug: count all assignments for this store grouped by status
     try {
-      const allQb = this.shiftAssignmentRepository
+      // Debug 1: count via slot.cycleId -> WorkCycle
+      const viaCycleQb = this.shiftAssignmentRepository
         .createQueryBuilder('assignment')
         .leftJoin('assignment.shiftSlot', 'slot')
         .leftJoin('slot.cycle', 'cycle')
-        .where('cycle.storeId = :storeId', { storeId });
-      const allResults = await allQb.getMany();
-      const statusCounts: Record<string, number> = {};
-      for (const a of allResults) {
-        statusCounts[a.status] = (statusCounts[a.status] || 0) + 1;
-      }
+        .where('cycle.store_id = :storeId', { storeId });
+      const viaCycle = await viaCycleQb.getMany();
+
+      // Debug 2: count via shiftSlot.cycleId -> WorkCycle.store_id
+      const viaSlotQb = this.shiftAssignmentRepository
+        .createQueryBuilder('assignment')
+        .leftJoin('assignment.shiftSlot', 'slot')
+        .leftJoin('slot.cycle', 'cycle')
+        .where('slot.cycle_id = cycle.id AND cycle.store_id = :storeId', {
+          storeId,
+        });
+      const viaSlot = await viaSlotQb.getMany();
+
+      // Debug 3: raw count all assignments
+      const allRaw = await this.shiftAssignmentRepository.find({
+        select: ['id', 'shiftSlotId', 'status'],
+      });
       console.log(
-        `[getShiftAssignments] All for storeId: total=${allResults.length}, byStatus=${JSON.stringify(statusCounts)}`,
+        `[getShiftAssignments] DEBUG: viaCycle.count=${viaCycle.length}, viaSlot.count=${viaSlot.length}, allRaw.count=${allRaw.length}`,
       );
+
+      // Show first few raw assignments
+      for (let i = 0; i < Math.min(allRaw.length, 5); i++) {
+        console.log(
+          `[getShiftAssignments] DEBUG raw[${i}]: id=${allRaw[i].id}, slotId=${allRaw[i].shiftSlotId}, status=${allRaw[i].status}`,
+        );
+      }
     } catch (e) {
       console.log(`[getShiftAssignments] Debug query error: ${e.message}`);
     }
