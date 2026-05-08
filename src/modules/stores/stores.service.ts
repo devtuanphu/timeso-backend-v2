@@ -10541,7 +10541,14 @@ export class StoresService {
     const now = new Date();
     let m: number, y: number;
     if (monthStr) {
-      [m, y] = monthStr.split('/').map(Number);
+      if (monthStr.includes('/')) {
+        [m, y] = monthStr.split('/').map(Number);
+      } else if (monthStr.includes('-')) {
+        [y, m] = monthStr.split('-').map(Number);
+      } else {
+        m = now.getMonth() + 1;
+        y = now.getFullYear();
+      }
     } else {
       m = now.getMonth() + 1;
       y = now.getFullYear();
