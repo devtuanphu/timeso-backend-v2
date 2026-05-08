@@ -3037,7 +3037,11 @@ export class StoresService {
           ? ShiftAssignmentStatus.APPROVED
           : ShiftAssignmentStatus.PENDING,
       });
-      return manager.save(assignment);
+      const saved = await manager.save(assignment);
+      console.log(
+        `[registerToShiftSlot] saved assignmentId=${saved.id}, slotId=${slotId}, cycleId=${slot.cycleId}, employeeId=${employeeId}, status=${saved.status}`,
+      );
+      return saved;
     });
   }
 
@@ -3062,10 +3066,16 @@ export class StoresService {
       qb.andWhere('assignment.status = :status', { status: filters.status });
     }
 
-    const result = qb.getMany();
+    const result = await qb.getMany();
     console.log(
-      `[getShiftAssignments] storeId=${storeId}, filters=${JSON.stringify(filters)}, count=${(await result).length}`,
+      `[getShiftAssignments] storeId=${storeId}, filters=${JSON.stringify(filters)}, rawCount=${result.length}`,
     );
+    for (let i = 0; i < Math.min(result.length, 3); i++) {
+      const a = result[i];
+      console.log(
+        `[getShiftAssignments] item[${i}]: id=${a.id}, status=${a.status}, slotCycleId=${a.shiftSlot?.cycleId}, cycleStoreId=${a.shiftSlot?.cycle?.storeId}`,
+      );
+    }
     return result;
   }
 

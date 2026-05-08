@@ -1566,6 +1566,7 @@ export class StoresController {
     @Query('cycleId') cycleId?: string,
     @Query('status') status?: string,
   ) {
+    console.log(`[Controller getShiftAssignments] storeId=${storeId}, cycleId=${cycleId}, status=${status}`);
     return this.storesService.getShiftAssignments(storeId, { cycleId, status });
   }
 

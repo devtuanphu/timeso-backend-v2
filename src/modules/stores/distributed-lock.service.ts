@@ -57,7 +57,10 @@ export class DistributedLockService implements OnModuleInit {
    * @param ttlSeconds - How long the lock is valid (default: 300s = 5 min)
    * @returns Lock record if acquired, null if already locked by another instance
    */
-  async acquireLock(jobName: string, ttlSeconds = 300): Promise<CronLock | null> {
+  async acquireLock(
+    jobName: string,
+    ttlSeconds = 300,
+  ): Promise<CronLock | null> {
     const instanceId = this.getInstanceId();
     const now = new Date();
     const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
@@ -74,7 +77,9 @@ export class DistributedLockService implements OnModuleInit {
       const advisoryAcquired = advisoryResult?.[0]?.acquired === true;
 
       if (!advisoryAcquired) {
-        this.logger.debug(`Advisory lock for '${jobName}' already held by another instance`);
+        this.logger.debug(
+          `Advisory lock for '${jobName}' already held by another instance`,
+        );
         return null;
       }
 
@@ -90,16 +95,25 @@ export class DistributedLockService implements OnModuleInit {
             acquiredAt: now,
             expiresAt,
           })
-          .onConflict(`("lockName") DO UPDATE SET
-            "instanceId" = EXCLUDED."instanceId",
-            "acquiredAt" = EXCLUDED."acquiredAt",
-            "expiresAt" = EXCLUDED."expiresAt"
-          `)
+          .onConflict(
+            `("lock_name") DO UPDATE SET
+            "instance_id" = EXCLUDED."instance_id",
+            "acquired_at" = EXCLUDED."acquired_at",
+            "expires_at" = EXCLUDED."expires_at"
+          `,
+          )
           .execute();
       });
 
-      this.logger.log(`Acquired lock for '${jobName}' (TTL: ${ttlSeconds}s, instance: ${instanceId})`);
-      return this.cronLockRepository.create({ lockName: jobName, instanceId, acquiredAt: now, expiresAt });
+      this.logger.log(
+        `Acquired lock for '${jobName}' (TTL: ${ttlSeconds}s, instance: ${instanceId})`,
+      );
+      return this.cronLockRepository.create({
+        lockName: jobName,
+        instanceId,
+        acquiredAt: now,
+        expiresAt,
+      });
     } catch (error) {
       this.logger.error(`Failed to acquire lock for '${jobName}':`, error);
       return null;
@@ -114,9 +128,7 @@ export class DistributedLockService implements OnModuleInit {
       const lockKey = this.hashLockName(lock.lockName);
 
       // Release PostgreSQL advisory lock
-      await this.dataSource.query(
-        `SELECT pg_advisory_unlock(${lockKey})`,
-      );
+      await this.dataSource.query(`SELECT pg_advisory_unlock(${lockKey})`);
 
       // Clean up tracking record
       await this.dataSource.transaction(async (manager) => {
@@ -125,7 +137,10 @@ export class DistributedLockService implements OnModuleInit {
 
       this.logger.log(`Released lock for '${lock.lockName}'`);
     } catch (error) {
-      this.logger.error(`Failed to release lock for '${lock.lockName}':`, error);
+      this.logger.error(
+        `Failed to release lock for '${lock.lockName}':`,
+        error,
+      );
     }
   }
 
