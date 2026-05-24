@@ -2546,6 +2546,7 @@ export class StoresService {
           workShiftId: s.workShiftId,
           workDate: s.workDate,
           maxStaff: s.maxStaff !== undefined ? s.maxStaff : null,
+          dayOfWeek: this.getDayOfWeek(s.workDate),
         }),
       );
       await this.shiftSlotRepository.save(slotEntities);
@@ -2597,7 +2598,8 @@ export class StoresService {
           cycleId,
           workShiftId: shiftId,
           workDate: dateStr,
-          maxStaff: workShift?.defaultMaxStaff || null, // Lấy từ WorkShift
+          maxStaff: workShift?.defaultMaxStaff || null,
+          dayOfWeek: this.getDayOfWeek(dateStr),
         });
       }
       current.setDate(current.getDate() + 1);
@@ -2649,6 +2651,7 @@ export class StoresService {
             workShiftId: template.workShiftId,
             workDate: dateStr,
             maxStaff: template.maxStaff,
+            dayOfWeek: this.getDayOfWeek(dateStr),
           });
         }
       }
@@ -2836,6 +2839,7 @@ export class StoresService {
           workShiftId: slot.workShiftId,
           workDate: tomorrowStr,
           maxStaff: slot.maxStaff,
+          dayOfWeek: this.getDayOfWeek(tomorrowStr),
         }),
       );
 
@@ -2916,7 +2920,11 @@ export class StoresService {
 
   async createShiftSlots(cycleId: string, slotsData: Partial<ShiftSlot>[]) {
     const slots = slotsData.map((data) =>
-      this.shiftSlotRepository.create({ ...data, cycleId }),
+      this.shiftSlotRepository.create({
+        ...data,
+        cycleId,
+        dayOfWeek: data.workDate ? this.getDayOfWeek(data.workDate) : undefined,
+      }),
     );
     return this.shiftSlotRepository.save(slots);
   }

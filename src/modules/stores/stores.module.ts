@@ -81,12 +81,15 @@ import { CronLock } from './entities/cron-lock.entity';
 import { StoresService } from './stores.service';
 import { StoresCronService } from './stores-cron.service';
 import { DistributedLockService } from './distributed-lock.service';
+import { ShiftAggregationService } from './shift-aggregation.service';
+import { ShiftAggregationController } from './shift-aggregation.controller';
 import { StoresController } from './stores.controller';
 import { StoresPublicController } from './stores-public.controller';
 import { AccountsModule } from '../accounts/accounts.module';
 import { MailModule } from '../mail/mail.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { FaceRecognitionService } from './face-recognition.service';
+import { Account } from '../accounts/entities/account.entity';
 
 @Module({
   imports: [
@@ -169,13 +172,18 @@ import { FaceRecognitionService } from './face-recognition.service';
     MailModule,
     ScheduleModule.forRoot(),
   ],
-  controllers: [StoresController, StoresPublicController],
+  controllers: [
+    StoresController,
+    StoresPublicController,
+    ShiftAggregationController,
+  ],
   providers: [
     StoresService,
     StoresCronService,
     DistributedLockService,
     FaceRecognitionService,
+    ShiftAggregationService,
   ],
-  exports: [StoresService, DistributedLockService],
+  exports: [StoresService, DistributedLockService, ShiftAggregationService],
 })
 export class StoresModule {}

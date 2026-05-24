@@ -253,8 +253,8 @@ describe('StoresService - Shift & Bonus Request Features', () => {
       return { provide: getRepositoryToken(entity), useValue: mock };
     });
 
-    shiftChangeRepo = repoMap.get(ShiftChangeRequest);
-    bonusWorkRepo = repoMap.get(BonusWorkRequest);
+    shiftChangeRepo = repoMap.get(ShiftChangeRequest)!;
+    bonusWorkRepo = repoMap.get(BonusWorkRequest)!;
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [

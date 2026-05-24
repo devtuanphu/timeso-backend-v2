@@ -222,6 +222,7 @@ describe('StoresService - Shift Registration Count', () => {
   let service: StoresService;
   let repoMap: Map<any, ReturnType<typeof mockRepo>>;
   const shiftSlotRepo = {
+    ...mockRepo(),
     find: jest.fn(),
     createQueryBuilder: jest.fn(),
   };

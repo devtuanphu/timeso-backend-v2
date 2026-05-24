@@ -26,10 +26,10 @@ export enum EmploymentStatus {
 }
 
 export enum WorkingStatus {
-  IDLE = 'idle',            // Trống ca / Chờ ca
-  WORKING = 'working',      // Đang làm việc
-  OFF = 'off',              // Nghỉ (Ngày nghỉ/Có phép)
-  ABSENT = 'absent',        // Nghỉ không phép (Quá giờ ca mà chưa check-in)
+  IDLE = 'idle', // Trống ca / Chờ ca
+  WORKING = 'working', // Đang làm việc
+  OFF = 'off', // Nghỉ (Ngày nghỉ/Có phép)
+  ABSENT = 'absent', // Nghỉ không phép (Quá giờ ca mà chưa check-in)
 }
 
 @Entity('employee_profiles')
@@ -86,17 +86,24 @@ export class EmployeeProfile extends BaseEntity {
   @JoinColumn({ name: 'work_shift_id' })
   workShift: WorkShift;
 
-
   @Column({ name: 'joined_at', type: 'timestamp', nullable: true })
   joinedAt: Date | null;
 
-  @Column({ name: 'capability_points', type: 'int', default: 0, comment: 'Điểm năng lực hiện có' })
+  @Column({
+    name: 'capability_points',
+    type: 'int',
+    default: 0,
+    comment: 'Điểm năng lực hiện có',
+  })
   capabilityPoints: number;
 
   @OneToMany(() => EmployeeContract, (contract) => contract.employeeProfile)
   contracts: EmployeeContract[];
 
-  @OneToMany(() => EmployeeAssetAssignment, (assignment: EmployeeAssetAssignment) => assignment.employeeProfile)
+  @OneToMany(
+    () => EmployeeAssetAssignment,
+    (assignment: EmployeeAssetAssignment) => assignment.employeeProfile,
+  )
   assetAssignments: EmployeeAssetAssignment[];
 
   @Column({ name: 'termination_reason_id', type: 'uuid', nullable: true })
@@ -118,4 +125,20 @@ export class EmployeeProfile extends BaseEntity {
   @ManyToOne(() => StoreSkill, { onDelete: 'SET NULL' })
   @JoinColumn({ name: 'skill_id' })
   skill: StoreSkill;
+
+  @Column({
+    name: 'preferred_shift_types',
+    type: 'simple-array',
+    nullable: true,
+    comment: 'Loại ca ưa thích: morning, noon, evening',
+  })
+  preferredShiftTypes: string[] | null;
+
+  @Column({
+    name: 'shift_preference_note',
+    type: 'varchar',
+    nullable: true,
+    comment: 'Ghi chú sở thích ca',
+  })
+  shiftPreferenceNote: string | null;
 }

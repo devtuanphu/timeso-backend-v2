@@ -167,6 +167,12 @@ export class ShiftSlot extends BaseEntity {
   @Column({ type: 'text', nullable: true })
   note?: string;
 
+  @Column({ name: 'location', type: 'varchar', nullable: true })
+  location: string | null;
+
+  @Column({ name: 'day_of_week', type: 'varchar', nullable: true })
+  dayOfWeek: string | null;
+
   @OneToMany(() => ShiftAssignment, (assignment) => assignment.shiftSlot)
   assignments: ShiftAssignment[];
 }

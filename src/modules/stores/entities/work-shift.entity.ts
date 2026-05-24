@@ -20,7 +20,7 @@ export class WorkShift extends BaseEntity {
   @Column({ name: 'end_time', type: 'time' })
   endTime: string;
 
-  @Column({ name: 'color_code', nullable: true })
+  @Column({ name: 'color_code', type: 'varchar', nullable: true })
   colorCode: string;
 
   @Column({ name: 'default_max_staff', type: 'int', nullable: true })
@@ -28,4 +28,7 @@ export class WorkShift extends BaseEntity {
 
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
+
+  @Column({ name: 'location', type: 'varchar', nullable: true })
+  location: string | null;
 }
