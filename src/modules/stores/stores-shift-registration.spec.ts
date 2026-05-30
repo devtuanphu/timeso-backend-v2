@@ -7,9 +7,13 @@ import { FaceRecognitionService } from './face-recognition.service';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
-import { EmployeeProfile } from './entities/employee-profile.entity';
+import { EmployeeProfile, EmploymentStatus } from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
-import { EmployeeContract, PaymentType } from './entities/employee-contract.entity';
+import {
+  EmployeeContract,
+  PaymentType,
+} from './entities/employee-contract.entity';
+import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
 import { Asset } from './entities/asset.entity';
 import { Product } from './entities/product.entity';
@@ -26,7 +30,10 @@ import { KpiTask } from './entities/kpi-task.entity';
 import { DailyEmployeeReport } from './entities/daily-employee-report.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { StoreEvent } from './entities/store-event.entity';
-import { StockTransaction, StockTransactionDetail } from './entities/stock-transaction.entity';
+import {
+  StockTransaction,
+  StockTransactionDetail,
+} from './entities/stock-transaction.entity';
 import {
   WorkCycle,
   WorkCycleStatus,
@@ -40,7 +47,11 @@ import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
 import { AttendanceLog } from './entities/attendance-log.entity';
 import { EmployeeAssetAssignment } from './entities/employee-asset-assignment.entity';
-import { ServiceCategory, ServiceItem, ServiceItemRecipe } from './entities/service-item.entity';
+import {
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+} from './entities/service-item.entity';
 import { Order, OrderItem } from './entities/order.entity';
 import { EmployeePerformance } from './entities/employee-performance.entity';
 import { EmployeeTerminationReason } from './entities/employee-termination-reason.entity';
@@ -72,16 +83,19 @@ import { StoreShiftConfig } from './entities/store-shift-config.entity';
 import { Feedback } from './entities/feedback.entity';
 import { ShiftChangeRequest } from './entities/shift-change-request.entity';
 import { BonusWorkRequest } from './entities/bonus-work-request.entity';
+import { BadRequestException } from '@nestjs/common';
 
 let AccountIdentityDocument: any;
 let AccountFinance: any;
 try {
-  AccountIdentityDocument = require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
+  AccountIdentityDocument =
+    require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
 } catch {
   AccountIdentityDocument = class AccountIdentityDocument {};
 }
 try {
-  AccountFinance = require('../accounts/entities/account-finance.entity').AccountFinance;
+  AccountFinance =
+    require('../accounts/entities/account-finance.entity').AccountFinance;
 } catch {
   AccountFinance = class AccountFinance {};
 }
@@ -102,7 +116,9 @@ function mockRepo() {
     find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(null),
     create: jest.fn((d: any) => ({ id: 'gen-id', ...d })),
-    save: jest.fn((e: any) => Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e })),
+    save: jest.fn((e: any) =>
+      Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e }),
+    ),
     delete: jest.fn().mockResolvedValue({ affected: 0 }),
     update: jest.fn().mockResolvedValue({ affected: 1 }),
     createQueryBuilder: jest.fn(() => {
@@ -128,43 +144,113 @@ function mockRepo() {
 
 function mockDataSource() {
   return {
-    transaction: jest.fn(async (cb) => cb({
-      find: jest.fn().mockResolvedValue([]),
-      findOne: jest.fn().mockResolvedValue(null),
-      create: jest.fn((entity: any, data: any) => ({ id: 'tx-gen-id', ...data })),
-      save: jest.fn((e: any) => Promise.resolve({ id: 'tx-gen-id', ...(Array.isArray(e) ? e[0] : e) })),
-      delete: jest.fn().mockResolvedValue({ affected: 1 }),
-      update: jest.fn().mockResolvedValue({ affected: 1 }),
-      decrement: jest.fn().mockResolvedValue({ affected: 1 }),
-      createQueryBuilder: () => ({
-        delete: () => ({ execute: jest.fn().mockResolvedValue({ affected: 0 }) }),
-        from: () => ({ where: () => ({ execute: jest.fn().mockResolvedValue({ affected: 0 }) }) }),
-        where: jest.fn().mockReturnThis(),
-        execute: jest.fn().mockResolvedValue({ affected: 0 }),
+    transaction: jest.fn(async (cb) =>
+      cb({
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn().mockResolvedValue(null),
+        create: jest.fn((entity: any, data: any) => ({
+          id: 'tx-gen-id',
+          ...data,
+        })),
+        save: jest.fn((e: any) =>
+          Promise.resolve({
+            id: 'tx-gen-id',
+            ...(Array.isArray(e) ? e[0] : e),
+          }),
+        ),
+        delete: jest.fn().mockResolvedValue({ affected: 1 }),
+        update: jest.fn().mockResolvedValue({ affected: 1 }),
+        decrement: jest.fn().mockResolvedValue({ affected: 1 }),
+        createQueryBuilder: () => ({
+          delete: () => ({
+            execute: jest.fn().mockResolvedValue({ affected: 0 }),
+          }),
+          from: () => ({
+            where: () => ({
+              execute: jest.fn().mockResolvedValue({ affected: 0 }),
+            }),
+          }),
+          where: jest.fn().mockReturnThis(),
+          execute: jest.fn().mockResolvedValue({ affected: 0 }),
+        }),
       }),
-    })),
+    ),
   };
 }
 
 const ENTITIES = [
-  Store, StoreEmployeeType, StoreRole, EmployeeProfile, EmployeeProfileRole,
-  EmployeeContract, WorkShift, Asset, Product, AssetUnit, ProductUnit,
-  MonthlyPayroll, SalaryConfig, EmployeeSalary, KpiType, AssetCategory,
-  AssetStatus, ProductCategory, ProductStatus, EmployeeKpi, KpiUnit, KpiPeriod,
-  KpiTask, DailyEmployeeReport, EmployeeMonthlySummary, StoreEvent,
-  StockTransaction, StockTransactionDetail, WorkCycle, ShiftSlot, ShiftAssignment,
-  ShiftSwap, CycleShiftTemplate, ServiceCategory, ServiceItem, ServiceItemRecipe,
-  Order, OrderItem, EmployeePerformance, EmployeeLeaveRequest, EmployeeAssetAssignment,
-  EmployeeTerminationReason, StoreProbationSetting, StoreSkill,
-  StorePayrollPaymentHistory, SalaryFundHistory, SalaryAdvanceRequest,
-  SalaryAdjustment, SalaryAdjustmentReason, EmployeePaymentHistory,
-  StorePaymentAccount, KpiApprovalRequest, InventoryReport, AssetExportType,
-  ProductExportType, StoreApprovalSetting, StoreTimekeepingSetting,
-  StorePayrollSetting, StorePayrollRule, StorePayrollIncrementRule,
-  AccountIdentityDocument, StoreInternalRule, StorePermissionConfig,
-  StoreShiftConfig, CycleShiftTemplate, AccountFinance, Feedback,
-  EmployeeFace, AttendanceLog,
-  ShiftChangeRequest, BonusWorkRequest,
+  Store,
+  StoreEmployeeType,
+  StoreRole,
+  EmployeeProfile,
+  EmployeeProfileRole,
+  EmployeeContract,
+  WorkShift,
+  Asset,
+  Product,
+  AssetUnit,
+  ProductUnit,
+  MonthlyPayroll,
+  SalaryConfig,
+  EmployeeSalary,
+  KpiType,
+  AssetCategory,
+  AssetStatus,
+  ProductCategory,
+  ProductStatus,
+  EmployeeKpi,
+  KpiUnit,
+  KpiPeriod,
+  KpiTask,
+  DailyEmployeeReport,
+  EmployeeMonthlySummary,
+  StoreEvent,
+  StockTransaction,
+  StockTransactionDetail,
+  WorkCycle,
+  ShiftSlot,
+  ShiftAssignment,
+  ShiftSwap,
+  CycleShiftTemplate,
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+  Order,
+  OrderItem,
+  EmployeePerformance,
+  EmployeeLeaveRequest,
+  EmployeeAssetAssignment,
+  EmployeeTerminationReason,
+  StoreProbationSetting,
+  StoreSkill,
+  StorePayrollPaymentHistory,
+  SalaryFundHistory,
+  SalaryAdvanceRequest,
+  SalaryAdjustment,
+  SalaryAdjustmentReason,
+  EmployeePaymentHistory,
+  StorePaymentAccount,
+  KpiApprovalRequest,
+  InventoryReport,
+  AssetExportType,
+  ProductExportType,
+  StoreApprovalSetting,
+  StoreTimekeepingSetting,
+  StorePayrollSetting,
+  StorePayrollRule,
+  StorePayrollIncrementRule,
+  AccountIdentityDocument,
+  StoreInternalRule,
+  StorePermissionConfig,
+  StoreShiftConfig,
+  CycleShiftTemplate,
+  AccountFinance,
+  Feedback,
+  EmployeeFace,
+  AttendanceLog,
+  ShiftChangeRequest,
+  BonusWorkRequest,
+  ContractTemplate,
 ];
 
 // ============================================================
@@ -278,10 +364,23 @@ describe('StoresService - Shift Registration Count', () => {
           workDate: '2025-02-10',
           maxStaff: 3,
           note: null,
-          workShift: { id: 'ws-1', shiftName: 'Ca sáng', startTime: '08:00', endTime: '12:00' },
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca sáng',
+            startTime: '08:00',
+            endTime: '12:00',
+          },
           assignments: [
-            { id: 'a1', employeeId: 'e1', status: ShiftAssignmentStatus.APPROVED },
-            { id: 'a2', employeeId: 'e2', status: ShiftAssignmentStatus.APPROVED },
+            {
+              id: 'a1',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+            {
+              id: 'a2',
+              employeeId: 'e2',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
           ],
         },
         {
@@ -291,9 +390,18 @@ describe('StoresService - Shift Registration Count', () => {
           workDate: '2025-02-10',
           maxStaff: 2,
           note: null,
-          workShift: { id: 'ws-2', shiftName: 'Ca chiều', startTime: '14:00', endTime: '18:00' },
+          workShift: {
+            id: 'ws-2',
+            shiftName: 'Ca chiều',
+            startTime: '14:00',
+            endTime: '18:00',
+          },
           assignments: [
-            { id: 'a3', employeeId: 'e3', status: ShiftAssignmentStatus.PENDING },
+            {
+              id: 'a3',
+              employeeId: 'e3',
+              status: ShiftAssignmentStatus.PENDING,
+            },
           ],
         },
       ];
@@ -317,7 +425,12 @@ describe('StoresService - Shift Registration Count', () => {
           workShiftId: 'ws-1',
           workDate: '2025-02-11',
           maxStaff: 5,
-          workShift: { id: 'ws-1', shiftName: 'Ca tối', startTime: '18:00', endTime: '22:00' },
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca tối',
+            startTime: '18:00',
+            endTime: '22:00',
+          },
           assignments: [],
         },
       ];
@@ -339,10 +452,23 @@ describe('StoresService - Shift Registration Count', () => {
           workShiftId: 'ws-1',
           workDate: '2025-02-12',
           maxStaff: 2,
-          workShift: { id: 'ws-1', shiftName: 'Ca đêm', startTime: '22:00', endTime: '02:00' },
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca đêm',
+            startTime: '22:00',
+            endTime: '02:00',
+          },
           assignments: [
-            { id: 'a1', employeeId: 'e1', status: ShiftAssignmentStatus.APPROVED },
-            { id: 'a2', employeeId: 'e2', status: ShiftAssignmentStatus.APPROVED },
+            {
+              id: 'a1',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+            {
+              id: 'a2',
+              employeeId: 'e2',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
           ],
         },
       ];
@@ -405,7 +531,18 @@ describe('StoresService - Shift Registration Count', () => {
       };
 
       const txManager = {
-        findOne: jest.fn().mockResolvedValue(fullSlot),
+        find: jest.fn().mockResolvedValue([
+          {
+            id: 'existing-a1',
+            employeeId: 'existing-employee',
+            status: ShiftAssignmentStatus.APPROVED,
+          },
+        ]),
+        findOne: jest.fn().mockImplementation((entityType) => {
+          if (entityType === WorkCycle) return Promise.resolve({ id: 'cycle-1', status: WorkCycleStatus.ACTIVE });
+          if (entityType === EmployeeProfile) return Promise.resolve({ id: 'existing-employee', employmentStatus: EmploymentStatus.ACTIVE });
+          return Promise.resolve(fullSlot);
+        }),
         createQueryBuilder: jest.fn(() => ({
           setLock: jest.fn().mockReturnThis(),
           leftJoinAndSelect: jest.fn().mockReturnThis(),
@@ -440,9 +577,21 @@ describe('StoresService - Shift Registration Count', () => {
             endTime: '12:00',
           },
           assignments: [
-            { id: 'a1', employeeId: 'e1', status: ShiftAssignmentStatus.APPROVED },
-            { id: 'a2', employeeId: 'e2', status: ShiftAssignmentStatus.APPROVED },
-            { id: 'a3', employeeId: 'e3', status: ShiftAssignmentStatus.PENDING },
+            {
+              id: 'a1',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+            {
+              id: 'a2',
+              employeeId: 'e2',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+            {
+              id: 'a3',
+              employeeId: 'e3',
+              status: ShiftAssignmentStatus.PENDING,
+            },
           ],
         },
       ];
@@ -479,8 +628,16 @@ describe('StoresService - Shift Registration Count', () => {
             endTime: '12:00',
           },
           assignments: [
-            { id: 'a1', employeeId: 'e1', status: ShiftAssignmentStatus.APPROVED },
-            { id: 'a2', employeeId: 'e2', status: ShiftAssignmentStatus.APPROVED },
+            {
+              id: 'a1',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+            {
+              id: 'a2',
+              employeeId: 'e2',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
           ],
         },
       ];
@@ -500,6 +657,187 @@ describe('StoresService - Shift Registration Count', () => {
 
       expect(result[0].currentCount).toBe(2);
       expect(result[0].isFull).toBe(true);
+    });
+  });
+
+  describe('createShiftRegistration - Batch Mode', () => {
+    it('should throw error if no slots match the daysOfWeek', async () => {
+      const mockQueryBuilder = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([
+          { id: '1', workDate: '2024-06-04' }, // Tuesday
+        ]),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2024-06-01',
+          endDate: '2024-06-30',
+          daysOfWeek: [1], // Monday
+        }),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should process batch registration successfully (Best-effort)', async () => {
+      // Mock 4 slots (e.g. 4 Mondays in a month)
+      const mockSlots = [
+        {
+          id: 's1',
+          workDate: '2024-06-03',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+        {
+          id: 's2',
+          workDate: '2024-06-10',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+        {
+          id: 's3',
+          workDate: '2024-06-17',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+        {
+          id: 's4',
+          workDate: '2024-06-24',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+      ];
+
+      const mockQueryBuilder = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(mockQueryBuilder);
+
+      // Mock the transaction manager
+      const managerMock = {
+        findOne: jest.fn(),
+        find: jest.fn(),
+        create: jest.fn(),
+        save: jest.fn(),
+        createQueryBuilder: jest.fn(),
+      };
+
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => {
+          return cb(managerMock);
+        });
+
+      // Employee is active
+      managerMock.findOne.mockResolvedValue({ id: 'emp-1', employmentStatus: EmploymentStatus.ACTIVE });
+
+      // Mock locking slots
+      managerMock.createQueryBuilder.mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest
+          .fn()
+          .mockResolvedValueOnce({ id: 's1', maxStaff: 2 }) // Slot 1: valid
+          .mockResolvedValueOnce({ id: 's2', maxStaff: 1 }) // Slot 2: full
+          .mockResolvedValueOnce({ id: 's3', maxStaff: 2 }) // Slot 3: valid
+          .mockResolvedValueOnce({ id: 's4', maxStaff: null }), // Slot 4: valid (unlimited)
+      });
+
+      // Mock assignments per slot
+      managerMock.find
+        .mockResolvedValueOnce([
+          {
+            id: 'a1',
+            employeeId: 'other',
+            status: ShiftAssignmentStatus.PENDING,
+          },
+        ]) // Slot 1 has 1 (not full)
+        .mockResolvedValueOnce([
+          {
+            id: 'a2',
+            employeeId: 'other',
+            status: ShiftAssignmentStatus.APPROVED,
+          },
+        ]) // Slot 2 has 1 (full since maxStaff=1)
+        .mockResolvedValueOnce([
+          {
+            id: 'a3',
+            employeeId: 'emp-1',
+            status: ShiftAssignmentStatus.PENDING,
+          },
+        ]) // Slot 3 already has this employee
+        .mockResolvedValueOnce([]); // Slot 4 empty
+
+      managerMock.create.mockReturnValue({ id: 'new-assignment' });
+      managerMock.save.mockResolvedValue({ id: 'new-assignment' });
+
+      const result = await service.createShiftRegistration('account-1', {
+        storeId: 'store-1',
+        employeeProfileId: 'emp-1',
+        workShiftId: 'ws-1',
+        startDate: '2024-06-01',
+        endDate: '2024-06-30',
+        daysOfWeek: [1], // Monday
+      });
+
+      expect(result).toEqual({ successCount: 2 });
+      expect(managerMock.create).toHaveBeenCalledTimes(2);
+      expect(managerMock.save).toHaveBeenCalledTimes(2);
+    });
+
+    it('should throw error if all slots fail', async () => {
+      const mockSlots = [
+        {
+          id: 's1',
+          workDate: '2024-06-03',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+      ];
+
+      shiftSlotRepo.createQueryBuilder.mockReturnValue({
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      });
+
+      const managerMock = {
+        findOne: jest
+          .fn()
+          .mockResolvedValue({ id: 'emp-1', employmentStatus: EmploymentStatus.ACTIVE }),
+        find: jest.fn().mockResolvedValue([
+          {
+            id: 'a1',
+            employeeId: 'other',
+            status: ShiftAssignmentStatus.APPROVED,
+          },
+        ]),
+        createQueryBuilder: jest.fn().mockReturnValue({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue({ id: 's1', maxStaff: 1 }), // Slot 1 full
+        }),
+      };
+
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => {
+          return cb(managerMock);
+        });
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2024-06-01',
+          daysOfWeek: [1],
+        }),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 });

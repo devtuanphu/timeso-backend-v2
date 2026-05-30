@@ -2,6 +2,7 @@ import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 import { EmployeeProfile } from './employee-profile.entity';
+import { ShiftAssignment } from './shift-management.entity';
 
 export enum LeaveRequestStatus {
   PENDING = 'PENDING',
@@ -42,6 +43,20 @@ export class EmployeeLeaveRequest extends BaseEntity {
 
   @Column({ name: 'end_date', type: 'date' })
   endDate: string;
+
+  // Cột bổ sung để liên kết với một ca làm việc cụ thể
+  @Column({ name: 'shift_assignment_id', type: 'uuid', nullable: true })
+  shiftAssignmentId: string | null;
+
+  @ManyToOne(() => ShiftAssignment, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'shift_assignment_id' })
+  shiftAssignment: ShiftAssignment;
+
+  @Column({ name: 'start_time', type: 'time', nullable: true })
+  startTime: string | null;
+
+  @Column({ name: 'end_time', type: 'time', nullable: true })
+  endTime: string | null;
 
   @Column({
     type: 'enum',

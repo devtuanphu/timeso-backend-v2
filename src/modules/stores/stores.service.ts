@@ -10860,7 +10860,7 @@ export class StoresService {
     return this.leaveRequestRepository.find({
       where: { employeeProfileId },
       order: { createdAt: 'DESC' },
-      relations: ['approvedBy', 'approvedBy.account'],
+      relations: ['approvedBy', 'approvedBy.account', 'shiftAssignment'],
     });
   }
 
@@ -10875,6 +10875,7 @@ export class StoresService {
         'employeeProfile.account',
         'approvedBy',
         'approvedBy.account',
+        'shiftAssignment',
       ],
     });
   }
@@ -11024,11 +11025,15 @@ export class StoresService {
   }
 
   async getBonusWorkRequestsByEmployee(employeeProfileId: string) {
-    return this.bonusWorkRequestRepository.find({
-      where: { employeeProfileId },
-      order: { createdAt: 'DESC' },
-      relations: ['approvedBy', 'approvedBy.account'],
-    });
+    try {
+      return await this.bonusWorkRequestRepository.find({
+        where: { employeeProfileId },
+        order: { createdAt: 'DESC' },
+        // relations: ['approvedBy', 'approvedBy.account'],
+      });
+    } catch (e: any) {
+      throw new BadRequestException("DEBUG ERROR: " + e.message);
+    }
   }
 
   async getBonusWorkRequestsByStore(
@@ -12173,16 +12178,35 @@ export class StoresService {
       `[getNextShiftAssignment] employeeProfileId=${employeeProfileId}, storeId=${storeId}, todayStr=${todayStr}`,
     );
 
-    // 1) Check if there's an active assignment (checked in but not checked out)
-    const activeAssignment = await this.shiftAssignmentRepository.findOne({
-      where: {
-        employeeId: employeeProfileId,
-        status: ShiftAssignmentStatus.CONFIRMED,
-        checkOutTime: null as any,
-      },
-      relations: ['shiftSlot', 'shiftSlot.workShift'],
-      order: { checkInTime: 'DESC' },
-    });
+    // Count total shifts today for this employee in this store
+    const totalShiftsToday = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoin('a.shiftSlot', 'slot')
+      .leftJoin('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('slot.workDate = :todayStr', { todayStr })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('a.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.APPROVED,
+          ShiftAssignmentStatus.CONFIRMED,
+          ShiftAssignmentStatus.COMPLETED,
+        ],
+      })
+      .getCount();
+
+    // 1) Check if there's an active assignment (checked in but not checked out) in this store
+    const activeAssignment = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('a.status = :status', { status: ShiftAssignmentStatus.CONFIRMED })
+      .andWhere('a.checkOutTime IS NULL')
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .orderBy('a.checkInTime', 'DESC')
+      .getOne();
 
     if (activeAssignment) {
       const ws = activeAssignment.shiftSlot?.workShift;
@@ -12199,6 +12223,9 @@ export class StoresService {
         shiftSlotId: activeAssignment.shiftSlot?.id || null,
         checkInTime: activeAssignment.checkInTime?.toISOString() || null,
         lateMinutes: activeAssignment.lateMinutes || 0,
+        location: activeAssignment.shiftSlot?.location || ws?.location || '',
+        note: activeAssignment.shiftSlot?.note || '',
+        totalShiftsToday,
       };
     }
 
@@ -12233,6 +12260,9 @@ export class StoresService {
         shiftSlotId: approvedAssignment.shiftSlot?.id || null,
         checkInTime: null,
         lateMinutes: 0,
+        location: approvedAssignment.shiftSlot?.location || ws?.location || '',
+        note: approvedAssignment.shiftSlot?.note || '',
+        totalShiftsToday,
       };
     }
 
@@ -12247,6 +12277,9 @@ export class StoresService {
       endTime: null,
       checkInTime: null,
       lateMinutes: 0,
+      location: '',
+      note: '',
+      totalShiftsToday,
     };
   }
 
@@ -12268,6 +12301,7 @@ export class StoresService {
       slotId?: string;
       startDate?: string;
       endDate?: string;
+      daysOfWeek?: number[];
       note?: string;
     },
   ) {
@@ -12280,14 +12314,141 @@ export class StoresService {
       );
     }
 
-    // Otherwise create a general shift proposal via leave-request-style record
-    // Find an open shift slot that matches the requested workShift + date
-    let targetSlotId: string | null = null;
+    // Batch Registration (Fixed Shift)
+    if (
+      data.workShiftId &&
+      data.startDate &&
+      data.daysOfWeek &&
+      data.daysOfWeek.length > 0
+    ) {
+      const slots = await this.shiftSlotRepository
+        .createQueryBuilder('slot')
+        .leftJoinAndSelect('slot.cycle', 'cycle')
+        .where('slot.workShiftId = :workShiftId', {
+          workShiftId: data.workShiftId,
+        })
+        .andWhere('slot.workDate >= :startDate', { startDate: data.startDate })
+        .andWhere('slot.workDate <= :endDate', {
+          endDate: data.endDate || data.startDate,
+        })
+        .andWhere('cycle.status = :activeStatus', {
+          activeStatus: WorkCycleStatus.ACTIVE,
+        })
+        .getMany();
 
+      const matchedSlots = slots.filter((slot) => {
+        // Safe parsing of YYYY-MM-DD
+        let y, m, d;
+        if (typeof slot.workDate === 'string') {
+          [y, m, d] = slot.workDate.split('-');
+        } else {
+          // If TypeORM mapped it to a Date object
+          const dateObj = slot.workDate as any;
+          y = dateObj.getFullYear();
+          m = dateObj.getMonth() + 1;
+          d = dateObj.getDate();
+        }
+        const day = new Date(Number(y), Number(m) - 1, Number(d)).getDay();
+        return data.daysOfWeek!.includes(day);
+      });
+
+      if (matchedSlots.length === 0) {
+        throw new BadRequestException(
+          'Không tìm thấy ca làm việc nào phù hợp với thời gian và các ngày đã chọn.',
+        );
+      }
+
+      return this.dataSource.transaction(async (manager) => {
+        let successCount = 0;
+
+        // Check employee status once
+        const employee = await manager.findOne(EmployeeProfile, {
+          where: { id: data.employeeProfileId },
+        });
+        if (!employee) {
+          throw new NotFoundException('Không tìm thấy nhân viên');
+        }
+        if (employee.employmentStatus !== EmploymentStatus.ACTIVE) {
+          throw new BadRequestException(
+            'Nhân viên không còn hoạt động, không thể đăng ký ca',
+          );
+        }
+
+        const now = new Date();
+
+        for (const slot of matchedSlots) {
+          // Pessimistic lock for this slot
+          const lockedSlot = await manager
+            .createQueryBuilder(ShiftSlot, 'slot')
+            .setLock('pessimistic_write')
+            .where('slot.id = :slotId', { slotId: slot.id })
+            .getOne();
+
+          if (!lockedSlot) continue; // Should exist, but just in case
+
+          // Check deadline
+          if (
+            slot.cycle?.registrationDeadline &&
+            now > new Date(slot.cycle.registrationDeadline)
+          ) {
+            continue; // Passed deadline, skip
+          }
+
+          // Check capacity
+          const assignments = await manager.find(ShiftAssignment, {
+            where: { shiftSlotId: lockedSlot.id },
+          });
+
+          const activeCount =
+            assignments.filter(
+              (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
+            ).length || 0;
+
+          if (
+            lockedSlot.maxStaff !== null &&
+            activeCount >= lockedSlot.maxStaff
+          ) {
+            continue; // Slot is full, skip
+          }
+
+          // Check if employee already registered
+          const existing = assignments.find(
+            (a) =>
+              a.employeeId === data.employeeProfileId &&
+              a.status !== ShiftAssignmentStatus.CANCELLED,
+          );
+          if (existing) {
+            continue; // Already registered, skip
+          }
+
+          // Create assignment
+          const assignment = manager.create(ShiftAssignment, {
+            shiftSlotId: lockedSlot.id,
+            employeeId: data.employeeProfileId,
+            note: data.note,
+            status: ShiftAssignmentStatus.PENDING,
+          });
+          await manager.save(assignment);
+          successCount++;
+        }
+
+        if (successCount === 0) {
+          throw new BadRequestException(
+            'Tất cả các ca bạn chọn đều đã đầy hoặc bạn đã đăng ký.',
+          );
+        }
+
+        return { successCount };
+      });
+    }
+
+    // Fallback for single shift registration by workShiftId + startDate (legacy compatibility)
+    let targetSlotId: string | null = null;
     if (data.workShiftId && data.startDate) {
       const slot = await this.shiftSlotRepository.findOne({
         where: {
           workShiftId: data.workShiftId,
+          workDate: data.startDate, // Explicitly match workDate so we get the exact slot
         } as any,
       });
       if (slot) targetSlotId = slot.id;
@@ -12301,9 +12462,9 @@ export class StoresService {
       );
     }
 
-    // No available slot found — return 400 instead of creating invalid record
+    // No available slot found
     throw new BadRequestException(
-      'Không tìm thấy slot ca phù hợp. Vui lòng chọn slotId cụ thể hoặc liên hệ quản lý.',
+      'Không tìm thấy slot ca phù hợp. Vui lòng chọn ca và ngày hợp lệ.',
     );
   }
 

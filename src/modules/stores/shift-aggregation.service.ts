@@ -15,6 +15,9 @@ import {
 } from './entities/employee-profile.entity';
 import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
 import { Store } from './entities/store.entity';
+import { AttendanceLog, AttendanceLogType } from './entities/attendance-log.entity';
+import { ShiftChangeRequest, ShiftChangeRequestStatus } from './entities/shift-change-request.entity';
+
 
 // ── Helper Maps ────────────────────────────────────────────────────────────────
 
@@ -219,6 +222,10 @@ export class ShiftAggregationService {
     private readonly leaveRequestRepo: Repository<EmployeeLeaveRequest>,
     @InjectRepository(Store)
     private readonly storeRepo: Repository<Store>,
+    @InjectRepository(AttendanceLog)
+    private readonly attendanceLogRepo: Repository<AttendanceLog>,
+    @InjectRepository(ShiftChangeRequest)
+    private readonly shiftChangeRequestRepo: Repository<ShiftChangeRequest>,
   ) { }
 
   // ── 1. List Shift Slots ────────────────────────────────────────────────────
@@ -1116,5 +1123,284 @@ export class ShiftAggregationService {
       return { reason: 'Đăng ký ưa thích ca này', reasonSub: null };
     }
     return { reason: 'Nhân viên khả dụng', reasonSub: null };
+  }
+
+  async getEmployeeActivities(params: {
+    storeId: string;
+    employeeId: string;
+    from: string;
+    to: string;
+  }): Promise<any[]> {
+    const { storeId, employeeId, from, to } = params;
+
+    const fromDate = new Date(from);
+    fromDate.setHours(0, 0, 0, 0);
+    const toDate = new Date(to);
+    toDate.setHours(23, 59, 59, 999);
+
+    // 1. Fetch Attendance Logs
+    const attendanceLogs = await this.attendanceLogRepo
+      .createQueryBuilder('log')
+      .leftJoinAndSelect('log.shiftAssignment', 'sa')
+      .leftJoinAndSelect('sa.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .where('log.storeId = :storeId', { storeId })
+      .andWhere('log.employeeProfileId = :employeeId', { employeeId })
+      .andWhere('log.timestamp >= :from', { from: fromDate })
+      .andWhere('log.timestamp <= :to', { to: toDate })
+      .getMany();
+
+    // 2. Fetch Shift Assignments (SHIFT_REGISTER)
+    const shiftAssignments = await this.shiftAssignmentRepo
+      .createQueryBuilder('sa')
+      .leftJoinAndSelect('sa.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .where('sa.employeeId = :employeeId', { employeeId })
+      .andWhere('sa.createdAt >= :from', { from: fromDate })
+      .andWhere('sa.createdAt <= :to', { to: toDate })
+      .getMany();
+
+    // 3. Fetch Shift Change Requests (SHIFT_CHANGE)
+    const shiftChangeRequests = await this.shiftChangeRequestRepo
+      .createQueryBuilder('scr')
+      .where('scr.storeId = :storeId', { storeId })
+      .andWhere('scr.employeeProfileId = :employeeId', { employeeId })
+      .andWhere('scr.createdAt >= :from', { from: fromDate })
+      .andWhere('scr.createdAt <= :to', { to: toDate })
+      .getMany();
+
+    // 4. Fetch Leave Requests (LEAVE, LATE, EARLY, OVERTIME)
+    const leaveRequests = await this.leaveRequestRepo
+      .createQueryBuilder('lr')
+      .leftJoinAndSelect('lr.shiftAssignment', 'sa')
+      .leftJoinAndSelect('sa.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .where('lr.storeId = :storeId', { storeId })
+      .andWhere('lr.employeeProfileId = :employeeId', { employeeId })
+      .andWhere('lr.createdAt >= :from', { from: fromDate })
+      .andWhere('lr.createdAt <= :to', { to: toDate })
+      .getMany();
+
+    // Collect all shift IDs to fetch details for shift change request lookup
+    const allShiftIds = new Set<string>();
+    for (const scr of shiftChangeRequests) {
+      if (scr.currentShiftId) allShiftIds.add(scr.currentShiftId);
+      if (scr.requestedShiftId) allShiftIds.add(scr.requestedShiftId);
+    }
+
+    const shiftLookupMap = new Map<string, { shiftName: string; timeRange: string; employeeName?: string }>();
+    if (allShiftIds.size > 0) {
+      const idsArray = Array.from(allShiftIds);
+      // Try to load as ShiftAssignment
+      const assignments = await this.shiftAssignmentRepo
+        .createQueryBuilder('sa')
+        .leftJoinAndSelect('sa.shiftSlot', 'slot')
+        .leftJoinAndSelect('slot.workShift', 'ws')
+        .leftJoinAndSelect('sa.employee', 'emp')
+        .leftJoinAndSelect('emp.account', 'acc')
+        .where('sa.id IN (:...idsArray)', { idsArray })
+        .getMany();
+
+      for (const a of assignments) {
+        shiftLookupMap.set(a.id, {
+          shiftName: a.shiftSlot?.workShift?.shiftName || 'Ca làm',
+          timeRange: `${a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || ''} - ${a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || ''}`,
+          employeeName: a.employee?.account?.fullName,
+        });
+      }
+
+      // Try to load as ShiftSlot
+      const slots = await this.shiftSlotRepo
+        .createQueryBuilder('slot')
+        .leftJoinAndSelect('slot.workShift', 'ws')
+        .where('slot.id IN (:...idsArray)', { idsArray })
+        .getMany();
+
+      for (const s of slots) {
+        shiftLookupMap.set(s.id, {
+          shiftName: s.workShift?.shiftName || 'Ca làm',
+          timeRange: `${s.startTime || s.workShift?.startTime || ''} - ${s.endTime || s.workShift?.endTime || ''}`,
+        });
+      }
+    }
+
+    const activities: any[] = [];
+
+    // Map Attendance Logs
+    for (const log of attendanceLogs) {
+      const isCheckIn = log.type === 'CHECK_IN';
+      const sa = log.shiftAssignment;
+      const ws = sa?.shiftSlot?.workShift;
+      const slot = sa?.shiftSlot;
+
+      let statusText = 'Đúng giờ';
+      let statusColor = '#12B76A'; // Green
+      if (isCheckIn && sa && sa.lateMinutes > 0) {
+        statusText = `Trễ ${sa.lateMinutes} phút`;
+        statusColor = '#F79009'; // Yellow/Orange
+      } else if (!isCheckIn && sa && sa.earlyMinutes > 0) {
+        statusText = `Về sớm ${sa.earlyMinutes} phút`;
+        statusColor = '#F04438'; // Red
+      }
+
+      activities.push({
+        id: log.id,
+        type: log.type,
+        title: isCheckIn ? 'Check-in' : 'Check-out',
+        timestamp: log.timestamp.toISOString(),
+        statusText,
+        statusColor,
+        hasWarningIcon: false,
+        details: {
+          shiftName: ws?.shiftName || 'Ca làm việc',
+          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+          method: log.method,
+        },
+      });
+    }
+
+    // Map Shift Assignments (SHIFT_REGISTER)
+    for (const sa of shiftAssignments) {
+      const ws = sa.shiftSlot?.workShift;
+      const slot = sa.shiftSlot;
+
+      let type: 'SHIFT_REGISTER' = 'SHIFT_REGISTER';
+      let title = 'Đăng ký ca làm';
+      let statusText = 'Chờ duyệt';
+      let statusColor = '#F79009'; // Yellow/Orange
+      let hasWarningIcon = false;
+
+      if (sa.status === ShiftAssignmentStatus.PENDING) {
+        statusText = 'Chờ duyệt';
+        statusColor = '#F79009';
+        hasWarningIcon = true;
+      } else if (sa.status === ShiftAssignmentStatus.CANCELLED) {
+        statusText = 'Đã từ chối';
+        statusColor = '#F04438';
+      } else {
+        statusText = 'Đã duyệt';
+        statusColor = '#12B76A';
+      }
+
+      activities.push({
+        id: sa.id,
+        type,
+        title,
+        timestamp: sa.createdAt.toISOString(),
+        statusText,
+        statusColor,
+        hasWarningIcon,
+        details: {
+          shiftName: ws?.shiftName || 'Ca làm việc',
+          workDate: slot?.workDate || '',
+          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+          note: sa.note || '',
+        },
+      });
+    }
+
+    // Map Shift Change Requests
+    for (const scr of shiftChangeRequests) {
+      let statusText = 'Chờ duyệt';
+      let statusColor = '#F79009'; // Yellow/Orange
+      let hasWarningIcon = false;
+
+      if (scr.status === ShiftChangeRequestStatus.PENDING) {
+        statusText = 'Chờ duyệt';
+        statusColor = '#F79009';
+        hasWarningIcon = true;
+      } else if (scr.status === ShiftChangeRequestStatus.APPROVED) {
+        statusText = 'Đã duyệt';
+        statusColor = '#12B76A';
+      } else if (scr.status === ShiftChangeRequestStatus.REJECTED) {
+        statusText = 'Đã từ chối';
+        statusColor = '#F04438';
+      } else {
+        statusText = 'Đã huỷ';
+        statusColor = '#98A2B3';
+      }
+
+      const current = scr.currentShiftId ? shiftLookupMap.get(scr.currentShiftId) : null;
+      const requested = scr.requestedShiftId ? shiftLookupMap.get(scr.requestedShiftId) : null;
+
+      activities.push({
+        id: scr.id,
+        type: 'SHIFT_CHANGE',
+        title: 'Xin đổi ca',
+        timestamp: scr.createdAt.toISOString(),
+        statusText,
+        statusColor,
+        hasWarningIcon,
+        details: {
+          requestDate: scr.requestDate,
+          reason: scr.reason || '',
+          currentShift: current ? `${current.shiftName} (${current.timeRange})` : 'Không có ca',
+          requestedShift: requested 
+            ? `${requested.shiftName} (${requested.timeRange})${requested.employeeName ? ` - ${requested.employeeName}` : ''}`
+            : 'Ca trống',
+        },
+      });
+    }
+
+    // Map Leave Requests (LEAVE, LATE, EARLY, OVERTIME)
+    for (const lr of leaveRequests) {
+      let type: 'LEAVE' | 'LATE' | 'EARLY' | 'OVERTIME' = 'LEAVE';
+      let title = 'Xin nghỉ phép';
+
+      if (lr.type === 'LATE') {
+        type = 'LATE';
+        title = 'Xin đi trễ';
+      } else if (lr.type === 'EARLY') {
+        type = 'EARLY';
+        title = 'Xin về sớm';
+      } else if (lr.type === 'OVERTIME') {
+        type = 'OVERTIME';
+        title = 'Xin tăng ca';
+      }
+
+      let statusText = 'Chờ duyệt';
+      let statusColor = '#F79009';
+      let hasWarningIcon = false;
+
+      if (lr.status === 'PENDING') {
+        statusText = 'Chờ duyệt';
+        statusColor = '#F79009';
+        hasWarningIcon = true;
+      } else if (lr.status === 'APPROVED') {
+        statusText = 'Đã duyệt';
+        statusColor = '#12B76A';
+      } else if (lr.status === 'REJECTED') {
+        statusText = 'Đã từ chối';
+        statusColor = '#F04438';
+      } else {
+        statusText = 'Đã huỷ';
+        statusColor = '#98A2B3';
+      }
+
+      const ws = lr.shiftAssignment?.shiftSlot?.workShift;
+      const slot = lr.shiftAssignment?.shiftSlot;
+
+      activities.push({
+        id: lr.id,
+        type,
+        title,
+        timestamp: lr.createdAt.toISOString(),
+        statusText,
+        statusColor,
+        hasWarningIcon,
+        details: {
+          reason: lr.reason || '',
+          startDate: lr.startDate,
+          endDate: lr.endDate,
+          startTime: lr.startTime,
+          endTime: lr.endTime,
+          shiftName: ws?.shiftName,
+          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+        },
+      });
+    }
+
+    // Sort by timestamp descending
+    return activities.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   }
 }

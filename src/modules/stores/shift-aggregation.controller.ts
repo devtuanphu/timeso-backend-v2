@@ -114,4 +114,23 @@ export class ShiftAggregationController {
       to,
     });
   }
+
+  /**
+   * GET /stores/:storeId/employees/:empId/activities
+   * Lấy danh sách hoạt động tổng hợp của nhân viên
+   */
+  @Get(':storeId/employees/:empId/activities')
+  async getEmployeeActivities(
+    @Param('storeId') storeId: string,
+    @Param('empId') empId: string,
+    @Query('from') from: string,
+    @Query('to') to: string,
+  ) {
+    return this.aggService.getEmployeeActivities({
+      storeId,
+      employeeId: empId,
+      from,
+      to,
+    });
+  }
 }
