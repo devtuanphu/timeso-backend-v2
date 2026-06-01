@@ -531,6 +531,8 @@ export class ShiftAggregationService {
         'slot.workShiftId as workShiftId',
         'slot.startTime as slotStartTime',
         'slot.endTime as slotEndTime',
+        'ws.shiftName as ws_shiftName',
+        'ws.startTime as ws_startTime',
         'COUNT(sa.id) as assignedCount',
       ])
       .having('slot.maxStaff > COUNT(sa.id)')
@@ -922,7 +924,14 @@ export class ShiftAggregationService {
     };
   }
 
-  private formatDateVn(dateStr: string): string {
+  private formatDateVn(dateInput: string | Date): string {
+    let dateStr = '';
+    if (dateInput instanceof Date) {
+      dateStr = dateInput.toISOString().split('T')[0];
+    } else {
+      dateStr = String(dateInput);
+    }
+    if (!dateStr.includes('-')) return dateStr;
     const [year, month, day] = dateStr.split('-');
     return `${day}/${month}/${year}`;
   }
