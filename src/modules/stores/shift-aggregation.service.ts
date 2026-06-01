@@ -1091,7 +1091,7 @@ export class ShiftAggregationService {
       .andWhere('sa.status != :cancelled', {
         cancelled: ShiftAssignmentStatus.CANCELLED,
       })
-      .select('AVG(sub_count)', 'avgCount')
+      .select('COUNT(sa.id) * 1.0 / NULLIF(COUNT(DISTINCT sa.employeeId), 0)', 'avgCount')
       .getRawOne();
 
     return Number(result?.avgCount) || 0;
