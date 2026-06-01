@@ -17,6 +17,7 @@ import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
 import { Store } from './entities/store.entity';
 import { AttendanceLog, AttendanceLogType } from './entities/attendance-log.entity';
 import { ShiftChangeRequest, ShiftChangeRequestStatus } from './entities/shift-change-request.entity';
+import { PaymentType } from './entities/employee-contract.entity';
 
 
 // ── Helper Maps ────────────────────────────────────────────────────────────────
@@ -257,6 +258,7 @@ export class ShiftAggregationService {
       .leftJoinAndSelect('slot.workShift', 'ws')
       .leftJoinAndSelect('slot.assignments', 'sa')
       .leftJoinAndSelect('sa.employee', 'emp')
+      .leftJoinAndSelect('emp.contracts', 'contract', 'contract.isActive = true')
       .leftJoinAndSelect('emp.account', 'account')
       .leftJoinAndSelect('emp.storeRole', 'role')
       .leftJoin('slot.cycle', 'cycle')
@@ -298,6 +300,7 @@ export class ShiftAggregationService {
       .leftJoinAndSelect('slot.workShift', 'ws')
       .leftJoinAndSelect('slot.assignments', 'sa')
       .leftJoinAndSelect('sa.employee', 'emp')
+      .leftJoinAndSelect('emp.contracts', 'contract', 'contract.isActive = true')
       .leftJoinAndSelect('emp.account', 'account')
       .leftJoinAndSelect('emp.storeRole', 'role')
       .leftJoin('slot.cycle', 'cycle')
@@ -322,12 +325,22 @@ export class ShiftAggregationService {
       this.calcSummary(storeId, yesterday, yesterday),
     ]);
 
-    response.estimatedTotalSalary = currentDaySummary.totalSalary;
+    response.estimatedTotalSalary = response.totalSalary;
     response.salaryChangePercent = prevDaySummary.totalSalary > 0 
       ? Math.round(((currentDaySummary.totalSalary - prevDaySummary.totalSalary) / prevDaySummary.totalSalary) * 100)
       : 0;
     
-    response.estimatedTotalHours = currentDaySummary.totalHours;
+    const startTimeStr = slot.startTime || slot.workShift?.startTime || '00:00:00';
+    const endTimeStr = slot.endTime || slot.workShift?.endTime || '00:00:00';
+    let startMs = new Date(`1970-01-01T${startTimeStr}Z`).getTime();
+    let endMs = new Date(`1970-01-01T${endTimeStr}Z`).getTime();
+    if (endMs < startMs) endMs += 24 * 60 * 60 * 1000;
+    const durationHours = (endMs - startMs) / 3600000;
+    const activeAssignments = (slot.assignments || []).filter(
+      (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
+    );
+
+    response.estimatedTotalHours = Math.round(durationHours * activeAssignments.length * 10) / 10;
     response.hoursChangePercent = prevDaySummary.totalHours > 0
       ? Math.round(((currentDaySummary.totalHours - prevDaySummary.totalHours) / prevDaySummary.totalHours) * 100)
       : 0;
@@ -736,6 +749,43 @@ export class ShiftAggregationService {
 
   // ── Private Helpers ─────────────────────────────────────────────────────────
 
+  private calculateEstimatedShiftSalary(
+    slot: ShiftSlot,
+    assignment: ShiftAssignment,
+  ): number {
+    const contract = assignment.employee?.contracts?.[0];
+    if (!contract || !contract.isActive || !contract.salaryAmount) return 0;
+
+    const startTime = slot.startTime || slot.workShift?.startTime || '00:00:00';
+    const endTime = slot.endTime || slot.workShift?.endTime || '00:00:00';
+
+    let start = new Date(`1970-01-01T${startTime}Z`).getTime();
+    let end = new Date(`1970-01-01T${endTime}Z`).getTime();
+    if (end < start) end += 24 * 60 * 60 * 1000;
+    
+    const durationMinutes = (end - start) / 60000;
+    const durationHours = durationMinutes / 60;
+    const baseSalary = Number(contract.salaryAmount);
+
+    switch (contract.paymentType) {
+      case PaymentType.HOUR:
+        return Math.round(baseSalary * durationHours);
+      case PaymentType.SHIFT:
+        return baseSalary;
+      case PaymentType.DAY:
+        return baseSalary;
+      case PaymentType.WEEK:
+        return Math.round(baseSalary / 7);
+      case PaymentType.MONTH: {
+        const date = new Date(slot.workDate);
+        const daysInMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+        return Math.round(baseSalary / daysInMonth);
+      }
+      default:
+        return 0;
+    }
+  }
+
   private mapSlotToResponse(slot: ShiftSlot): ShiftSlotResponse {
     const activeAssignments = (slot.assignments || []).filter(
       (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
@@ -778,7 +828,12 @@ export class ShiftAggregationService {
       insufficientRatio: Math.round(insufficientRatio * 100),
       staffingStatus,
       totalSalary: activeAssignments.reduce(
-        (sum, a) => sum + Number(a.shiftEarnings || 0),
+        (sum, a) => {
+          if (a.shiftEarnings != null && Number(a.shiftEarnings) > 0) {
+            return sum + Number(a.shiftEarnings);
+          }
+          return sum + this.calculateEstimatedShiftSalary(slot, a);
+        },
         0,
       ),
       location: slot.location || (slot.workShift as any)?.location || null,
