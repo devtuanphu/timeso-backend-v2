@@ -3074,11 +3074,12 @@ export class StoresService {
 
       if (!slot) throw new NotFoundException('Shift slot not found');
 
-      // Step 2: Load cycle and assignments separately (now inside transaction)
-      const [cycle, assignments] = await Promise.all([
+      // Step 2: Load cycle, workShift and assignments separately (now inside transaction)
+      const [cycle, workShift, assignments] = await Promise.all([
         slot.cycleId
           ? manager.findOne(WorkCycle, { where: { id: slot.cycleId } })
           : Promise.resolve(null),
+        manager.findOne(WorkShift, { where: { id: slot.workShiftId } }),
         manager.find(ShiftAssignment, {
           where: { shiftSlotId: slotId },
         }),
@@ -3098,12 +3099,13 @@ export class StoresService {
         throw new BadRequestException('Đã quá hạn đăng ký ca làm việc');
       }
 
-      // Check capacity (null maxStaff = unlimited)
+      // Check capacity (0 or null = unlimited)
       const activeCount =
         assignments.filter((a) => a.status !== ShiftAssignmentStatus.CANCELLED)
           .length || 0;
 
-      if (slot.maxStaff !== null && activeCount >= slot.maxStaff) {
+      const maxRequired = slot.maxStaff ?? workShift?.defaultMaxStaff ?? 0;
+      if (maxRequired > 0 && activeCount >= maxRequired) {
         throw new BadRequestException('Ca đã đầy người');
       }
 

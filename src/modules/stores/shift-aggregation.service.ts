@@ -70,7 +70,7 @@ export interface ShiftSlotResponse {
   shiftType: string;
   colorCode: string | null;
   maxStaff: number | null;
-  requiredCount: number;
+  requiredCount: number | null;
   assignedCount: number;
   insufficientCount: number;
   insufficientRatio: number;
@@ -790,10 +790,12 @@ export class ShiftAggregationService {
     const activeAssignments = (slot.assignments || []).filter(
       (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
     );
-    const required = slot.maxStaff ?? slot.workShift?.defaultMaxStaff ?? 0;
+    const required = slot.maxStaff ?? slot.workShift?.defaultMaxStaff ?? null;
     const assigned = activeAssignments.length;
-    const insufficientCount = Math.max(0, required - assigned);
-    const insufficientRatio = required > 0 ? insufficientCount / required : 0;
+    
+    // If required is null (unlimited), insufficient is 0. Otherwise, it's required - assigned
+    const insufficientCount = required === null ? 0 : Math.max(0, required - assigned);
+    const insufficientRatio = required && required > 0 ? insufficientCount / required : 0;
 
     let staffingStatus: StaffingStatus;
     if (insufficientCount === 0) {
