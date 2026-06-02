@@ -141,4 +141,12 @@ export class EmployeeProfile extends BaseEntity {
     comment: 'Ghi chú sở thích ca',
   })
   shiftPreferenceNote: string | null;
+
+  @Column({
+    name: 'reminder_settings',
+    type: 'jsonb',
+    nullable: true,
+    comment: 'Cài đặt nhắc nhở ca làm việc của nhân viên',
+  })
+  reminderSettings: any | null;
 }

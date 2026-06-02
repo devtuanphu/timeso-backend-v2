@@ -18,7 +18,6 @@ import { ProductCategory } from './entities/product-category.entity';
 import { ProductStatus } from './entities/product-status.entity';
 import { AssetExportType } from './entities/asset-export-type.entity';
 import { ProductExportType } from './entities/product-export-type.entity';
-
 import { MonthlyPayroll } from './entities/monthly-payroll.entity';
 import { SalaryConfig } from './entities/salary-config.entity';
 import { EmployeeSalary } from './entities/employee-salary.entity';
@@ -90,6 +89,10 @@ import { MailModule } from '../mail/mail.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { FaceRecognitionService } from './face-recognition.service';
 import { Account } from '../accounts/entities/account.entity';
+import { BullModule } from '@nestjs/bullmq';
+import { ShiftReminderService } from './shift-reminder.service';
+import { ShiftReminderProcessor } from './shift-reminder.processor';
+import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
   imports: [
@@ -110,7 +113,6 @@ import { Account } from '../accounts/entities/account.entity';
       AssetStatus,
       ProductCategory,
       ProductStatus,
-
       MonthlyPayroll,
       SalaryConfig,
       EmployeeSalary,
@@ -160,7 +162,6 @@ import { Account } from '../accounts/entities/account.entity';
       StorePermissionConfig,
       StoreShiftConfig,
       AssetExportType,
-
       ProductExportType,
       Feedback,
       ShiftChangeRequest,
@@ -170,7 +171,11 @@ import { Account } from '../accounts/entities/account.entity';
 
     AccountsModule,
     MailModule,
+    NotificationsModule,
     ScheduleModule.forRoot(),
+    BullModule.registerQueue({
+      name: 'shift-reminders',
+    }),
   ],
   controllers: [
     StoresController,
@@ -183,7 +188,14 @@ import { Account } from '../accounts/entities/account.entity';
     DistributedLockService,
     FaceRecognitionService,
     ShiftAggregationService,
+    ShiftReminderService,
+    ShiftReminderProcessor,
   ],
-  exports: [StoresService, DistributedLockService, ShiftAggregationService],
+  exports: [
+    StoresService,
+    DistributedLockService,
+    ShiftAggregationService,
+    ShiftReminderService,
+  ],
 })
 export class StoresModule {}

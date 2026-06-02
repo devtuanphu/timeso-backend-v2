@@ -13,6 +13,7 @@ import { DevicesModule } from './modules/devices/devices.module';
 import { ChatGroupsModule } from './modules/chat-groups/chat-groups.module';
 import { AiReportsModule } from './modules/ai-reports/ai-reports.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
+import { BullModule } from '@nestjs/bullmq';
 import { join } from 'path';
 
 @Module({
@@ -37,6 +38,17 @@ import { join } from 'path';
         database: configService.get<string>('DATABASE_NAME'),
         autoLoadEntities: true,
         synchronize: true, // Should be false in production
+      }),
+    }),
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: async (configService: ConfigService) => ({
+        connection: {
+          host: configService.get('REDIS_HOST', 'localhost'),
+          port: configService.get('REDIS_PORT', 6379),
+          password: configService.get('REDIS_PASSWORD', ''),
+        },
       }),
     }),
     AccountsModule,

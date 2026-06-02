@@ -1184,6 +1184,30 @@ export class StoresController {
     return result;
   }
 
+  @Patch(':id/me/reminder-settings')
+  @ApiOperation({
+    summary: 'Cập nhật cài đặt nhắc nhở ca làm (Dành cho nhân viên hiện tại)',
+    description:
+      'Cập nhật cấu hình nhắc nhở của tài khoản đang đăng nhập trong cửa hàng này',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Cập nhật thành công',
+  })
+  async updateMyReminderSettings(
+    @GetUser() user: any,
+    @Param('id') storeId: string,
+    @Body() body: any,
+  ) {
+    const profile = await this.storesService.getEmployeeByAccountId(
+      user.userId,
+    );
+    if (!profile) {
+      throw new NotFoundException('Không tìm thấy nhân viên');
+    }
+    return this.storesService.updateEmployeeReminderSettings(profile.id, body);
+  }
+
   @Get(':id/me/personal-info')
   @ApiOperation({
     summary: 'Lấy thông tin cá nhân của người dùng tại cửa hàng hiện tại',
@@ -4093,7 +4117,4 @@ export class StoresController {
   ) {
     return this.storesService.requestKpiAiSuggestion(body);
   }
-
-
-
 }

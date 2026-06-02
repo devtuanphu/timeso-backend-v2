@@ -7,6 +7,7 @@ export enum NotificationType {
   SCHEDULE_CONFIRMATION = 'Xác nhận lịch',
   SHIFT_APPROVAL = 'Duyệt ca',
   STAFF_SHORTAGE = 'Thiếu nhân viên',
+  SHIFT_REMINDER = 'Nhắc ca làm',
 }
 
 export enum NotificationPriority {

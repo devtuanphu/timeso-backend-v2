@@ -208,6 +208,8 @@ import { AccountFinance } from '../accounts/entities/account-finance.entity';
 import { AccountsService } from '../accounts/accounts.service';
 
 import { MailService } from '../mail/mail.service';
+import { ShiftReminderService } from './shift-reminder.service';
+
 @Injectable()
 export class StoresService {
   private readonly logger = new Logger(StoresService.name);
@@ -360,6 +362,7 @@ export class StoresService {
     private readonly accountsService: AccountsService,
     private readonly faceRecognitionService: FaceRecognitionService,
     private readonly dataSource: DataSource,
+    private readonly shiftReminderService: ShiftReminderService,
   ) {}
 
   // Store management
@@ -1230,6 +1233,77 @@ export class StoresService {
     return this.profileRepository.save(profile);
   }
 
+  async updateEmployeeReminderSettings(profileId: string, settings: any) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+    });
+
+    if (!profile) {
+      throw new NotFoundException('Không tìm thấy nhân viên');
+    }
+
+    profile.reminderSettings = settings;
+    await this.profileRepository.save(profile);
+
+    // Fetch upcoming shifts to reschedule reminders
+    const upcomingShifts = await this.shiftAssignmentRepository.find({
+      where: {
+        employeeId: profileId,
+      },
+      relations: ['shiftSlot', 'shiftSlot.workShift'],
+    });
+    
+    // Filter out past shifts in memory
+    const futureShifts = upcomingShifts.filter((s) => {
+      const dateStr = s.shiftSlot?.workDate;
+      const timeStr = s.shiftSlot?.startTime || s.shiftSlot?.workShift?.startTime;
+      if (dateStr && timeStr) {
+        return new Date(`${dateStr}T${timeStr}`).getTime() > Date.now();
+      }
+      return false;
+    });
+
+    await this.shiftReminderService.syncEmployeeReminders(
+      profileId,
+      profile.storeId,
+      settings,
+      futureShifts,
+    );
+
+    return { success: true, reminderSettings: settings };
+  }
+
+  async scheduleReminderForAssignment(assignmentId: string) {
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      where: { id: assignmentId },
+      relations: ['shiftSlot', 'shiftSlot.workShift', 'employee'],
+    });
+
+    if (!assignment || !assignment.shiftSlot || !assignment.shiftSlot.workShift || !assignment.employee) {
+      return;
+    }
+
+    const { employee, shiftSlot } = assignment;
+    const settings = employee.reminderSettings;
+    if (!settings || settings.type === 'off') return;
+
+    const dateStr = shiftSlot.workDate;
+    const timeStr = shiftSlot.startTime || shiftSlot.workShift.startTime;
+    
+    if (dateStr && timeStr) {
+      const shiftStart = new Date(`${dateStr}T${timeStr}`);
+      if (shiftStart.getTime() > Date.now()) {
+        await this.shiftReminderService.scheduleReminder(
+          employee.id,
+          employee.storeId,
+          shiftSlot.workShift.id,
+          shiftStart,
+          settings
+        );
+      }
+    }
+  }
+
   async getEmployeeById(profileId: string) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -1708,7 +1782,6 @@ export class StoresService {
     }
 
     return stages;
-    return stages;
   }
 
   async getEmployeeScheduleDetails(profileId: string, month: Date) {
@@ -1931,7 +2004,16 @@ export class StoresService {
       // If rejected, maybe save reason somewhere? Currently Note.
       if (status === 'REJECTED' && reason) assignment.note = reason;
 
-      return this.shiftAssignmentRepository.save(assignment);
+      const savedAssignment = await this.shiftAssignmentRepository.save(assignment);
+      
+      // Hook: Schedule reminder if approved
+      if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
+        this.scheduleReminderForAssignment(savedAssignment.id).catch(err => {
+          this.logger.error(`Failed to schedule reminder for assignment ${savedAssignment.id}: ${err.message}`);
+        });
+      }
+      
+      return savedAssignment;
     } else if (type === 'SWAP') {
       const swap = await this.shiftSwapRepository.findOne({
         where: { id: requestId },
@@ -2422,7 +2504,30 @@ export class StoresService {
     }
 
     await this.workShiftRepository.update(shiftId, data);
+    
+    // Reschedule reminders since time might have changed
+    if (data.startTime) {
+      this.rescheduleRemindersForShift(shiftId).catch(err => {
+        this.logger.error(`Error rescheduling reminders for shift ${shiftId}: ${err.message}`, err.stack);
+      });
+    }
+
     return this.workShiftRepository.findOne({ where: { id: shiftId } });
+  }
+
+  // Helper function to re-sync reminders for all employees assigned to a shift
+  async rescheduleRemindersForShift(shiftId: string) {
+    const assignments = await this.shiftAssignmentRepository.find({
+      where: {
+        shiftSlot: { workShift: { id: shiftId } },
+        status: ShiftAssignmentStatus.APPROVED,
+      },
+      select: ['id'],
+    });
+
+    for (const a of assignments) {
+      await this.scheduleReminderForAssignment(a.id);
+    }
   }
 
   // ==================== WORK CYCLE MANAGEMENT ====================
@@ -2863,7 +2968,14 @@ export class StoresService {
               note: 'Auto-assigned from cycle',
             }),
           );
-          await this.shiftAssignmentRepository.save(newAssignments);
+          const savedAssignments = await this.shiftAssignmentRepository.save(newAssignments);
+          
+          // Hook: Schedule reminders for auto-assigned shifts
+          for (const a of savedAssignments) {
+            this.scheduleReminderForAssignment(a.id).catch(err => {
+              this.logger.error(`Failed to schedule reminder for auto-assignment ${a.id}: ${err.message}`);
+            });
+          }
         }
       }
     }
@@ -3143,6 +3255,14 @@ export class StoresService {
       console.log(
         `[registerToShiftSlot] saved assignmentId=${saved.id}, slotId=${slotId}, cycleId=${slot.cycleId}, employeeId=${employeeId}, status=${saved.status}`,
       );
+      
+      // Hook: Schedule reminder if approved
+      if (saved.status === ShiftAssignmentStatus.APPROVED) {
+        this.scheduleReminderForAssignment(saved.id).catch(err => {
+          this.logger.error(`Failed to schedule reminder for registered assignment ${saved.id}: ${err.message}`);
+        });
+      }
+      
       return saved;
     });
   }
