@@ -4158,8 +4158,8 @@ export class StoresService {
       monthlyPayrollId: monthlyPayroll.id,
       baseSalary: data.contract?.salaryAmount || 0,
       paymentType: data.contract?.paymentType,
-      workingDays: 0,
       workingHours: 0,
+      earnedBaseSalary: 0,
     });
 
     return this.getEmployeeById(savedProfile.id);
@@ -4323,6 +4323,7 @@ export class StoresService {
           netSalary: 0,
           advancePayment: 0,
           otherDeductions: 0,
+          earnedBaseSalary: 0,
         });
         continue;
       }
@@ -4356,64 +4357,14 @@ export class StoresService {
       // ========== CALCULATE SALARY ==========
       // Prefer real-time per-shift earnings if available
       const paymentType = activeContract.paymentType || PaymentType.MONTH;
-      let calculatedSalary = 0;
 
-      if (attendanceSummary.hasShiftEarnings) {
-        // Use SUM of real-time shift earnings (calculated at each checkout)
-        calculatedSalary = attendanceSummary.totalShiftEarnings;
-        this.logger.debug(
-          `[Payroll] Using real-time shiftEarnings SUM: ${calculatedSalary}`,
-        );
-      } else if (
-        paymentType === PaymentType.HOUR ||
-        payrollSetting?.calculationMethod === PayrollCalculationMethod.HOUR
-      ) {
-        // HOURLY rate: salaryAmount is the hourly rate (VND/hour)
-        // Bug 4.1 fix: Use configurable standard hours from payroll setting, fallback to 176
-        const standardHours = payrollSetting?.priorityCalcValue || 176;
-        calculatedSalary =
-          currentBaseSalary * (attendanceSummary.workingHours / standardHours);
-      } else if (
-        paymentType === PaymentType.SHIFT ||
-        payrollSetting?.calculationMethod === PayrollCalculationMethod.SHIFT
-      ) {
-        // Fallback: Per-shift
-        calculatedSalary =
-          currentBaseSalary * attendanceSummary.completedShifts;
-      } else if (
-        paymentType === PaymentType.DAY ||
-        payrollSetting?.calculationMethod === PayrollCalculationMethod.DAY
-      ) {
-        // Fallback: Per-day
-        calculatedSalary =
-          currentBaseSalary * attendanceSummary.completedShifts;
-      } else {
-        // Bug 4.2 fix: Calculate monthly prorate based on actual working days in the month
-        // Get the number of days from start of month to end of month or today (if current month)
-        const daysInMonth = new Date(
-          month.getFullYear(),
-          month.getMonth() + 1,
-          0,
-        ).getDate();
-        const today = new Date();
-        const isCurrentMonth =
-          today.getFullYear() === month.getFullYear() &&
-          today.getMonth() === month.getMonth();
-        // Use actual days in month for proration
-        const totalWorkDaysInMonth = isCurrentMonth
-          ? today.getDate()
-          : daysInMonth;
-
-        if (totalWorkDaysInMonth > 0) {
-          // Prorate by completed shifts vs expected work days in month
-          // Bug 4.2 fix: Use work days in month, not completedShifts
-          calculatedSalary =
-            currentBaseSalary *
-            (attendanceSummary.completedShifts / totalWorkDaysInMonth);
-        } else {
-          calculatedSalary = currentBaseSalary;
-        }
-      }
+      const calculatedSalary = this.calculateBaseSalary(
+        currentBaseSalary,
+        paymentType,
+        attendanceSummary,
+        payrollSetting,
+        month,
+      );
 
       // ========== APPLY PAYROLL RULES (Bonus/Penalty) ==========
       let bonus = 0;
@@ -4493,6 +4444,7 @@ export class StoresService {
         netSalary,
         advancePayment,
         otherDeductions,
+        earnedBaseSalary: calculatedSalary,
       });
 
       console.log(
@@ -4611,6 +4563,7 @@ export class StoresService {
             netSalary: 0,
             advancePayment: 0,
             otherDeductions: 0,
+            earnedBaseSalary: 0,
           });
           continue;
         }
@@ -4747,6 +4700,7 @@ export class StoresService {
           totalIncome,
           totalDeductions,
           netSalary,
+          earnedBaseSalary: calculatedSalary,
         });
         await manager.save(EmployeeSalary, salaryRecord);
         totalEstimatedPayment += netSalary;
@@ -4833,7 +4787,7 @@ export class StoresService {
 
     return {
       totalAssignedShifts,
-      completedShifts: completedShifts + confirmedShifts, // Both completed and checked-in count
+      completedShifts: completedShifts, // Only completed shifts count
       workingHours: Math.round((totalWorkedMinutes / 60) * 100) / 100,
       lateCount,
       totalLateMinutes,
@@ -4843,6 +4797,51 @@ export class StoresService {
       totalShiftEarnings,
       hasShiftEarnings,
     };
+  }
+
+  /**
+   * Helper method to calculate base salary accurately based on PaymentType
+   */
+  private calculateBaseSalary(
+    currentBaseSalary: number,
+    paymentType: string,
+    attendanceSummary: any,
+    payrollSetting: any,
+    now: Date
+  ): number {
+    if (attendanceSummary.hasShiftEarnings) {
+      return attendanceSummary.totalShiftEarnings;
+    }
+
+    if (
+      paymentType === PaymentType.HOUR ||
+      payrollSetting?.calculationMethod === PayrollCalculationMethod.HOUR
+    ) {
+      const standardHours = payrollSetting?.priorityCalcValue || 176;
+      return currentBaseSalary * (attendanceSummary.workingHours / standardHours);
+    }
+
+    if (
+      paymentType === PaymentType.SHIFT ||
+      payrollSetting?.calculationMethod === PayrollCalculationMethod.SHIFT ||
+      paymentType === PaymentType.DAY ||
+      payrollSetting?.calculationMethod === PayrollCalculationMethod.DAY
+    ) {
+      return currentBaseSalary * attendanceSummary.completedShifts;
+    }
+
+    // Default to PaymentType.MONTH logic
+    const daysInMonth = new Date(
+      now.getFullYear(),
+      now.getMonth() + 1,
+      0,
+    ).getDate();
+
+    if (daysInMonth > 0 && attendanceSummary.completedShifts > 0) {
+      return currentBaseSalary * (attendanceSummary.completedShifts / daysInMonth);
+    }
+    
+    return 0; // If they haven't completed any shifts, base salary earned is 0
   }
 
   // --- Store Payroll Payment History ---
@@ -11840,30 +11839,17 @@ export class StoresService {
           nextMonthDate,
         );
 
-        // 4. Calculate salary (same logic as batch)
-        let calculatedSalary = 0;
-        if (attendanceSummary.hasShiftEarnings) {
-          calculatedSalary = attendanceSummary.totalShiftEarnings;
-        } else if (paymentType === PaymentType.HOUR) {
-          calculatedSalary = currentBaseSalary * attendanceSummary.workingHours;
-        } else if (
-          paymentType === PaymentType.SHIFT ||
-          paymentType === PaymentType.DAY
-        ) {
-          calculatedSalary =
-            currentBaseSalary * attendanceSummary.completedShifts;
-        } else {
-          const daysInMonth = new Date(
-            now.getFullYear(),
-            now.getMonth() + 1,
-            0,
-          ).getDate();
-          calculatedSalary =
-            daysInMonth > 0
-              ? currentBaseSalary *
-                (attendanceSummary.completedShifts / daysInMonth)
-              : currentBaseSalary;
-        }
+        const payrollSetting = await this.payrollSettingRepository.findOne({
+          where: { storeId, isActive: true },
+        });
+
+        const calculatedSalary = this.calculateBaseSalary(
+          currentBaseSalary,
+          paymentType,
+          attendanceSummary,
+          payrollSetting,
+          now,
+        );
 
         // 5. Apply PayrollRules
         const payrollRules = await this.payrollRuleRepository.find({
@@ -11936,6 +11922,7 @@ export class StoresService {
         salary.totalIncome = totalIncome;
         salary.totalDeductions = totalDeductions;
         salary.netSalary = netSalary;
+        salary.earnedBaseSalary = calculatedSalary;
         await this.employeeSalaryRepository.save(salary);
 
         this.logger.debug(

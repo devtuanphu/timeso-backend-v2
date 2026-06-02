@@ -42,6 +42,16 @@ export class EmployeeSalary extends BaseEntity {
   @Column({ name: 'payment_type', nullable: true })
   paymentType: string; // Hình thức trả lương (từ contract)
 
+  // Lương sinh ra từ ca làm việc (không bao gồm phụ cấp/thưởng)
+  @Column({
+    name: 'earned_base_salary',
+    type: 'decimal',
+    precision: 12,
+    scale: 2,
+    default: 0,
+  })
+  earnedBaseSalary: number;
+
   // Phụ cấp
   @Column({ type: 'jsonb', nullable: true })
   allowances: Record<string, number>; // { "Tiền ăn": 500000, "Xăng xe": 300000 }
