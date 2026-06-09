@@ -209,6 +209,7 @@ import { AccountsService } from '../accounts/accounts.service';
 
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import * as ExcelJS from 'exceljs';
 
 @Injectable()
 export class StoresService {
@@ -421,7 +422,7 @@ export class StoresService {
     } catch (err) {
       // Non-blocking: geocode/QR failure should not fail store creation
       this.logger.warn(
-        `[CreateStore] Auto-geocode/QR failed: ${err?.message || err}`,
+        `[CreateStore] Auto-geocode/QR failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -454,7 +455,7 @@ export class StoresService {
       }
     } catch (err) {
       this.logger.warn(
-        `[UpdateStore] Auto-geocode failed: ${err?.message || err}`,
+        `[UpdateStore] Auto-geocode failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -2056,6 +2057,13 @@ export class StoresService {
     throw new BadRequestException('Loại yêu cầu không hợp lệ');
   }
 
+  async getEmployeeByAccountAndStore(accountId: string, storeId: string) {
+    return this.profileRepository.findOne({
+      where: { accountId, storeId },
+      relations: ['account'],
+    });
+  }
+
   async getEmployeeByAccountId(accountId: string) {
     return this.profileRepository.findOne({
       where: { accountId },
@@ -3345,7 +3353,7 @@ export class StoresService {
         }
       }
     } catch (e) {
-      console.log(`[getShiftAssignments] Debug query error: ${e.message}`);
+      console.log(`[getShiftAssignments] Debug query error: ${e instanceof Error ? e.message : String(e)}`);
     }
     for (let i = 0; i < Math.min(result.length, 3); i++) {
       const a = result[i];
@@ -4804,7 +4812,7 @@ export class StoresService {
    */
   private calculateBaseSalary(
     currentBaseSalary: number,
-    paymentType: string,
+    paymentType: PaymentType,
     attendanceSummary: any,
     payrollSetting: any,
     now: Date
@@ -5068,7 +5076,7 @@ export class StoresService {
       };
 
       if (Number(salary.penalty) > 0) {
-        let reasons: string[] = [];
+        const reasons: string[] = [];
         if (summary) {
           if (summary.lateArrivalsCount > 0)
             reasons.push(`Muộn ${summary.lateArrivalsCount} lần`);
@@ -5110,8 +5118,7 @@ export class StoresService {
   }
 
   async downloadPayrollReport(storeId: string, monthStr: string) {
-    const exceljs = require('exceljs');
-    const workbook = new exceljs.Workbook();
+    const workbook = new ExcelJS.Workbook();
 
     let targetMonth: Date;
     if (monthStr.includes('/')) {
@@ -6092,7 +6099,7 @@ export class StoresService {
       return await this.createDailyReportForStore(storeId);
     } catch (error) {
       this.logger.warn(
-        `[EnsureDailyReport] Failed for store ${storeId}: ${error?.message || error}`,
+        `[EnsureDailyReport] Failed for store ${storeId}: ${error instanceof Error ? error.message : String(error)}`,
       );
       return null;
     }
@@ -6112,7 +6119,7 @@ export class StoresService {
       }
     } catch (error) {
       this.logger.warn(
-        `[EnsureDailyReport] Failed for owner ${ownerAccountId}: ${error?.message || error}`,
+        `[EnsureDailyReport] Failed for owner ${ownerAccountId}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -6146,7 +6153,7 @@ export class StoresService {
       }
     } catch (error) {
       this.logger.warn(
-        `[DailyReport] append ${field} failed: ${error?.message || error}`,
+        `[DailyReport] append ${field} failed: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
   }
@@ -11499,7 +11506,7 @@ export class StoresService {
         workingStatus: WorkingStatus.WORKING,
       });
     } catch (err) {
-      this.logger.warn(`[CheckIn] workingStatus sync failed: ${err?.message}`);
+      this.logger.warn(`[CheckIn] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // Create audit log with GPS data
@@ -11706,7 +11713,7 @@ export class StoresService {
       }
     } catch (err) {
       this.logger.warn(
-        `[CheckOut] Earnings calc failed: ${err?.message || err}`,
+        `[CheckOut] Earnings calc failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -11742,7 +11749,7 @@ export class StoresService {
         workingStatus: WorkingStatus.IDLE,
       });
     } catch (err) {
-      this.logger.warn(`[CheckOut] workingStatus sync failed: ${err?.message}`);
+      this.logger.warn(`[CheckOut] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     // ===== Fix 1: Real-time MonthlySummary Update =====
@@ -11799,7 +11806,7 @@ export class StoresService {
       );
     } catch (err) {
       this.logger.warn(
-        `[CheckOut] MonthlySummary update failed: ${err?.message}`,
+        `[CheckOut] MonthlySummary update failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
@@ -11931,7 +11938,7 @@ export class StoresService {
       }
     } catch (err) {
       this.logger.warn(
-        `[CheckOut] Real-time salary update failed: ${err?.message}`,
+        `[CheckOut] Real-time salary update failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 

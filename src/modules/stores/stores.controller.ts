@@ -1192,8 +1192,9 @@ export class StoresController {
     @GetUser() user: any,
     @Param('id') storeId: string,
   ) {
-    const profile = await this.storesService.getEmployeeByAccountId(
+    const profile = await this.storesService.getEmployeeByAccountAndStore(
       user.userId,
+      storeId,
     );
     if (!profile) {
       throw new NotFoundException('Không tìm thấy nhân viên');
@@ -1223,8 +1224,9 @@ export class StoresController {
     @Param('id') storeId: string,
     @Body() body: any,
   ) {
-    const profile = await this.storesService.getEmployeeByAccountId(
+    const profile = await this.storesService.getEmployeeByAccountAndStore(
       user.userId,
+      storeId,
     );
     if (!profile) {
       throw new NotFoundException('Không tìm thấy nhân viên');
