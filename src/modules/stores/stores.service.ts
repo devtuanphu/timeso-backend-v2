@@ -11213,6 +11213,38 @@ export class StoresService {
     return this.bonusWorkRequestRepository.save(request);
   }
 
+  // Lấy thống kê duyệt
+  async getApprovalStats(storeId: string) {
+    const oneDayAgo = new Date();
+    oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+
+    const registrations = await this.shiftAssignmentRepository.find({
+      where: { shiftSlot: { workShift: { storeId } } },
+      select: ['status', 'createdAt'],
+    });
+
+    const changeRequests = await this.shiftChangeRequestRepository.find({
+      where: { storeId },
+      select: ['status', 'createdAt'],
+    });
+
+    const leaveRequests = await this.leaveRequestRepository.find({
+      where: { storeId },
+      select: ['status', 'createdAt'],
+    });
+
+    const allRequests = [...registrations, ...changeRequests, ...leaveRequests];
+
+    const total = allRequests.length;
+    const pending = allRequests.filter((r) => r.status === 'PENDING').length;
+    const approved = allRequests.filter((r) => r.status === 'APPROVED').length;
+    const urgent = allRequests.filter(
+      (r) => r.status === 'PENDING' && new Date(r.createdAt) < oneDayAgo,
+    ).length;
+
+    return { total, pending, approved, urgent };
+  }
+
   async cancelBonusWorkRequest(
     id: string,
     employeeProfileId: string | undefined,
@@ -12602,6 +12634,9 @@ export class StoresService {
         );
       }
       where.employeeId = filters.employeeProfileId;
+    }
+    if (filters.storeId) {
+      where.shiftSlot = { workShift: { storeId: filters.storeId } };
     }
     if (filters.status) where.status = filters.status;
 

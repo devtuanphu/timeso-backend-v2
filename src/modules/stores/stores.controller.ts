@@ -4054,6 +4054,16 @@ export class StoresController {
     return this.storesService.createShiftRegistration(user.userId, body);
   }
 
+  @Get('approvals/stats')
+  @ApiOperation({ summary: 'Lấy thống kê phê duyệt' })
+  @ApiQuery({ name: 'storeId', required: true })
+  async getApprovalStats(@Query('storeId') storeId: string) {
+    if (!storeId) {
+      throw new BadRequestException('storeId is required');
+    }
+    return this.storesService.getApprovalStats(storeId);
+  }
+
   @Get('shift-registrations')
   @ApiOperation({ summary: 'Lấy danh sách đề xuất đăng ký ca' })
   @ApiQuery({ name: 'storeId', required: false })

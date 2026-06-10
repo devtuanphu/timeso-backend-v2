@@ -679,6 +679,13 @@ export class ShiftAggregationService {
       .andWhere('cycle.storeId = :storeId', { storeId })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
+      .andWhere('sa.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.APPROVED,
+          ShiftAssignmentStatus.CONFIRMED,
+          ShiftAssignmentStatus.COMPLETED,
+        ],
+      })
       .orderBy('slot.workDate', 'ASC')
       .getMany();
 

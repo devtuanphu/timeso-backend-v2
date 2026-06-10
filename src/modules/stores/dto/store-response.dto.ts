@@ -1006,6 +1006,7 @@ export class ApprovalRequestDto {
   status: 'APPROVED' | 'REJECTED';
 
   @ApiProperty({ required: false })
+  @IsOptional()
   @IsString()
   reason?: string;
 }
