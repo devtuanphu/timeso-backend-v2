@@ -1959,12 +1959,23 @@ export class StoresController {
   })
   @ApiQuery({ name: 'startDate', required: false, description: 'YYYY-MM-DD' })
   @ApiQuery({ name: 'endDate', required: false, description: 'YYYY-MM-DD' })
+  @ApiQuery({
+    name: 'employeeProfileId',
+    required: false,
+    description: 'Nếu truyền, mỗi slot kèm lương tạm tính cho nhân viên này',
+  })
   async getStoreShiftSlots(
     @Param('id') storeId: string,
     @Query('startDate') startDate?: string,
     @Query('endDate') endDate?: string,
+    @Query('employeeProfileId') employeeProfileId?: string,
   ) {
-    return this.storesService.getStoreShiftSlots(storeId, startDate, endDate);
+    return this.storesService.getStoreShiftSlots(
+      storeId,
+      startDate,
+      endDate,
+      employeeProfileId,
+    );
   }
 
   // ==================== SHIFT ASSIGNMENT MANAGEMENT ====================
@@ -2825,6 +2836,21 @@ export class StoresController {
     @Query('month') month?: string,
   ) {
     return this.storesService.getEmployeeSalaries(profileId, month);
+  }
+
+  @Get('employees/:profileId/estimated-salary')
+  @ApiOperation({
+    summary: 'Lương tạm tính (live) cho màn hình Trang chủ nhân viên',
+  })
+  @ApiQuery({ name: 'storeId', required: true })
+  @ApiQuery({ name: 'month', required: false })
+  @ApiResponse({ status: 200, description: 'Lương tạm tính + giờ đã làm' })
+  async getEstimatedSalary(
+    @Param('profileId') profileId: string,
+    @Query('storeId') storeId: string,
+    @Query('month') month?: string,
+  ) {
+    return this.storesService.getEstimatedSalary(profileId, storeId, month);
   }
 
   @Get('employee-salaries/:salaryId')

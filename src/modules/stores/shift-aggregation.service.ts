@@ -7,6 +7,7 @@ import {
   ShiftAssignmentStatus,
   AttendanceStatus,
   WorkCycle,
+  WorkCycleStatus,
 } from './entities/shift-management.entity';
 import { WorkShift } from './entities/work-shift.entity';
 import {
@@ -147,9 +148,11 @@ export interface EmployeeScheduleDay {
   shifts: {
     id: string;
     type: string;
+    shiftName: string;
     startTime: string;
     endTime: string;
     hours: number | null;
+    salary: number;
     status: string;
     location: string | null;
   }[];
@@ -262,7 +265,13 @@ export class ShiftAggregationService {
       .leftJoinAndSelect('emp.account', 'account')
       .leftJoinAndSelect('emp.storeRole', 'role')
       .leftJoin('slot.cycle', 'cycle')
-      .where('cycle.storeId = :storeId', { storeId });
+      .where('cycle.storeId = :storeId', { storeId })
+      // Exclude slots from manually-stopped or draft cycles. When a new cycle
+      // is created the previous one is STOPPED, but its slots remain in the DB —
+      // including them here caused duplicate shifts (2 ca sáng / trưa / tối).
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      });
 
     if (from) qb.andWhere('slot.workDate >= :from', { from });
     if (to) qb.andWhere('slot.workDate <= :to', { to });
@@ -446,6 +455,9 @@ export class ShiftAggregationService {
       .leftJoinAndSelect('slot.assignments', 'sa')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
       .getMany();
@@ -531,6 +543,9 @@ export class ShiftAggregationService {
       .leftJoin('slot.assignments', 'sa')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
       .andWhere('slot.maxStaff IS NOT NULL')
@@ -582,6 +597,9 @@ export class ShiftAggregationService {
       .leftJoin('sa.shiftSlot', 'slot')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
       .andWhere('sa.status != :cancelled', {
@@ -674,9 +692,14 @@ export class ShiftAggregationService {
       .createQueryBuilder('sa')
       .leftJoinAndSelect('sa.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoinAndSelect('sa.employee', 'saEmp')
+      .leftJoinAndSelect('saEmp.contracts', 'contract', 'contract.isActive = true')
       .leftJoin('slot.cycle', 'cycle')
       .where('sa.employeeId = :employeeId', { employeeId })
       .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
       .andWhere('sa.status IN (:...statuses)', {
@@ -691,6 +714,32 @@ export class ShiftAggregationService {
 
     const dateRange = this.getDateRange(from, to);
     const today = new Date().toISOString().split('T')[0];
+
+    // Hours for an assignment: realized worked-minutes if available, else the
+    // scheduled slot duration (so "expected"/dự kiến shows before the shift runs).
+    const assignmentHours = (a: ShiftAssignment): number => {
+      if (a.workedMinutes && a.workedMinutes > 0) {
+        return Math.round((a.workedMinutes / 60) * 10) / 10;
+      }
+      const slot = a.shiftSlot;
+      const startTime = slot?.startTime || slot?.workShift?.startTime || '';
+      const endTime = slot?.endTime || slot?.workShift?.endTime || '';
+      if (!startTime || !endTime) return 0;
+      let start = new Date(`1970-01-01T${startTime}Z`).getTime();
+      let end = new Date(`1970-01-01T${endTime}Z`).getTime();
+      if (end < start) end += 24 * 60 * 60 * 1000;
+      return Math.round(((end - start) / 3600000) * 10) / 10;
+    };
+
+    // Salary for an assignment: realized earnings if present, else estimate.
+    const assignmentSalary = (a: ShiftAssignment): number => {
+      if (a.shiftEarnings != null && Number(a.shiftEarnings) > 0) {
+        return Number(a.shiftEarnings);
+      }
+      return a.shiftSlot
+        ? this.calculateEstimatedShiftSalary(a.shiftSlot, a)
+        : 0;
+    };
 
     const schedule: EmployeeScheduleDay[] = dateRange.map((date) => {
       const dateStr = date.toISOString().split('T')[0];
@@ -712,27 +761,27 @@ export class ShiftAggregationService {
             a.shiftSlot?.workShift?.shiftName || '',
             a.shiftSlot?.workShift?.startTime || '',
           ),
+          shiftName: a.shiftSlot?.workShift?.shiftName || 'Ca làm',
           startTime:
             a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '',
           endTime:
             a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || '',
-          hours: a.workedMinutes
-            ? Math.round((a.workedMinutes / 60) * 10) / 10
-            : null,
+          hours: assignmentHours(a),
+          salary: assignmentSalary(a),
           status: a.status,
           location: a.shiftSlot?.location || null,
         })),
       };
     });
 
-    const totalMinutes = assignments.reduce(
-      (sum, a) => sum + (a.workedMinutes || 0),
+    const totalHours = assignments.reduce(
+      (sum, a) => sum + assignmentHours(a),
       0,
     );
     const workingDays = new Set(assignments.map((a) => a.shiftSlot?.workDate))
       .size;
     const totalSalary = assignments.reduce(
-      (sum, a) => sum + Number(a.shiftEarnings || 0),
+      (sum, a) => sum + assignmentSalary(a),
       0,
     );
 
@@ -747,7 +796,7 @@ export class ShiftAggregationService {
       },
       schedule,
       summary: {
-        totalHoursPerWeek: Math.round((totalMinutes / 60) * 10) / 10,
+        totalHoursPerWeek: Math.round(totalHours * 10) / 10,
         daysPerWeek: workingDays,
         salaryPerWeek: Math.round(totalSalary),
       },
@@ -868,7 +917,12 @@ export class ShiftAggregationService {
           lateMinutes: a.lateMinutes || null,
           earlyMinutes: a.earlyMinutes || null,
           workedMinutes: a.workedMinutes || null,
-          salary: Number(a.shiftEarnings) || null,
+          // Realized earnings if the shift has been worked, otherwise the
+          // estimated salary so "Lương dự kiến" shows before the shift runs.
+          salary:
+            a.shiftEarnings != null && Number(a.shiftEarnings) > 0
+              ? Number(a.shiftEarnings)
+              : this.calculateEstimatedShiftSalary(slot, a),
           salaryDiff,
           assignmentId: a.id,
         };
@@ -942,6 +996,9 @@ export class ShiftAggregationService {
         .leftJoin('sa.shiftSlot', 'slot')
         .leftJoin('slot.cycle', 'cycle')
         .where('cycle.storeId = :storeId', { storeId })
+        .andWhere('cycle.status IN (:...cycleStatuses)', {
+          cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+        })
         .andWhere('slot.workDate >= :from', { from })
         .andWhere('slot.workDate <= :to', { to })
         .andWhere('sa.status != :cancelled', {
@@ -958,6 +1015,9 @@ export class ShiftAggregationService {
         .createQueryBuilder('slot')
         .leftJoin('slot.cycle', 'cycle')
         .where('cycle.storeId = :storeId', { storeId })
+        .andWhere('cycle.status IN (:...cycleStatuses)', {
+          cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+        })
         .andWhere('slot.workDate >= :from', { from })
         .andWhere('slot.workDate <= :to', { to })
         .select('COALESCE(SUM(slot.maxStaff), 0) as totalRequired')
@@ -1150,6 +1210,9 @@ export class ShiftAggregationService {
       .leftJoin('sa.shiftSlot', 'slot')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
       .andWhere('sa.status != :cancelled', {

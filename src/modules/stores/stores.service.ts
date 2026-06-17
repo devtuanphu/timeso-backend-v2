@@ -3113,6 +3113,7 @@ export class StoresService {
     storeId: string,
     startDate?: string,
     endDate?: string,
+    employeeProfileId?: string,
   ) {
     const qb = this.shiftSlotRepository
       .createQueryBuilder('slot')
@@ -3134,11 +3135,56 @@ export class StoresService {
 
     const slots = await qb.getMany();
 
+    // If an employee is given, resolve their active contract once so each slot
+    // can carry an estimated salary (for the "Đăng ký ca làm" cards).
+    let activeContract: EmployeeContract | null = null;
+    if (employeeProfileId) {
+      activeContract = await this.contractRepository.findOne({
+        where: { employeeProfileId, isActive: true },
+        order: { createdAt: 'DESC' },
+      });
+    }
+
+    // Estimated salary for a single slot from contract rate + slot duration.
+    const slotSalary = (slot: ShiftSlot): number => {
+      if (!activeContract || !activeContract.salaryAmount) return 0;
+      const startTime =
+        slot.startTime || slot.workShift?.startTime || '00:00:00';
+      const endTime = slot.endTime || slot.workShift?.endTime || '00:00:00';
+      let start = new Date(`1970-01-01T${startTime}Z`).getTime();
+      let end = new Date(`1970-01-01T${endTime}Z`).getTime();
+      if (end < start) end += 24 * 60 * 60 * 1000;
+      const durationHours = (end - start) / 3600000;
+      const base = Number(activeContract.salaryAmount);
+
+      switch (activeContract.paymentType) {
+        case PaymentType.HOUR:
+          return Math.round(base * durationHours);
+        case PaymentType.SHIFT:
+        case PaymentType.DAY:
+          return Math.round(base);
+        case PaymentType.WEEK:
+          return Math.round(base / 7);
+        case PaymentType.MONTH: {
+          const date = new Date(slot.workDate);
+          const daysInMonth = new Date(
+            date.getFullYear(),
+            date.getMonth() + 1,
+            0,
+          ).getDate();
+          return Math.round(base / daysInMonth);
+        }
+        default:
+          return 0;
+      }
+    };
+
     return slots.map((slot) => ({
       id: slot.id,
       workDate: slot.workDate,
       maxStaff: slot.maxStaff,
       cycleId: slot.cycleId,
+      estimatedSalary: employeeProfileId ? slotSalary(slot) : 0,
       workShift: slot.workShift
         ? {
             id: slot.workShift.id,
@@ -5504,6 +5550,96 @@ export class StoresService {
       where: { id },
       relations: ['employeeProfile', 'monthlyPayroll'],
     });
+  }
+
+  /**
+   * Live "lương tạm tính" for the employee Home screen.
+   *
+   * The finalized EmployeeSalary record only exists after the monthly payroll
+   * is generated (typically month-end), so mid-month it returns nothing — which
+   * is why the Home card showed empty. This computes an on-the-fly estimate from
+   * the active contract + current-month attendance, mirroring the payroll
+   * generation logic. If a finalized salary record already exists, that value
+   * takes precedence.
+   */
+  async getEstimatedSalary(
+    employeeProfileId: string,
+    storeId: string,
+    monthStr?: string,
+  ): Promise<{
+    estimatedSalary: number;
+    earnedBaseSalary: number;
+    completedShifts: number;
+    workingHours: number;
+    isFinalized: boolean;
+    month: string;
+  }> {
+    const now = new Date();
+    let m: number, y: number;
+    if (monthStr && monthStr.includes('-')) {
+      [y, m] = monthStr.split('-').map(Number);
+    } else if (monthStr && monthStr.includes('/')) {
+      [m, y] = monthStr.split('/').map(Number);
+    } else {
+      m = now.getMonth() + 1;
+      y = now.getFullYear();
+    }
+    const monthStart = new Date(y, m - 1, 1);
+    const monthEnd = new Date(y, m, 1);
+    const monthLabel = `${y}-${String(m).padStart(2, '0')}`;
+
+    // Attendance for the month (worked shifts/hours/earnings).
+    const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
+      employeeProfileId,
+      storeId,
+      monthStart,
+      monthEnd,
+    );
+
+    // If payroll already finalized this month, prefer the stored value.
+    const existing = await this.employeeSalaryRepository.findOne({
+      where: { employeeProfileId, month: monthStart },
+    });
+    if (existing) {
+      return {
+        estimatedSalary: Number(existing.netSalary) || 0,
+        earnedBaseSalary: Number(existing.earnedBaseSalary) || 0,
+        completedShifts: attendanceSummary.completedShifts,
+        workingHours: attendanceSummary.workingHours,
+        isFinalized: true,
+        month: monthLabel,
+      };
+    }
+
+    // Otherwise compute a live estimate from the active contract.
+    const profile = await this.profileRepository.findOne({
+      where: { id: employeeProfileId },
+      relations: ['contracts'],
+    });
+    const activeContract = profile?.contracts?.find((c) => c.isActive);
+
+    let earnedBaseSalary = 0;
+    if (activeContract) {
+      const payrollSetting = await this.payrollSettingRepository.findOne({
+        where: { storeId },
+      });
+      earnedBaseSalary = this.calculateBaseSalary(
+        Number(activeContract.salaryAmount) || 0,
+        activeContract.paymentType || PaymentType.MONTH,
+        attendanceSummary,
+        payrollSetting,
+        monthStart,
+      );
+    }
+
+    return {
+      estimatedSalary: Math.round(earnedBaseSalary),
+      earnedBaseSalary: Math.round(earnedBaseSalary),
+      completedShifts: attendanceSummary.completedShifts,
+      workingHours: attendanceSummary.workingHours,
+      isFinalized: false,
+      month: monthLabel,
+    };
   }
 
   async getEmployeeSalariesByStore(
@@ -10855,6 +10991,7 @@ export class StoresService {
     const query = this.shiftAssignmentRepository
       .createQueryBuilder('a')
       .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('CAST(slot.workDate AS DATE) >= :startDate', { startDate })
       .andWhere('CAST(slot.workDate AS DATE) <= :endDate', { endDate })
@@ -10888,7 +11025,8 @@ export class StoresService {
         'Thứ 7',
       ];
       const dayLabel = `${dayNames[dateObj.getDay()]}, ${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${String(dateObj.getFullYear()).slice(2)}`;
-      const shiftName = slot?.name || slot?.id?.slice(0, 8) || 'Ca làm';
+      const shiftName =
+        slot?.workShift?.shiftName || slot?.name || 'Ca làm';
 
       let status = 'Đúng giờ';
       let statusColor = '#12B569';
@@ -11218,8 +11356,18 @@ export class StoresService {
     const oneDayAgo = new Date();
     oneDayAgo.setDate(oneDayAgo.getDate() - 1);
 
+    // Only count registrations belonging to live cycles (ACTIVE/EXPIRED).
+    // Registrations from STOPPED/DRAFT cycles are stale and would otherwise
+    // keep the pending count permanently elevated (the "stuck at 3" bug).
     const registrations = await this.shiftAssignmentRepository.find({
-      where: { shiftSlot: { workShift: { storeId } } },
+      where: {
+        shiftSlot: {
+          cycle: {
+            status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]),
+          },
+          workShift: { storeId },
+        },
+      },
       select: ['status', 'createdAt'],
     });
 
@@ -12636,13 +12784,27 @@ export class StoresService {
       where.employeeId = filters.employeeProfileId;
     }
     if (filters.storeId) {
-      where.shiftSlot = { workShift: { storeId: filters.storeId } };
+      // Only count registrations on slots that belong to a live cycle
+      // (ACTIVE/EXPIRED). Stopped/draft cycles' registrations are stale and
+      // must not keep inflating the pending-approval badge.
+      where.shiftSlot = {
+        workShift: { storeId: filters.storeId },
+        cycle: { status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]) },
+      };
     }
     if (filters.status) where.status = filters.status;
 
     return this.shiftAssignmentRepository.find({
       where,
-      relations: ['shiftSlot'],
+      relations: [
+        'shiftSlot',
+        'shiftSlot.cycle',
+        'shiftSlot.workShift',
+        'employee',
+        'employee.account',
+        'employee.storeRole',
+        'employee.employeeType',
+      ],
       order: { createdAt: 'DESC' },
     });
   }
