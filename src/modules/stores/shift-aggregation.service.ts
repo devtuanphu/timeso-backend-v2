@@ -15,10 +15,15 @@ import {
   EmploymentStatus,
 } from './entities/employee-profile.entity';
 import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
+import { PaymentType } from './entities/employee-contract.entity';
+import {
+  StorePayrollRule,
+  PayrollRuleCategory,
+  PayrollCalcType,
+} from './entities/store-payroll-rule.entity';
 import { Store } from './entities/store.entity';
 import { AttendanceLog, AttendanceLogType } from './entities/attendance-log.entity';
 import { ShiftChangeRequest, ShiftChangeRequestStatus } from './entities/shift-change-request.entity';
-import { PaymentType } from './entities/employee-contract.entity';
 
 
 // ── Helper Maps ────────────────────────────────────────────────────────────────
@@ -230,6 +235,8 @@ export class ShiftAggregationService {
     private readonly attendanceLogRepo: Repository<AttendanceLog>,
     @InjectRepository(ShiftChangeRequest)
     private readonly shiftChangeRequestRepo: Repository<ShiftChangeRequest>,
+    @InjectRepository(StorePayrollRule)
+    private readonly payrollRuleRepo: Repository<StorePayrollRule>,
   ) { }
 
   // ── 1. List Shift Slots ────────────────────────────────────────────────────
@@ -281,7 +288,8 @@ export class ShiftAggregationService {
       .addOrderBy('ws.startTime', 'ASC')
       .getMany();
 
-    let slots = rawSlots.map((slot) => this.mapSlotToResponse(slot));
+    const rules = await this.loadActivePayrollRules(storeId);
+    let slots = rawSlots.map((slot) => this.mapSlotToResponse(slot, rules));
 
     if (staffingStatus) {
       slots = slots.filter((s) => s.staffingStatus === staffingStatus);
@@ -319,7 +327,8 @@ export class ShiftAggregationService {
 
     if (!slot) return null;
 
-    const response = this.mapSlotToResponse(slot) as ShiftDetailResponse;
+    const rules = await this.loadActivePayrollRules(storeId);
+    const response = this.mapSlotToResponse(slot, rules) as ShiftDetailResponse;
     response.shiftName = slot.workShift?.shiftName || 'Ca làm việc';
     response.date = this.formatDateVn(slot.workDate);
     response.dayOfWeekVi =
@@ -453,6 +462,8 @@ export class ShiftAggregationService {
       .createQueryBuilder('slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
       .leftJoinAndSelect('slot.assignments', 'sa')
+      .leftJoinAndSelect('sa.employee', 'emp')
+      .leftJoinAndSelect('emp.contracts', 'contract', 'contract.isActive = true')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
       .andWhere('cycle.status IN (:...cycleStatuses)', {
@@ -486,11 +497,11 @@ export class ShiftAggregationService {
       );
 
       totalSalary += activeAssignments.reduce(
-        (sum, a) => sum + Number(a.shiftEarnings || 0),
+        (sum, a) => sum + this.estimateAssignmentSalary(a, slot),
         0,
       );
       totalMinutes += activeAssignments.reduce(
-        (sum, a) => sum + (a.workedMinutes || 0),
+        (sum, a) => sum + this.assignmentHours(a, slot) * 60,
         0,
       );
 
@@ -715,32 +726,6 @@ export class ShiftAggregationService {
     const dateRange = this.getDateRange(from, to);
     const today = new Date().toISOString().split('T')[0];
 
-    // Hours for an assignment: realized worked-minutes if available, else the
-    // scheduled slot duration (so "expected"/dự kiến shows before the shift runs).
-    const assignmentHours = (a: ShiftAssignment): number => {
-      if (a.workedMinutes && a.workedMinutes > 0) {
-        return Math.round((a.workedMinutes / 60) * 10) / 10;
-      }
-      const slot = a.shiftSlot;
-      const startTime = slot?.startTime || slot?.workShift?.startTime || '';
-      const endTime = slot?.endTime || slot?.workShift?.endTime || '';
-      if (!startTime || !endTime) return 0;
-      let start = new Date(`1970-01-01T${startTime}Z`).getTime();
-      let end = new Date(`1970-01-01T${endTime}Z`).getTime();
-      if (end < start) end += 24 * 60 * 60 * 1000;
-      return Math.round(((end - start) / 3600000) * 10) / 10;
-    };
-
-    // Salary for an assignment: realized earnings if present, else estimate.
-    const assignmentSalary = (a: ShiftAssignment): number => {
-      if (a.shiftEarnings != null && Number(a.shiftEarnings) > 0) {
-        return Number(a.shiftEarnings);
-      }
-      return a.shiftSlot
-        ? this.calculateEstimatedShiftSalary(a.shiftSlot, a)
-        : 0;
-    };
-
     const schedule: EmployeeScheduleDay[] = dateRange.map((date) => {
       const dateStr = date.toISOString().split('T')[0];
       const dayAssignments = assignments.filter(
@@ -766,8 +751,8 @@ export class ShiftAggregationService {
             a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '',
           endTime:
             a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || '',
-          hours: assignmentHours(a),
-          salary: assignmentSalary(a),
+          hours: this.assignmentHours(a),
+          salary: this.estimateAssignmentSalary(a),
           status: a.status,
           location: a.shiftSlot?.location || null,
         })),
@@ -775,13 +760,13 @@ export class ShiftAggregationService {
     });
 
     const totalHours = assignments.reduce(
-      (sum, a) => sum + assignmentHours(a),
+      (sum, a) => sum + this.assignmentHours(a),
       0,
     );
     const workingDays = new Set(assignments.map((a) => a.shiftSlot?.workDate))
       .size;
     const totalSalary = assignments.reduce(
-      (sum, a) => sum + assignmentSalary(a),
+      (sum, a) => sum + this.estimateAssignmentSalary(a),
       0,
     );
 
@@ -805,44 +790,134 @@ export class ShiftAggregationService {
 
   // ── Private Helpers ─────────────────────────────────────────────────────────
 
-  private calculateEstimatedShiftSalary(
-    slot: ShiftSlot,
-    assignment: ShiftAssignment,
-  ): number {
-    const contract = assignment.employee?.contracts?.[0];
-    if (!contract || !contract.isActive || !contract.salaryAmount) return 0;
-
-    const startTime = slot.startTime || slot.workShift?.startTime || '00:00:00';
-    const endTime = slot.endTime || slot.workShift?.endTime || '00:00:00';
-
+  /**
+   * Số giờ theo lịch của 1 slot (không phải giờ thực làm).
+   * Dùng cho ước tính lương HOUR và tổng-giờ-dự-kiến. Xử lý ca qua nửa đêm.
+   */
+  private slotDurationHours(slot?: ShiftSlot | null): number {
+    if (!slot) return 0;
+    const startTime = slot.startTime || slot.workShift?.startTime || '';
+    const endTime = slot.endTime || slot.workShift?.endTime || '';
+    if (!startTime || !endTime) return 0;
     let start = new Date(`1970-01-01T${startTime}Z`).getTime();
     let end = new Date(`1970-01-01T${endTime}Z`).getTime();
+    if (Number.isNaN(start) || Number.isNaN(end)) return 0;
     if (end < start) end += 24 * 60 * 60 * 1000;
-    
-    const durationMinutes = (end - start) / 60000;
-    const durationHours = durationMinutes / 60;
-    const baseSalary = Number(contract.salaryAmount);
+    return Math.round(((end - start) / 3600000) * 10) / 10;
+  }
+
+  /**
+   * Số giờ của 1 assignment: đã làm → workedMinutes thực; chưa → thời lượng ca theo lịch.
+   */
+  private assignmentHours(a: ShiftAssignment, slot?: ShiftSlot | null): number {
+    if (a.workedMinutes && a.workedMinutes > 0) {
+      return Math.round((a.workedMinutes / 60) * 10) / 10;
+    }
+    return this.slotDurationHours(slot || a.shiftSlot);
+  }
+
+  /**
+   * Lương 1 assignment theo quy tắc thống nhất:
+   *  - Đã check-out (shiftEarnings != null) → lấy shiftEarnings thực đã lưu.
+   *  - Chưa → ước tính từ hợp đồng active × thời lượng ca.
+   * Công thức ước tính mirror checkOutWithFace (stores.service.ts) để số ước tính
+   * trùng khớp với số thực nhận sau khi check-out, không bị nhảy giá trị.
+   * MONTH dùng daysInMonth theo slot.workDate (không phải thời điểm hiện tại).
+   */
+  private estimateAssignmentSalary(
+    a: ShiftAssignment,
+    slot?: ShiftSlot | null,
+  ): number {
+    if (a.shiftEarnings != null) return Number(a.shiftEarnings);
+
+    const s = slot || a.shiftSlot;
+    const contract = (a.employee as any)?.contracts?.find(
+      (c: any) => c.isActive,
+    );
+    const base = Number(contract?.salaryAmount) || 0;
+    if (!base) return 0;
 
     switch (contract.paymentType) {
       case PaymentType.HOUR:
-        return Math.round(baseSalary * durationHours);
+        return Math.round(base * this.slotDurationHours(s));
       case PaymentType.SHIFT:
-        return baseSalary;
       case PaymentType.DAY:
-        return baseSalary;
+        return Math.round(base);
       case PaymentType.WEEK:
-        return Math.round(baseSalary / 7);
+        return Math.round(base / 6); // 6 ngày làm/tuần — khớp checkOutWithFace
       case PaymentType.MONTH: {
-        const date = new Date(slot.workDate);
-        const daysInMonth = new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
-        return Math.round(baseSalary / daysInMonth);
+        const date = new Date(s?.workDate || '');
+        const daysInMonth = Number.isNaN(date.getTime())
+          ? 30
+          : new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+        return Math.round(base / daysInMonth);
       }
       default:
         return 0;
     }
   }
 
-  private mapSlotToResponse(slot: ShiftSlot): ShiftSlotResponse {
+  /** Load các rule thưởng/phạt đang active của cửa hàng (mảng rỗng nếu chưa cấu hình). */
+  private async loadActivePayrollRules(
+    storeId: string,
+  ): Promise<StorePayrollRule[]> {
+    return this.payrollRuleRepo.find({ where: { storeId, isActive: true } });
+  }
+
+  /**
+   * Chênh lệch lương của 1 ca (thưởng/phạt) theo StorePayrollRule của cửa hàng.
+   * Chỉ áp phần PHẠT map được về mức 1 ca: LATE / EARLY / ABSENT (mirror công thức
+   * payroll thật trong stores.service.ts). Bonus ATTENDANCE/GENERAL là mức THÁNG,
+   * không thuộc 1 ca nên không cộng vào đây.
+   * Trả về số âm (phạt) hoặc 0. Ca chưa đi làm (chưa có shiftEarnings) => 0.
+   */
+  private assignmentSalaryDiff(
+    a: ShiftAssignment,
+    rules: StorePayrollRule[],
+    baseSalary: number,
+    slot?: ShiftSlot | null,
+  ): number {
+    if (a.shiftEarnings == null) return 0; // chưa đi làm
+    if (!rules || rules.length === 0) return 0;
+
+    const s = slot || a.shiftSlot;
+    // Đếm mức 1 ca: mỗi loại vi phạm tính 1 lần cho ca này.
+    const lateCount = (a.lateMinutes || 0) > 0 ? 1 : 0;
+    const earlyCount = (a.earlyMinutes || 0) > 0 ? 1 : 0;
+    const today = new Date().toISOString().slice(0, 10);
+    const absentCount =
+      a.status === ShiftAssignmentStatus.APPROVED &&
+      !a.checkInTime &&
+      (s?.workDate || '') < today
+        ? 1
+        : 0;
+
+    let penalty = 0;
+    for (const rule of rules) {
+      if (rule.category !== PayrollRuleCategory.FINE) continue;
+      if (rule.ruleType === 'LATE' && lateCount > 0) {
+        penalty +=
+          rule.calcType === PayrollCalcType.AMOUNT
+            ? Number(rule.value) * lateCount
+            : ((baseSalary * Number(rule.value)) / 100) * lateCount;
+      }
+      if (rule.ruleType === 'EARLY' && earlyCount > 0) {
+        penalty +=
+          rule.calcType === PayrollCalcType.AMOUNT
+            ? Number(rule.value) * earlyCount
+            : ((baseSalary * Number(rule.value)) / 100) * earlyCount;
+      }
+      if (rule.ruleType === 'ABSENT' && absentCount > 0) {
+        penalty += Number(rule.value) * absentCount;
+      }
+    }
+    return penalty > 0 ? -Math.round(penalty) : 0;
+  }
+
+  private mapSlotToResponse(
+    slot: ShiftSlot,
+    rules: StorePayrollRule[] = [],
+  ): ShiftSlotResponse {
     const activeAssignments = (slot.assignments || []).filter(
       (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
     );
@@ -886,24 +961,17 @@ export class ShiftAggregationService {
       insufficientRatio: Math.round(insufficientRatio * 100),
       staffingStatus,
       totalSalary: activeAssignments.reduce(
-        (sum, a) => {
-          if (a.shiftEarnings != null && Number(a.shiftEarnings) > 0) {
-            return sum + Number(a.shiftEarnings);
-          }
-          return sum + this.calculateEstimatedShiftSalary(slot, a);
-        },
+        // Đã check-out → shiftEarnings thực; chưa → ước tính từ hợp đồng.
+        (sum, a) => sum + this.estimateAssignmentSalary(a, slot),
         0,
       ),
       location: slot.location || (slot.workShift as any)?.location || null,
       note: slot.note || null,
       status: this.computeShiftStatus(slot),
       employees: activeAssignments.map((a) => {
-        const late = a.lateMinutes || 0;
-        const early = a.earlyMinutes || 0;
-        const isNegative = late > 0 || early > 0;
-        const penalty = (late + early) * 10000;
-        const bonus = (a.workedMinutes || 0) > 480 ? 50000 : 0;
-        const salaryDiff = isNegative ? -penalty : bonus;
+        const salary = this.estimateAssignmentSalary(a, slot);
+        // Thưởng/phạt theo StorePayrollRule (chỉ phần phạt map được về 1 ca).
+        const salaryDiff = this.assignmentSalaryDiff(a, rules, salary, slot);
 
         return {
           id: a.employeeId,
@@ -917,12 +985,8 @@ export class ShiftAggregationService {
           lateMinutes: a.lateMinutes || null,
           earlyMinutes: a.earlyMinutes || null,
           workedMinutes: a.workedMinutes || null,
-          // Realized earnings if the shift has been worked, otherwise the
-          // estimated salary so "Lương dự kiến" shows before the shift runs.
-          salary:
-            a.shiftEarnings != null && Number(a.shiftEarnings) > 0
-              ? Number(a.shiftEarnings)
-              : this.calculateEstimatedShiftSalary(slot, a),
+          // Lương dự kiến: đã check-out → thực nhận; chưa → ước tính từ hợp đồng.
+          salary,
           salaryDiff,
           assignmentId: a.id,
         };
@@ -990,10 +1054,17 @@ export class ShiftAggregationService {
   }
 
   private async calcSummary(storeId: string, from: string, to: string) {
-    const [assignResult, slotResult] = await Promise.all([
+    const [assignments, slotResult] = await Promise.all([
       this.shiftAssignmentRepo
         .createQueryBuilder('sa')
-        .leftJoin('sa.shiftSlot', 'slot')
+        .leftJoinAndSelect('sa.shiftSlot', 'slot')
+        .leftJoinAndSelect('slot.workShift', 'ws')
+        .leftJoinAndSelect('sa.employee', 'emp')
+        .leftJoinAndSelect(
+          'emp.contracts',
+          'contract',
+          'contract.isActive = true',
+        )
         .leftJoin('slot.cycle', 'cycle')
         .where('cycle.storeId = :storeId', { storeId })
         .andWhere('cycle.status IN (:...cycleStatuses)', {
@@ -1004,13 +1075,7 @@ export class ShiftAggregationService {
         .andWhere('sa.status != :cancelled', {
           cancelled: ShiftAssignmentStatus.CANCELLED,
         })
-        .select([
-          'COALESCE(SUM(sa.shiftEarnings), 0) as totalSalary',
-          'COUNT(DISTINCT sa.employeeId) as totalEmployees',
-          'COALESCE(SUM(sa.workedMinutes), 0) as totalMinutes',
-          'COUNT(DISTINCT slot.id) as totalShifts',
-        ])
-        .getRawOne(),
+        .getMany(),
       this.shiftSlotRepo
         .createQueryBuilder('slot')
         .leftJoin('slot.cycle', 'cycle')
@@ -1024,11 +1089,23 @@ export class ShiftAggregationService {
         .getRawOne(),
     ]);
 
+    // Đồng nhất quy tắc: đã làm → thực tế; chưa → ước tính (giờ theo lịch, lương theo hợp đồng).
+    let totalSalary = 0;
+    let totalHours = 0;
+    const employeeIds = new Set<string>();
+    const slotIds = new Set<string>();
+    for (const a of assignments) {
+      totalSalary += this.estimateAssignmentSalary(a);
+      totalHours += this.assignmentHours(a);
+      if (a.employeeId) employeeIds.add(a.employeeId);
+      if (a.shiftSlotId) slotIds.add(a.shiftSlotId);
+    }
+
     return {
-      totalSalary: Number(assignResult?.totalSalary) || 0,
-      totalEmployees: Number(assignResult?.totalEmployees) || 0,
-      totalHours: (Number(assignResult?.totalMinutes) || 0) / 60,
-      totalShifts: Number(assignResult?.totalShifts) || 0,
+      totalSalary,
+      totalEmployees: employeeIds.size,
+      totalHours,
+      totalShifts: slotIds.size,
       totalRequiredEmployees: Number(slotResult?.totalRequired) || 0,
     };
   }

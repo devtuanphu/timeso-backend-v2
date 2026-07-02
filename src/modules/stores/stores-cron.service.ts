@@ -35,7 +35,10 @@ export class StoresCronService {
 
   /**
    * Cron job chạy vào 00:10 (12:10 AM) ngày 1 mỗi tháng
-   * Tạo MonthlyPayroll cho tất cả các cửa hàng active
+   * Với mỗi cửa hàng active: (1) chốt sổ lại tháng vừa kết thúc (bắt các ca
+   * check-out muộn/điều chỉnh chấm công sau đó — an toàn vì đã có guard
+   * không đụng vào lương APPROVED/PAID), (2) tạo scaffold MonthlyPayroll
+   * rỗng cho tháng mới để real-time check-out có payroll để gắn vào ngay.
    */
   @Cron('10 0 1 * *', {
     name: 'create-monthly-payrolls',

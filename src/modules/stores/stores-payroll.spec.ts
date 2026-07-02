@@ -4,9 +4,16 @@ import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
+import { ShiftReminderService } from './shift-reminder.service';
 import { PaymentType } from './entities/employee-contract.entity';
 import { PayrollRuleCategory, PayrollCalcType } from './entities/store-payroll-rule.entity';
 import { PayrollCalculationMethod } from './entities/store-payroll-setting.entity';
+import { PaymentStatus } from './entities/employee-salary.entity';
+import { EmploymentStatus } from './entities/employee-profile.entity';
+import {
+  ShiftAssignmentStatus,
+  AttendanceStatus,
+} from './entities/shift-management.entity';
 
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
@@ -70,6 +77,7 @@ import { StoreShiftConfig } from './entities/store-shift-config.entity';
 import { Feedback } from './entities/feedback.entity';
 import { ShiftChangeRequest } from './entities/shift-change-request.entity';
 import { BonusWorkRequest } from './entities/bonus-work-request.entity';
+import { ContractTemplate } from './entities/contract-template.entity';
 
 let AccountIdentityDocument: any;
 let AccountFinance: any;
@@ -90,6 +98,7 @@ function mockRepo() {
     findOne: jest.fn().mockResolvedValue(null),
     create: jest.fn((d: any) => ({ id: 'gen-id', ...d })),
     save: jest.fn((e: any) => Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e })),
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
     delete: jest.fn().mockResolvedValue({ affected: 0 }),
     createQueryBuilder: jest.fn(() => {
       const qb: any = {};
@@ -118,7 +127,7 @@ const ENTITIES = [
   AssetStatus, ProductCategory, ProductStatus, EmployeeKpi, KpiUnit, KpiPeriod,
   KpiTask, DailyEmployeeReport, EmployeeMonthlySummary, StoreEvent,
   StockTransaction, StockTransactionDetail, WorkCycle, ShiftSlot, ShiftAssignment,
-  ShiftSwap, CycleShiftTemplate, ServiceCategory, ServiceItem, ServiceItemRecipe,
+  ShiftSwap, CycleShiftTemplate, ContractTemplate, ServiceCategory, ServiceItem, ServiceItemRecipe,
   Order, OrderItem, EmployeePerformance, EmployeeLeaveRequest, EmployeeAssetAssignment,
   EmployeeTerminationReason, StoreProbationSetting, StoreSkill,
   StorePayrollPaymentHistory, SalaryFundHistory, SalaryAdvanceRequest,
@@ -568,6 +577,10 @@ describe('StoresService - Payroll Integration', () => {
           provide: DataSource,
           useValue: {},
         },
+        {
+          provide: ShiftReminderService,
+          useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+        },
       ],
     }).compile();
 
@@ -600,4 +613,351 @@ describe('StoresService - Payroll Integration', () => {
     });
   });
 
+});
+
+// ─── Bug fix regression tests ───────────────────────────────────────────────
+// createMonthlyPayrollForStore / recalculatePayroll / checkOutWithFace used to
+// (1) skip recalculating an EmployeeSalary just because a row already
+//     existed, regardless of paymentStatus, silently freezing salaries that
+//     were never approved/paid, and
+// (2) let the real-time check-out update create an EmployeeSalary with no
+//     monthlyPayrollId if no MonthlyPayroll existed yet, making it invisible
+//     to getEmployeeSalariesByStore/getPayrollSummary.
+// These tests lock in the fix: PAID/APPROVED salaries are never touched, and
+// every write path always ends up linked to a MonthlyPayroll.
+describe('StoresService - Payroll upsert protection & orphan fix', () => {
+  let service: StoresService;
+  let payrollRepo: any;
+  let employeeSalaryRepo: any;
+  let profileRepo: any;
+
+  const STORE_ID = 'store-1';
+  const EMPLOYEE_ID = 'emp-1';
+  const MONTH = new Date(2026, 6, 1); // July 2026 (month is 0-indexed)
+
+  const activeEmployee = {
+    id: EMPLOYEE_ID,
+    storeId: STORE_ID,
+    employmentStatus: EmploymentStatus.ACTIVE,
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 10_000_000,
+        paymentType: PaymentType.MONTH,
+        allowances: {},
+      },
+    ],
+  };
+
+  beforeEach(async () => {
+    const repoMap = new Map<any, ReturnType<typeof mockRepo>>();
+    const providers = ENTITIES.map((entity) => {
+      const mock = mockRepo();
+      repoMap.set(entity, mock);
+      return { provide: getRepositoryToken(entity), useValue: mock };
+    });
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        StoresService,
+        ...providers,
+        {
+          provide: AccountsService,
+          useValue: { findById: jest.fn(), findByEmail: jest.fn() },
+        },
+        {
+          provide: FaceRecognitionService,
+          useValue: {
+            extractDescriptor: jest.fn().mockResolvedValue(null),
+            compareFaces: jest.fn().mockReturnValue({}),
+            detectFace: jest.fn().mockResolvedValue({}),
+          },
+        },
+        {
+          provide: DataSource,
+          useValue: {},
+        },
+        {
+          provide: ShiftReminderService,
+          useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = module.get<StoresService>(StoresService);
+    payrollRepo = repoMap.get(MonthlyPayroll);
+    employeeSalaryRepo = repoMap.get(EmployeeSalary);
+    profileRepo = repoMap.get(EmployeeProfile);
+
+    profileRepo.find.mockResolvedValue([activeEmployee]);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('createMonthlyPayrollForStore', () => {
+    it('does NOT overwrite an EmployeeSalary that is already PAID', async () => {
+      const paidSalary = {
+        id: 'salary-1',
+        employeeProfileId: EMPLOYEE_ID,
+        month: MONTH,
+        monthlyPayrollId: 'payroll-1',
+        paymentStatus: PaymentStatus.PAID,
+        netSalary: 9_999_999,
+        bonus: 0,
+        penalty: 0,
+      };
+      employeeSalaryRepo.findOne.mockResolvedValue(paidSalary);
+      payrollRepo.findOne.mockResolvedValue({
+        id: 'payroll-1',
+        storeId: STORE_ID,
+        month: MONTH,
+      });
+
+      const result = await service.createMonthlyPayrollForStore(STORE_ID, MONTH);
+
+      // Should never call update/create/save on the protected salary record.
+      expect(employeeSalaryRepo.update).not.toHaveBeenCalled();
+      expect(employeeSalaryRepo.create).not.toHaveBeenCalled();
+      expect(employeeSalaryRepo.save).not.toHaveBeenCalled();
+      // Its existing net salary is still folded into the payroll total.
+      expect(result.estimatedPayment).toBe(9_999_999);
+    });
+
+    it('backfills monthlyPayrollId on an orphaned PAID salary without recalculating it', async () => {
+      const orphanedPaidSalary = {
+        id: 'salary-1',
+        employeeProfileId: EMPLOYEE_ID,
+        month: MONTH,
+        monthlyPayrollId: null,
+        paymentStatus: PaymentStatus.PAID,
+        netSalary: 5_000_000,
+        bonus: 0,
+        penalty: 0,
+      };
+      employeeSalaryRepo.findOne.mockResolvedValue(orphanedPaidSalary);
+      payrollRepo.findOne.mockResolvedValue({
+        id: 'payroll-1',
+        storeId: STORE_ID,
+        month: MONTH,
+      });
+
+      await service.createMonthlyPayrollForStore(STORE_ID, MONTH);
+
+      expect(employeeSalaryRepo.update).toHaveBeenCalledWith(
+        'salary-1',
+        expect.objectContaining({ monthlyPayrollId: 'payroll-1' }),
+      );
+      // update is only called with the backfill payload, no salary fields.
+      expect(employeeSalaryRepo.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('recalculates and updates in place a PENDING salary instead of skipping/duplicating it', async () => {
+      const pendingSalary = {
+        id: 'salary-1',
+        employeeProfileId: EMPLOYEE_ID,
+        month: MONTH,
+        monthlyPayrollId: 'payroll-1',
+        paymentStatus: PaymentStatus.PENDING,
+        netSalary: 1_000_000, // stale low value from an earlier partial month
+        bonus: 0,
+        penalty: 0,
+      };
+      employeeSalaryRepo.findOne.mockResolvedValue(pendingSalary);
+      payrollRepo.findOne.mockResolvedValue({
+        id: 'payroll-1',
+        storeId: STORE_ID,
+        month: MONTH,
+      });
+
+      await service.createMonthlyPayrollForStore(STORE_ID, MONTH);
+
+      // Must update the existing row (not insert a duplicate).
+      expect(employeeSalaryRepo.create).not.toHaveBeenCalled();
+      expect(employeeSalaryRepo.update).toHaveBeenCalledWith(
+        'salary-1',
+        expect.objectContaining({ monthlyPayrollId: 'payroll-1' }),
+      );
+    });
+
+    it('creates a fresh EmployeeSalary when none exists yet, linked to the MonthlyPayroll', async () => {
+      employeeSalaryRepo.findOne.mockResolvedValue(null);
+      payrollRepo.findOne.mockResolvedValue(null); // no MonthlyPayroll yet either
+
+      await service.createMonthlyPayrollForStore(STORE_ID, MONTH);
+
+      expect(payrollRepo.create).toHaveBeenCalled();
+      expect(employeeSalaryRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ employeeProfileId: EMPLOYEE_ID, monthlyPayrollId: 'gen-id' }),
+      );
+    });
+  });
+
+  describe('createMonthlyPayrollsForAllStores', () => {
+    it('reconciles the previous month and scaffolds the current month for each store', async () => {
+      const spy = jest.spyOn(service, 'createMonthlyPayrollForStore');
+      (service as any).storeRepository.find = jest
+        .fn()
+        .mockResolvedValue([{ id: STORE_ID, status: 'active' }]);
+      payrollRepo.findOne.mockResolvedValue({
+        id: 'payroll-1',
+        storeId: STORE_ID,
+        month: MONTH,
+      });
+
+      const now = new Date(2026, 6, 1); // "now" = July 1st
+      await service.createMonthlyPayrollsForAllStores(now);
+
+      // Called twice per store: once for the previous month (June), once for "now" (July).
+      expect(spy).toHaveBeenCalledTimes(2);
+      const calledMonths = spy.mock.calls.map((args) => (args[1] as Date).getMonth());
+      expect(calledMonths).toEqual([5, 6]); // June (5), July (6)
+    });
+  });
+});
+
+describe('StoresService - checkOutWithFace real-time salary orphan fix', () => {
+  let service: StoresService;
+  let shiftAssignmentRepo: any;
+  let employeeFaceRepo: any;
+  let payrollRepo: any;
+  let employeeSalaryRepo: any;
+  let profileRepo: any;
+  let faceService: any;
+
+  const STORE_ID = 'store-1';
+  const EMPLOYEE_ID = 'emp-1';
+
+  const baseAssignment = {
+    id: 'assignment-1',
+    employeeId: EMPLOYEE_ID,
+    checkInTime: new Date('2026-07-01T08:00:00'),
+    checkOutTime: null,
+    status: ShiftAssignmentStatus.CONFIRMED,
+    attendanceStatus: AttendanceStatus.ON_TIME,
+    lateMinutes: 0,
+    shiftSlot: {
+      workDate: '2026-07-01',
+      workShift: { startTime: '08:00', endTime: '17:00' },
+      cycle: { storeId: STORE_ID },
+    },
+  };
+
+  const activeEmployee = {
+    id: EMPLOYEE_ID,
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 10_000_000,
+        paymentType: PaymentType.MONTH,
+        allowances: {},
+      },
+    ],
+  };
+
+  beforeEach(async () => {
+    const repoMap = new Map<any, ReturnType<typeof mockRepo>>();
+    const providers = ENTITIES.map((entity) => {
+      const mock = mockRepo();
+      repoMap.set(entity, mock);
+      return { provide: getRepositoryToken(entity), useValue: mock };
+    });
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        StoresService,
+        ...providers,
+        {
+          provide: AccountsService,
+          useValue: { findById: jest.fn(), findByEmail: jest.fn() },
+        },
+        {
+          provide: FaceRecognitionService,
+          useValue: {
+            extractDescriptor: jest.fn().mockResolvedValue([0.1, 0.2, 0.3]),
+            compareFaces: jest
+              .fn()
+              .mockReturnValue({ matched: true, distance: 0.3 }),
+          },
+        },
+        { provide: DataSource, useValue: {} },
+        {
+          provide: ShiftReminderService,
+          useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+        },
+      ],
+    }).compile();
+
+    service = module.get<StoresService>(StoresService);
+    shiftAssignmentRepo = repoMap.get(ShiftAssignment);
+    employeeFaceRepo = repoMap.get(EmployeeFace);
+    payrollRepo = repoMap.get(MonthlyPayroll);
+    employeeSalaryRepo = repoMap.get(EmployeeSalary);
+    profileRepo = repoMap.get(EmployeeProfile);
+    faceService = service['faceRecognitionService'];
+
+    shiftAssignmentRepo.findOne.mockResolvedValue({ ...baseAssignment });
+    employeeFaceRepo.findOne.mockResolvedValue({
+      employeeProfileId: EMPLOYEE_ID,
+      faceDescriptors: [[0.1, 0.2, 0.3]],
+      isActive: true,
+    });
+    profileRepo.findOne.mockResolvedValue(activeEmployee);
+  });
+
+  afterEach(() => jest.clearAllMocks());
+
+  it('creates a MonthlyPayroll and links monthlyPayrollId when none exists yet (fixes the orphan bug)', async () => {
+    payrollRepo.findOne.mockResolvedValue(null); // no MonthlyPayroll for this month yet
+    employeeSalaryRepo.findOne.mockResolvedValue(null); // no EmployeeSalary yet either
+
+    await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
+
+    expect(payrollRepo.create).toHaveBeenCalledWith(
+      expect.objectContaining({ storeId: STORE_ID }),
+    );
+    expect(employeeSalaryRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ monthlyPayrollId: 'gen-id' }),
+    );
+  });
+
+  it('backfills monthlyPayrollId on an existing orphaned EmployeeSalary', async () => {
+    payrollRepo.findOne.mockResolvedValue({
+      id: 'payroll-1',
+      storeId: STORE_ID,
+    });
+    employeeSalaryRepo.findOne.mockResolvedValue({
+      id: 'salary-1',
+      employeeProfileId: EMPLOYEE_ID,
+      monthlyPayrollId: null, // orphaned by an earlier real-time update
+      paymentStatus: PaymentStatus.PENDING,
+      netSalary: 0,
+    });
+
+    await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
+
+    expect(employeeSalaryRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ monthlyPayrollId: 'payroll-1' }),
+    );
+  });
+
+  it('does NOT overwrite a salary that is already PAID', async () => {
+    payrollRepo.findOne.mockResolvedValue({ id: 'payroll-1', storeId: STORE_ID });
+    const paidSalary = {
+      id: 'salary-1',
+      employeeProfileId: EMPLOYEE_ID,
+      monthlyPayrollId: 'payroll-1',
+      paymentStatus: PaymentStatus.PAID,
+      netSalary: 9_999_999,
+    };
+    employeeSalaryRepo.findOne.mockResolvedValue(paidSalary);
+
+    const result = await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
+
+    expect(employeeSalaryRepo.save).not.toHaveBeenCalled();
+    expect(result.netSalary).toBe(9_999_999);
+  });
 });

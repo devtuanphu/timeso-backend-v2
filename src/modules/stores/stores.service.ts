@@ -13,6 +13,7 @@ import {
   Not,
   IsNull,
   DataSource,
+  EntityManager,
 } from 'typeorm';
 import { isUUID } from 'class-validator';
 import * as QRCode from 'qrcode';
@@ -4282,6 +4283,41 @@ export class StoresService {
     return { message: 'Payroll deleted successfully' };
   }
 
+  /**
+   * Find or create the MonthlyPayroll scaffold row for a store+month.
+   * Shared by createMonthlyPayrollForStore, recalculatePayroll and the
+   * real-time salary update on check-out, so every write path is guaranteed
+   * a MonthlyPayroll to attach EmployeeSalary rows to (fixes orphaned
+   * EmployeeSalary.monthlyPayrollId when check-out happens before the
+   * monthly cron/generate endpoint has ever run for that month).
+   */
+  private async findOrCreateMonthlyPayroll(
+    storeId: string,
+    month: Date,
+    manager?: EntityManager,
+  ): Promise<MonthlyPayroll> {
+    const repo = manager
+      ? manager.getRepository(MonthlyPayroll)
+      : this.payrollRepository;
+    let payroll = await repo.findOne({ where: { storeId, month } });
+    if (!payroll) {
+      payroll = repo.create({
+        storeId,
+        month,
+        estimatedPayment: 0,
+        salaryFund: 0,
+        totalBonus: 0,
+        totalPenalty: 0,
+        totalOvertime: 0,
+        totalPendingApproval: 0,
+        totalApproved: 0,
+        isFinalized: false,
+      });
+      payroll = await repo.save(payroll);
+    }
+    return payroll;
+  }
+
   async createMonthlyPayrollForStore(storeId: string, date?: Date) {
     const currentDate = date || new Date();
     const month = new Date(
@@ -4300,25 +4336,7 @@ export class StoresService {
     );
 
     // 1. Create or find MonthlyPayroll
-    let payroll = await this.payrollRepository.findOne({
-      where: { storeId, month },
-    });
-
-    if (!payroll) {
-      payroll = this.payrollRepository.create({
-        storeId,
-        month,
-        estimatedPayment: 0,
-        salaryFund: 0,
-        totalBonus: 0,
-        totalPenalty: 0,
-        totalOvertime: 0,
-        totalPendingApproval: 0,
-        totalApproved: 0,
-        isFinalized: false,
-      });
-      payroll = await this.payrollRepository.save(payroll);
-    }
+    const payroll = await this.findOrCreateMonthlyPayroll(storeId, month);
 
     // 2. Load payroll rules for this store
     const payrollRules = await this.payrollRuleRepository.find({
@@ -4342,12 +4360,23 @@ export class StoresService {
     let totalBonus = 0;
     let totalPenalty = 0;
 
+    const PROTECTED_STATUSES = [PaymentStatus.APPROVED, PaymentStatus.PAID];
+
     for (const employee of employees) {
-      // Skip if salary already exists for this month
       const existingSalary = await this.employeeSalaryRepository.findOne({
         where: { employeeProfileId: employee.id, month },
       });
-      if (existingSalary) {
+
+      // Never overwrite a salary that's already been approved or paid —
+      // just make sure it's linked to this MonthlyPayroll (backfills any
+      // record that was created as an "orphan" by the real-time check-out
+      // update before this MonthlyPayroll existed) and fold its totals in.
+      if (existingSalary && PROTECTED_STATUSES.includes(existingSalary.paymentStatus)) {
+        if (!existingSalary.monthlyPayrollId) {
+          await this.employeeSalaryRepository.update(existingSalary.id, {
+            monthlyPayrollId: payroll.id,
+          });
+        }
         totalEstimatedPayment += Number(existingSalary.netSalary) || 0;
         totalBonus += Number(existingSalary.bonus) || 0;
         totalPenalty += Number(existingSalary.penalty) || 0;
@@ -4359,9 +4388,9 @@ export class StoresService {
       if (!activeContract) {
         // Bug 4.3 fix: Create salary record with 0 salary instead of skipping
         console.log(
-          `⚠️ [Payroll] No contract for ${employee.id}, creating zero-salary record`,
+          `⚠️ [Payroll] No contract for ${employee.id}, ${existingSalary ? 'updating' : 'creating'} zero-salary record`,
         );
-        await this.createEmployeeSalary({
+        const zeroSalaryPayload: Partial<EmployeeSalary> = {
           employeeProfileId: employee.id,
           month,
           monthlyPayrollId: payroll.id,
@@ -4378,7 +4407,12 @@ export class StoresService {
           advancePayment: 0,
           otherDeductions: 0,
           earnedBaseSalary: 0,
-        });
+        };
+        if (existingSalary) {
+          await this.employeeSalaryRepository.update(existingSalary.id, zeroSalaryPayload);
+        } else {
+          await this.createEmployeeSalary(zeroSalaryPayload);
+        }
         continue;
       }
 
@@ -4481,8 +4515,10 @@ export class StoresService {
       const totalDeductions = penalty + advancePayment + otherDeductions;
       const netSalary = Math.max(0, totalIncome - totalDeductions);
 
-      // ========== SAVE EmployeeSalary ==========
-      await this.createEmployeeSalary({
+      // ========== SAVE EmployeeSalary (update in place if it already
+      // exists as PENDING/REJECTED — never insert a duplicate row for the
+      // same employee+month) ==========
+      const salaryPayload: Partial<EmployeeSalary> = {
         employeeProfileId: employee.id,
         month,
         monthlyPayrollId: payroll.id,
@@ -4499,7 +4535,12 @@ export class StoresService {
         advancePayment,
         otherDeductions,
         earnedBaseSalary: calculatedSalary,
-      });
+      };
+      if (existingSalary) {
+        await this.employeeSalaryRepository.update(existingSalary.id, salaryPayload);
+      } else {
+        await this.createEmployeeSalary(salaryPayload);
+      }
 
       console.log(
         `✅ [Payroll] ${employee.id}: salary=${calculatedSalary.toFixed(0)}, bonus=${bonus.toFixed(0)}, penalty=${penalty.toFixed(0)}, net=${netSalary.toFixed(0)}`,
@@ -4536,13 +4577,15 @@ export class StoresService {
       1,
     );
     const dataSource = this.payrollRepository.manager;
+    const PROTECTED_STATUSES = [PaymentStatus.APPROVED, PaymentStatus.PAID];
 
     console.log(
       `🔄 [Payroll] Recalculating payroll for store=${storeId}, month=${month.toISOString().slice(0, 7)}`,
     );
 
     return dataSource.transaction(async (manager) => {
-      // 1. Delete existing salary records for this month
+      // 1. Delete existing salary records for this month, EXCEPT ones that
+      // are already approved/paid — those must never be recomputed/removed.
       const deleteResult = await manager
         .createQueryBuilder()
         .delete()
@@ -4551,31 +4594,21 @@ export class StoresService {
           'monthly_payroll_id IN (SELECT id FROM monthly_payrolls WHERE store_id = :storeId AND month = :month)',
           { storeId, month: month.toISOString().slice(0, 10) },
         )
+        .andWhere('payment_status NOT IN (:...protectedStatuses)', {
+          protectedStatuses: PROTECTED_STATUSES,
+        })
         .execute();
 
       console.log(
         `🗑️ [Payroll] Deleted ${deleteResult.affected || 0} old salary records`,
       );
 
-      // 2. Delete the MonthlyPayroll record so it gets recreated cleanly
-      await manager.delete(MonthlyPayroll, { storeId, month });
+      // 2. Find or create the MonthlyPayroll row — never delete it, since
+      // doing so would cascade-delete any protected EmployeeSalary rows
+      // that survived the filtered delete above.
+      const payroll = await this.findOrCreateMonthlyPayroll(storeId, month, manager);
 
-      // 3. Recreate payroll via a managed query (bypass the standalone repo to stay in transaction)
-      const payroll = manager.create(MonthlyPayroll, {
-        storeId,
-        month,
-        estimatedPayment: 0,
-        salaryFund: 0,
-        totalBonus: 0,
-        totalPenalty: 0,
-        totalOvertime: 0,
-        totalPendingApproval: 0,
-        totalApproved: 0,
-        isFinalized: false,
-      });
-      await manager.save(payroll);
-
-      // 4. Load payroll rules and settings via manager
+      // 3. Load payroll rules and settings via manager
       const [payrollRules, payrollSetting] = await Promise.all([
         manager.findBy(StorePayrollRule, { storeId, isActive: true }),
         manager.findOne(StorePayrollSetting, {
@@ -4583,7 +4616,7 @@ export class StoresService {
         }),
       ]);
 
-      // 5. Get active employees via manager
+      // 4. Get active employees via manager
       const employees = await manager.find(EmployeeProfile, {
         where: { storeId, employmentStatus: EmploymentStatus.ACTIVE },
         relations: ['contracts'],
@@ -4594,6 +4627,24 @@ export class StoresService {
       let totalPenalty = 0;
 
       for (const employee of employees) {
+        // Any surviving record here is either protected (APPROVED/PAID,
+        // skipped) or was deleted above (PENDING/REJECTED) and will be
+        // recreated fresh below.
+        const existingSalary = await manager.findOne(EmployeeSalary, {
+          where: { employeeProfileId: employee.id, month },
+        });
+        if (existingSalary && PROTECTED_STATUSES.includes(existingSalary.paymentStatus)) {
+          if (!existingSalary.monthlyPayrollId) {
+            await manager.update(EmployeeSalary, existingSalary.id, {
+              monthlyPayrollId: payroll.id,
+            });
+          }
+          totalEstimatedPayment += Number(existingSalary.netSalary) || 0;
+          totalBonus += Number(existingSalary.bonus) || 0;
+          totalPenalty += Number(existingSalary.penalty) || 0;
+          continue;
+        }
+
         const activeContract = employee.contracts?.find((c) => c.isActive);
 
         // Bug 4.3 fix: Handle employees without contract
@@ -4601,7 +4652,7 @@ export class StoresService {
           console.log(
             `⚠️ [Payroll] No contract for ${employee.id}, creating zero-salary record`,
           );
-          await this.createEmployeeSalary({
+          const zeroSalary = manager.create(EmployeeSalary, {
             employeeProfileId: employee.id,
             month,
             monthlyPayrollId: payroll.id,
@@ -4619,6 +4670,7 @@ export class StoresService {
             otherDeductions: 0,
             earnedBaseSalary: 0,
           });
+          await manager.save(EmployeeSalary, zeroSalary);
           continue;
         }
 
@@ -4643,52 +4695,16 @@ export class StoresService {
         );
 
         const paymentType = activeContract.paymentType || PaymentType.MONTH;
-        let calculatedSalary = 0;
-
-        if (attendanceSummary.hasShiftEarnings) {
-          calculatedSalary = attendanceSummary.totalShiftEarnings;
-        } else if (
-          paymentType === PaymentType.HOUR ||
-          payrollSetting?.calculationMethod === PayrollCalculationMethod.HOUR
-        ) {
-          // Bug 4.1 fix: Use configurable standard hours
-          const standardHours = payrollSetting?.priorityCalcValue || 176;
-          calculatedSalary =
-            currentBaseSalary *
-            (attendanceSummary.workingHours / standardHours);
-        } else if (
-          paymentType === PaymentType.SHIFT ||
-          payrollSetting?.calculationMethod === PayrollCalculationMethod.SHIFT
-        ) {
-          calculatedSalary =
-            currentBaseSalary * attendanceSummary.completedShifts;
-        } else if (
-          paymentType === PaymentType.DAY ||
-          payrollSetting?.calculationMethod === PayrollCalculationMethod.DAY
-        ) {
-          calculatedSalary =
-            currentBaseSalary * attendanceSummary.completedShifts;
-        } else {
-          // Bug 4.2 fix: Calculate monthly prorate based on actual working days
-          const daysInMonth = new Date(
-            month.getFullYear(),
-            month.getMonth() + 1,
-            0,
-          ).getDate();
-          const today = new Date();
-          const isCurrentMonth =
-            today.getFullYear() === month.getFullYear() &&
-            today.getMonth() === month.getMonth();
-          const totalWorkDaysInMonth = isCurrentMonth
-            ? today.getDate()
-            : daysInMonth;
-
-          calculatedSalary =
-            totalWorkDaysInMonth > 0
-              ? currentBaseSalary *
-                (attendanceSummary.completedShifts / totalWorkDaysInMonth)
-              : currentBaseSalary;
-        }
+        // Reuse the single source of truth for base-salary calculation
+        // instead of re-implementing the same branching inline (previously
+        // this duplicated — and had silently drifted from — calculateBaseSalary).
+        const calculatedSalary = this.calculateBaseSalary(
+          currentBaseSalary,
+          paymentType,
+          attendanceSummary,
+          payrollSetting,
+          month,
+        );
 
         let bonus = 0;
         let penalty = 0;
@@ -4740,7 +4756,7 @@ export class StoresService {
         const totalDeductions = penalty;
         const netSalary = Math.max(0, totalIncome - totalDeductions);
 
-        const salaryRecord = manager.create(EmployeeSalary, {
+        const salaryPayload = {
           employeeProfileId: employee.id,
           month,
           monthlyPayrollId: payroll.id,
@@ -4755,8 +4771,13 @@ export class StoresService {
           totalDeductions,
           netSalary,
           earnedBaseSalary: calculatedSalary,
-        });
-        await manager.save(EmployeeSalary, salaryRecord);
+        };
+        if (existingSalary) {
+          await manager.update(EmployeeSalary, existingSalary.id, salaryPayload);
+        } else {
+          const salaryRecord = manager.create(EmployeeSalary, salaryPayload);
+          await manager.save(EmployeeSalary, salaryRecord);
+        }
         totalEstimatedPayment += netSalary;
         totalBonus += bonus;
         totalPenalty += penalty;
@@ -5407,10 +5428,20 @@ export class StoresService {
       where: { status: StoreStatus.ACTIVE },
     });
 
+    const now = date || new Date();
+    // The previous month has just ended — run one reconciliation pass so any
+    // shifts checked out late (or attendance corrected after month-end) are
+    // folded in. Safe: createMonthlyPayrollForStore now skips anyone already
+    // APPROVED/PAID, so this can never clobber a payment already made.
+    const prevMonthAnchor = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+
     const results: MonthlyPayroll[] = [];
     for (const store of stores) {
       try {
-        const payroll = await this.createMonthlyPayrollForStore(store.id, date);
+        await this.createMonthlyPayrollForStore(store.id, prevMonthAnchor);
+        // Scaffold the new month so real-time check-out updates have a
+        // MonthlyPayroll to attach to right away.
+        const payroll = await this.createMonthlyPayrollForStore(store.id, now);
         results.push(payroll);
       } catch (error) {
         console.error(
@@ -12088,33 +12119,58 @@ export class StoresService {
         const netSalary = Math.max(0, totalIncome - totalDeductions);
         netSalaryResult = netSalary;
 
-        // 7. Upsert EmployeeSalary
+        // 7. Upsert EmployeeSalary — ensure a MonthlyPayroll exists first so
+        // this record is never "orphaned" (monthlyPayrollId null), which
+        // previously made it invisible to getEmployeeSalariesByStore /
+        // getPayrollSummary until the monthly cron happened to run.
+        const payrollForMonth = await this.findOrCreateMonthlyPayroll(
+          storeId,
+          monthDate,
+        );
+
         let salary = await this.employeeSalaryRepository.findOne({
           where: { employeeProfileId: assignment.employeeId, month: monthDate },
         });
-        if (!salary) {
-          salary = this.employeeSalaryRepository.create({
-            employeeProfileId: assignment.employeeId,
-            month: monthDate,
-          });
-        }
-        salary.baseSalary = currentBaseSalary;
-        salary.paymentType = paymentType;
-        salary.allowances = allowancesMap;
-        salary.workingDays = attendanceSummary.completedShifts;
-        salary.workingHours = attendanceSummary.workingHours;
-        salary.unauthorizedLeaveDays = attendanceSummary.absentCount;
-        salary.bonus = bonus;
-        salary.penalty = penalty;
-        salary.totalIncome = totalIncome;
-        salary.totalDeductions = totalDeductions;
-        salary.netSalary = netSalary;
-        salary.earnedBaseSalary = calculatedSalary;
-        await this.employeeSalaryRepository.save(salary);
 
-        this.logger.debug(
-          `[CheckOut] Real-time salary: income=${totalIncome}, deductions=${totalDeductions}, net=${netSalary}`,
-        );
+        // Never overwrite a salary that's already been approved or paid.
+        if (
+          salary &&
+          [PaymentStatus.APPROVED, PaymentStatus.PAID].includes(
+            salary.paymentStatus,
+          )
+        ) {
+          netSalaryResult = Number(salary.netSalary) || 0;
+          this.logger.debug(
+            `[CheckOut] Skipped real-time salary update — already ${salary.paymentStatus}`,
+          );
+        } else {
+          if (!salary) {
+            salary = this.employeeSalaryRepository.create({
+              employeeProfileId: assignment.employeeId,
+              month: monthDate,
+              monthlyPayrollId: payrollForMonth.id,
+            });
+          } else if (!salary.monthlyPayrollId) {
+            salary.monthlyPayrollId = payrollForMonth.id;
+          }
+          salary.baseSalary = currentBaseSalary;
+          salary.paymentType = paymentType;
+          salary.allowances = allowancesMap;
+          salary.workingDays = attendanceSummary.completedShifts;
+          salary.workingHours = attendanceSummary.workingHours;
+          salary.unauthorizedLeaveDays = attendanceSummary.absentCount;
+          salary.bonus = bonus;
+          salary.penalty = penalty;
+          salary.totalIncome = totalIncome;
+          salary.totalDeductions = totalDeductions;
+          salary.netSalary = netSalary;
+          salary.earnedBaseSalary = calculatedSalary;
+          await this.employeeSalaryRepository.save(salary);
+
+          this.logger.debug(
+            `[CheckOut] Real-time salary: income=${totalIncome}, deductions=${totalDeductions}, net=${netSalary}`,
+          );
+        }
       }
     } catch (err) {
       this.logger.warn(
