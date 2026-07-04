@@ -12618,6 +12618,50 @@ export class StoresService {
       };
     }
 
+    // 3) No actionable shift (not waiting for check-in, not currently working).
+    //    But the employee may still HAVE a shift today that is already done
+    //    (checked in + checked out / COMPLETED) or checked in via another flow.
+    //    Return it so the "Hôm nay" card stays consistent with the schedule grid
+    //    instead of wrongly showing "Không có ca".
+    const doneAssignment = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('slot.workDate = :todayStr', { todayStr })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('a.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.APPROVED,
+          ShiftAssignmentStatus.CONFIRMED,
+          ShiftAssignmentStatus.COMPLETED,
+        ],
+      })
+      .orderBy('ws.startTime', 'ASC')
+      .getOne();
+
+    if (doneAssignment) {
+      const ws = doneAssignment.shiftSlot?.workShift;
+      this.logger.log(
+        `[getNextShiftAssignment] Found already-processed assignment for today: ${doneAssignment.id}, status=${doneAssignment.status}`,
+      );
+      return {
+        assignmentId: doneAssignment.id,
+        mode: 'done' as const,
+        shiftName: ws?.shiftName || '',
+        startTime: ws?.startTime || '',
+        endTime: ws?.endTime || '',
+        workDate: doneAssignment.shiftSlot?.workDate || todayStr,
+        shiftSlotId: doneAssignment.shiftSlot?.id || null,
+        checkInTime: doneAssignment.checkInTime?.toISOString() || null,
+        lateMinutes: doneAssignment.lateMinutes || 0,
+        location: doneAssignment.shiftSlot?.location || ws?.location || '',
+        note: doneAssignment.shiftSlot?.note || '',
+        totalShiftsToday,
+      };
+    }
+
     this.logger.log(
       `[getNextShiftAssignment] No shifts found for today (${todayStr})`,
     );
