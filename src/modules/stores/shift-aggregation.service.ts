@@ -828,6 +828,16 @@ export class ShiftAggregationService {
     a: ShiftAssignment,
     slot?: ShiftSlot | null,
   ): number {
+    // Chỉ tính lương khi nhân viên đã đăng ký xong VÀ được duyệt.
+    // PENDING (chờ owner duyệt) chưa được cộng vào lương dự kiến.
+    if (
+      a.status !== ShiftAssignmentStatus.APPROVED &&
+      a.status !== ShiftAssignmentStatus.CONFIRMED &&
+      a.status !== ShiftAssignmentStatus.COMPLETED
+    ) {
+      return 0;
+    }
+
     if (a.shiftEarnings != null) return Number(a.shiftEarnings);
 
     const s = slot || a.shiftSlot;
@@ -960,11 +970,13 @@ export class ShiftAggregationService {
       insufficientCount,
       insufficientRatio: Math.round(insufficientRatio * 100),
       staffingStatus,
-      totalSalary: activeAssignments.reduce(
+      totalSalary: activeAssignments.reduce((sum, a) => {
         // Đã check-out → shiftEarnings thực; chưa → ước tính từ hợp đồng.
-        (sum, a) => sum + this.estimateAssignmentSalary(a, slot),
-        0,
-      ),
+        // Trừ thêm phần phạt trễ/về sớm/vắng (assignmentSalaryDiff) để tổng
+        // lương dự kiến khớp với số hiển thị từng nhân viên.
+        const salary = this.estimateAssignmentSalary(a, slot);
+        return sum + salary + this.assignmentSalaryDiff(a, rules, salary, slot);
+      }, 0),
       location: slot.location || (slot.workShift as any)?.location || null,
       note: slot.note || null,
       status: this.computeShiftStatus(slot),
