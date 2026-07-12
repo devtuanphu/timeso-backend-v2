@@ -45,7 +45,7 @@ export class ShiftEndWorkflow extends BaseEntity {
   @Column({ name: 'auto_checkout_at', type: 'timestamptz', nullable: true })
   autoCheckoutAt: Date | null;
 
-  @Column({ name: 'overtime_request_id', nullable: true })
+  @Column({ name: 'overtime_request_id', type: 'uuid', nullable: true })
   overtimeRequestId: string | null;
 
   @Column({ name: 'last_error', type: 'text', nullable: true })

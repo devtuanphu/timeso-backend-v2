@@ -247,7 +247,7 @@ export class ShiftAssignment extends BaseEntity {
   @Column({ name: 'is_auto_checkout', default: false })
   isAutoCheckout: boolean;
 
-  @Column({ name: 'auto_checkout_reason', nullable: true })
+  @Column({ name: 'auto_checkout_reason', type: 'varchar', nullable: true })
   autoCheckoutReason: string | null;
 
   @Column({ name: 'scheduled_checkout_time', type: 'timestamptz', nullable: true })
