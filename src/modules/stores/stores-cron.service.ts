@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { StoresService } from './stores.service';
 import { DistributedLockService } from './distributed-lock.service';
+import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 
 @Injectable()
 export class StoresCronService {
@@ -10,7 +11,20 @@ export class StoresCronService {
   constructor(
     private readonly storesService: StoresService,
     private readonly lockService: DistributedLockService,
+    private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
   ) {}
+
+  @Cron(CronExpression.EVERY_MINUTE, {
+    name: 'reconcile-shift-end-workflows',
+    timeZone: 'Asia/Ho_Chi_Minh',
+  })
+  async handleReconcileShiftEndWorkflows() {
+    await this.lockService.withLock(
+      'cron:reconcile-shift-end-workflows',
+      55,
+      () => this.shiftEndWorkflowService.reconcileActiveAssignments(),
+    );
+  }
 
   /**
    * Cron job chạy vào 00:05 (12:05 AM) mỗi ngày
@@ -153,6 +167,7 @@ export class StoresCronService {
   async handleDetectAttendanceIssues() {
     const result = await this.lockService.withLock('cron:detect-attendance-issues', 300, async () => {
       this.logger.log('Starting end-of-day attendance issues detection...');
+      await this.shiftEndWorkflowService.reconcileActiveAssignments();
       const detectResult = await this.storesService.detectEndOfDayAttendanceIssues();
       this.logger.log(`Attendance issues detected: ${detectResult.forgotCount} forgot clock-out, ${detectResult.unauthorizedCount} unauthorized leaves`);
       return detectResult;

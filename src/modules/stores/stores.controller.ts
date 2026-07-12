@@ -17,6 +17,7 @@ import {
   Req,
   Res,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { Request, Response } from 'express';
 import * as path from 'path';
@@ -130,10 +131,16 @@ import {
   AnyFilesInterceptor,
   FilesInterceptor,
 } from '@nestjs/platform-express';
-import { multerConfig } from '../../common/utils/multer-config';
+import {
+  attendanceMulterConfig,
+  multerConfig,
+} from '../../common/utils/multer-config';
 import { AssetMultipartInterceptor } from './interceptors/asset-multipart.interceptor';
 import { ProductMultipartInterceptor } from './interceptors/product-multipart.interceptor';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 
 import { StoreEventType } from './entities/store-event.entity';
 import { KpiStatus } from './entities/employee-kpi.entity';
@@ -145,10 +152,15 @@ import { InventoryReportStatus } from './entities/inventory-report.entity';
 @Controller('stores')
 @UseGuards(JwtAuthGuard)
 export class StoresController {
+  private readonly logger = new Logger(StoresController.name);
+
   constructor(
     private readonly storesService: StoresService,
     private readonly accountsService: AccountsService,
     private readonly mailService: MailService,
+    @InjectQueue('attendance-background')
+    private readonly attendanceQueue: Queue,
+    private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
   ) {}
 
   @Post()
@@ -680,6 +692,7 @@ export class StoresController {
       storeId: string;
       employeeProfileId: string;
       shiftSlotId?: string | null;
+      shiftAssignmentId?: string | null;
       requestDate: string;
       startTime?: string;
       endTime?: string;
@@ -687,7 +700,9 @@ export class StoresController {
       attachments?: string[];
     },
   ) {
-    return this.storesService.createBonusWorkRequest(body);
+    const request = await this.storesService.createBonusWorkRequest(body);
+    await this.shiftEndWorkflowService.markOvertimePending(request);
+    return request;
   }
 
   @Get('bonus-work-requests')
@@ -718,7 +733,9 @@ export class StoresController {
   @ApiOperation({ summary: 'Phê duyệt yêu cầu bổ sung công' })
   async approveBonusWorkRequest(@Param('id') id: string, @GetUser() user: any) {
     const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    return this.storesService.approveBonusWorkRequest(id, profile?.id);
+    const request = await this.storesService.approveBonusWorkRequest(id, profile?.id);
+    await this.shiftEndWorkflowService.approveOvertime(request);
+    return request;
   }
 
   @Patch('bonus-work-requests/:id/reject')
@@ -729,18 +746,22 @@ export class StoresController {
     @Body() body: { reason?: string },
   ) {
     const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    return this.storesService.rejectBonusWorkRequest(
+    const request = await this.storesService.rejectBonusWorkRequest(
       id,
       profile?.id,
       body.reason,
     );
+    await this.shiftEndWorkflowService.resumeAfterOvertime(request);
+    return request;
   }
 
   @Patch('bonus-work-requests/:id/cancel')
   @ApiOperation({ summary: 'Hủy yêu cầu bổ sung công' })
   async cancelBonusWorkRequest(@Param('id') id: string, @GetUser() user: any) {
     const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    return this.storesService.cancelBonusWorkRequest(id, profile?.id);
+    const request = await this.storesService.cancelBonusWorkRequest(id, profile?.id);
+    await this.shiftEndWorkflowService.resumeAfterOvertime(request);
+    return request;
   }
 
   @Get(':id')
@@ -3885,61 +3906,81 @@ export class StoresController {
 
   @Post('shift-assignments/:id/check-in')
   @ApiOperation({ summary: 'Check-in ca làm việc (3 bước: QR → GPS → Face)' })
-  @UseInterceptors(FileInterceptor('photo', multerConfig))
+  @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkIn(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
-    @Body() body: { latitude?: string; longitude?: string; qrStoreId?: string },
+    @Body()
+    body: {
+      latitude?: string;
+      longitude?: string;
+      qrStoreId?: string;
+      orientationNormalized?: string;
+    },
   ) {
     if (!photo) throw new BadRequestException('Photo is required');
-    // multerConfig uses diskStorage → file.buffer is undefined, read from file.path
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fsLib = require('fs');
-    const imageBuffer =
-      photo.buffer || (photo.path ? fsLib.readFileSync(photo.path) : null);
+    const imageBuffer = photo.buffer;
     if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
     const result = await this.storesService.checkInWithFace(id, imageBuffer, {
       latitude: body.latitude ? parseFloat(body.latitude) : undefined,
       longitude: body.longitude ? parseFloat(body.longitude) : undefined,
       qrStoreId: body.qrStoreId,
+      orientationNormalized: body.orientationNormalized === 'true',
     });
-    // Clean up temp file
-    if (photo.path)
-      try {
-        fsLib.unlinkSync(photo.path);
-      } catch (_e) {
-        /* ignore */
-      }
+    if (result.matched) {
+      void this.shiftEndWorkflowService.scheduleForAssignment(id).catch((error) =>
+        this.logger.error(
+          `[CheckIn] Unable to schedule shift-end workflow for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      );
+    }
     return result;
   }
 
   @Post('shift-assignments/:id/check-out')
   @ApiOperation({ summary: 'Check-out ca làm việc (3 bước: QR → GPS → Face)' })
-  @UseInterceptors(FileInterceptor('photo', multerConfig))
+  @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkOut(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
-    @Body() body: { latitude?: string; longitude?: string; qrStoreId?: string },
+    @Body()
+    body: {
+      latitude?: string;
+      longitude?: string;
+      qrStoreId?: string;
+      orientationNormalized?: string;
+    },
   ) {
     if (!photo) throw new BadRequestException('Photo is required');
-    // multerConfig uses diskStorage → file.buffer is undefined, read from file.path
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fsLib = require('fs');
-    const imageBuffer =
-      photo.buffer || (photo.path ? fsLib.readFileSync(photo.path) : null);
+    const imageBuffer = photo.buffer;
     if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
     const result = await this.storesService.checkOutWithFace(id, imageBuffer, {
       latitude: body.latitude ? parseFloat(body.latitude) : undefined,
       longitude: body.longitude ? parseFloat(body.longitude) : undefined,
       qrStoreId: body.qrStoreId,
+      orientationNormalized: body.orientationNormalized === 'true',
     });
-    // Clean up temp file
-    if (photo.path)
-      try {
-        fsLib.unlinkSync(photo.path);
-      } catch (_e) {
-        /* ignore */
-      }
+
+    if (result.matched) {
+      void this.shiftEndWorkflowService.markCompletedByEmployee(id);
+      void this.attendanceQueue
+        .add(
+          'process-checkout-payroll',
+          { assignmentId: id },
+          {
+            jobId: `checkout-payroll-${id}`,
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 1000 },
+            removeOnComplete: 1000,
+            removeOnFail: 1000,
+          },
+        )
+        .catch((error) => {
+          this.logger.error(
+            `[CheckOut] Unable to enqueue payroll for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
     return result;
   }
 

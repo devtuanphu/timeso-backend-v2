@@ -6,7 +6,10 @@ import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { ShiftReminderService } from './shift-reminder.service';
 import { PaymentType } from './entities/employee-contract.entity';
-import { PayrollRuleCategory, PayrollCalcType } from './entities/store-payroll-rule.entity';
+import {
+  PayrollRuleCategory,
+  PayrollCalcType,
+} from './entities/store-payroll-rule.entity';
 import { PayrollCalculationMethod } from './entities/store-payroll-setting.entity';
 import { PaymentStatus } from './entities/employee-salary.entity';
 import { EmploymentStatus } from './entities/employee-profile.entity';
@@ -41,15 +44,26 @@ import { KpiTask } from './entities/kpi-task.entity';
 import { DailyEmployeeReport } from './entities/daily-employee-report.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { StoreEvent } from './entities/store-event.entity';
-import { StockTransaction, StockTransactionDetail } from './entities/stock-transaction.entity';
 import {
-  WorkCycle, ShiftSlot, ShiftAssignment, ShiftSwap, CycleShiftTemplate,
+  StockTransaction,
+  StockTransactionDetail,
+} from './entities/stock-transaction.entity';
+import {
+  WorkCycle,
+  ShiftSlot,
+  ShiftAssignment,
+  ShiftSwap,
+  CycleShiftTemplate,
 } from './entities/shift-management.entity';
 import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
 import { AttendanceLog } from './entities/attendance-log.entity';
 import { EmployeeAssetAssignment } from './entities/employee-asset-assignment.entity';
-import { ServiceCategory, ServiceItem, ServiceItemRecipe } from './entities/service-item.entity';
+import {
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+} from './entities/service-item.entity';
 import { Order, OrderItem } from './entities/order.entity';
 import { EmployeePerformance } from './entities/employee-performance.entity';
 import { EmployeeTerminationReason } from './entities/employee-termination-reason.entity';
@@ -82,12 +96,14 @@ import { ContractTemplate } from './entities/contract-template.entity';
 let AccountIdentityDocument: any;
 let AccountFinance: any;
 try {
-  AccountIdentityDocument = require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
+  AccountIdentityDocument =
+    require('../accounts/entities/account-identity-document.entity').AccountIdentityDocument;
 } catch {
   AccountIdentityDocument = class AccountIdentityDocument {};
 }
 try {
-  AccountFinance = require('../accounts/entities/account-finance.entity').AccountFinance;
+  AccountFinance =
+    require('../accounts/entities/account-finance.entity').AccountFinance;
 } catch {
   AccountFinance = class AccountFinance {};
 }
@@ -97,7 +113,9 @@ function mockRepo() {
     find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(null),
     create: jest.fn((d: any) => ({ id: 'gen-id', ...d })),
-    save: jest.fn((e: any) => Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e })),
+    save: jest.fn((e: any) =>
+      Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e }),
+    ),
     update: jest.fn().mockResolvedValue({ affected: 1 }),
     delete: jest.fn().mockResolvedValue({ affected: 0 }),
     createQueryBuilder: jest.fn(() => {
@@ -121,29 +139,82 @@ function mockRepo() {
 }
 
 const ENTITIES = [
-  Store, StoreEmployeeType, StoreRole, EmployeeProfile, EmployeeProfileRole,
-  EmployeeContract, WorkShift, Asset, Product, AssetUnit, ProductUnit,
-  MonthlyPayroll, SalaryConfig, EmployeeSalary, KpiType, AssetCategory,
-  AssetStatus, ProductCategory, ProductStatus, EmployeeKpi, KpiUnit, KpiPeriod,
-  KpiTask, DailyEmployeeReport, EmployeeMonthlySummary, StoreEvent,
-  StockTransaction, StockTransactionDetail, WorkCycle, ShiftSlot, ShiftAssignment,
-  ShiftSwap, CycleShiftTemplate, ContractTemplate, ServiceCategory, ServiceItem, ServiceItemRecipe,
-  Order, OrderItem, EmployeePerformance, EmployeeLeaveRequest, EmployeeAssetAssignment,
-  EmployeeTerminationReason, StoreProbationSetting, StoreSkill,
-  StorePayrollPaymentHistory, SalaryFundHistory, SalaryAdvanceRequest,
-  SalaryAdjustment, SalaryAdjustmentReason, EmployeePaymentHistory,
-  StorePaymentAccount, KpiApprovalRequest, InventoryReport, AssetExportType,
-  ProductExportType, StoreApprovalSetting, StoreTimekeepingSetting,
-  StorePayrollSetting, StorePayrollRule, StorePayrollIncrementRule,
-  AccountIdentityDocument, StoreInternalRule, StorePermissionConfig,
-  StoreShiftConfig, CycleShiftTemplate, AccountFinance, Feedback,
-  EmployeeFace, AttendanceLog,
-  ShiftChangeRequest, BonusWorkRequest,
+  Store,
+  StoreEmployeeType,
+  StoreRole,
+  EmployeeProfile,
+  EmployeeProfileRole,
+  EmployeeContract,
+  WorkShift,
+  Asset,
+  Product,
+  AssetUnit,
+  ProductUnit,
+  MonthlyPayroll,
+  SalaryConfig,
+  EmployeeSalary,
+  KpiType,
+  AssetCategory,
+  AssetStatus,
+  ProductCategory,
+  ProductStatus,
+  EmployeeKpi,
+  KpiUnit,
+  KpiPeriod,
+  KpiTask,
+  DailyEmployeeReport,
+  EmployeeMonthlySummary,
+  StoreEvent,
+  StockTransaction,
+  StockTransactionDetail,
+  WorkCycle,
+  ShiftSlot,
+  ShiftAssignment,
+  ShiftSwap,
+  CycleShiftTemplate,
+  ContractTemplate,
+  ServiceCategory,
+  ServiceItem,
+  ServiceItemRecipe,
+  Order,
+  OrderItem,
+  EmployeePerformance,
+  EmployeeLeaveRequest,
+  EmployeeAssetAssignment,
+  EmployeeTerminationReason,
+  StoreProbationSetting,
+  StoreSkill,
+  StorePayrollPaymentHistory,
+  SalaryFundHistory,
+  SalaryAdvanceRequest,
+  SalaryAdjustment,
+  SalaryAdjustmentReason,
+  EmployeePaymentHistory,
+  StorePaymentAccount,
+  KpiApprovalRequest,
+  InventoryReport,
+  AssetExportType,
+  ProductExportType,
+  StoreApprovalSetting,
+  StoreTimekeepingSetting,
+  StorePayrollSetting,
+  StorePayrollRule,
+  StorePayrollIncrementRule,
+  AccountIdentityDocument,
+  StoreInternalRule,
+  StorePermissionConfig,
+  StoreShiftConfig,
+  CycleShiftTemplate,
+  AccountFinance,
+  Feedback,
+  EmployeeFace,
+  AttendanceLog,
+  ShiftChangeRequest,
+  BonusWorkRequest,
 ];
 
 // ─── Pure Calculation Tests ─────────────────────────────────────────────────────
 describe('Payroll Calculation Logic', () => {
-
   /**
    * These are pure unit tests that validate the payroll calculation formulas
    * without needing any NestJS DI infrastructure.
@@ -167,7 +238,6 @@ describe('Payroll Calculation Logic', () => {
   const STANDARD_MONTHLY_HOURS = 176;
 
   describe('calculateBaseSalary', () => {
-
     function calculateBaseSalary(
       paymentType: PaymentType,
       baseSalary: number,
@@ -197,78 +267,136 @@ describe('Payroll Calculation Logic', () => {
 
     it('should use totalShiftEarnings when hasShiftEarnings=true', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 200, 22, true, 15_000_000, 30,
+        PaymentType.MONTH,
+        10_000_000,
+        200,
+        22,
+        true,
+        15_000_000,
+        30,
       );
       expect(result).toBe(15_000_000);
     });
 
     it('should calculate HOURLY salary correctly (88h = 50% of full month)', () => {
       const result = calculateBaseSalary(
-        PaymentType.HOUR, 100_000, 88, 0, false, 0, 30,
+        PaymentType.HOUR,
+        100_000,
+        88,
+        0,
+        false,
+        0,
+        30,
       );
       expect(result).toBeCloseTo(50_000, 0);
     });
 
     it('should calculate HOURLY salary correctly (176h = 100%)', () => {
       const result = calculateBaseSalary(
-        PaymentType.HOUR, 100_000, 176, 0, false, 0, 30,
+        PaymentType.HOUR,
+        100_000,
+        176,
+        0,
+        false,
+        0,
+        30,
       );
       expect(result).toBe(100_000);
     });
 
     it('should calculate SHIFT salary correctly', () => {
       const result = calculateBaseSalary(
-        PaymentType.SHIFT, 500_000, 0, 22, false, 0, 30,
+        PaymentType.SHIFT,
+        500_000,
+        0,
+        22,
+        false,
+        0,
+        30,
       );
       expect(result).toBe(11_000_000);
     });
 
     it('should calculate DAY salary correctly', () => {
       const result = calculateBaseSalary(
-        PaymentType.DAY, 400_000, 0, 20, false, 0, 30,
+        PaymentType.DAY,
+        400_000,
+        0,
+        20,
+        false,
+        0,
+        30,
       );
       expect(result).toBe(8_000_000);
     });
 
     it('should calculate MONTH salary (prorated, 30-day month)', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 0, 10, false, 0, 30,
+        PaymentType.MONTH,
+        10_000_000,
+        0,
+        10,
+        false,
+        0,
+        30,
       );
       expect(result).toBeCloseTo(3_333_333, 0);
     });
 
     it('should calculate MONTH salary (prorated, 28-day February)', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 0, 14, false, 0, 28,
+        PaymentType.MONTH,
+        10_000_000,
+        0,
+        14,
+        false,
+        0,
+        28,
       );
       expect(result).toBeCloseTo(5_000_000, 0);
     });
 
     it('should calculate MONTH salary (prorated, 29-day leap February)', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 0, 15, false, 0, 29,
+        PaymentType.MONTH,
+        10_000_000,
+        0,
+        15,
+        false,
+        0,
+        29,
       );
       expect(result).toBeCloseTo(5_172_414, 0);
     });
 
     it('should calculate MONTH salary with 0 shifts = 0', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 0, 0, false, 0, 30,
+        PaymentType.MONTH,
+        10_000_000,
+        0,
+        0,
+        false,
+        0,
+        30,
       );
       expect(result).toBe(0);
     });
 
     it('should use full MONTH salary when shifts >= daysInMonth', () => {
       const result = calculateBaseSalary(
-        PaymentType.MONTH, 10_000_000, 0, 30, false, 0, 30,
+        PaymentType.MONTH,
+        10_000_000,
+        0,
+        30,
+        false,
+        0,
+        30,
       );
       expect(result).toBe(10_000_000);
     });
-
   });
 
   describe('calculatePenalty', () => {
-
     function calculatePenalty(
       calculatedSalary: number,
       rules: Array<{
@@ -285,7 +413,7 @@ describe('Payroll Calculation Logic', () => {
         if (rule.count <= 0) continue;
 
         if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-          penalty += (calculatedSalary * rule.value / 100) * rule.count;
+          penalty += ((calculatedSalary * rule.value) / 100) * rule.count;
         } else if (rule.calcType === PayrollCalcType.AMOUNT) {
           penalty += rule.value * rule.count;
         }
@@ -295,7 +423,15 @@ describe('Payroll Calculation Logic', () => {
 
     it('should apply PERCENTAGE late penalty correctly', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 5, count: 2 }];
+      const rules = [
+        {
+          ruleType: 'LATE',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 5,
+          count: 2,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       // 5% of 10M = 500,000 * 2 = 1,000,000
       expect(penalty).toBe(1_000_000);
@@ -303,7 +439,15 @@ describe('Payroll Calculation Logic', () => {
 
     it('should apply AMOUNT late penalty correctly', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.AMOUNT, value: 50_000, count: 3 }];
+      const rules = [
+        {
+          ruleType: 'LATE',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.AMOUNT,
+          value: 50_000,
+          count: 3,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       // 50,000 * 3 = 150,000
       expect(penalty).toBe(150_000);
@@ -311,7 +455,15 @@ describe('Payroll Calculation Logic', () => {
 
     it('should apply EARLY penalty', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'EARLY', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 3, count: 2 }];
+      const rules = [
+        {
+          ruleType: 'EARLY',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 3,
+          count: 2,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       // 3% of 10M = 300,000 * 2 = 600,000
       expect(penalty).toBe(600_000);
@@ -319,7 +471,15 @@ describe('Payroll Calculation Logic', () => {
 
     it('should apply ABSENT penalty', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'ABSENT', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 3 }];
+      const rules = [
+        {
+          ruleType: 'ABSENT',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.AMOUNT,
+          value: 200_000,
+          count: 3,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       // 200,000 * 3 = 600,000
       expect(penalty).toBe(600_000);
@@ -328,9 +488,27 @@ describe('Payroll Calculation Logic', () => {
     it('should apply multiple penalties simultaneously', () => {
       const salary = 10_000_000;
       const rules = [
-        { ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 5, count: 2 },
-        { ruleType: 'EARLY', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 3, count: 1 },
-        { ruleType: 'ABSENT', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 2 },
+        {
+          ruleType: 'LATE',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 5,
+          count: 2,
+        },
+        {
+          ruleType: 'EARLY',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 3,
+          count: 1,
+        },
+        {
+          ruleType: 'ABSENT',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.AMOUNT,
+          value: 200_000,
+          count: 2,
+        },
       ];
       const penalty = calculatePenalty(salary, rules);
       // Late: (10M * 5% * 2) = 1,000,000
@@ -342,22 +520,36 @@ describe('Payroll Calculation Logic', () => {
 
     it('should NOT apply penalty when count is zero', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 5, count: 0 }];
+      const rules = [
+        {
+          ruleType: 'LATE',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 5,
+          count: 0,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       expect(penalty).toBe(0);
     });
 
     it('should NOT apply BONUS rules as penalty', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'ATTENDANCE', category: PayrollRuleCategory.BONUS, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 1 }];
+      const rules = [
+        {
+          ruleType: 'ATTENDANCE',
+          category: PayrollRuleCategory.BONUS,
+          calcType: PayrollCalcType.AMOUNT,
+          value: 200_000,
+          count: 1,
+        },
+      ];
       const penalty = calculatePenalty(salary, rules);
       expect(penalty).toBe(0);
     });
-
   });
 
   describe('calculateBonus', () => {
-
     function calculateBonus(
       calculatedSalary: number,
       rules: Array<{
@@ -374,7 +566,7 @@ describe('Payroll Calculation Logic', () => {
         if (rule.count <= 0) continue;
 
         if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-          bonus += (calculatedSalary * rule.value / 100) * rule.count;
+          bonus += ((calculatedSalary * rule.value) / 100) * rule.count;
         } else if (rule.calcType === PayrollCalcType.AMOUNT) {
           bonus += rule.value * rule.count;
         }
@@ -384,27 +576,53 @@ describe('Payroll Calculation Logic', () => {
 
     it('should apply BONUS with AMOUNT', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'ATTENDANCE', category: PayrollRuleCategory.BONUS, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 1 }];
+      const rules = [
+        {
+          ruleType: 'ATTENDANCE',
+          category: PayrollRuleCategory.BONUS,
+          calcType: PayrollCalcType.AMOUNT,
+          value: 200_000,
+          count: 1,
+        },
+      ];
       expect(calculateBonus(salary, rules)).toBe(200_000);
     });
 
     it('should apply BONUS with PERCENTAGE', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'KPI', category: PayrollRuleCategory.BONUS, calcType: PayrollCalcType.PERCENTAGE, value: 10, count: 1 }];
+      const rules = [
+        {
+          ruleType: 'KPI',
+          category: PayrollRuleCategory.BONUS,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 10,
+          count: 1,
+        },
+      ];
       expect(calculateBonus(salary, rules)).toBe(1_000_000);
     });
 
     it('should NOT apply FINE rules as bonus', () => {
       const salary = 10_000_000;
-      const rules = [{ ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 5, count: 2 }];
+      const rules = [
+        {
+          ruleType: 'LATE',
+          category: PayrollRuleCategory.FINE,
+          calcType: PayrollCalcType.PERCENTAGE,
+          value: 5,
+          count: 2,
+        },
+      ];
       expect(calculateBonus(salary, rules)).toBe(0);
     });
-
   });
 
   describe('netSalary floor', () => {
-
-    function calculateNetSalary(calculatedSalary: number, bonus: number, penalty: number): number {
+    function calculateNetSalary(
+      calculatedSalary: number,
+      bonus: number,
+      penalty: number,
+    ): number {
       const totalIncome = calculatedSalary + bonus;
       const totalDeductions = penalty;
       return Math.max(0, totalIncome - totalDeductions);
@@ -430,11 +648,9 @@ describe('Payroll Calculation Logic', () => {
       const net = calculateNetSalary(10_000_000, 500_000, 0);
       expect(net).toBe(10_500_000);
     });
-
   });
 
   describe('complete payroll flow', () => {
-
     function runPayroll(params: {
       paymentType: PaymentType;
       baseSalary: number;
@@ -450,19 +666,29 @@ describe('Payroll Calculation Logic', () => {
         value: number;
         count: number;
       }>;
-    }): { calculatedSalary: number; penalty: number; bonus: number; netSalary: number } {
+    }): {
+      calculatedSalary: number;
+      penalty: number;
+      bonus: number;
+      netSalary: number;
+    } {
       const STANDARD_MONTHLY_HOURS = 176;
       let calculatedSalary = 0;
       if (params.hasShiftEarnings) {
         calculatedSalary = params.totalShiftEarnings;
       } else if (params.paymentType === PaymentType.HOUR) {
-        calculatedSalary = params.baseSalary * (params.workingHours / STANDARD_MONTHLY_HOURS);
-      } else if (params.paymentType === PaymentType.SHIFT || params.paymentType === PaymentType.DAY) {
+        calculatedSalary =
+          params.baseSalary * (params.workingHours / STANDARD_MONTHLY_HOURS);
+      } else if (
+        params.paymentType === PaymentType.SHIFT ||
+        params.paymentType === PaymentType.DAY
+      ) {
         calculatedSalary = params.baseSalary * params.completedShifts;
       } else {
-        calculatedSalary = params.daysInMonth > 0
-          ? params.baseSalary * (params.completedShifts / params.daysInMonth)
-          : params.baseSalary;
+        calculatedSalary =
+          params.daysInMonth > 0
+            ? params.baseSalary * (params.completedShifts / params.daysInMonth)
+            : params.baseSalary;
       }
 
       let penalty = 0;
@@ -470,7 +696,7 @@ describe('Payroll Calculation Logic', () => {
       for (const rule of params.rules) {
         if (rule.count <= 0) continue;
         if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-          const amount = (calculatedSalary * rule.value / 100) * rule.count;
+          const amount = ((calculatedSalary * rule.value) / 100) * rule.count;
           if (rule.category === PayrollRuleCategory.FINE) penalty += amount;
           else if (rule.category === PayrollRuleCategory.BONUS) bonus += amount;
         } else if (rule.calcType === PayrollCalcType.AMOUNT) {
@@ -493,7 +719,15 @@ describe('Payroll Calculation Logic', () => {
         hasShiftEarnings: false,
         totalShiftEarnings: 0,
         daysInMonth: 30,
-        rules: [{ ruleType: 'LATE', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.PERCENTAGE, value: 5, count: 2 }],
+        rules: [
+          {
+            ruleType: 'LATE',
+            category: PayrollRuleCategory.FINE,
+            calcType: PayrollCalcType.PERCENTAGE,
+            value: 5,
+            count: 2,
+          },
+        ],
       });
       // calculatedSalary = 10M * (20/30) = 6,666,667
       expect(result.calculatedSalary).toBeCloseTo(6_666_667, 0);
@@ -512,7 +746,15 @@ describe('Payroll Calculation Logic', () => {
         hasShiftEarnings: true,
         totalShiftEarnings: 20_000_000,
         daysInMonth: 30,
-        rules: [{ ruleType: 'ATTENDANCE', category: PayrollRuleCategory.BONUS, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 1 }],
+        rules: [
+          {
+            ruleType: 'ATTENDANCE',
+            category: PayrollRuleCategory.BONUS,
+            calcType: PayrollCalcType.AMOUNT,
+            value: 200_000,
+            count: 1,
+          },
+        ],
       });
       expect(result.calculatedSalary).toBe(20_000_000);
       expect(result.bonus).toBe(200_000);
@@ -530,16 +772,20 @@ describe('Payroll Calculation Logic', () => {
         totalShiftEarnings: 0,
         daysInMonth: 30,
         rules: [
-          { ruleType: 'ABSENT', category: PayrollRuleCategory.FINE, calcType: PayrollCalcType.AMOUNT, value: 200_000, count: 4 },
+          {
+            ruleType: 'ABSENT',
+            category: PayrollRuleCategory.FINE,
+            calcType: PayrollCalcType.AMOUNT,
+            value: 200_000,
+            count: 4,
+          },
         ],
       });
       expect(result.calculatedSalary).toBe(9_000_000);
       expect(result.penalty).toBe(800_000);
       expect(result.netSalary).toBe(8_200_000);
     });
-
   });
-
 });
 
 // ─── Integration Tests (StoresService) ─────────────────────────────────────────
@@ -612,7 +858,6 @@ describe('StoresService - Payroll Integration', () => {
       expect(result).toEqual([]);
     });
   });
-
 });
 
 // ─── Bug fix regression tests ───────────────────────────────────────────────
@@ -716,7 +961,10 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
         month: MONTH,
       });
 
-      const result = await service.createMonthlyPayrollForStore(STORE_ID, MONTH);
+      const result = await service.createMonthlyPayrollForStore(
+        STORE_ID,
+        MONTH,
+      );
 
       // Should never call update/create/save on the protected salary record.
       expect(employeeSalaryRepo.update).not.toHaveBeenCalled();
@@ -790,7 +1038,10 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
 
       expect(payrollRepo.create).toHaveBeenCalled();
       expect(employeeSalaryRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({ employeeProfileId: EMPLOYEE_ID, monthlyPayrollId: 'gen-id' }),
+        expect.objectContaining({
+          employeeProfileId: EMPLOYEE_ID,
+          monthlyPayrollId: 'gen-id',
+        }),
       );
     });
   });
@@ -812,13 +1063,15 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
 
       // Called twice per store: once for the previous month (June), once for "now" (July).
       expect(spy).toHaveBeenCalledTimes(2);
-      const calledMonths = spy.mock.calls.map((args) => (args[1] as Date).getMonth());
+      const calledMonths = spy.mock.calls.map((args) =>
+        (args[1] as Date).getMonth(),
+      );
       expect(calledMonths).toEqual([5, 6]); // June (5), July (6)
     });
   });
 });
 
-describe('StoresService - checkOutWithFace real-time salary orphan fix', () => {
+describe('StoresService - deferred checkout payroll', () => {
   let service: StoresService;
   let shiftAssignmentRepo: any;
   let employeeFaceRepo: any;
@@ -883,7 +1136,26 @@ describe('StoresService - checkOutWithFace real-time salary orphan fix', () => {
               .mockReturnValue({ matched: true, distance: 0.3 }),
           },
         },
-        { provide: DataSource, useValue: {} },
+        {
+          provide: DataSource,
+          useValue: {
+            transaction: jest.fn(async (callback) => {
+              const queryBuilder = {
+                update: jest.fn().mockReturnThis(),
+                set: jest.fn().mockReturnThis(),
+                where: jest.fn().mockReturnThis(),
+                andWhere: jest.fn().mockReturnThis(),
+                execute: jest.fn().mockResolvedValue({ affected: 1 }),
+              };
+              return callback({
+                createQueryBuilder: jest.fn(() => queryBuilder),
+                create: jest.fn((_entity, value) => value),
+                save: jest.fn().mockResolvedValue(undefined),
+                findOne: jest.fn(),
+              });
+            }),
+          },
+        },
         {
           provide: ShiftReminderService,
           useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
@@ -910,54 +1182,48 @@ describe('StoresService - checkOutWithFace real-time salary orphan fix', () => {
 
   afterEach(() => jest.clearAllMocks());
 
-  it('creates a MonthlyPayroll and links monthlyPayrollId when none exists yet (fixes the orphan bug)', async () => {
-    payrollRepo.findOne.mockResolvedValue(null); // no MonthlyPayroll for this month yet
-    employeeSalaryRepo.findOne.mockResolvedValue(null); // no EmployeeSalary yet either
-
-    await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
-
-    expect(payrollRepo.create).toHaveBeenCalledWith(
-      expect.objectContaining({ storeId: STORE_ID }),
+  it('returns immediately without touching payroll repositories', async () => {
+    const result = await service.checkOutWithFace(
+      'assignment-1',
+      Buffer.from('fake'),
     );
-    expect(employeeSalaryRepo.save).toHaveBeenCalledWith(
-      expect.objectContaining({ monthlyPayrollId: 'gen-id' }),
+
+    expect(result).toEqual(
+      expect.objectContaining({ matched: true, payrollProcessing: true }),
     );
-  });
-
-  it('backfills monthlyPayrollId on an existing orphaned EmployeeSalary', async () => {
-    payrollRepo.findOne.mockResolvedValue({
-      id: 'payroll-1',
-      storeId: STORE_ID,
-    });
-    employeeSalaryRepo.findOne.mockResolvedValue({
-      id: 'salary-1',
-      employeeProfileId: EMPLOYEE_ID,
-      monthlyPayrollId: null, // orphaned by an earlier real-time update
-      paymentStatus: PaymentStatus.PENDING,
-      netSalary: 0,
-    });
-
-    await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
-
-    expect(employeeSalaryRepo.save).toHaveBeenCalledWith(
-      expect.objectContaining({ monthlyPayrollId: 'payroll-1' }),
-    );
-  });
-
-  it('does NOT overwrite a salary that is already PAID', async () => {
-    payrollRepo.findOne.mockResolvedValue({ id: 'payroll-1', storeId: STORE_ID });
-    const paidSalary = {
-      id: 'salary-1',
-      employeeProfileId: EMPLOYEE_ID,
-      monthlyPayrollId: 'payroll-1',
-      paymentStatus: PaymentStatus.PAID,
-      netSalary: 9_999_999,
-    };
-    employeeSalaryRepo.findOne.mockResolvedValue(paidSalary);
-
-    const result = await service.checkOutWithFace('assignment-1', Buffer.from('fake'));
-
+    expect(payrollRepo.findOne).not.toHaveBeenCalled();
+    expect(employeeSalaryRepo.findOne).not.toHaveBeenCalled();
     expect(employeeSalaryRepo.save).not.toHaveBeenCalled();
-    expect(result.netSalary).toBe(9_999_999);
+  });
+
+  it('returns an idempotent success when checkout was already recorded', async () => {
+    shiftAssignmentRepo.findOne.mockResolvedValue({
+      ...baseAssignment,
+      checkOutTime: new Date('2026-07-01T17:00:00'),
+      workedMinutes: 540,
+      status: ShiftAssignmentStatus.COMPLETED,
+    });
+
+    const result = await service.checkOutWithFace(
+      'assignment-1',
+      Buffer.from('fake'),
+    );
+
+    expect(result).toEqual(
+      expect.objectContaining({ matched: true, alreadyRecorded: true }),
+    );
+    expect(faceService.extractDescriptor).not.toHaveBeenCalled();
+  });
+
+  it('does not persist attendance when the face does not match', async () => {
+    faceService.compareFaces.mockReturnValue({ matched: false, distance: 0.9 });
+
+    const result = await service.checkOutWithFace(
+      'assignment-1',
+      Buffer.from('fake'),
+    );
+
+    expect(result).toEqual(expect.objectContaining({ matched: false }));
+    expect(profileRepo.update).not.toHaveBeenCalled();
   });
 });

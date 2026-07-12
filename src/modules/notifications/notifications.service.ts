@@ -18,7 +18,14 @@ export class NotificationsService {
   ) {}
 
   // Create notification
-  async create(data: Partial<Notification>) {
+  async create(
+    data: Partial<Notification>,
+    pushOptions?: {
+      categoryId?: string;
+      priority?: 'default' | 'normal' | 'high';
+      channelId?: string;
+    },
+  ) {
     const notification = this.notificationRepository.create(data);
     const saved = await this.notificationRepository.save(notification);
 
@@ -28,10 +35,12 @@ export class NotificationsService {
         title: data.title || 'Thông báo mới',
         body: data.content || '',
         data: {
+          ...(data.metadata || {}),
           notificationId: saved.id,
-          type: data.type || '',
+          notificationType: data.type || '',
           actionUrl: data.actionUrl || '',
         },
+        ...pushOptions,
       });
     }
 
@@ -45,6 +54,9 @@ export class NotificationsService {
       title: string;
       body: string;
       data?: Record<string, any>;
+      categoryId?: string;
+      priority?: 'default' | 'normal' | 'high';
+      channelId?: string;
     }
   ) {
     const devices = await this.devicesService.getActiveDevicesByUser(userId);
@@ -65,9 +77,19 @@ export class NotificationsService {
     accountId: string,
     title: string,
     body: string,
-    data?: Record<string, any>
+    data?: Record<string, any>,
+    options?: {
+      categoryId?: string;
+      priority?: 'default' | 'normal' | 'high';
+      channelId?: string;
+    },
   ) {
-    return this.sendPushToUser(accountId, { title, body, data });
+    return this.sendPushToUser(accountId, {
+      title,
+      body,
+      data,
+      ...options,
+    });
   }
 
   // Get all notifications for a user with filters

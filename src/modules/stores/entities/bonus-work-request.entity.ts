@@ -2,6 +2,7 @@ import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 import { EmployeeProfile } from './employee-profile.entity';
+import { ShiftAssignment } from './shift-management.entity';
 
 export enum BonusWorkRequestStatus {
   PENDING = 'PENDING',
@@ -28,6 +29,13 @@ export class BonusWorkRequest extends BaseEntity {
 
   @Column({ name: 'shift_slot_id', type: 'uuid', nullable: true })
   shiftSlotId: string | null;
+
+  @Column({ name: 'shift_assignment_id', type: 'uuid', nullable: true })
+  shiftAssignmentId: string | null;
+
+  @ManyToOne(() => ShiftAssignment, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'shift_assignment_id' })
+  shiftAssignment: ShiftAssignment | null;
 
   @Column({ name: 'request_date', type: 'date' })
   requestDate: string;

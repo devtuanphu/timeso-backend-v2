@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, Unique } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { EmployeeProfile } from './employee-profile.entity';
 import { Store } from './store.entity';
@@ -12,9 +12,11 @@ export enum AttendanceLogType {
 export enum AttendanceMethod {
   FACE = 'FACE',
   MANUAL = 'MANUAL',
+  SYSTEM = 'SYSTEM',
 }
 
 @Entity('attendance_logs')
+@Unique(['shiftAssignmentId', 'type'])
 export class AttendanceLog extends BaseEntity {
   @Column({ name: 'shift_assignment_id' })
   shiftAssignmentId: string;
@@ -70,10 +72,22 @@ export class AttendanceLog extends BaseEntity {
   deviceInfo: string;
 
   // -- GPS Check-in/out location --
-  @Column({ name: 'checkin_latitude', type: 'decimal', precision: 10, scale: 7, nullable: true })
+  @Column({
+    name: 'checkin_latitude',
+    type: 'decimal',
+    precision: 10,
+    scale: 7,
+    nullable: true,
+  })
   checkinLatitude: number;
 
-  @Column({ name: 'checkin_longitude', type: 'decimal', precision: 10, scale: 7, nullable: true })
+  @Column({
+    name: 'checkin_longitude',
+    type: 'decimal',
+    precision: 10,
+    scale: 7,
+    nullable: true,
+  })
   checkinLongitude: number;
 
   @Column({

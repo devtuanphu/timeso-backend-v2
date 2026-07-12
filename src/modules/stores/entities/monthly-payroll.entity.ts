@@ -1,8 +1,9 @@
-import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, Unique } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 
 @Entity('monthly_payrolls')
+@Unique(['storeId', 'month'])
 export class MonthlyPayroll extends BaseEntity {
   @Column({ name: 'store_id' })
   storeId: string;

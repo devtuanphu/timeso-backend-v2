@@ -25,7 +25,10 @@ try {
   faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
   faceApiAvailable = true;
 } catch (err) {
-  console.warn('⚠️ Face recognition dependencies not available (canvas/face-api). Face features disabled.', (err as Error)?.message);
+  console.warn(
+    '⚠️ Face recognition dependencies not available (canvas/face-api). Face features disabled.',
+    (err as Error)?.message,
+  );
 }
 /* eslint-enable @typescript-eslint/no-require-imports */
 
@@ -39,10 +42,33 @@ export interface FaceMatchResult {
 export class FaceRecognitionService implements OnModuleInit {
   private readonly logger = new Logger(FaceRecognitionService.name);
   private modelsLoaded = false;
+  private activeInferences = 0;
+  private readonly inferenceWaiters: Array<() => void> = [];
+  private readonly maxConcurrentInferences = Math.max(
+    1,
+    Number(process.env.FACE_INFERENCE_CONCURRENCY) || 2,
+  );
+
+  private async acquireInferenceSlot(): Promise<void> {
+    if (this.activeInferences < this.maxConcurrentInferences) {
+      this.activeInferences += 1;
+      return;
+    }
+
+    await new Promise<void>((resolve) => this.inferenceWaiters.push(resolve));
+    this.activeInferences += 1;
+  }
+
+  private releaseInferenceSlot(): void {
+    this.activeInferences -= 1;
+    this.inferenceWaiters.shift()?.();
+  }
 
   async onModuleInit() {
     if (!faceApiAvailable) {
-      this.logger.warn('Face recognition dependencies not available. Service disabled.');
+      this.logger.warn(
+        'Face recognition dependencies not available. Service disabled.',
+      );
       return;
     }
     await this.loadModels();
@@ -114,16 +140,21 @@ export class FaceRecognitionService implements OnModuleInit {
    *  2. Use a lower SSD minConfidence so turned/profile faces (steps 2 & 3)
    *     are not dropped by the frontal-biased default (0.5).
    */
-  async extractDescriptor(imageBuffer: Buffer): Promise<Float32Array | null> {
+  async extractDescriptor(
+    imageBuffer: Buffer,
+    options?: { rotations?: number[]; maxSize?: number },
+  ): Promise<Float32Array | null> {
     if (!this.modelsLoaded || !faceApiAvailable) {
       this.logger.warn('Face recognition not available');
       return null;
     }
 
+    await this.acquireInferenceSlot();
     try {
       const startTime = Date.now();
       const img = await canvas.loadImage(imageBuffer);
-      const MAX_SIZE = 640;
+      const maxSize = options?.maxSize ?? 640;
+      const rotations = options?.rotations ?? [0, 90, 270, 180];
 
       // Lower confidence than the 0.5 default so profile/angled faces survive
       const detectorOptions = new faceapi.SsdMobilenetv1Options({
@@ -132,8 +163,8 @@ export class FaceRecognitionService implements OnModuleInit {
 
       // EXIF-orientation is unknown here, so try each rotation until one hits.
       // Upright (0) is by far the most common, so it is tried first.
-      for (const rotation of [0, 90, 270, 180]) {
-        const orientedCanvas = this.drawOriented(img, rotation, MAX_SIZE);
+      for (const rotation of rotations) {
+        const orientedCanvas = this.drawOriented(img, rotation, maxSize);
 
         const detection = await faceapi
           .detectSingleFace(orientedCanvas, detectorOptions)
@@ -156,6 +187,8 @@ export class FaceRecognitionService implements OnModuleInit {
     } catch (error) {
       this.logger.error('Error extracting descriptor:', error);
       return null;
+    } finally {
+      this.releaseInferenceSlot();
     }
   }
 
@@ -167,7 +200,11 @@ export class FaceRecognitionService implements OnModuleInit {
     storedDescriptors: number[][],
     threshold = 0.6,
   ): FaceMatchResult {
-    if (!faceApiAvailable || !storedDescriptors || storedDescriptors.length === 0) {
+    if (
+      !faceApiAvailable ||
+      !storedDescriptors ||
+      storedDescriptors.length === 0
+    ) {
       return { matched: false, distance: Infinity, bestMatchIndex: -1 };
     }
 
@@ -201,7 +238,11 @@ export class FaceRecognitionService implements OnModuleInit {
   }> {
     if (!faceApiAvailable || !this.modelsLoaded) {
       this.logger.warn('Face recognition not available for registration');
-      return { descriptors: [], successCount: 0, failedCount: imageBuffers.length };
+      return {
+        descriptors: [],
+        successCount: 0,
+        failedCount: imageBuffers.length,
+      };
     }
 
     const startTime = Date.now();
@@ -220,7 +261,9 @@ export class FaceRecognitionService implements OnModuleInit {
     }
 
     const totalTime = Date.now() - startTime;
-    this.logger.log(`⏱️ Registration total: ${totalTime}ms (${descriptors.length} success, ${failedCount} failed)`);
+    this.logger.log(
+      `⏱️ Registration total: ${totalTime}ms (${descriptors.length} success, ${failedCount} failed)`,
+    );
 
     return { descriptors, successCount: descriptors.length, failedCount };
   }
@@ -229,4 +272,3 @@ export class FaceRecognitionService implements OnModuleInit {
     return this.modelsLoaded && faceApiAvailable;
   }
 }
-

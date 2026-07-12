@@ -1254,11 +1254,12 @@ export class StoresService {
       },
       relations: ['shiftSlot', 'shiftSlot.workShift'],
     });
-    
+
     // Filter out past shifts in memory
     const futureShifts = upcomingShifts.filter((s) => {
       const dateStr = s.shiftSlot?.workDate;
-      const timeStr = s.shiftSlot?.startTime || s.shiftSlot?.workShift?.startTime;
+      const timeStr =
+        s.shiftSlot?.startTime || s.shiftSlot?.workShift?.startTime;
       if (dateStr && timeStr) {
         return new Date(`${dateStr}T${timeStr}`).getTime() > Date.now();
       }
@@ -1281,7 +1282,12 @@ export class StoresService {
       relations: ['shiftSlot', 'shiftSlot.workShift', 'employee'],
     });
 
-    if (!assignment || !assignment.shiftSlot || !assignment.shiftSlot.workShift || !assignment.employee) {
+    if (
+      !assignment ||
+      !assignment.shiftSlot ||
+      !assignment.shiftSlot.workShift ||
+      !assignment.employee
+    ) {
       return;
     }
 
@@ -1291,7 +1297,7 @@ export class StoresService {
 
     const dateStr = shiftSlot.workDate;
     const timeStr = shiftSlot.startTime || shiftSlot.workShift.startTime;
-    
+
     if (dateStr && timeStr) {
       const shiftStart = new Date(`${dateStr}T${timeStr}`);
       if (shiftStart.getTime() > Date.now()) {
@@ -1300,7 +1306,7 @@ export class StoresService {
           employee.storeId,
           shiftSlot.workShift.id,
           shiftStart,
-          settings
+          settings,
         );
       }
     }
@@ -2006,15 +2012,18 @@ export class StoresService {
       // If rejected, maybe save reason somewhere? Currently Note.
       if (status === 'REJECTED' && reason) assignment.note = reason;
 
-      const savedAssignment = await this.shiftAssignmentRepository.save(assignment);
-      
+      const savedAssignment =
+        await this.shiftAssignmentRepository.save(assignment);
+
       // Hook: Schedule reminder if approved
       if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
-        this.scheduleReminderForAssignment(savedAssignment.id).catch(err => {
-          this.logger.error(`Failed to schedule reminder for assignment ${savedAssignment.id}: ${err.message}`);
+        this.scheduleReminderForAssignment(savedAssignment.id).catch((err) => {
+          this.logger.error(
+            `Failed to schedule reminder for assignment ${savedAssignment.id}: ${err.message}`,
+          );
         });
       }
-      
+
       return savedAssignment;
     } else if (type === 'SWAP') {
       const swap = await this.shiftSwapRepository.findOne({
@@ -2513,11 +2522,14 @@ export class StoresService {
     }
 
     await this.workShiftRepository.update(shiftId, data);
-    
+
     // Reschedule reminders since time might have changed
     if (data.startTime) {
-      this.rescheduleRemindersForShift(shiftId).catch(err => {
-        this.logger.error(`Error rescheduling reminders for shift ${shiftId}: ${err.message}`, err.stack);
+      this.rescheduleRemindersForShift(shiftId).catch((err) => {
+        this.logger.error(
+          `Error rescheduling reminders for shift ${shiftId}: ${err.message}`,
+          err.stack,
+        );
       });
     }
 
@@ -2977,12 +2989,15 @@ export class StoresService {
               note: 'Auto-assigned from cycle',
             }),
           );
-          const savedAssignments = await this.shiftAssignmentRepository.save(newAssignments);
-          
+          const savedAssignments =
+            await this.shiftAssignmentRepository.save(newAssignments);
+
           // Hook: Schedule reminders for auto-assigned shifts
           for (const a of savedAssignments) {
-            this.scheduleReminderForAssignment(a.id).catch(err => {
-              this.logger.error(`Failed to schedule reminder for auto-assignment ${a.id}: ${err.message}`);
+            this.scheduleReminderForAssignment(a.id).catch((err) => {
+              this.logger.error(
+                `Failed to schedule reminder for auto-assignment ${a.id}: ${err.message}`,
+              );
             });
           }
         }
@@ -3310,14 +3325,16 @@ export class StoresService {
       console.log(
         `[registerToShiftSlot] saved assignmentId=${saved.id}, slotId=${slotId}, cycleId=${slot.cycleId}, employeeId=${employeeId}, status=${saved.status}`,
       );
-      
+
       // Hook: Schedule reminder if approved
       if (saved.status === ShiftAssignmentStatus.APPROVED) {
-        this.scheduleReminderForAssignment(saved.id).catch(err => {
-          this.logger.error(`Failed to schedule reminder for registered assignment ${saved.id}: ${err.message}`);
+        this.scheduleReminderForAssignment(saved.id).catch((err) => {
+          this.logger.error(
+            `Failed to schedule reminder for registered assignment ${saved.id}: ${err.message}`,
+          );
         });
       }
-      
+
       return saved;
     });
   }
@@ -3400,7 +3417,9 @@ export class StoresService {
         }
       }
     } catch (e) {
-      console.log(`[getShiftAssignments] Debug query error: ${e instanceof Error ? e.message : String(e)}`);
+      console.log(
+        `[getShiftAssignments] Debug query error: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
     for (let i = 0; i < Math.min(result.length, 3); i++) {
       const a = result[i];
@@ -4300,22 +4319,26 @@ export class StoresService {
       ? manager.getRepository(MonthlyPayroll)
       : this.payrollRepository;
     let payroll = await repo.findOne({ where: { storeId, month } });
-    if (!payroll) {
-      payroll = repo.create({
-        storeId,
-        month,
-        estimatedPayment: 0,
-        salaryFund: 0,
-        totalBonus: 0,
-        totalPenalty: 0,
-        totalOvertime: 0,
-        totalPendingApproval: 0,
-        totalApproved: 0,
-        isFinalized: false,
-      });
-      payroll = await repo.save(payroll);
+    if (payroll) return payroll;
+
+    payroll = repo.create({
+      storeId,
+      month,
+      estimatedPayment: 0,
+      salaryFund: 0,
+      totalBonus: 0,
+      totalPenalty: 0,
+      totalOvertime: 0,
+      totalPendingApproval: 0,
+      totalApproved: 0,
+      isFinalized: false,
+    });
+    try {
+      return await repo.save(payroll);
+    } catch (error: any) {
+      if (error?.code !== '23505') throw error;
+      return repo.findOneOrFail({ where: { storeId, month } });
     }
-    return payroll;
   }
 
   async createMonthlyPayrollForStore(storeId: string, date?: Date) {
@@ -4371,7 +4394,10 @@ export class StoresService {
       // just make sure it's linked to this MonthlyPayroll (backfills any
       // record that was created as an "orphan" by the real-time check-out
       // update before this MonthlyPayroll existed) and fold its totals in.
-      if (existingSalary && PROTECTED_STATUSES.includes(existingSalary.paymentStatus)) {
+      if (
+        existingSalary &&
+        PROTECTED_STATUSES.includes(existingSalary.paymentStatus)
+      ) {
         if (!existingSalary.monthlyPayrollId) {
           await this.employeeSalaryRepository.update(existingSalary.id, {
             monthlyPayrollId: payroll.id,
@@ -4409,7 +4435,10 @@ export class StoresService {
           earnedBaseSalary: 0,
         };
         if (existingSalary) {
-          await this.employeeSalaryRepository.update(existingSalary.id, zeroSalaryPayload);
+          await this.employeeSalaryRepository.update(
+            existingSalary.id,
+            zeroSalaryPayload,
+          );
         } else {
           await this.createEmployeeSalary(zeroSalaryPayload);
         }
@@ -4537,7 +4566,10 @@ export class StoresService {
         earnedBaseSalary: calculatedSalary,
       };
       if (existingSalary) {
-        await this.employeeSalaryRepository.update(existingSalary.id, salaryPayload);
+        await this.employeeSalaryRepository.update(
+          existingSalary.id,
+          salaryPayload,
+        );
       } else {
         await this.createEmployeeSalary(salaryPayload);
       }
@@ -4606,7 +4638,11 @@ export class StoresService {
       // 2. Find or create the MonthlyPayroll row — never delete it, since
       // doing so would cascade-delete any protected EmployeeSalary rows
       // that survived the filtered delete above.
-      const payroll = await this.findOrCreateMonthlyPayroll(storeId, month, manager);
+      const payroll = await this.findOrCreateMonthlyPayroll(
+        storeId,
+        month,
+        manager,
+      );
 
       // 3. Load payroll rules and settings via manager
       const [payrollRules, payrollSetting] = await Promise.all([
@@ -4633,7 +4669,10 @@ export class StoresService {
         const existingSalary = await manager.findOne(EmployeeSalary, {
           where: { employeeProfileId: employee.id, month },
         });
-        if (existingSalary && PROTECTED_STATUSES.includes(existingSalary.paymentStatus)) {
+        if (
+          existingSalary &&
+          PROTECTED_STATUSES.includes(existingSalary.paymentStatus)
+        ) {
           if (!existingSalary.monthlyPayrollId) {
             await manager.update(EmployeeSalary, existingSalary.id, {
               monthlyPayrollId: payroll.id,
@@ -4773,7 +4812,11 @@ export class StoresService {
           earnedBaseSalary: calculatedSalary,
         };
         if (existingSalary) {
-          await manager.update(EmployeeSalary, existingSalary.id, salaryPayload);
+          await manager.update(
+            EmployeeSalary,
+            existingSalary.id,
+            salaryPayload,
+          );
         } else {
           const salaryRecord = manager.create(EmployeeSalary, salaryPayload);
           await manager.save(EmployeeSalary, salaryRecord);
@@ -4882,7 +4925,7 @@ export class StoresService {
     paymentType: PaymentType,
     attendanceSummary: any,
     payrollSetting: any,
-    now: Date
+    now: Date,
   ): number {
     if (attendanceSummary.hasShiftEarnings) {
       return attendanceSummary.totalShiftEarnings;
@@ -4893,7 +4936,9 @@ export class StoresService {
       payrollSetting?.calculationMethod === PayrollCalculationMethod.HOUR
     ) {
       const standardHours = payrollSetting?.priorityCalcValue || 176;
-      return currentBaseSalary * (attendanceSummary.workingHours / standardHours);
+      return (
+        currentBaseSalary * (attendanceSummary.workingHours / standardHours)
+      );
     }
 
     if (
@@ -4913,9 +4958,11 @@ export class StoresService {
     ).getDate();
 
     if (daysInMonth > 0 && attendanceSummary.completedShifts > 0) {
-      return currentBaseSalary * (attendanceSummary.completedShifts / daysInMonth);
+      return (
+        currentBaseSalary * (attendanceSummary.completedShifts / daysInMonth)
+      );
     }
-    
+
     return 0; // If they haven't completed any shifts, base salary earned is 0
   }
 
@@ -11056,8 +11103,7 @@ export class StoresService {
         'Thứ 7',
       ];
       const dayLabel = `${dayNames[dateObj.getDay()]}, ${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${String(dateObj.getFullYear()).slice(2)}`;
-      const shiftName =
-        slot?.workShift?.shiftName || slot?.name || 'Ca làm';
+      const shiftName = slot?.workShift?.shiftName || slot?.name || 'Ca làm';
 
       let status = 'Đúng giờ';
       let statusColor = '#12B569';
@@ -11301,16 +11347,42 @@ export class StoresService {
     storeId: string;
     employeeProfileId: string;
     shiftSlotId?: string | null;
+    shiftAssignmentId?: string | null;
     requestDate: string;
     startTime?: string;
     endTime?: string;
     reason?: string;
     attachments?: string[];
   }) {
+    if (data.shiftAssignmentId) {
+      const assignment = await this.shiftAssignmentRepository.findOne({
+        where: {
+          id: data.shiftAssignmentId,
+          employeeId: data.employeeProfileId,
+        },
+      });
+      if (
+        !assignment ||
+        assignment.status !== ShiftAssignmentStatus.CONFIRMED ||
+        assignment.checkOutTime
+      ) {
+        throw new BadRequestException('Ca làm không còn hợp lệ để xin tăng ca');
+      }
+      const existing = await this.bonusWorkRequestRepository.findOne({
+        where: {
+          shiftAssignmentId: data.shiftAssignmentId,
+          status: In([BonusWorkRequestStatus.PENDING, BonusWorkRequestStatus.APPROVED]),
+        },
+      });
+      if (existing) {
+        throw new BadRequestException('Ca làm đã có yêu cầu tăng ca đang xử lý');
+      }
+    }
     const request = this.bonusWorkRequestRepository.create({
       storeId: data.storeId,
       employeeProfileId: data.employeeProfileId,
       shiftSlotId: data.shiftSlotId || undefined,
+      shiftAssignmentId: data.shiftAssignmentId || undefined,
       requestDate: data.requestDate,
       startTime: data.startTime || undefined,
       endTime: data.endTime || undefined,
@@ -11329,7 +11401,7 @@ export class StoresService {
         // relations: ['approvedBy', 'approvedBy.account'],
       });
     } catch (e: any) {
-      throw new BadRequestException("DEBUG ERROR: " + e.message);
+      throw new BadRequestException('DEBUG ERROR: ' + e.message);
     }
   }
 
@@ -11596,8 +11668,14 @@ export class StoresService {
   async checkInWithFace(
     assignmentId: string,
     imageBuffer: Buffer,
-    options?: { latitude?: number; longitude?: number; qrStoreId?: string },
+    options?: {
+      latitude?: number;
+      longitude?: number;
+      qrStoreId?: string;
+      orientationNormalized?: boolean;
+    },
   ) {
+    const requestStartedAt = Date.now();
     const assignment = await this.shiftAssignmentRepository.findOne({
       where: { id: assignmentId },
       relations: [
@@ -11608,8 +11686,16 @@ export class StoresService {
       ],
     });
     if (!assignment) throw new NotFoundException('Shift assignment not found');
-    if (assignment.checkInTime)
-      throw new BadRequestException('Already checked in');
+    if (assignment.checkInTime) {
+      return {
+        matched: true,
+        alreadyRecorded: true,
+        lateMinutes: assignment.lateMinutes,
+        attendanceStatus: assignment.attendanceStatus,
+        checkInTime: assignment.checkInTime.toISOString(),
+        gpsDistance: null,
+      };
+    }
     if (assignment.status !== ShiftAssignmentStatus.APPROVED) {
       throw new BadRequestException(
         'Ca làm việc chưa được chấp thuận. Vui lòng chờ chủ cửa hàng duyệt.',
@@ -11638,8 +11724,11 @@ export class StoresService {
       );
     }
 
-    const descriptor =
-      await this.faceRecognitionService.extractDescriptor(imageBuffer);
+    const faceStartedAt = Date.now();
+    const descriptor = await this.faceRecognitionService.extractDescriptor(
+      imageBuffer,
+      options?.orientationNormalized ? { rotations: [0] } : undefined,
+    );
     if (!descriptor) {
       return { matched: false, message: 'No face detected in image' };
     }
@@ -11704,12 +11793,60 @@ export class StoresService {
     const attendanceStatus =
       lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
 
-    // Update assignment
-    assignment.checkInTime = now;
-    assignment.lateMinutes = lateMinutes;
-    assignment.attendanceStatus = attendanceStatus;
-    assignment.status = ShiftAssignmentStatus.CONFIRMED;
-    await this.shiftAssignmentRepository.save(assignment);
+    const persistence = await this.dataSource.transaction(async (manager) => {
+      const updateResult = await manager
+        .createQueryBuilder()
+        .update(ShiftAssignment)
+        .set({
+          checkInTime: now,
+          lateMinutes,
+          attendanceStatus,
+          status: ShiftAssignmentStatus.CONFIRMED,
+        })
+        .where('id = :assignmentId', { assignmentId })
+        .andWhere('check_in_time IS NULL')
+        .andWhere('status = :approvedStatus', {
+          approvedStatus: ShiftAssignmentStatus.APPROVED,
+        })
+        .execute();
+
+      if (!updateResult.affected) {
+        const existing = await manager.findOne(ShiftAssignment, {
+          where: { id: assignmentId },
+        });
+        if (existing?.checkInTime) {
+          return { recorded: false, assignment: existing };
+        }
+        throw new BadRequestException('Unable to check in this assignment');
+      }
+
+      const checkInLog = manager.create(AttendanceLog, {
+        shiftAssignmentId: assignmentId,
+        employeeProfileId: assignment.employeeId,
+        storeId: storeId ?? '',
+        type: AttendanceLogType.CHECK_IN,
+        timestamp: now,
+        method: AttendanceMethod.FACE,
+        faceMatchScore: matchResult.distance,
+        checkinLatitude: checkinLatitude ?? undefined,
+        checkinLongitude: checkinLongitude ?? undefined,
+        checkinDistance: checkinDistance ?? undefined,
+      });
+      await manager.save(AttendanceLog, checkInLog);
+      return { recorded: true, assignment: null };
+    });
+
+    if (!persistence.recorded && persistence.assignment) {
+      return {
+        matched: true,
+        alreadyRecorded: true,
+        distance: matchResult.distance,
+        lateMinutes: persistence.assignment.lateMinutes,
+        attendanceStatus: persistence.assignment.attendanceStatus,
+        checkInTime: persistence.assignment.checkInTime.toISOString(),
+        gpsDistance: null,
+      };
+    }
 
     // Fix 2: Sync workingStatus → WORKING
     try {
@@ -11717,28 +11854,19 @@ export class StoresService {
         workingStatus: WorkingStatus.WORKING,
       });
     } catch (err) {
-      this.logger.warn(`[CheckIn] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger.warn(
+        `[CheckIn] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
-
-    // Create audit log with GPS data
-    const checkInLog = new AttendanceLog();
-    checkInLog.shiftAssignmentId = assignmentId;
-    checkInLog.employeeProfileId = assignment.employeeId;
-    checkInLog.storeId = storeId ?? '';
-    checkInLog.type = AttendanceLogType.CHECK_IN;
-    checkInLog.timestamp = now;
-    checkInLog.method = AttendanceMethod.FACE;
-    checkInLog.faceMatchScore = matchResult.distance;
-    if (checkinLatitude != null) checkInLog.checkinLatitude = checkinLatitude;
-    if (checkinLongitude != null)
-      checkInLog.checkinLongitude = checkinLongitude;
-    if (checkinDistance != null) checkInLog.checkinDistance = checkinDistance;
-    await this.attendanceLogRepository.save(checkInLog);
 
     // Ghi nhận đi trễ vào DailyEmployeeReport
     if (lateMinutes > 0 && storeId) {
       this.appendToDailyReport(storeId, 'lateArrivals', assignment.employeeId);
     }
+
+    this.logger.log(
+      `[AttendanceTiming] mode=check-in assignment=${assignmentId} face=${Date.now() - faceStartedAt}ms total=${Date.now() - requestStartedAt}ms`,
+    );
 
     return {
       matched: true,
@@ -11753,8 +11881,14 @@ export class StoresService {
   async checkOutWithFace(
     assignmentId: string,
     imageBuffer: Buffer,
-    options?: { latitude?: number; longitude?: number; qrStoreId?: string },
+    options?: {
+      latitude?: number;
+      longitude?: number;
+      qrStoreId?: string;
+      orientationNormalized?: boolean;
+    },
   ) {
+    const requestStartedAt = Date.now();
     const assignment = await this.shiftAssignmentRepository.findOne({
       where: { id: assignmentId },
       relations: [
@@ -11767,8 +11901,20 @@ export class StoresService {
     if (!assignment) throw new NotFoundException('Shift assignment not found');
     if (!assignment.checkInTime)
       throw new BadRequestException('Must check in first');
-    if (assignment.checkOutTime)
-      throw new BadRequestException('Already checked out');
+    if (assignment.checkOutTime) {
+      return {
+        matched: true,
+        alreadyRecorded: true,
+        earlyMinutes: assignment.earlyMinutes,
+        workedMinutes: assignment.workedMinutes,
+        attendanceStatus: assignment.attendanceStatus,
+        checkOutTime: assignment.checkOutTime.toISOString(),
+        gpsDistance: null,
+        shiftEarnings: assignment.shiftEarnings ?? null,
+        netSalary: null,
+        payrollProcessing: true,
+      };
+    }
 
     const storeId = assignment.shiftSlot?.cycle?.storeId;
 
@@ -11790,8 +11936,11 @@ export class StoresService {
       throw new BadRequestException('Face not registered');
     }
 
-    const descriptor =
-      await this.faceRecognitionService.extractDescriptor(imageBuffer);
+    const faceStartedAt = Date.now();
+    const descriptor = await this.faceRecognitionService.extractDescriptor(
+      imageBuffer,
+      options?.orientationNormalized ? { rotations: [0] } : undefined,
+    );
     if (!descriptor) {
       return { matched: false, message: 'No face detected in image' };
     }
@@ -11866,84 +12015,63 @@ export class StoresService {
       attendanceStatus = AttendanceStatus.EARLY;
     }
 
-    // Update assignment
-    assignment.checkOutTime = now;
-    assignment.earlyMinutes = earlyMinutes;
-    assignment.workedMinutes = workedMinutes;
-    assignment.attendanceStatus = attendanceStatus;
-    assignment.status = ShiftAssignmentStatus.COMPLETED;
+    const persistence = await this.dataSource.transaction(async (manager) => {
+      const updateResult = await manager
+        .createQueryBuilder()
+        .update(ShiftAssignment)
+        .set({
+          checkOutTime: now,
+          earlyMinutes,
+          workedMinutes,
+          attendanceStatus,
+          status: ShiftAssignmentStatus.COMPLETED,
+        })
+        .where('id = :assignmentId', { assignmentId })
+        .andWhere('check_out_time IS NULL')
+        .andWhere('check_in_time IS NOT NULL')
+        .execute();
 
-    // ===== Real-time Payroll: Calculate shift earnings =====
-    let shiftEarnings: number | null = null;
-    try {
-      const employeeProfile = await this.profileRepository.findOne({
-        where: { id: assignment.employeeId },
-        relations: ['contracts'],
-      });
-      const activeContract = employeeProfile?.contracts?.find(
-        (c) => c.isActive,
-      );
-
-      if (activeContract) {
-        const baseSalary = Number(activeContract.salaryAmount) || 0;
-        const workedHours = workedMinutes / 60;
-
-        switch (activeContract.paymentType) {
-          case PaymentType.HOUR:
-            shiftEarnings = Math.round(baseSalary * workedHours);
-            break;
-          case PaymentType.SHIFT:
-            shiftEarnings = baseSalary;
-            break;
-          case PaymentType.DAY:
-            shiftEarnings = baseSalary;
-            break;
-          case PaymentType.WEEK:
-            shiftEarnings = Math.round(baseSalary / 6); // 6 working days per week
-            break;
-          case PaymentType.MONTH: {
-            // Actual days in the current month
-            const daysInMonth = new Date(
-              now.getFullYear(),
-              now.getMonth() + 1,
-              0,
-            ).getDate();
-            shiftEarnings = Math.round(baseSalary / daysInMonth);
-            break;
-          }
-          default:
-            shiftEarnings = null;
+      if (!updateResult.affected) {
+        const existing = await manager.findOne(ShiftAssignment, {
+          where: { id: assignmentId },
+        });
+        if (existing?.checkOutTime) {
+          return { recorded: false, assignment: existing };
         }
-
-        if (shiftEarnings != null) {
-          assignment.shiftEarnings = shiftEarnings;
-        }
-        this.logger.debug(
-          `[CheckOut] Earnings: ${shiftEarnings}đ (type=${activeContract.paymentType}, base=${baseSalary})`,
-        );
+        throw new BadRequestException('Unable to check out this assignment');
       }
-    } catch (err) {
-      this.logger.warn(
-        `[CheckOut] Earnings calc failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+
+      const checkOutLog = manager.create(AttendanceLog, {
+        shiftAssignmentId: assignmentId,
+        employeeProfileId: assignment.employeeId,
+        storeId: storeId ?? '',
+        type: AttendanceLogType.CHECK_OUT,
+        timestamp: now,
+        method: AttendanceMethod.FACE,
+        faceMatchScore: matchResult.distance,
+        checkinLatitude: checkinLatitude ?? undefined,
+        checkinLongitude: checkinLongitude ?? undefined,
+        checkinDistance: checkinDistance ?? undefined,
+      });
+      await manager.save(AttendanceLog, checkOutLog);
+      return { recorded: true, assignment: null };
+    });
+
+    if (!persistence.recorded && persistence.assignment) {
+      return {
+        matched: true,
+        alreadyRecorded: true,
+        distance: matchResult.distance,
+        earlyMinutes: persistence.assignment.earlyMinutes,
+        workedMinutes: persistence.assignment.workedMinutes,
+        attendanceStatus: persistence.assignment.attendanceStatus,
+        checkOutTime: persistence.assignment.checkOutTime.toISOString(),
+        gpsDistance: null,
+        shiftEarnings: persistence.assignment.shiftEarnings ?? null,
+        netSalary: null,
+        payrollProcessing: true,
+      };
     }
-
-    await this.shiftAssignmentRepository.save(assignment);
-
-    // Create audit log with GPS data
-    const checkOutLog = new AttendanceLog();
-    checkOutLog.shiftAssignmentId = assignmentId;
-    checkOutLog.employeeProfileId = assignment.employeeId;
-    checkOutLog.storeId = storeId ?? '';
-    checkOutLog.type = AttendanceLogType.CHECK_OUT;
-    checkOutLog.timestamp = now;
-    checkOutLog.method = AttendanceMethod.FACE;
-    checkOutLog.faceMatchScore = matchResult.distance;
-    if (checkinLatitude != null) checkOutLog.checkinLatitude = checkinLatitude;
-    if (checkinLongitude != null)
-      checkOutLog.checkinLongitude = checkinLongitude;
-    if (checkinDistance != null) checkOutLog.checkinDistance = checkinDistance;
-    await this.attendanceLogRepository.save(checkOutLog);
 
     // Ghi nhận về sớm vào DailyEmployeeReport
     if (earlyMinutes > 0 && storeId) {
@@ -11960,223 +12088,14 @@ export class StoresService {
         workingStatus: WorkingStatus.IDLE,
       });
     } catch (err) {
-      this.logger.warn(`[CheckOut] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-
-    // ===== Fix 1: Real-time MonthlySummary Update =====
-    try {
-      const monthDate = new Date(now.getFullYear(), now.getMonth(), 1);
-      let summary = await this.monthlySummaryRepository.findOne({
-        where: { employeeProfileId: assignment.employeeId, month: monthDate },
-      });
-      if (!summary) {
-        const employeeForSummary = await this.profileRepository.findOne({
-          where: { id: assignment.employeeId },
-          relations: ['contracts'],
-        });
-        const contractForSummary = employeeForSummary?.contracts?.find(
-          (c) => c.isActive,
-        );
-        summary = this.monthlySummaryRepository.create({
-          employeeProfileId: assignment.employeeId,
-          month: monthDate,
-          baseSalary: contractForSummary?.salaryAmount || 0,
-        });
-      }
-      summary.completedShifts = (summary.completedShifts || 0) + 1;
-      summary.monthlyWorkHours =
-        Number(summary.monthlyWorkHours || 0) + workedMinutes / 60;
-      if (assignment.lateMinutes > 0) {
-        summary.lateArrivalsCount = (summary.lateArrivalsCount || 0) + 1;
-      } else {
-        // Fix: onTimeArrivalsCount — tăng khi đi đúng giờ
-        summary.onTimeArrivalsCount = (summary.onTimeArrivalsCount || 0) + 1;
-      }
-      if (earlyMinutes > 0)
-        summary.earlyDeparturesCount = (summary.earlyDeparturesCount || 0) + 1;
-      if (shiftEarnings != null) {
-        summary.estimatedSalary =
-          Number(summary.estimatedSalary || 0) + shiftEarnings;
-      }
-
-      // Fix: totalWorkHours & totalCompletedShifts — tích lũy xuyên tháng
-      summary.totalWorkHours =
-        Number(summary.totalWorkHours || 0) + workedMinutes / 60;
-      summary.totalCompletedShifts = (summary.totalCompletedShifts || 0) + 1;
-
-      // Fix: performanceScore — tự động tính = (onTimeArrivals / completedShifts) * 100
-      if (summary.completedShifts > 0) {
-        summary.performanceScore = Math.round(
-          ((summary.onTimeArrivalsCount || 0) / summary.completedShifts) * 100,
-        );
-      }
-
-      await this.monthlySummaryRepository.save(summary);
-      this.logger.debug(
-        `[CheckOut] MonthlySummary updated: shifts=${summary.completedShifts}, onTime=${summary.onTimeArrivalsCount}, totalHours=${summary.totalWorkHours}, perf=${summary.performanceScore}%`,
-      );
-    } catch (err) {
       this.logger.warn(
-        `[CheckOut] MonthlySummary update failed: ${err instanceof Error ? err.message : String(err)}`,
+        `[CheckOut] workingStatus sync failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
 
-    // ===== Fix 5: Real-time EmployeeSalary + netSalary =====
-    let netSalaryResult: number | null = null;
-    try {
-      const monthDate = new Date(now.getFullYear(), now.getMonth(), 1);
-      const nextMonthDate = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-
-      // 1. Load employee profile + contract (reuse if already loaded)
-      const employeeForSalary = await this.profileRepository.findOne({
-        where: { id: assignment.employeeId },
-        relations: ['contracts'],
-      });
-      const activeContractForSalary = employeeForSalary?.contracts?.find(
-        (c) => c.isActive,
-      );
-
-      if (activeContractForSalary && storeId) {
-        const currentBaseSalary =
-          Number(activeContractForSalary.salaryAmount) || 0;
-        const paymentType =
-          activeContractForSalary.paymentType || PaymentType.MONTH;
-
-        // 2. Allowances from contract
-        const allowancesMap = activeContractForSalary.allowances || {};
-        const allowancesTotal = Object.values(allowancesMap).reduce(
-          (sum, v) => sum + Number(v || 0),
-          0,
-        );
-
-        // 3. Re-aggregate attendance
-        const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
-          assignment.employeeId,
-          storeId,
-          monthDate,
-          nextMonthDate,
-        );
-
-        const payrollSetting = await this.payrollSettingRepository.findOne({
-          where: { storeId, isActive: true },
-        });
-
-        const calculatedSalary = this.calculateBaseSalary(
-          currentBaseSalary,
-          paymentType,
-          attendanceSummary,
-          payrollSetting,
-          now,
-        );
-
-        // 5. Apply PayrollRules
-        const payrollRules = await this.payrollRuleRepository.find({
-          where: { storeId, isActive: true },
-        });
-        let bonus = 0,
-          penalty = 0;
-        for (const rule of payrollRules) {
-          if (rule.category === PayrollRuleCategory.FINE) {
-            if (rule.ruleType === 'LATE' && attendanceSummary.lateCount > 0) {
-              penalty +=
-                rule.calcType === PayrollCalcType.AMOUNT
-                  ? Number(rule.value) * attendanceSummary.lateCount
-                  : ((calculatedSalary * Number(rule.value)) / 100) *
-                    attendanceSummary.lateCount;
-            }
-            if (rule.ruleType === 'EARLY' && attendanceSummary.earlyCount > 0) {
-              penalty +=
-                rule.calcType === PayrollCalcType.AMOUNT
-                  ? Number(rule.value) * attendanceSummary.earlyCount
-                  : ((calculatedSalary * Number(rule.value)) / 100) *
-                    attendanceSummary.earlyCount;
-            }
-            if (
-              rule.ruleType === 'ABSENT' &&
-              attendanceSummary.absentCount > 0
-            ) {
-              penalty += Number(rule.value) * attendanceSummary.absentCount;
-            }
-          } else if (rule.category === PayrollRuleCategory.BONUS) {
-            if (
-              rule.ruleType === 'ATTENDANCE' &&
-              attendanceSummary.lateCount === 0 &&
-              attendanceSummary.absentCount === 0
-            ) {
-              bonus += Number(rule.value);
-            }
-            if (!rule.ruleType || rule.ruleType === 'GENERAL') {
-              bonus += Number(rule.value);
-            }
-          }
-        }
-
-        // 6. Calculate totals
-        const totalIncome = Math.round(
-          calculatedSalary + allowancesTotal + bonus,
-        );
-        const totalDeductions = Math.round(penalty);
-        const netSalary = Math.max(0, totalIncome - totalDeductions);
-        netSalaryResult = netSalary;
-
-        // 7. Upsert EmployeeSalary — ensure a MonthlyPayroll exists first so
-        // this record is never "orphaned" (monthlyPayrollId null), which
-        // previously made it invisible to getEmployeeSalariesByStore /
-        // getPayrollSummary until the monthly cron happened to run.
-        const payrollForMonth = await this.findOrCreateMonthlyPayroll(
-          storeId,
-          monthDate,
-        );
-
-        let salary = await this.employeeSalaryRepository.findOne({
-          where: { employeeProfileId: assignment.employeeId, month: monthDate },
-        });
-
-        // Never overwrite a salary that's already been approved or paid.
-        if (
-          salary &&
-          [PaymentStatus.APPROVED, PaymentStatus.PAID].includes(
-            salary.paymentStatus,
-          )
-        ) {
-          netSalaryResult = Number(salary.netSalary) || 0;
-          this.logger.debug(
-            `[CheckOut] Skipped real-time salary update — already ${salary.paymentStatus}`,
-          );
-        } else {
-          if (!salary) {
-            salary = this.employeeSalaryRepository.create({
-              employeeProfileId: assignment.employeeId,
-              month: monthDate,
-              monthlyPayrollId: payrollForMonth.id,
-            });
-          } else if (!salary.monthlyPayrollId) {
-            salary.monthlyPayrollId = payrollForMonth.id;
-          }
-          salary.baseSalary = currentBaseSalary;
-          salary.paymentType = paymentType;
-          salary.allowances = allowancesMap;
-          salary.workingDays = attendanceSummary.completedShifts;
-          salary.workingHours = attendanceSummary.workingHours;
-          salary.unauthorizedLeaveDays = attendanceSummary.absentCount;
-          salary.bonus = bonus;
-          salary.penalty = penalty;
-          salary.totalIncome = totalIncome;
-          salary.totalDeductions = totalDeductions;
-          salary.netSalary = netSalary;
-          salary.earnedBaseSalary = calculatedSalary;
-          await this.employeeSalaryRepository.save(salary);
-
-          this.logger.debug(
-            `[CheckOut] Real-time salary: income=${totalIncome}, deductions=${totalDeductions}, net=${netSalary}`,
-          );
-        }
-      }
-    } catch (err) {
-      this.logger.warn(
-        `[CheckOut] Real-time salary update failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+    this.logger.log(
+      `[AttendanceTiming] mode=check-out assignment=${assignmentId} face=${Date.now() - faceStartedAt}ms total=${Date.now() - requestStartedAt}ms`,
+    );
 
     return {
       matched: true,
@@ -12186,9 +12105,249 @@ export class StoresService {
       attendanceStatus,
       checkOutTime: now.toISOString(),
       gpsDistance: checkinDistance != null ? Math.round(checkinDistance) : null,
-      shiftEarnings,
-      netSalary: netSalaryResult,
+      shiftEarnings: null,
+      netSalary: null,
+      payrollProcessing: true,
     };
+  }
+
+  async processCheckoutPayroll(assignmentId: string): Promise<void> {
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      where: { id: assignmentId },
+      relations: [
+        'shiftSlot',
+        'shiftSlot.cycle',
+        'employee',
+        'employee.contracts',
+      ],
+    });
+
+    if (
+      !assignment ||
+      assignment.status !== ShiftAssignmentStatus.COMPLETED ||
+      !assignment.checkOutTime
+    ) {
+      this.logger.warn(
+        `[CheckoutPayroll] Skipping incomplete assignment ${assignmentId}`,
+      );
+      return;
+    }
+
+    const storeId = assignment.shiftSlot?.cycle?.storeId;
+    if (!storeId) {
+      this.logger.warn(
+        `[CheckoutPayroll] Assignment ${assignmentId} has no store`,
+      );
+      return;
+    }
+
+    const checkoutTime = new Date(assignment.checkOutTime);
+    const activeContract = assignment.employee?.contracts?.find(
+      (contract) => contract.isActive,
+    );
+
+    if (activeContract) {
+      const baseSalary = Number(activeContract.salaryAmount) || 0;
+      const workedHours = Number(assignment.workedMinutes || 0) / 60;
+      let shiftEarnings: number | null = null;
+
+      switch (activeContract.paymentType) {
+        case PaymentType.HOUR:
+          shiftEarnings = Math.round(baseSalary * workedHours);
+          break;
+        case PaymentType.SHIFT:
+        case PaymentType.DAY:
+          shiftEarnings = baseSalary;
+          break;
+        case PaymentType.WEEK:
+          shiftEarnings = Math.round(baseSalary / 6);
+          break;
+        case PaymentType.MONTH: {
+          const daysInMonth = new Date(
+            checkoutTime.getFullYear(),
+            checkoutTime.getMonth() + 1,
+            0,
+          ).getDate();
+          shiftEarnings = Math.round(baseSalary / daysInMonth);
+          break;
+        }
+      }
+
+      if (shiftEarnings != null && assignment.shiftEarnings !== shiftEarnings) {
+        assignment.shiftEarnings = shiftEarnings;
+        await this.shiftAssignmentRepository.save(assignment);
+      }
+    }
+
+    const monthDate = new Date(
+      checkoutTime.getFullYear(),
+      checkoutTime.getMonth(),
+      1,
+    );
+    const nextMonthDate = new Date(
+      checkoutTime.getFullYear(),
+      checkoutTime.getMonth() + 1,
+      1,
+    );
+    const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
+      assignment.employeeId,
+      storeId,
+      monthDate,
+      nextMonthDate,
+    );
+
+    const cumulative = await this.shiftAssignmentRepository
+      .createQueryBuilder('assignment')
+      .select('COUNT(assignment.id)', 'completedShifts')
+      .addSelect(
+        'COALESCE(SUM(assignment.workedMinutes), 0)',
+        'workedMinutes',
+      )
+      .where('assignment.employeeId = :employeeId', {
+        employeeId: assignment.employeeId,
+      })
+      .andWhere('assignment.status = :status', {
+        status: ShiftAssignmentStatus.COMPLETED,
+      })
+      .getRawOne<{ completedShifts: string; workedMinutes: string }>();
+
+    const onTimeArrivalsCount = Math.max(
+      0,
+      attendanceSummary.completedShifts - attendanceSummary.lateCount,
+    );
+    const performanceScore = attendanceSummary.completedShifts
+      ? Math.round(
+          (onTimeArrivalsCount / attendanceSummary.completedShifts) * 100,
+        )
+      : 0;
+    await this.monthlySummaryRepository.upsert(
+      {
+        employeeProfileId: assignment.employeeId,
+        month: monthDate,
+        totalShifts: attendanceSummary.totalAssignedShifts,
+        completedShifts: attendanceSummary.completedShifts,
+        monthlyWorkHours: attendanceSummary.workingHours,
+        lateArrivalsCount: attendanceSummary.lateCount,
+        onTimeArrivalsCount,
+        earlyDeparturesCount: attendanceSummary.earlyCount,
+        unauthorizedLeavesCount: attendanceSummary.absentCount,
+        estimatedSalary: attendanceSummary.totalShiftEarnings,
+        baseSalary: Number(activeContract?.salaryAmount) || 0,
+        performanceScore,
+        totalCompletedShifts: Number(cumulative?.completedShifts || 0),
+        totalWorkHours: Number(cumulative?.workedMinutes || 0) / 60,
+      },
+      ['employeeProfileId', 'month'],
+    );
+
+    if (!activeContract) return;
+
+    const payrollSetting = await this.payrollSettingRepository.findOne({
+      where: { storeId, isActive: true },
+    });
+    const calculatedSalary = this.calculateBaseSalary(
+      Number(activeContract.salaryAmount) || 0,
+      activeContract.paymentType || PaymentType.MONTH,
+      attendanceSummary,
+      payrollSetting,
+      checkoutTime,
+    );
+    const payrollRules = await this.payrollRuleRepository.find({
+      where: { storeId, isActive: true },
+    });
+    let bonus = 0;
+    let penalty = 0;
+    for (const rule of payrollRules) {
+      if (rule.category === PayrollRuleCategory.FINE) {
+        if (rule.ruleType === 'LATE' && attendanceSummary.lateCount > 0) {
+          penalty +=
+            rule.calcType === PayrollCalcType.AMOUNT
+              ? Number(rule.value) * attendanceSummary.lateCount
+              : ((calculatedSalary * Number(rule.value)) / 100) *
+                attendanceSummary.lateCount;
+        }
+        if (rule.ruleType === 'EARLY' && attendanceSummary.earlyCount > 0) {
+          penalty +=
+            rule.calcType === PayrollCalcType.AMOUNT
+              ? Number(rule.value) * attendanceSummary.earlyCount
+              : ((calculatedSalary * Number(rule.value)) / 100) *
+                attendanceSummary.earlyCount;
+        }
+        if (rule.ruleType === 'ABSENT' && attendanceSummary.absentCount > 0) {
+          penalty += Number(rule.value) * attendanceSummary.absentCount;
+        }
+      } else if (rule.category === PayrollRuleCategory.BONUS) {
+        if (
+          rule.ruleType === 'ATTENDANCE' &&
+          attendanceSummary.lateCount === 0 &&
+          attendanceSummary.absentCount === 0
+        ) {
+          bonus += Number(rule.value);
+        }
+        if (!rule.ruleType || rule.ruleType === 'GENERAL') {
+          bonus += Number(rule.value);
+        }
+      }
+    }
+
+    const allowances = activeContract.allowances || {};
+    const allowancesTotal = Object.values(allowances).reduce(
+      (sum, value) => sum + Number(value || 0),
+      0,
+    );
+    const totalIncome = Math.round(calculatedSalary + allowancesTotal + bonus);
+    const totalDeductions = Math.round(penalty);
+    const netSalary = Math.max(0, totalIncome - totalDeductions);
+    const payroll = await this.findOrCreateMonthlyPayroll(storeId, monthDate);
+    const existingSalary = await this.employeeSalaryRepository.findOne({
+      where: { employeeProfileId: assignment.employeeId, month: monthDate },
+    });
+
+    if (
+      !existingSalary ||
+      ![PaymentStatus.APPROVED, PaymentStatus.PAID].includes(
+        existingSalary.paymentStatus,
+      )
+    ) {
+      await this.employeeSalaryRepository.upsert(
+        {
+          employeeProfileId: assignment.employeeId,
+          month: monthDate,
+          monthlyPayrollId: payroll.id,
+          baseSalary: Number(activeContract.salaryAmount) || 0,
+          paymentType: activeContract.paymentType,
+          allowances,
+          workingDays: attendanceSummary.completedShifts,
+          workingHours: attendanceSummary.workingHours,
+          unauthorizedLeaveDays: attendanceSummary.absentCount,
+          bonus,
+          penalty,
+          totalIncome,
+          totalDeductions,
+          netSalary,
+          earnedBaseSalary: calculatedSalary,
+        },
+        ['employeeProfileId', 'month'],
+      );
+    }
+
+    const totals = await this.employeeSalaryRepository
+      .createQueryBuilder('salary')
+      .select('COALESCE(SUM(salary.netSalary), 0)', 'estimatedPayment')
+      .addSelect('COALESCE(SUM(salary.bonus), 0)', 'totalBonus')
+      .addSelect('COALESCE(SUM(salary.penalty), 0)', 'totalPenalty')
+      .where('salary.monthlyPayrollId = :payrollId', { payrollId: payroll.id })
+      .getRawOne<{
+        estimatedPayment: string;
+        totalBonus: string;
+        totalPenalty: string;
+      }>();
+    await this.payrollRepository.update(payroll.id, {
+      estimatedPayment: Number(totals?.estimatedPayment || 0),
+      totalBonus: Number(totals?.totalBonus || 0),
+      totalPenalty: Number(totals?.totalPenalty || 0),
+      totalPendingApproval: Number(totals?.estimatedPayment || 0),
+    });
   }
 
   /**
@@ -12554,7 +12713,9 @@ export class StoresService {
       .leftJoinAndSelect('slot.workShift', 'ws')
       .leftJoinAndSelect('slot.cycle', 'cycle')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
-      .andWhere('a.status = :status', { status: ShiftAssignmentStatus.CONFIRMED })
+      .andWhere('a.status = :status', {
+        status: ShiftAssignmentStatus.CONFIRMED,
+      })
       .andWhere('a.checkOutTime IS NULL')
       .andWhere('cycle.storeId = :storeId', { storeId })
       .orderBy('a.checkInTime', 'DESC')
@@ -12889,7 +13050,9 @@ export class StoresService {
       // must not keep inflating the pending-approval badge.
       where.shiftSlot = {
         workShift: { storeId: filters.storeId },
-        cycle: { status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]) },
+        cycle: {
+          status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]),
+        },
       };
     }
     if (filters.status) where.status = filters.status;

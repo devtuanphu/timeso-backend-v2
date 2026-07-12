@@ -8,6 +8,9 @@ export enum NotificationType {
   SHIFT_APPROVAL = 'Duyệt ca',
   STAFF_SHORTAGE = 'Thiếu nhân viên',
   SHIFT_REMINDER = 'Nhắc ca làm',
+  SHIFT_CHECKOUT_REMINDER = 'Nhắc chấm công ra',
+  SHIFT_AUTO_CHECKOUT = 'Tự động kết thúc ca',
+  OVERTIME_REQUEST_STATUS = 'Trạng thái tăng ca',
 }
 
 export enum NotificationPriority {

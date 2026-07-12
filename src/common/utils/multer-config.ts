@@ -26,6 +26,24 @@ export const multerConfig = {
   },
 };
 
+export const attendanceMulterConfig = {
+  storage: memoryStorage(),
+  limits: {
+    fileSize: 1024 * 1024,
+    files: 1,
+    parts: 8,
+  },
+  fileFilter: (req, file, callback) => {
+    if (!['image/jpeg', 'image/png'].includes(file.mimetype)) {
+      return callback(
+        new Error('Only JPEG and PNG images are allowed!'),
+        false,
+      );
+    }
+    callback(null, true);
+  },
+};
+
 export const imageFileFilter = (req, file, callback) => {
   if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/)) {
     return callback(new Error('Only image files are allowed!'), false);

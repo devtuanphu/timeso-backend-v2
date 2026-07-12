@@ -243,6 +243,15 @@ export class ShiftAssignment extends BaseEntity {
     comment: 'Calculated earnings for this shift based on contract type',
   })
   shiftEarnings: number;
+
+  @Column({ name: 'is_auto_checkout', default: false })
+  isAutoCheckout: boolean;
+
+  @Column({ name: 'auto_checkout_reason', nullable: true })
+  autoCheckoutReason: string | null;
+
+  @Column({ name: 'scheduled_checkout_time', type: 'timestamptz', nullable: true })
+  scheduledCheckoutTime: Date | null;
 }
 
 @Entity('shift_swaps')

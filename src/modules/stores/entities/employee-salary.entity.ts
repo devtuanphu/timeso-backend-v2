@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, Unique } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { EmployeeProfile } from './employee-profile.entity';
 import { MonthlyPayroll } from './monthly-payroll.entity';
@@ -11,6 +11,7 @@ export enum PaymentStatus {
 }
 
 @Entity('employee_salaries')
+@Unique(['employeeProfileId', 'month'])
 export class EmployeeSalary extends BaseEntity {
   @Column({ name: 'employee_profile_id' })
   employeeProfileId: string;

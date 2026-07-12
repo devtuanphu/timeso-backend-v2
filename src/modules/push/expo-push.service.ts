@@ -7,6 +7,9 @@ interface PushMessage {
   data?: Record<string, any>;
   sound?: string;
   badge?: number;
+  categoryId?: string;
+  priority?: 'default' | 'normal' | 'high';
+  channelId?: string;
 }
 
 interface PushTicket {
@@ -58,6 +61,9 @@ export class ExpoPushService {
     title: string;
     body: string;
     data?: Record<string, any>;
+    categoryId?: string;
+    priority?: 'default' | 'normal' | 'high';
+    channelId?: string;
   }): Promise<void> {
     this.logger.log(`📤 Sending push to ${tokens.length} device(s)...`);
     this.logger.log(`Tokens: ${JSON.stringify(tokens)}`);
@@ -69,6 +75,9 @@ export class ExpoPushService {
       body: notification.body,
       data: notification.data,
       sound: 'default',
+      categoryId: notification.categoryId,
+      priority: notification.priority,
+      channelId: notification.channelId,
     }));
 
     // Send in batches of 100 (Expo limit)

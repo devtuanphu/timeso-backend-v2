@@ -93,6 +93,10 @@ import { BullModule } from '@nestjs/bullmq';
 import { ShiftReminderService } from './shift-reminder.service';
 import { ShiftReminderProcessor } from './shift-reminder.processor';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { AttendanceBackgroundProcessor } from './attendance-background.processor';
+import { ShiftEndWorkflow } from './entities/shift-end-workflow.entity';
+import { ShiftEndWorkflowService } from './shift-end-workflow.service';
+import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
 
 @Module({
   imports: [
@@ -167,6 +171,7 @@ import { NotificationsModule } from '../notifications/notifications.module';
       ShiftChangeRequest,
       BonusWorkRequest,
       CronLock,
+      ShiftEndWorkflow,
     ]),
 
     AccountsModule,
@@ -175,6 +180,12 @@ import { NotificationsModule } from '../notifications/notifications.module';
     ScheduleModule.forRoot(),
     BullModule.registerQueue({
       name: 'shift-reminders',
+    }),
+    BullModule.registerQueue({
+      name: 'attendance-background',
+    }),
+    BullModule.registerQueue({
+      name: 'shift-end-workflows',
     }),
   ],
   controllers: [
@@ -190,12 +201,16 @@ import { NotificationsModule } from '../notifications/notifications.module';
     ShiftAggregationService,
     ShiftReminderService,
     ShiftReminderProcessor,
+    AttendanceBackgroundProcessor,
+    ShiftEndWorkflowService,
+    ShiftEndWorkflowProcessor,
   ],
   exports: [
     StoresService,
     DistributedLockService,
     ShiftAggregationService,
     ShiftReminderService,
+    ShiftEndWorkflowService,
   ],
 })
 export class StoresModule {}
