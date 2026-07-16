@@ -9,6 +9,7 @@ import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { AccountsService } from '../accounts/accounts.service';
+import { ShiftReminderService } from './shift-reminder.service';
 
 // Import all entities
 import { Store } from './entities/store.entity';
@@ -20,6 +21,7 @@ import {
   EmployeeContract,
   PaymentType,
 } from './entities/employee-contract.entity';
+import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
 import {
   ShiftAssignment,
@@ -84,18 +86,18 @@ function mockDataSource() {
         delete: jest.fn().mockResolvedValue({ affected: 1 }),
         update: jest.fn().mockResolvedValue({ affected: 1 }),
         decrement: jest.fn().mockResolvedValue({ affected: 1 }),
-        createQueryBuilder: () => ({
-          delete: () => ({
-            execute: jest.fn().mockResolvedValue({ affected: 0 }),
-          }),
-          from: () => ({
-            where: () => ({
-              execute: jest.fn().mockResolvedValue({ affected: 0 }),
-            }),
-          }),
-          where: jest.fn().mockReturnThis(),
-          execute: jest.fn().mockResolvedValue({ affected: 0 }),
-        }),
+        createQueryBuilder: () => {
+          const queryBuilder: any = {
+            update: jest.fn().mockReturnThis(),
+            set: jest.fn().mockReturnThis(),
+            where: jest.fn().mockReturnThis(),
+            andWhere: jest.fn().mockReturnThis(),
+            execute: jest.fn().mockResolvedValue({ affected: 1 }),
+            delete: jest.fn().mockReturnThis(),
+            from: jest.fn().mockReturnThis(),
+          };
+          return queryBuilder;
+        },
       }),
     ),
   };
@@ -183,6 +185,7 @@ const ENTITIES = [
   EmployeeProfile,
   EmployeeProfileRole,
   EmployeeContract,
+  ContractTemplate,
   WorkShift,
   Asset,
   Product,
@@ -720,6 +723,13 @@ describe('StoresService - Check-in/Check-out Integration', () => {
           },
         },
         { provide: DataSource, useValue: dataSourceMock },
+        {
+          provide: ShiftReminderService,
+          useValue: {
+            syncEmployeeReminders: jest.fn(),
+            scheduleReminder: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -736,7 +746,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       ).rejects.toThrow(NotFoundException);
     });
 
-    it('should reject if already checked in', async () => {
+    it('should return the existing result if already checked in', async () => {
       shiftAssignmentRepo.findOne.mockResolvedValue({
         id: 'a1',
         checkInTime: new Date(), // Already checked in
@@ -745,7 +755,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       });
       await expect(
         service.checkInWithFace('a1', Buffer.from('fake')),
-      ).rejects.toThrow(BadRequestException);
+      ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
     });
 
     it('should reject if assignment not APPROVED', async () => {
@@ -776,7 +786,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       ).rejects.toThrow(BadRequestException);
     });
 
-    it('should reject if already checked out', async () => {
+    it('should return the existing result if already checked out', async () => {
       shiftAssignmentRepo.findOne.mockResolvedValue({
         id: 'a1',
         checkInTime: new Date(),
@@ -785,7 +795,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       });
       await expect(
         service.checkOutWithFace('a1', Buffer.from('fake')),
-      ).rejects.toThrow(BadRequestException);
+      ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
     });
   });
 
@@ -843,7 +853,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
 
       expect(result.lateMinutes).toBe(10);
       expect(result.attendanceStatus).toBe(AttendanceStatus.LATE);
-      expect(shiftAssignmentRepo.save).toHaveBeenCalled();
+      expect(dataSourceMock.transaction).toHaveBeenCalled();
 
       jest.useRealTimers();
     });

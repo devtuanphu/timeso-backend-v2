@@ -4,10 +4,14 @@ import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
+import { ShiftReminderService } from './shift-reminder.service';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
-import { EmployeeProfile, EmploymentStatus } from './entities/employee-profile.entity';
+import {
+  EmployeeProfile,
+  EmploymentStatus,
+} from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import {
   EmployeeContract,
@@ -344,6 +348,13 @@ describe('StoresService - Shift Registration Count', () => {
           provide: DataSource,
           useValue: dataSourceMock,
         },
+        {
+          provide: ShiftReminderService,
+          useValue: {
+            syncEmployeeReminders: jest.fn(),
+            scheduleReminder: jest.fn(),
+          },
+        },
       ],
     }).compile();
 
@@ -539,8 +550,16 @@ describe('StoresService - Shift Registration Count', () => {
           },
         ]),
         findOne: jest.fn().mockImplementation((entityType) => {
-          if (entityType === WorkCycle) return Promise.resolve({ id: 'cycle-1', status: WorkCycleStatus.ACTIVE });
-          if (entityType === EmployeeProfile) return Promise.resolve({ id: 'existing-employee', employmentStatus: EmploymentStatus.ACTIVE });
+          if (entityType === WorkCycle)
+            return Promise.resolve({
+              id: 'cycle-1',
+              status: WorkCycleStatus.ACTIVE,
+            });
+          if (entityType === EmployeeProfile)
+            return Promise.resolve({
+              id: 'existing-employee',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            });
           return Promise.resolve(fullSlot);
         }),
         createQueryBuilder: jest.fn(() => ({
@@ -733,7 +752,10 @@ describe('StoresService - Shift Registration Count', () => {
         });
 
       // Employee is active
-      managerMock.findOne.mockResolvedValue({ id: 'emp-1', employmentStatus: EmploymentStatus.ACTIVE });
+      managerMock.findOne.mockResolvedValue({
+        id: 'emp-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      });
 
       // Mock locking slots
       managerMock.createQueryBuilder.mockReturnValue({
@@ -808,7 +830,10 @@ describe('StoresService - Shift Registration Count', () => {
       const managerMock = {
         findOne: jest
           .fn()
-          .mockResolvedValue({ id: 'emp-1', employmentStatus: EmploymentStatus.ACTIVE }),
+          .mockResolvedValue({
+            id: 'emp-1',
+            employmentStatus: EmploymentStatus.ACTIVE,
+          }),
         find: jest.fn().mockResolvedValue([
           {
             id: 'a1',

@@ -5,6 +5,7 @@ import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
+import { ShiftReminderService } from './shift-reminder.service';
 import {
   ShiftChangeRequest,
   ShiftChangeRequestStatus,
@@ -21,6 +22,7 @@ import { StoreRole } from './entities/store-role.entity';
 import { EmployeeProfile } from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import { EmployeeContract } from './entities/employee-contract.entity';
+import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
 import { Asset } from './entities/asset.entity';
 import { Product } from './entities/product.entity';
@@ -171,6 +173,7 @@ const ENTITIES = [
   EmployeeProfile,
   EmployeeProfileRole,
   EmployeeContract,
+  ContractTemplate,
   WorkShift,
   Asset,
   Product,
@@ -274,6 +277,13 @@ describe('StoresService - Shift & Bonus Request Features', () => {
           },
         },
         { provide: DataSource, useValue: mockDataSource() },
+        {
+          provide: ShiftReminderService,
+          useValue: {
+            syncEmployeeReminders: jest.fn(),
+            scheduleReminder: jest.fn(),
+          },
+        },
       ],
     }).compile();
 

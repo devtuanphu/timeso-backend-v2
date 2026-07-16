@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -156,6 +157,22 @@ import {
 import { StoreApprovalSettingDto } from './dto/store-approval-setting.dto';
 import { StoreTimekeepingSettingDto } from './dto/store-timekeeping-setting.dto';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
+import { CreateShiftScheduleDto } from './dto/create-shift-schedule.dto';
+import {
+  ShiftMonthlyMode,
+  ShiftRecurrenceEndType,
+  ShiftRecurrenceFrequency,
+  ShiftRecurrenceRule,
+} from './shift-schedule.types';
+import {
+  SHIFT_SCHEDULE_HORIZON_DAYS,
+  addDays,
+  generateShiftScheduleDates,
+  getTodayDateString,
+  getWeekDayForDate,
+  matchesShiftRecurrence,
+  parseDateOnly,
+} from './shift-schedule.utils';
 
 import { StorePayrollPaymentHistory } from './entities/store-payroll-payment-history.entity';
 import { SalaryFundHistory } from './entities/salary-fund-history.entity';
@@ -2493,8 +2510,10 @@ export class StoresService {
 
     // Validate time values
     if (data.startTime && data.endTime) {
-      if (data.startTime >= data.endTime) {
-        throw new BadRequestException('Giờ bắt đầu phải nhỏ hơn giờ kết thúc');
+      if (data.startTime === data.endTime) {
+        throw new BadRequestException(
+          'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+        );
       }
     }
 
@@ -2505,6 +2524,200 @@ export class StoresService {
   async getWorkShifts(storeId: string) {
     return this.workShiftRepository.find({
       where: { storeId, isActive: true },
+    });
+  }
+
+  private normalizeShiftRecurrence(
+    data: CreateShiftScheduleDto,
+  ): ShiftRecurrenceRule {
+    parseDateOnly(data.startDate);
+
+    if (data.startDate < getTodayDateString()) {
+      throw new BadRequestException('Ngày áp dụng không được ở trong quá khứ');
+    }
+
+    if (data.startTime === data.endTime) {
+      throw new BadRequestException(
+        'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+      );
+    }
+
+    if (!data.recurrence.enabled) {
+      return {
+        enabled: false,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount: 1,
+      };
+    }
+
+    const recurrence: ShiftRecurrenceRule = {
+      enabled: true,
+      frequency: data.recurrence.frequency,
+      interval: data.recurrence.interval,
+      endType: data.recurrence.endType,
+    };
+
+    if (recurrence.frequency === ShiftRecurrenceFrequency.WEEKLY) {
+      if (!data.recurrence.weekDays?.length) {
+        throw new BadRequestException(
+          'Vui lòng chọn ít nhất một thứ trong tuần',
+        );
+      }
+      recurrence.weekDays = data.recurrence.weekDays;
+    }
+
+    if (recurrence.frequency === ShiftRecurrenceFrequency.MONTHLY) {
+      if (!data.recurrence.monthlyMode) {
+        throw new BadRequestException('Vui lòng chọn cách lặp theo tháng');
+      }
+      recurrence.monthlyMode = data.recurrence.monthlyMode;
+
+      if (recurrence.monthlyMode === ShiftMonthlyMode.DAY_OF_MONTH) {
+        if (!data.recurrence.dayOfMonth) {
+          throw new BadRequestException('Vui lòng chọn ngày lặp trong tháng');
+        }
+        recurrence.dayOfMonth = data.recurrence.dayOfMonth;
+      } else {
+        if (!data.recurrence.weekOfMonth || !data.recurrence.weekday) {
+          throw new BadRequestException(
+            'Vui lòng chọn thứ và tuần lặp trong tháng',
+          );
+        }
+        recurrence.weekOfMonth = data.recurrence.weekOfMonth;
+        recurrence.weekday = data.recurrence.weekday;
+      }
+    }
+
+    if (recurrence.endType === ShiftRecurrenceEndType.UNTIL) {
+      if (!data.recurrence.endDate) {
+        throw new BadRequestException('Vui lòng chọn ngày kết thúc');
+      }
+      parseDateOnly(data.recurrence.endDate);
+      if (data.recurrence.endDate < data.startDate) {
+        throw new BadRequestException(
+          'Ngày kết thúc phải từ ngày áp dụng trở đi',
+        );
+      }
+      recurrence.endDate = data.recurrence.endDate;
+    }
+
+    if (recurrence.endType === ShiftRecurrenceEndType.COUNT) {
+      if (!data.recurrence.occurrenceCount) {
+        throw new BadRequestException('Vui lòng nhập số lần lặp');
+      }
+      recurrence.occurrenceCount = data.recurrence.occurrenceCount;
+    }
+
+    return recurrence;
+  }
+
+  async createShiftSchedule(
+    storeId: string,
+    ownerAccountId: string,
+    data: CreateShiftScheduleDto,
+  ) {
+    const shiftName = data.shiftName.trim();
+    if (!shiftName) {
+      throw new BadRequestException('Tên ca không được để trống');
+    }
+
+    const recurrenceRule = this.normalizeShiftRecurrence(data);
+    const workDates = generateShiftScheduleDates(
+      data.startDate,
+      recurrenceRule,
+    );
+    const cycleType = !recurrenceRule.enabled
+      ? CycleType.DAILY
+      : recurrenceRule.endType === ShiftRecurrenceEndType.NEVER
+        ? CycleType.INDEFINITE
+        : (recurrenceRule.frequency as unknown as CycleType);
+    const cycleEndDate =
+      recurrenceRule.endType === ShiftRecurrenceEndType.NEVER
+        ? null
+        : recurrenceRule.endType === ShiftRecurrenceEndType.UNTIL
+          ? (recurrenceRule.endDate as string)
+          : workDates[workDates.length - 1];
+
+    return this.dataSource.transaction(async (manager) => {
+      const store = await manager.findOne(Store, {
+        where: { id: storeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!store) {
+        throw new NotFoundException('Không tìm thấy cửa hàng');
+      }
+      if (store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền tạo lịch làm việc cho cửa hàng này',
+        );
+      }
+
+      const activeShifts = await manager.find(WorkShift, {
+        where: { storeId, isActive: true },
+        select: ['id', 'shiftName'],
+      });
+      const normalizedName = shiftName.toLocaleLowerCase('vi-VN');
+      if (
+        activeShifts.some(
+          (shift) =>
+            shift.shiftName.trim().toLocaleLowerCase('vi-VN') ===
+            normalizedName,
+        )
+      ) {
+        throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+      }
+
+      const workShift = manager.create(WorkShift, {
+        storeId,
+        shiftName,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        defaultMaxStaff: data.maxStaff,
+        colorCode: '#21D4D4',
+        note: data.note?.trim() || null,
+        isActive: true,
+      });
+      const savedShift = await manager.save(WorkShift, workShift);
+
+      const cycle = manager.create(WorkCycle, {
+        storeId,
+        name: shiftName,
+        cycleType,
+        startDate: data.startDate,
+        endDate: cycleEndDate,
+        status: WorkCycleStatus.ACTIVE,
+        workShiftId: savedShift.id,
+        recurrenceRule,
+      });
+      const savedCycle = await manager.save(WorkCycle, cycle);
+
+      const slots = workDates.map((workDate) =>
+        manager.create(ShiftSlot, {
+          cycleId: savedCycle.id,
+          workShiftId: savedShift.id,
+          workDate,
+          startTime: data.startTime,
+          endTime: data.endTime,
+          maxStaff: data.maxStaff,
+          note: data.note?.trim() || null,
+          dayOfWeek: getWeekDayForDate(workDate),
+        }),
+      );
+      await manager.save(ShiftSlot, slots, { chunk: 500 });
+
+      return {
+        id: savedCycle.id,
+        storeId,
+        status: savedCycle.status,
+        shift: savedShift,
+        recurrence: recurrenceRule,
+        generatedSlotCount: slots.length,
+        firstWorkDate: workDates[0],
+        lastGeneratedWorkDate: workDates[workDates.length - 1],
+      };
     });
   }
 
@@ -2556,7 +2769,11 @@ export class StoresService {
   // Lấy chu kỳ đang active của cửa hàng (chỉ có 1 tại 1 thời điểm)
   async getActiveCycle(storeId: string) {
     return this.workCycleRepository.findOne({
-      where: { storeId, status: WorkCycleStatus.ACTIVE },
+      where: {
+        storeId,
+        status: WorkCycleStatus.ACTIVE,
+        recurrenceRule: IsNull(),
+      },
       relations: [
         'slots',
         'slots.workShift',
@@ -2596,17 +2813,7 @@ export class StoresService {
 
   // Lấy ngày trong tuần của 1 date
   private getDayOfWeek(dateString: string): WeekDaySchedule {
-    const date = new Date(dateString);
-    const days: WeekDaySchedule[] = [
-      WeekDaySchedule.SUNDAY,
-      WeekDaySchedule.MONDAY,
-      WeekDaySchedule.TUESDAY,
-      WeekDaySchedule.WEDNESDAY,
-      WeekDaySchedule.THURSDAY,
-      WeekDaySchedule.FRIDAY,
-      WeekDaySchedule.SATURDAY,
-    ];
-    return days[date.getDay()];
+    return getWeekDayForDate(dateString);
   }
 
   // Tạo chu kỳ mới
@@ -2928,6 +3135,7 @@ export class StoresService {
       .createQueryBuilder('cycle')
       .leftJoinAndSelect('cycle.slots', 'slot')
       .where('cycle.status = :status', { status: WorkCycleStatus.ACTIVE })
+      .andWhere('cycle.recurrenceRule IS NULL')
       .andWhere('cycle.cycleType != :indefinite', {
         indefinite: CycleType.INDEFINITE,
       })
@@ -3009,16 +3217,68 @@ export class StoresService {
 
   // Tạo slots cho chu kỳ INDEFINITE (gọi bởi cron job hàng ngày)
   async generateDailySlotsForIndefiniteCycles() {
-    let indefiniteCycles = await this.workCycleRepository.find({
+    const indefiniteCycles = await this.workCycleRepository.find({
       where: {
         cycleType: CycleType.INDEFINITE,
         status: WorkCycleStatus.ACTIVE,
       },
     });
 
-    const tomorrow = new Date();
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+    const unifiedSchedules = indefiniteCycles.filter(
+      (cycle) => cycle.recurrenceRule && cycle.workShiftId,
+    );
+    let legacyCycles = indefiniteCycles.filter(
+      (cycle) => !cycle.recurrenceRule || !cycle.workShiftId,
+    );
+
+    const today = getTodayDateString();
+    const horizonDate = addDays(today, SHIFT_SCHEDULE_HORIZON_DAYS - 1);
+    let createdCount = 0;
+
+    for (const cycle of unifiedSchedules) {
+      const rule = cycle.recurrenceRule as ShiftRecurrenceRule;
+      if (
+        horizonDate < cycle.startDate ||
+        rule.endType !== ShiftRecurrenceEndType.NEVER ||
+        !matchesShiftRecurrence(horizonDate, cycle.startDate, rule)
+      ) {
+        continue;
+      }
+
+      const existing = await this.shiftSlotRepository.findOne({
+        where: {
+          cycleId: cycle.id,
+          workShiftId: cycle.workShiftId as string,
+          workDate: horizonDate,
+        },
+      });
+      if (existing) continue;
+
+      const workShift = await this.workShiftRepository.findOne({
+        where: {
+          id: cycle.workShiftId as string,
+          storeId: cycle.storeId,
+          isActive: true,
+        },
+      });
+      if (!workShift) continue;
+
+      await this.shiftSlotRepository.save(
+        this.shiftSlotRepository.create({
+          cycleId: cycle.id,
+          workShiftId: workShift.id,
+          workDate: horizonDate,
+          startTime: workShift.startTime,
+          endTime: workShift.endTime,
+          maxStaff: workShift.defaultMaxStaff,
+          note: workShift.note || null,
+          dayOfWeek: getWeekDayForDate(horizonDate),
+        }),
+      );
+      createdCount += 1;
+    }
+
+    const tomorrowStr = addDays(today, 1);
 
     // Bug 5.1 fix: Check if slots already exist for tomorrow before generating
     const existingTomorrowSlots = await this.shiftSlotRepository.find({
@@ -3030,26 +3290,27 @@ export class StoresService {
       const existingCycleIds = new Set(
         existingTomorrowSlots.map((s) => s.cycleId),
       );
-      const indefiniteWithSlots = indefiniteCycles.filter((c) =>
+      const indefiniteWithSlots = legacyCycles.filter((c) =>
         existingCycleIds.has(c.id),
       );
 
       // Remove cycles that already have slots for tomorrow
-      indefiniteCycles = indefiniteCycles.filter(
-        (c) => !existingCycleIds.has(c.id),
-      );
+      legacyCycles = legacyCycles.filter((c) => !existingCycleIds.has(c.id));
 
       this.logger.debug(
         `Skipped ${indefiniteWithSlots.length} indefinite cycles - slots already exist for tomorrow`,
       );
     }
 
-    for (const cycle of indefiniteCycles) {
+    for (const cycle of legacyCycles) {
       // Tạo slots cho ngày mai dựa trên template
       await this.generateSlotsFromTemplate(cycle.id, tomorrowStr, 1);
     }
 
-    return { processedCount: indefiniteCycles.length };
+    return {
+      processedCount: indefiniteCycles.length,
+      createdCount,
+    };
   }
 
   // ==================== SHIFT SLOT MANAGEMENT ====================

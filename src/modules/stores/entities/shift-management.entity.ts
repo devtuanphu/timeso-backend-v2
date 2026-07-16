@@ -3,6 +3,7 @@ import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 import { WorkShift } from './work-shift.entity';
 import { EmployeeProfile } from './employee-profile.entity';
+import type { ShiftRecurrenceRule } from '../shift-schedule.types';
 
 // --- ENUMS ---
 
@@ -82,6 +83,16 @@ export class WorkCycle extends BaseEntity {
 
   @Column({ name: 'end_date', type: 'date', nullable: true })
   endDate: string | null; // null cho INDEFINITE
+
+  @Column({ name: 'work_shift_id', type: 'uuid', nullable: true })
+  workShiftId: string | null;
+
+  @ManyToOne(() => WorkShift, { onDelete: 'SET NULL', nullable: true })
+  @JoinColumn({ name: 'work_shift_id' })
+  workShift: WorkShift | null;
+
+  @Column({ name: 'recurrence_rule', type: 'jsonb', nullable: true })
+  recurrenceRule: ShiftRecurrenceRule | null;
 
   @Column({ name: 'registration_deadline', type: 'timestamp', nullable: true })
   registrationDeadline: Date;
@@ -165,7 +176,7 @@ export class ShiftSlot extends BaseEntity {
   maxStaff: number | null;
 
   @Column({ type: 'text', nullable: true })
-  note?: string;
+  note: string | null;
 
   @Column({ name: 'location', type: 'varchar', nullable: true })
   location: string | null;

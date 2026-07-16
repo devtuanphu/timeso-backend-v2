@@ -26,6 +26,9 @@ export class WorkShift extends BaseEntity {
   @Column({ name: 'default_max_staff', type: 'int', nullable: true })
   defaultMaxStaff: number | null;
 
+  @Column({ type: 'text', nullable: true })
+  note: string | null;
+
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
 

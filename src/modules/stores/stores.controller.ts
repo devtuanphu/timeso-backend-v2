@@ -138,6 +138,7 @@ import {
 import { AssetMultipartInterceptor } from './interceptors/asset-multipart.interceptor';
 import { ProductMultipartInterceptor } from './interceptors/product-multipart.interceptor';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
+import { CreateShiftScheduleDto } from './dto/create-shift-schedule.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
@@ -1818,6 +1819,21 @@ export class StoresController {
   }
 
   // Work Shifts
+  @Post(':id/shift-schedules')
+  @ApiOperation({
+    summary: 'Tạo lịch ca làm việc thống nhất',
+    description:
+      'Tạo ca, quy tắc lặp và các ngày làm việc trong cùng một giao dịch. Hỗ trợ không lặp, hàng ngày, hàng tuần và hàng tháng.',
+  })
+  @ApiResponse({ status: 201, description: 'Tạo lịch ca thành công' })
+  async createShiftSchedule(
+    @GetUser() user: any,
+    @Param('id') storeId: string,
+    @Body() body: CreateShiftScheduleDto,
+  ) {
+    return this.storesService.createShiftSchedule(storeId, user.userId, body);
+  }
+
   @Post(':id/work-shifts')
   @ApiOperation({
     summary: 'Tạo ca làm việc',

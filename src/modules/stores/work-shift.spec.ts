@@ -8,7 +8,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { BadRequestException, NotFoundException } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, IsNull } from 'typeorm';
 import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { AccountsService } from '../accounts/accounts.service';
@@ -20,6 +20,7 @@ import { StoreRole } from './entities/store-role.entity';
 import { EmployeeProfile } from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import { EmployeeContract } from './entities/employee-contract.entity';
+import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
 import { Asset } from './entities/asset.entity';
 import { Product } from './entities/product.entity';
@@ -90,6 +91,7 @@ import { StoreShiftConfig } from './entities/store-shift-config.entity';
 import { Feedback } from './entities/feedback.entity';
 import { ShiftChangeRequest } from './entities/shift-change-request.entity';
 import { BonusWorkRequest } from './entities/bonus-work-request.entity';
+import { ShiftReminderService } from './shift-reminder.service';
 
 // Check if AccountIdentityDocument and AccountFinance exist
 let AccountIdentityDocument: any;
@@ -176,6 +178,7 @@ const ENTITIES = [
   EmployeeProfile,
   EmployeeProfileRole,
   EmployeeContract,
+  ContractTemplate,
   WorkShift,
   Asset,
   Product,
@@ -275,26 +278,29 @@ describe('Work Shift & Cycle Management', () => {
           provide: FaceRecognitionService,
           useValue: {
             extractDescriptor: jest.fn().mockResolvedValue(null),
-            compareFaces: jest
-              .fn()
-              .mockReturnValue({
-                matched: false,
-                distance: Infinity,
-                bestMatchIndex: -1,
-              }),
-            registerFace: jest
-              .fn()
-              .mockResolvedValue({
-                descriptors: [],
-                successCount: 0,
-                failedCount: 0,
-              }),
+            compareFaces: jest.fn().mockReturnValue({
+              matched: false,
+              distance: Infinity,
+              bestMatchIndex: -1,
+            }),
+            registerFace: jest.fn().mockResolvedValue({
+              descriptors: [],
+              successCount: 0,
+              failedCount: 0,
+            }),
             isReady: jest.fn().mockReturnValue(false),
           },
         },
         {
           provide: DataSource,
           useValue: mockDataSource,
+        },
+        {
+          provide: ShiftReminderService,
+          useValue: {
+            scheduleReminder: jest.fn(),
+            cancelReminder: jest.fn(),
+          },
         },
       ],
     }).compile();
@@ -432,7 +438,11 @@ describe('Work Shift & Cycle Management', () => {
       const result = await service.getActiveCycle('store-1');
 
       expect(workCycleRepo.findOne).toHaveBeenCalledWith({
-        where: { storeId: 'store-1', status: WorkCycleStatus.ACTIVE },
+        where: {
+          storeId: 'store-1',
+          status: WorkCycleStatus.ACTIVE,
+          recurrenceRule: IsNull(),
+        },
         relations: [
           'slots',
           'slots.workShift',
