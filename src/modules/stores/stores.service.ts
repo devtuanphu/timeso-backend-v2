@@ -89,6 +89,7 @@ import {
 } from './entities/employee-performance.entity';
 import {
   EmployeeLeaveRequest,
+  LeaveType,
   LeaveRequestStatus,
 } from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
@@ -157,7 +158,10 @@ import {
 import { StoreApprovalSettingDto } from './dto/store-approval-setting.dto';
 import { StoreTimekeepingSettingDto } from './dto/store-timekeeping-setting.dto';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
-import { CreateShiftScheduleDto } from './dto/create-shift-schedule.dto';
+import {
+  CreateShiftScheduleDto,
+  ShiftEmployeeOptionsDto,
+} from './dto/create-shift-schedule.dto';
 import {
   ShiftMonthlyMode,
   ShiftRecurrenceEndType,
@@ -228,6 +232,42 @@ import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
 import * as ExcelJS from 'exceljs';
+
+type ShiftEmployeeAvailability =
+  | 'AVAILABLE'
+  | 'OTHER_SHIFT'
+  | 'CONFLICT'
+  | 'ON_LEAVE';
+
+type ShiftInterval = {
+  start: number;
+  end: number;
+};
+
+const MAX_GENERATED_SHIFT_ASSIGNMENTS = 10000;
+
+const timeToMinutes = (time: string): number => {
+  const [hours, minutes] = time.slice(0, 5).split(':').map(Number);
+  return hours * 60 + minutes;
+};
+
+const toShiftInterval = (
+  workDate: string,
+  startTime: string,
+  endTime: string,
+): ShiftInterval => {
+  const dayStart = parseDateOnly(workDate).getTime() / 60000;
+  const startMinutes = timeToMinutes(startTime);
+  let endMinutes = timeToMinutes(endTime);
+  if (endMinutes <= startMinutes) endMinutes += 24 * 60;
+  return {
+    start: dayStart + startMinutes,
+    end: dayStart + endMinutes,
+  };
+};
+
+const intervalsOverlap = (left: ShiftInterval, right: ShiftInterval) =>
+  left.start < right.end && right.start < left.end;
 
 @Injectable()
 export class StoresService {
@@ -2528,7 +2568,10 @@ export class StoresService {
   }
 
   private normalizeShiftRecurrence(
-    data: CreateShiftScheduleDto,
+    data: Pick<
+      CreateShiftScheduleDto,
+      'startDate' | 'startTime' | 'endTime' | 'recurrence'
+    >,
   ): ShiftRecurrenceRule {
     parseDateOnly(data.startDate);
 
@@ -2613,14 +2656,20 @@ export class StoresService {
     return recurrence;
   }
 
-  async createShiftSchedule(
+  async getShiftEmployeeOptions(
     storeId: string,
     ownerAccountId: string,
-    data: CreateShiftScheduleDto,
+    data: ShiftEmployeeOptionsDto,
   ) {
-    const shiftName = data.shiftName.trim();
-    if (!shiftName) {
-      throw new BadRequestException('Tên ca không được để trống');
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw new NotFoundException('Không tìm thấy cửa hàng');
+    if (store.ownerAccountId !== ownerAccountId) {
+      throw new ForbiddenException(
+        'Bạn không có quyền xem lịch nhân viên của cửa hàng này',
+      );
     }
 
     const recurrenceRule = this.normalizeShiftRecurrence(data);
@@ -2628,6 +2677,202 @@ export class StoresService {
       data.startDate,
       recurrenceRule,
     );
+    const proposedIntervals = workDates.map((workDate) =>
+      toShiftInterval(workDate, data.startTime, data.endTime),
+    );
+    const workDateSet = new Set(workDates);
+
+    const employees = await this.profileRepository.find({
+      where: { storeId, employmentStatus: EmploymentStatus.ACTIVE },
+      relations: ['account', 'storeRole', 'employeeType'],
+    });
+    if (employees.length === 0) {
+      return {
+        workDates,
+        summary: {
+          total: 0,
+          available: 0,
+          otherShift: 0,
+          conflict: 0,
+          onLeave: 0,
+        },
+        employees: [],
+      };
+    }
+
+    const employeeIds = employees.map((employee) => employee.id);
+    const rangeStart = addDays(workDates[0], -1);
+    const rangeEnd = addDays(workDates[workDates.length - 1], 1);
+
+    const assignments = await this.shiftAssignmentRepository
+      .createQueryBuilder('assignment')
+      .leftJoinAndSelect('assignment.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'workShift')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('assignment.employeeId IN (:...employeeIds)', { employeeIds })
+      .andWhere('assignment.status != :cancelledStatus', {
+        cancelledStatus: ShiftAssignmentStatus.CANCELLED,
+      })
+      .andWhere('cycle.status = :activeCycleStatus', {
+        activeCycleStatus: WorkCycleStatus.ACTIVE,
+      })
+      .andWhere('slot.workDate BETWEEN :rangeStart AND :rangeEnd', {
+        rangeStart,
+        rangeEnd,
+      })
+      .getMany();
+
+    const leaveRequests = await this.leaveRequestRepository
+      .createQueryBuilder('leave')
+      .where('leave.storeId = :storeId', { storeId })
+      .andWhere('leave.employeeProfileId IN (:...employeeIds)', {
+        employeeIds,
+      })
+      .andWhere('leave.status = :approvedStatus', {
+        approvedStatus: LeaveRequestStatus.APPROVED,
+      })
+      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
+      .andWhere('leave.endDate >= :firstWorkDate', {
+        firstWorkDate: workDates[0],
+      })
+      .getMany();
+
+    const assignmentsByEmployee = new Map<string, ShiftAssignment[]>();
+    for (const assignment of assignments) {
+      const list = assignmentsByEmployee.get(assignment.employeeId) || [];
+      list.push(assignment);
+      assignmentsByEmployee.set(assignment.employeeId, list);
+    }
+
+    const leavesByEmployee = new Map<string, EmployeeLeaveRequest[]>();
+    for (const request of leaveRequests) {
+      const list = leavesByEmployee.get(request.employeeProfileId) || [];
+      list.push(request);
+      leavesByEmployee.set(request.employeeProfileId, list);
+    }
+
+    const blockingLeaveTypes = new Set<LeaveType>([
+      LeaveType.SICK,
+      LeaveType.PERSONAL,
+      LeaveType.VACATION,
+      LeaveType.UNPAID,
+      LeaveType.OTHER,
+    ]);
+    const statusLabels: Record<ShiftEmployeeAvailability, string> = {
+      AVAILABLE: 'Rảnh',
+      OTHER_SHIFT: 'Đang làm ca khác',
+      CONFLICT: 'Trùng ca',
+      ON_LEAVE: 'Nghỉ phép',
+    };
+
+    const options = employees
+      .map((employee) => {
+        const employeeAssignments =
+          assignmentsByEmployee.get(employee.id) || [];
+        const employeeLeaves = leavesByEmployee.get(employee.id) || [];
+
+        const hasBlockingLeave = employeeLeaves.some((request) => {
+          if (!blockingLeaveTypes.has(request.type)) return false;
+          return workDates.some((workDate, index) => {
+            if (workDate < request.startDate || workDate > request.endDate) {
+              return false;
+            }
+            if (!request.startTime || !request.endTime) return true;
+            return intervalsOverlap(
+              proposedIntervals[index],
+              toShiftInterval(workDate, request.startTime, request.endTime),
+            );
+          });
+        });
+
+        const hasConflict = employeeAssignments.some((assignment) => {
+          const slot = assignment.shiftSlot;
+          const startTime = slot?.startTime || slot?.workShift?.startTime;
+          const endTime = slot?.endTime || slot?.workShift?.endTime;
+          if (!slot?.workDate || !startTime || !endTime) return false;
+          const existingInterval = toShiftInterval(
+            slot.workDate,
+            startTime,
+            endTime,
+          );
+          return proposedIntervals.some((interval) =>
+            intervalsOverlap(interval, existingInterval),
+          );
+        });
+
+        const hasOtherShift = employeeAssignments.some((assignment) =>
+          workDateSet.has(assignment.shiftSlot?.workDate),
+        );
+
+        const availability: ShiftEmployeeAvailability = hasBlockingLeave
+          ? 'ON_LEAVE'
+          : hasConflict
+            ? 'CONFLICT'
+            : hasOtherShift
+              ? 'OTHER_SHIFT'
+              : 'AVAILABLE';
+
+        return {
+          id: employee.id,
+          name: employee.account?.fullName || 'Nhân viên',
+          avatarUrl: employee.account?.avatar || null,
+          position: employee.storeRole?.name || null,
+          employmentType: employee.employeeType?.name || null,
+          availability,
+          statusLabel: statusLabels[availability],
+          selectable:
+            availability === 'AVAILABLE' || availability === 'OTHER_SHIFT',
+        };
+      })
+      .sort((left, right) => left.name.localeCompare(right.name, 'vi'));
+
+    return {
+      workDates,
+      summary: {
+        total: options.length,
+        available: options.filter((item) => item.availability === 'AVAILABLE')
+          .length,
+        otherShift: options.filter(
+          (item) => item.availability === 'OTHER_SHIFT',
+        ).length,
+        conflict: options.filter((item) => item.availability === 'CONFLICT')
+          .length,
+        onLeave: options.filter((item) => item.availability === 'ON_LEAVE')
+          .length,
+      },
+      employees: options,
+    };
+  }
+
+  async createShiftSchedule(
+    storeId: string,
+    ownerAccountId: string,
+    data: CreateShiftScheduleDto,
+  ) {
+    const shiftName = data.shiftName.trim();
+    const employeeIds = data.employeeIds || [];
+    if (!shiftName) {
+      throw new BadRequestException('Tên ca không được để trống');
+    }
+    if (employeeIds.length > data.maxStaff) {
+      throw new BadRequestException(
+        'Số nhân viên được chọn không được vượt quá số lượng nhân viên của ca',
+      );
+    }
+
+    const recurrenceRule = this.normalizeShiftRecurrence(data);
+    const workDates = generateShiftScheduleDates(
+      data.startDate,
+      recurrenceRule,
+    );
+    if (
+      employeeIds.length * workDates.length >
+      MAX_GENERATED_SHIFT_ASSIGNMENTS
+    ) {
+      throw new BadRequestException(
+        `Lịch này tạo quá ${MAX_GENERATED_SHIFT_ASSIGNMENTS} lượt phân ca. Vui lòng giảm số nhân viên hoặc số lần lặp.`,
+      );
+    }
     const cycleType = !recurrenceRule.enabled
       ? CycleType.DAILY
       : recurrenceRule.endType === ShiftRecurrenceEndType.NEVER
@@ -2640,7 +2885,7 @@ export class StoresService {
           ? (recurrenceRule.endDate as string)
           : workDates[workDates.length - 1];
 
-    return this.dataSource.transaction(async (manager) => {
+    const result = await this.dataSource.transaction(async (manager) => {
       const store = await manager.findOne(Store, {
         where: { id: storeId },
         lock: { mode: 'pessimistic_write' },
@@ -2668,6 +2913,51 @@ export class StoresService {
         )
       ) {
         throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+      }
+
+      if (employeeIds.length > 0) {
+        const activeEmployees = await manager.find(EmployeeProfile, {
+          where: {
+            storeId,
+            employmentStatus: EmploymentStatus.ACTIVE,
+          },
+          select: ['id'],
+        });
+        const activeEmployeeIds = new Set(
+          activeEmployees.map((employee) => employee.id),
+        );
+        if (employeeIds.some((id) => !activeEmployeeIds.has(id))) {
+          throw new BadRequestException(
+            'Có nhân viên không còn hoạt động hoặc không thuộc cửa hàng này',
+          );
+        }
+
+        const options = await this.getShiftEmployeeOptions(
+          storeId,
+          ownerAccountId,
+          data,
+        );
+        const optionMap = new Map(
+          options.employees.map((employee) => [employee.id, employee]),
+        );
+        const unknownEmployeeIds = employeeIds.filter(
+          (id) => !optionMap.has(id),
+        );
+        if (unknownEmployeeIds.length > 0) {
+          throw new BadRequestException(
+            'Có nhân viên không tồn tại hoặc không thuộc cửa hàng này',
+          );
+        }
+        const unavailableEmployees = employeeIds
+          .map((id) => optionMap.get(id))
+          .filter((employee) => employee && !employee.selectable);
+        if (unavailableEmployees.length > 0) {
+          throw new BadRequestException(
+            `Không thể xếp ca cho: ${unavailableEmployees
+              .map((employee) => `${employee?.name} (${employee?.statusLabel})`)
+              .join(', ')}`,
+          );
+        }
       }
 
       const workShift = manager.create(WorkShift, {
@@ -2708,6 +2998,20 @@ export class StoresService {
       );
       await manager.save(ShiftSlot, slots, { chunk: 500 });
 
+      const assignments = employeeIds.flatMap((employeeId) =>
+        slots.map((slot) =>
+          manager.create(ShiftAssignment, {
+            shiftSlotId: slot.id,
+            employeeId,
+            status: ShiftAssignmentStatus.APPROVED,
+            note: 'Owner assigned during shift creation',
+          }),
+        ),
+      );
+      if (assignments.length > 0) {
+        await manager.save(ShiftAssignment, assignments, { chunk: 500 });
+      }
+
       return {
         id: savedCycle.id,
         storeId,
@@ -2715,10 +3019,23 @@ export class StoresService {
         shift: savedShift,
         recurrence: recurrenceRule,
         generatedSlotCount: slots.length,
+        assignedEmployeeCount: employeeIds.length,
+        generatedAssignmentCount: assignments.length,
+        assignmentIds: assignments.map((assignment) => assignment.id),
         firstWorkDate: workDates[0],
         lastGeneratedWorkDate: workDates[workDates.length - 1],
       };
     });
+
+    for (const assignmentId of result.assignmentIds) {
+      this.scheduleReminderForAssignment(assignmentId).catch((error) => {
+        this.logger.error(
+          `Failed to schedule reminder for assignment ${assignmentId}: ${error.message}`,
+        );
+      });
+    }
+
+    return result;
   }
 
   async updateWorkShift(
@@ -11632,11 +11949,16 @@ export class StoresService {
       const existing = await this.bonusWorkRequestRepository.findOne({
         where: {
           shiftAssignmentId: data.shiftAssignmentId,
-          status: In([BonusWorkRequestStatus.PENDING, BonusWorkRequestStatus.APPROVED]),
+          status: In([
+            BonusWorkRequestStatus.PENDING,
+            BonusWorkRequestStatus.APPROVED,
+          ]),
         },
       });
       if (existing) {
-        throw new BadRequestException('Ca làm đã có yêu cầu tăng ca đang xử lý');
+        throw new BadRequestException(
+          'Ca làm đã có yêu cầu tăng ca đang xử lý',
+        );
       }
     }
     const request = this.bonusWorkRequestRepository.create({
@@ -12460,10 +12782,7 @@ export class StoresService {
     const cumulative = await this.shiftAssignmentRepository
       .createQueryBuilder('assignment')
       .select('COUNT(assignment.id)', 'completedShifts')
-      .addSelect(
-        'COALESCE(SUM(assignment.workedMinutes), 0)',
-        'workedMinutes',
-      )
+      .addSelect('COALESCE(SUM(assignment.workedMinutes), 0)', 'workedMinutes')
       .where('assignment.employeeId = :employeeId', {
         employeeId: assignment.employeeId,
       })

@@ -13,9 +13,14 @@ import { MailService } from '../src/modules/mail/mail.service';
 import { StoresController } from '../src/modules/stores/stores.controller';
 import { ShiftEndWorkflowService } from '../src/modules/stores/shift-end-workflow.service';
 import {
+  ShiftAssignment,
   ShiftSlot,
   WorkCycle,
 } from '../src/modules/stores/entities/shift-management.entity';
+import {
+  EmployeeProfile,
+  EmploymentStatus,
+} from '../src/modules/stores/entities/employee-profile.entity';
 import { Store } from '../src/modules/stores/entities/store.entity';
 import { WorkShift } from '../src/modules/stores/entities/work-shift.entity';
 import { StoresService } from '../src/modules/stores/stores.service';
@@ -35,6 +40,8 @@ interface MemoryState {
   shifts: any[];
   cycles: any[];
   slots: any[];
+  employees: any[];
+  assignments: any[];
   sequence: number;
 }
 
@@ -44,6 +51,19 @@ class MemoryScheduleDatabase {
     shifts: [],
     cycles: [],
     slots: [],
+    employees: [
+      {
+        id: 'employee-1',
+        storeId: 'store-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      {
+        id: 'employee-2',
+        storeId: 'store-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+    ],
+    assignments: [],
     sequence: 1,
   };
 
@@ -80,7 +100,9 @@ class MemoryScheduleDatabase {
               ? staged.shifts
               : entity === WorkCycle
                 ? staged.cycles
-                : staged.slots;
+                : entity === EmployeeProfile
+                  ? staged.employees
+                  : staged.slots;
         return (
           source.find((item) =>
             Object.entries(where).every(([key, value]) => item[key] === value),
@@ -89,7 +111,12 @@ class MemoryScheduleDatabase {
       }),
       find: jest.fn(async (entity: any, options: any) => {
         const where = options?.where || {};
-        const source = entity === WorkShift ? staged.shifts : [];
+        const source =
+          entity === WorkShift
+            ? staged.shifts
+            : entity === EmployeeProfile
+              ? staged.employees
+              : [];
         return source.filter((item) =>
           Object.entries(where).every(([key, value]) => item[key] === value),
         );
@@ -108,6 +135,7 @@ class MemoryScheduleDatabase {
         if (entity === WorkShift) staged.shifts.push(...values);
         if (entity === WorkCycle) staged.cycles.push(...values);
         if (entity === ShiftSlot) staged.slots.push(...values);
+        if (entity === ShiftAssignment) staged.assignments.push(...values);
         return value;
       }),
     };
@@ -124,6 +152,27 @@ describe('Unified shift schedule flow (e2e)', () => {
       StoresService.prototype,
     ) as StoresService;
     (storesService as any).dataSource = database;
+    (storesService as any).getShiftEmployeeOptions = jest.fn(
+      async (_storeId: string, _ownerId: string, payload: any) => {
+        const assignedEmployeeIds = new Set(
+          database.state.assignments.map((assignment) => assignment.employeeId),
+        );
+        return {
+          employees: (payload.employeeIds || []).map((id: string) => {
+            const hasConflict = assignedEmployeeIds.has(id);
+            return {
+              id,
+              name: id,
+              statusLabel: hasConflict ? 'Trùng ca' : 'Rảnh',
+              selectable: !hasConflict,
+            };
+          }),
+        };
+      },
+    );
+    (storesService as any).scheduleReminderForAssignment = jest.fn(
+      async () => undefined,
+    );
 
     const authenticatedGuard: CanActivate = {
       canActivate(context: ExecutionContext) {
@@ -168,6 +217,7 @@ describe('Unified shift schedule flow (e2e)', () => {
     database.state.shifts = [];
     database.state.cycles = [];
     database.state.slots = [];
+    database.state.assignments = [];
     database.failNextSlotSave = false;
   });
 
@@ -202,6 +252,29 @@ describe('Unified shift schedule flow (e2e)', () => {
     ).toBe(true);
   });
 
+  it('assigns every selected employee to every generated slot atomically', async () => {
+    const payload = {
+      ...createPayload('Ca có nhân viên'),
+      employeeIds: ['employee-1', 'employee-2'],
+    };
+
+    const response = await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload)
+      .expect(201);
+
+    expect(response.body.assignedEmployeeCount).toBe(2);
+    expect(response.body.generatedAssignmentCount).toBe(6);
+    expect(database.state.assignments).toHaveLength(6);
+    expect(
+      database.state.assignments.every(
+        (assignment) =>
+          assignment.status === 'APPROVED' &&
+          ['employee-1', 'employee-2'].includes(assignment.employeeId),
+      ),
+    ).toBe(true);
+  });
+
   it('rejects an incomplete weekly rule without persisting partial data', async () => {
     const payload = createPayload('Ca tuần');
     payload.recurrence.frequency = ShiftRecurrenceFrequency.WEEKLY;
@@ -230,6 +303,35 @@ describe('Unified shift schedule flow (e2e)', () => {
     expect(database.state.shifts).toHaveLength(1);
     expect(database.state.cycles).toHaveLength(1);
     expect(database.state.slots).toHaveLength(3);
+  });
+
+  it('rechecks employee conflicts after acquiring the transaction lock', async () => {
+    const firstPayload = {
+      ...createPayload('Ca nhân viên đồng thời 1'),
+      employeeIds: ['employee-1'],
+    };
+    const secondPayload = {
+      ...createPayload('Ca nhân viên đồng thời 2'),
+      employeeIds: ['employee-1'],
+    };
+
+    const [first, second] = await Promise.all([
+      request(app.getHttpServer())
+        .post('/stores/store-1/shift-schedules')
+        .send(firstPayload),
+      request(app.getHttpServer())
+        .post('/stores/store-1/shift-schedules')
+        .send(secondPayload),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([201, 400]);
+    expect(database.state.shifts).toHaveLength(1);
+    expect(database.state.assignments).toHaveLength(3);
+    expect(
+      database.state.assignments.every(
+        (assignment) => assignment.employeeId === 'employee-1',
+      ),
+    ).toBe(true);
   });
 
   it('rolls back the whole operation if slot persistence fails', async () => {

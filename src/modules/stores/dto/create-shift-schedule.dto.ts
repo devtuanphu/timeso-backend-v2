@@ -1,5 +1,6 @@
 import { Type } from 'class-transformer';
 import {
+  ArrayMaxSize,
   ArrayUnique,
   IsArray,
   IsBoolean,
@@ -118,6 +119,37 @@ export class CreateShiftScheduleDto {
   @IsString()
   @MaxLength(100)
   note?: string;
+
+  @ApiPropertyOptional({
+    type: [String],
+    description:
+      'Danh sách employee profile ID được chủ cửa hàng xếp trực tiếp vào tất cả ca được tạo.',
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @ArrayMaxSize(500)
+  @IsString({ each: true })
+  employeeIds?: string[];
+
+  @ApiProperty({ type: ShiftRecurrenceDto })
+  @ValidateNested()
+  @Type(() => ShiftRecurrenceDto)
+  recurrence: ShiftRecurrenceDto;
+}
+
+export class ShiftEmployeeOptionsDto {
+  @ApiProperty({ example: '2026-07-17' })
+  @Matches(DATE_PATTERN)
+  startDate: string;
+
+  @ApiProperty({ example: '07:00' })
+  @Matches(TIME_PATTERN)
+  startTime: string;
+
+  @ApiProperty({ example: '11:00' })
+  @Matches(TIME_PATTERN)
+  endTime: string;
 
   @ApiProperty({ type: ShiftRecurrenceDto })
   @ValidateNested()

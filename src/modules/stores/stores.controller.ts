@@ -138,7 +138,10 @@ import {
 import { AssetMultipartInterceptor } from './interceptors/asset-multipart.interceptor';
 import { ProductMultipartInterceptor } from './interceptors/product-multipart.interceptor';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
-import { CreateShiftScheduleDto } from './dto/create-shift-schedule.dto';
+import {
+  CreateShiftScheduleDto,
+  ShiftEmployeeOptionsDto,
+} from './dto/create-shift-schedule.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
@@ -734,7 +737,10 @@ export class StoresController {
   @ApiOperation({ summary: 'Phê duyệt yêu cầu bổ sung công' })
   async approveBonusWorkRequest(@Param('id') id: string, @GetUser() user: any) {
     const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    const request = await this.storesService.approveBonusWorkRequest(id, profile?.id);
+    const request = await this.storesService.approveBonusWorkRequest(
+      id,
+      profile?.id,
+    );
     await this.shiftEndWorkflowService.approveOvertime(request);
     return request;
   }
@@ -760,7 +766,10 @@ export class StoresController {
   @ApiOperation({ summary: 'Hủy yêu cầu bổ sung công' })
   async cancelBonusWorkRequest(@Param('id') id: string, @GetUser() user: any) {
     const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    const request = await this.storesService.cancelBonusWorkRequest(id, profile?.id);
+    const request = await this.storesService.cancelBonusWorkRequest(
+      id,
+      profile?.id,
+    );
     await this.shiftEndWorkflowService.resumeAfterOvertime(request);
     return request;
   }
@@ -1819,6 +1828,25 @@ export class StoresController {
   }
 
   // Work Shifts
+  @Post(':id/shift-schedules/employee-options')
+  @ApiOperation({
+    summary: 'Xem trạng thái nhân viên cho lịch ca đang tạo',
+    description:
+      'Phân loại nhân viên rảnh, có ca khác, trùng ca hoặc nghỉ phép trên toàn bộ các ngày sẽ được sinh từ quy tắc lặp.',
+  })
+  @ApiResponse({ status: 201, description: 'Danh sách trạng thái nhân viên' })
+  async getShiftEmployeeOptions(
+    @GetUser() user: any,
+    @Param('id') storeId: string,
+    @Body() body: ShiftEmployeeOptionsDto,
+  ) {
+    return this.storesService.getShiftEmployeeOptions(
+      storeId,
+      user.userId,
+      body,
+    );
+  }
+
   @Post(':id/shift-schedules')
   @ApiOperation({
     summary: 'Tạo lịch ca làm việc thống nhất',
@@ -3944,11 +3972,13 @@ export class StoresController {
       orientationNormalized: body.orientationNormalized === 'true',
     });
     if (result.matched) {
-      void this.shiftEndWorkflowService.scheduleForAssignment(id).catch((error) =>
-        this.logger.error(
-          `[CheckIn] Unable to schedule shift-end workflow for ${id}: ${error instanceof Error ? error.message : String(error)}`,
-        ),
-      );
+      void this.shiftEndWorkflowService
+        .scheduleForAssignment(id)
+        .catch((error) =>
+          this.logger.error(
+            `[CheckIn] Unable to schedule shift-end workflow for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
     }
     return result;
   }
