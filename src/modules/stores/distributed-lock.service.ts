@@ -1,6 +1,8 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, EntityManager } from 'typeorm';
+import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { CronLock } from './entities/cron-lock.entity';
 
 /**
@@ -28,9 +30,12 @@ export class DistributedLockService implements OnModuleInit {
     @InjectRepository(CronLock)
     private readonly cronLockRepository: Repository<CronLock>,
     private readonly dataSource: DataSource,
+    private readonly configService: ConfigService,
   ) {}
 
   async onModuleInit() {
+    if (isAppReadOnlyMode(this.configService)) return;
+
     // Ensure the cron_locks table exists
     await this.ensureTable();
   }

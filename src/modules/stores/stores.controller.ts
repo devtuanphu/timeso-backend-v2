@@ -78,10 +78,12 @@ import {
   ServiceItemResponseDto,
   OrderResponseDto,
   RevenueReportResponseDto,
+  HomeRevenueSummaryResponseDto,
   PayrollResponseDto,
   SalaryConfigResponseDto,
   KpiResponseDto,
   DailyReportResponseDto,
+  DailyReportForOwnerResponseDto,
   EventResponseDto,
   KpiTypeResponseDto,
   EmployeeBasicInfoResponseDto,
@@ -107,6 +109,10 @@ import {
   EmployeePersonalInfoResponseDto,
   UpdatePersonalInfoDto,
 } from './dto/store-response.dto';
+import {
+  resolveStoreRevenueDateRange,
+  validateStoreReportDate,
+} from './store-report-date.utils';
 
 import {
   CreateSalaryConfigDto,
@@ -2668,8 +2674,9 @@ export class StoresController {
   async getPayrollSummary(
     @Param('id') id: string,
     @Query('date') date: string,
+    @GetUser() user: any,
   ) {
-    return this.storesService.getPayrollSummary(id, date);
+    return this.storesService.getPayrollSummary(id, date, user.userId);
   }
 
   @Get(':id/payroll-details')
@@ -3132,7 +3139,7 @@ export class StoresController {
   @ApiResponse({
     status: 200,
     description: 'Báo cáo ngày',
-    type: DailyReportResponseDto,
+    type: DailyReportForOwnerResponseDto,
   })
   @ApiResponse({
     status: 404,
@@ -3141,10 +3148,13 @@ export class StoresController {
   async getDailyReportByDate(
     @Param('id') id: string,
     @Query('date') date: string,
+    @GetUser() user: any,
   ) {
-    const report = await this.storesService.getDailyReportByDate(
+    const reportDate = validateStoreReportDate(date);
+    const report = await this.storesService.getDailyReportByDateForOwner(
       id,
-      new Date(date),
+      reportDate,
+      user.userId,
     );
     if (!report) {
       throw new NotFoundException(`Không tìm thấy báo cáo cho ngày ${date}`);
@@ -3506,14 +3516,50 @@ export class StoresController {
     @Param('id') id: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @GetUser() user: any,
   ) {
-    // Default to last 30 days if not provided
     const end = endDate ? new Date(endDate) : new Date();
     const start = startDate
       ? new Date(startDate)
       : new Date(new Date().setDate(end.getDate() - 30));
 
-    return this.storesService.getRevenueReport(id, start, end);
+    return this.storesService.getRevenueReport(id, start, end, user.userId);
+  }
+
+  @Get(':id/home-revenue-summary')
+  @ApiOperation({
+    summary: 'Tóm tắt doanh thu cho Home của chủ cửa hàng',
+    description:
+      'Tổng hợp doanh thu, chi phí, lợi nhuận và số đơn theo ngày HCM cho chủ cửa hàng',
+  })
+  @ApiQuery({
+    name: 'startDate',
+    required: false,
+    description: 'Ngày bắt đầu (YYYY-MM-DD)',
+  })
+  @ApiQuery({
+    name: 'endDate',
+    required: false,
+    description: 'Ngày kết thúc (YYYY-MM-DD)',
+  })
+  @ApiResponse({ status: 200, type: HomeRevenueSummaryResponseDto })
+  async getHomeRevenueSummary(
+    @Param('id') id: string,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+    @GetUser() user: any,
+  ) {
+    const { startUtc, endExclusiveUtc } = resolveStoreRevenueDateRange(
+      startDate,
+      endDate,
+    );
+
+    return this.storesService.getHomeRevenueSummary(
+      id,
+      startUtc,
+      endExclusiveUtc,
+      user.userId,
+    );
   }
 
   @Get(':id/top-employees-report')

@@ -33,6 +33,9 @@ export class Account extends BaseEntity {
   @Column({ unique: true })
   phone: string;
 
+  @Column({ name: 'is_innovation_pioneer', default: true })
+  isInnovationPioneer: boolean;
+
   @Column({ name: 'password_hash', select: false })
   passwordHash: string;
 

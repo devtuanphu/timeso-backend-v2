@@ -495,6 +495,25 @@ export class RevenueReportResponseDto {
   topItems: any[];
 }
 
+export class HomeRevenueSummaryMetricsDto {
+  @ApiProperty()
+  totalRevenue: number;
+
+  @ApiProperty()
+  totalOrders: number;
+
+  @ApiProperty()
+  totalProfit: number;
+
+  @ApiProperty()
+  totalCost: number;
+}
+
+export class HomeRevenueSummaryResponseDto {
+  @ApiProperty({ type: HomeRevenueSummaryMetricsDto })
+  summary: HomeRevenueSummaryMetricsDto;
+}
+
 export class SalaryConfigResponseDto {
   @ApiProperty()
   id: string;
@@ -627,6 +646,11 @@ export class EmployeeBasicInfoResponseDto {
 
   @ApiProperty({ required: false })
   employeeType: string;
+}
+
+export class DailyReportForOwnerResponseDto extends DailyReportResponseDto {
+  @ApiProperty({ type: [EmployeeBasicInfoResponseDto] })
+  employees: EmployeeBasicInfoResponseDto[];
 }
 
 export class EmployeeStatisticsSummaryDto {
@@ -1232,5 +1256,3 @@ export class MonthlySalaryFundResponseDto {
   @ApiProperty({ type: [MonthlySalaryFundStoreDto] })
   stores: MonthlySalaryFundStoreDto[];
 }
-
-

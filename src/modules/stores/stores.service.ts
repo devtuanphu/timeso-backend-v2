@@ -772,6 +772,50 @@ export class StoresService {
     return this.storeRepository.findOne({ where: { id } });
   }
 
+  async assertOwnerStoreAccess(storeId: string, ownerAccountId: string) {
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+
+    if (!store) {
+      throw new NotFoundException('Cửa hàng không tồn tại');
+    }
+    if (store.ownerAccountId !== ownerAccountId) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+
+    return store;
+  }
+
+  async assertStoreRevenueReportAccess(storeId: string, accountId: string) {
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+
+    if (!store) {
+      throw new NotFoundException('Cửa hàng không tồn tại');
+    }
+    if (store.ownerAccountId === accountId) {
+      return store;
+    }
+
+    const activeEmployee = await this.profileRepository.findOne({
+      where: {
+        storeId,
+        accountId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id'],
+    });
+    if (!activeEmployee) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+
+    return store;
+  }
+
   async getEmployeesBasicInfo(ids: string[]) {
     if (!ids || ids.length === 0) return [];
 
@@ -5594,7 +5638,12 @@ export class StoresService {
   async getPayrollSummary(
     storeId: string,
     dateStr: string,
+    ownerAccountId: string,
   ): Promise<PayrollMonthlySummaryResponseDto> {
+    const authorizedStore = await this.assertOwnerStoreAccess(
+      storeId,
+      ownerAccountId,
+    );
     let date: Date;
     if (dateStr.includes('/')) {
       const [month, year] = dateStr.split('/').map(Number);
@@ -5618,29 +5667,26 @@ export class StoresService {
     let salaryFundTotalStore = 0;
     let estimatedPaymentTotalStore = 0;
     try {
-      const store = await this.storeRepository.findOne({
-        where: { id: storeId },
+      const allOwnerStores = await this.storeRepository.find({
+        where: {
+          ownerAccountId: authorizedStore.ownerAccountId,
+          status: StoreStatus.ACTIVE,
+        },
       });
-      if (store) {
-        const allOwnerStores = await this.storeRepository.find({
-          where: {
-            ownerAccountId: store.ownerAccountId,
-            status: StoreStatus.ACTIVE,
-          },
-        });
-        const storeIds = allOwnerStores.map((s) => s.id);
-        const allPayrolls = await this.payrollRepository.find({
-          where: { storeId: In(storeIds), month: currentMonth },
-        });
-        salaryFundTotalStore = allPayrolls.reduce(
-          (sum, p) => sum + Number(p.salaryFund || 0),
-          0,
-        );
-        estimatedPaymentTotalStore = allPayrolls.reduce(
-          (sum, p) => sum + Number(p.estimatedPayment || 0),
-          0,
-        );
-      }
+      const storeIds = allOwnerStores.map((s) => s.id);
+      const allPayrolls = storeIds.length
+        ? await this.payrollRepository.find({
+            where: { storeId: In(storeIds), month: currentMonth },
+          })
+        : [];
+      salaryFundTotalStore = allPayrolls.reduce(
+        (sum, p) => sum + Number(p.salaryFund || 0),
+        0,
+      );
+      estimatedPaymentTotalStore = allPayrolls.reduce(
+        (sum, p) => sum + Number(p.estimatedPayment || 0),
+        0,
+      );
     } catch (e) {
       console.warn(
         '[getPayrollSummary] Error calculating salaryFundTotalStore:',
@@ -7070,6 +7116,47 @@ export class StoresService {
     return this.getFinancialDataForReport(report);
   }
 
+  async getDailyReportByDateForOwner(
+    storeId: string,
+    date: string,
+    ownerAccountId: string,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const report = await this.getDailyReportByDate(storeId, date);
+    if (!report) return null;
+
+    const employeeIds = Array.from(
+      new Set(
+        [
+          report.lateArrivals,
+          report.earlyDepartures,
+          report.forgotClockOut,
+          report.unauthorizedLeaves,
+          report.extraShifts,
+          report.authorizedLeaves,
+        ].flatMap((ids) => ids || []),
+      ),
+    );
+
+    const profiles = employeeIds.length
+      ? await this.profileRepository.find({
+          where: { id: In(employeeIds), storeId: report.storeId },
+          relations: ['account', 'storeRole', 'employeeType'],
+        })
+      : [];
+
+    return {
+      ...report,
+      employees: profiles.map((profile) => ({
+        id: profile.id,
+        fullName: profile.account?.fullName,
+        avatar: profile.account?.avatar,
+        storeRole: profile.storeRole?.name,
+        employeeType: profile.employeeType?.name,
+      })),
+    };
+  }
+
   private async getFinancialDataForReport(report: DailyEmployeeReport) {
     // Đảm bảo reportDate là đối tượng Date
     const rDate = new Date(report.reportDate);
@@ -8155,13 +8242,13 @@ export class StoresService {
   }
 
   // --- Revenue Reporting ---
-  async getRevenueReport(storeId: string, startDate: Date, endDate: Date) {
-    // Ensure endDate includes the full day
-    const adjustedEndDate = new Date(endDate);
-    adjustedEndDate.setHours(23, 59, 59, 999);
-
-    // 1. Overall Summary (All orders in period)
-    const summary = await this.orderRepository
+  private async queryRevenueSummary(
+    storeId: string,
+    startDate: Date,
+    endDate: Date,
+    halfOpenRange: boolean,
+  ) {
+    const query = this.orderRepository
       .createQueryBuilder('o')
       .select(
         'SUM(CASE WHEN o.status = :completed THEN o."totalAmount" ELSE 0 END)',
@@ -8192,12 +8279,84 @@ export class StoresService {
         storeId,
         completed: OrderStatus.COMPLETED,
         cancelled: OrderStatus.CANCELLED,
-      })
-      .andWhere('o.created_at BETWEEN :startDate AND :endDate', {
+      });
+
+    if (halfOpenRange) {
+      query.andWhere(
+        'o.created_at >= :startDate AND o.created_at < :endDate',
+        { startDate, endDate },
+      );
+    } else {
+      query.andWhere('o.created_at BETWEEN :startDate AND :endDate', {
         startDate,
-        endDate: adjustedEndDate,
-      })
-      .getRawOne();
+        endDate,
+      });
+    }
+
+    return query.getRawOne();
+  }
+
+  private mapRevenueSummary(summary: any) {
+    const totalRevenue = parseFloat(summary?.totalRevenue || 0);
+    const totalCost = parseFloat(summary?.totalCost || 0);
+    const totalTax = parseFloat(summary?.totalTax || 0);
+
+    return {
+      totalRevenue,
+      totalCost,
+      totalProfit: totalRevenue - totalCost - totalTax,
+      totalDiscount: parseFloat(summary?.totalDiscount || 0),
+      totalTax,
+      totalOrders: parseInt(summary?.totalOrders || '0'),
+      successOrders: parseInt(summary?.successOrders || '0'),
+      failedOrders: parseInt(summary?.failedOrders || '0'),
+    };
+  }
+
+  async getHomeRevenueSummary(
+    storeId: string,
+    startDate: Date,
+    endExclusiveDate: Date,
+    ownerAccountId: string,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const summary = this.mapRevenueSummary(
+      await this.queryRevenueSummary(
+        storeId,
+        startDate,
+        endExclusiveDate,
+        true,
+      ),
+    );
+
+    return {
+      summary: {
+        totalRevenue: summary.totalRevenue,
+        totalOrders: summary.totalOrders,
+        totalProfit: summary.totalProfit,
+        totalCost: summary.totalCost,
+      },
+    };
+  }
+
+  async getRevenueReport(
+    storeId: string,
+    startDate: Date,
+    endDate: Date,
+    accountId: string,
+  ) {
+    await this.assertStoreRevenueReportAccess(storeId, accountId);
+
+    const adjustedEndDate = new Date(endDate);
+    adjustedEndDate.setHours(23, 59, 59, 999);
+
+    // 1. Overall Summary (All orders in period)
+    const summary = await this.queryRevenueSummary(
+      storeId,
+      startDate,
+      adjustedEndDate,
+      false,
+    );
 
     // 2. Daily Detailed Breakdown
     const dailyReport = await this.orderRepository
@@ -8280,10 +8439,11 @@ export class StoresService {
       topItems = [];
     }
 
-    const totalRev = parseFloat(summary?.totalRevenue || 0);
-    const totalCost = parseFloat(summary?.totalCost || 0);
-    const totalTax = parseFloat(summary?.totalTax || 0);
-    const totalProfit = totalRev - totalCost - totalTax;
+    const mappedSummary = this.mapRevenueSummary(summary);
+    const totalRev = mappedSummary.totalRevenue;
+    const totalCost = mappedSummary.totalCost;
+    const totalTax = mappedSummary.totalTax;
+    const totalProfit = mappedSummary.totalProfit;
 
     // A.I Insight Heuristic
     let insight = '';
@@ -8347,16 +8507,7 @@ export class StoresService {
     };
 
     return {
-      summary: {
-        totalRevenue: totalRev,
-        totalCost: totalCost,
-        totalProfit: totalProfit,
-        totalDiscount: parseFloat(summary?.totalDiscount || 0),
-        totalTax: totalTax,
-        totalOrders: parseInt(summary?.totalOrders || '0'),
-        successOrders: parseInt(summary?.successOrders || '0'),
-        failedOrders: parseInt(summary?.failedOrders || '0'),
-      },
+      summary: mappedSummary,
       insight,
       expenseBreakdown,
       daily: dailyMapped,

@@ -15,6 +15,7 @@ import { AiReportsModule } from './modules/ai-reports/ai-reports.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { BullModule } from '@nestjs/bullmq';
 import { join } from 'path';
+import { createAppTypeOrmOptions } from './app-database.config';
 
 @Module({
   imports: [
@@ -29,16 +30,7 @@ import { join } from 'path';
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        type: 'postgres',
-        host: configService.get<string>('DATABASE_HOST'),
-        port: configService.get<number>('DATABASE_PORT'),
-        username: configService.get<string>('DATABASE_USER'),
-        password: configService.get<string>('DATABASE_PASSWORD'),
-        database: configService.get<string>('DATABASE_NAME'),
-        autoLoadEntities: true,
-        synchronize: true, // Should be false in production
-      }),
+      useFactory: createAppTypeOrmOptions,
     }),
     BullModule.forRootAsync({
       imports: [ConfigModule],

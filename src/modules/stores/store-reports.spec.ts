@@ -9,7 +9,10 @@ import { ShiftReminderService } from './shift-reminder.service';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
-import { EmployeeProfile } from './entities/employee-profile.entity';
+import {
+  EmployeeProfile,
+  EmploymentStatus,
+} from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import { EmployeeContract } from './entities/employee-contract.entity';
 import { ContractTemplate } from './entities/contract-template.entity';
@@ -100,6 +103,7 @@ function mockRepo() {
   return {
     find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(null),
+    count: jest.fn().mockResolvedValue(0),
     create: jest.fn((d) => ({ id: 'gen-id', ...d })),
     save: jest.fn((e) =>
       Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e }),
@@ -117,6 +121,7 @@ function mockRepo() {
       qb.having = jest.fn().mockReturnValue(qb);
       qb.limit = jest.fn().mockReturnValue(qb);
       qb.getMany = jest.fn().mockResolvedValue([]);
+      qb.getOne = jest.fn().mockResolvedValue(null);
       qb.getRawMany = jest.fn().mockResolvedValue([]);
       qb.getRawOne = jest.fn().mockResolvedValue(null);
       return qb;
@@ -200,6 +205,10 @@ const ENTITIES = [
 
 describe('Store Reports Module', () => {
   let service: StoresService;
+  let storeRepo: ReturnType<typeof mockRepo>;
+  let profileRepo: ReturnType<typeof mockRepo>;
+  let payrollRepo: ReturnType<typeof mockRepo>;
+  let dailyReportRepo: ReturnType<typeof mockRepo>;
   let orderRepo: ReturnType<typeof mockRepo>;
   let orderItemRepo: ReturnType<typeof mockRepo>;
 
@@ -211,8 +220,16 @@ describe('Store Reports Module', () => {
       return { provide: getRepositoryToken(entity), useValue: mock };
     });
 
+    storeRepo = repoMap.get(Store)!;
+    profileRepo = repoMap.get(EmployeeProfile)!;
+    payrollRepo = repoMap.get(MonthlyPayroll)!;
+    dailyReportRepo = repoMap.get(DailyEmployeeReport)!;
     orderRepo = repoMap.get(Order)!;
     orderItemRepo = repoMap.get(OrderItem)!;
+    storeRepo.findOne.mockResolvedValue({
+      id: 'store-1',
+      ownerAccountId: 'owner-1',
+    });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -337,6 +354,7 @@ describe('Store Reports Module', () => {
         'store-1',
         new Date(),
         new Date(),
+        'owner-1',
       );
 
       expect(result).toBeDefined();
@@ -350,6 +368,10 @@ describe('Store Reports Module', () => {
         revenue: 50000,
       });
       expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(3);
+      expect(qbStore.andWhere).toHaveBeenCalledWith(
+        'o.created_at BETWEEN :startDate AND :endDate',
+        expect.any(Object),
+      );
     });
 
     it('should handle zero data scenarios (no orders)', async () => {
@@ -370,11 +392,247 @@ describe('Store Reports Module', () => {
         'store-1',
         new Date(),
         new Date(),
+        'owner-1',
       );
       expect(result.summary.totalRevenue).toBe(0);
       expect(result.summary.totalProfit).toBe(0);
       expect(result.insight).toContain('Chưa có giao dịch nào');
     });
+
+    it('allows an active staff account in the same store', async () => {
+      profileRepo.findOne.mockResolvedValueOnce({
+        id: 'employee-1',
+        storeId: 'store-1',
+        accountId: 'staff-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      });
+
+      await expect(
+        service.getRevenueReport(
+          'store-1',
+          new Date('2026-07-01'),
+          new Date('2026-07-22'),
+          'staff-1',
+        ),
+      ).resolves.toBeDefined();
+
+      expect(profileRepo.findOne).toHaveBeenCalledWith({
+        where: {
+          storeId: 'store-1',
+          accountId: 'staff-1',
+          employmentStatus: EmploymentStatus.ACTIVE,
+        },
+        select: ['id'],
+      });
+    });
+
+    it('denies an unrelated account before running revenue queries', async () => {
+      profileRepo.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        service.getRevenueReport(
+          'store-1',
+          new Date('2026-07-01'),
+          new Date('2026-07-22'),
+          'unrelated-account',
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+      expect(orderRepo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getHomeRevenueSummary', () => {
+    it('returns only Home metrics with strict half-open bounds', async () => {
+      const qb = orderRepo.createQueryBuilder();
+      orderRepo.createQueryBuilder.mockClear();
+      qb.getRawOne.mockResolvedValueOnce({
+        totalRevenue: '100000',
+        totalCost: '50000',
+        totalTax: '10000',
+        totalOrders: '5',
+      });
+      orderRepo.createQueryBuilder.mockReturnValueOnce(qb);
+
+      const result = await service.getHomeRevenueSummary(
+        'store-1',
+        new Date('2026-07-21T17:00:00.000Z'),
+        new Date('2026-07-22T17:00:00.000Z'),
+        'owner-1',
+      );
+
+      expect(result).toEqual({
+        summary: {
+          totalRevenue: 100000,
+          totalOrders: 5,
+          totalProfit: 40000,
+          totalCost: 50000,
+        },
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        'o.created_at >= :startDate AND o.created_at < :endDate',
+        {
+          startDate: new Date('2026-07-21T17:00:00.000Z'),
+          endDate: new Date('2026-07-22T17:00:00.000Z'),
+        },
+      );
+      expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('owner report authorization and daily hydration', () => {
+    it('returns owner-wide payroll totals for the authorized owner', async () => {
+      storeRepo.find.mockResolvedValueOnce([
+        { id: 'store-1' },
+        { id: 'store-2' },
+      ]);
+      payrollRepo.find.mockResolvedValueOnce([
+        { salaryFund: 100, estimatedPayment: 80 },
+        { salaryFund: 200, estimatedPayment: 150 },
+      ]);
+
+      const result = await service.getPayrollSummary(
+        'store-1',
+        '07/2026',
+        'owner-1',
+      );
+
+      expect(result.salaryFundTotalStore).toBe(300);
+      expect(result.estimatedPaymentTotalStore).toBe(230);
+    });
+
+    it('hydrates unique, store-scoped employees without changing ID arrays', async () => {
+      const report = {
+        id: 'report-1',
+        storeId: 'store-1',
+        reportDate: new Date('2026-07-22T00:00:00.000Z'),
+        lateArrivals: ['employee-1', 'employee-missing'],
+        earlyDepartures: ['employee-1'],
+        forgotClockOut: ['employee-foreign'],
+        unauthorizedLeaves: [],
+        extraShifts: [],
+        authorizedLeaves: [],
+      };
+      const qb = dailyReportRepo.createQueryBuilder();
+      qb.getOne.mockResolvedValueOnce(report);
+      dailyReportRepo.createQueryBuilder.mockReturnValueOnce(qb);
+      profileRepo.find.mockResolvedValueOnce([
+        {
+          id: 'employee-1',
+          account: { fullName: 'Nguyen An', avatar: '/avatar.png' },
+          storeRole: { name: 'Thu ngân' },
+          employeeType: { name: 'Toàn thời gian' },
+        },
+      ]);
+
+      const result = await service.getDailyReportByDateForOwner(
+        'store-1',
+        '2026-07-22',
+        'owner-1',
+      );
+
+      expect(result?.lateArrivals).toEqual(['employee-1', 'employee-missing']);
+      expect(result?.earlyDepartures).toEqual(['employee-1']);
+      expect(result?.forgotClockOut).toEqual(['employee-foreign']);
+      expect(result?.employees).toEqual([
+        {
+          id: 'employee-1',
+          fullName: 'Nguyen An',
+          avatar: '/avatar.png',
+          storeRole: 'Thu ngân',
+          employeeType: 'Toàn thời gian',
+        },
+      ]);
+
+      const employeeWhere = profileRepo.find.mock.calls[0][0].where as any;
+      expect(employeeWhere.storeId).toBe('store-1');
+      expect(employeeWhere.id._value).toEqual([
+        'employee-1',
+        'employee-missing',
+        'employee-foreign',
+      ]);
+      expect(profileRepo.find).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [
+        'Home revenue summary',
+        () =>
+          service.getHomeRevenueSummary(
+            'store-1',
+            new Date('2026-07-21T17:00:00.000Z'),
+            new Date('2026-07-22T17:00:00.000Z'),
+            'owner-2',
+          ),
+      ],
+      [
+        'legacy revenue report',
+        () =>
+          service.getRevenueReport(
+            'store-1',
+            new Date('2026-07-21T17:00:00.000Z'),
+            new Date('2026-07-22T17:00:00.000Z'),
+            'owner-2',
+          ),
+      ],
+      [
+        'daily report',
+        () =>
+          service.getDailyReportByDateForOwner(
+            'store-1',
+            '2026-07-22',
+            'owner-2',
+          ),
+      ],
+      [
+        'payroll summary',
+        () => service.getPayrollSummary('store-1', '07/2026', 'owner-2'),
+      ],
+    ])('forbids a foreign owner for %s', async (_label, operation) => {
+      await expect(operation()).rejects.toMatchObject({ status: 403 });
+    });
+
+    it.each([
+      [
+        'Home revenue summary',
+        () =>
+          service.getHomeRevenueSummary(
+            'missing-store',
+            new Date('2026-07-21T17:00:00.000Z'),
+            new Date('2026-07-22T17:00:00.000Z'),
+            'owner-1',
+          ),
+      ],
+      [
+        'legacy revenue report',
+        () =>
+          service.getRevenueReport(
+            'missing-store',
+            new Date('2026-07-21T17:00:00.000Z'),
+            new Date('2026-07-22T17:00:00.000Z'),
+            'owner-1',
+          ),
+      ],
+      [
+        'daily report',
+        () =>
+          service.getDailyReportByDateForOwner(
+            'missing-store',
+            '2026-07-22',
+            'owner-1',
+          ),
+      ],
+      [
+        'payroll summary',
+        () => service.getPayrollSummary('missing-store', '07/2026', 'owner-1'),
+      ],
+    ])(
+      'returns not found for a missing store on %s',
+      async (_label, operation) => {
+        storeRepo.findOne.mockResolvedValueOnce(null);
+
+        await expect(operation()).rejects.toMatchObject({ status: 404 });
+      },
+    );
   });
 
   describe('getTopEmployeesReport', () => {

@@ -58,6 +58,9 @@ export class AccountResponseDto {
   @ApiProperty({ example: '0901234567' })
   phone: string;
 
+  @ApiProperty({ example: true, default: true })
+  isInnovationPioneer: boolean;
+
   @ApiProperty({ example: 'Ha Noi' })
   address: string;
 

@@ -5,6 +5,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
+import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { ZaloToken } from './entities/zalo-token.entity';
 
 /**
@@ -67,6 +68,8 @@ export class ZaloService implements OnModuleInit {
   // ═══════════════════════════════════════════════════════════
 
   async onModuleInit() {
+    if (isAppReadOnlyMode(this.configService)) return;
+
     const token = await this.findLatestToken();
 
     if (!token) {
@@ -363,6 +366,8 @@ export class ZaloService implements OnModuleInit {
    */
   @Cron(`0 */${CRON_INTERVAL_HOURS} * * *`)
   async keepAliveToken() {
+    if (isAppReadOnlyMode(this.configService)) return;
+
     // ─── PM2 Cluster Guard ───
     // PM2 cluster mode gán NODE_APP_INSTANCE cho mỗi worker (0, 1, 2...).
     // Chỉ cho worker 0 chạy cron để tránh race condition hoàn toàn.

@@ -12,6 +12,7 @@ import { AccountStatus } from '../accounts/entities/account.entity';
 import { ZaloService } from '../zalo/zalo.service';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
 import { StoresService } from '../stores/stores.service';
+import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 
 @Injectable()
 export class AuthService {
@@ -61,16 +62,19 @@ export class AuthService {
       expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN'),
     });
 
-    // Save refresh token to DB (hashed)
-    const refreshTokenHash = await bcrypt.hash(refreshTokenValue, 10);
-    const refreshTokenEntity = this.refreshTokenRepository.create({
-      accountId: user.id,
-      tokenHash: refreshTokenHash,
-      appType,
-      issuedAt: new Date(),
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days matching .env
-    });
-    await this.refreshTokenRepository.save(refreshTokenEntity);
+    const readOnly = isAppReadOnlyMode(this.configService);
+    if (!readOnly) {
+      // Save refresh token to DB (hashed)
+      const refreshTokenHash = await bcrypt.hash(refreshTokenValue, 10);
+      const refreshTokenEntity = this.refreshTokenRepository.create({
+        accountId: user.id,
+        tokenHash: refreshTokenHash,
+        appType,
+        issuedAt: new Date(),
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days matching .env
+      });
+      await this.refreshTokenRepository.save(refreshTokenEntity);
+    }
 
     const { passwordHash, ...cleanUser } = user;
 
@@ -91,8 +95,10 @@ export class AuthService {
       }
     }
 
-    // Fire-and-forget: ensure daily report exists (cron job fallback)
-    this.triggerDailyReportEnsure(user, appType, employeeData.storeId);
+    if (!readOnly) {
+      // Fire-and-forget: ensure daily report exists (cron job fallback)
+      this.triggerDailyReportEnsure(user, appType, employeeData.storeId);
+    }
 
     return {
       access_token: accessToken,

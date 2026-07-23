@@ -1,5 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
+import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { StoresService } from './stores.service';
 import { DistributedLockService } from './distributed-lock.service';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
@@ -12,13 +14,20 @@ export class StoresCronService {
     private readonly storesService: StoresService,
     private readonly lockService: DistributedLockService,
     private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
+    private readonly configService: ConfigService,
   ) {}
+
+  private isReadOnlyMode(): boolean {
+    return isAppReadOnlyMode(this.configService);
+  }
 
   @Cron(CronExpression.EVERY_MINUTE, {
     name: 'reconcile-shift-end-workflows',
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleReconcileShiftEndWorkflows() {
+    if (this.isReadOnlyMode()) return;
+
     await this.lockService.withLock(
       'cron:reconcile-shift-end-workflows',
       55,
@@ -35,6 +44,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleCreateDailyReports() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:create-daily-reports', 300, async () => {
       this.logger.log('Starting daily reports creation for all stores...');
       const reports = await this.storesService.createDailyReportsForAllStores();
@@ -59,6 +70,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleCreateMonthlyPayrolls() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:create-monthly-payrolls', 1800, async () => {
       this.logger.log('Starting monthly payrolls creation for all stores...');
       const payrolls = await this.storesService.createMonthlyPayrollsForAllStores();
@@ -80,6 +93,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleCreateMonthlySummaries() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:create-monthly-employee-summaries', 600, async () => {
       this.logger.log('Starting monthly employee summaries creation for all active employees...');
       const summaries = await this.storesService.createMonthlySummariesForAllEmployees();
@@ -101,6 +116,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleProcessExpiredCycles() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:process-expired-work-cycles', 300, async () => {
       this.logger.log('Starting to process expired and scheduled-stop work cycles...');
       const processResult = await this.storesService.processExpiredCycles();
@@ -122,6 +139,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleGenerateDailySlots() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:generate-daily-slots', 300, async () => {
       this.logger.log('Starting to generate slots for tomorrow for all active cycles...');
       const generateResult = await this.storesService.generateDailySlotsForAllCycles();
@@ -143,6 +162,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleGenerateSlotsForIndefiniteCycles() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:generate-slots-indefinite-cycles', 300, async () => {
       this.logger.log('Starting to generate slots for indefinite work cycles...');
       const processResult = await this.storesService.generateDailySlotsForIndefiniteCycles();
@@ -165,6 +186,8 @@ export class StoresCronService {
     timeZone: 'Asia/Ho_Chi_Minh',
   })
   async handleDetectAttendanceIssues() {
+    if (this.isReadOnlyMode()) return;
+
     const result = await this.lockService.withLock('cron:detect-attendance-issues', 300, async () => {
       this.logger.log('Starting end-of-day attendance issues detection...');
       await this.shiftEndWorkflowService.reconcileActiveAssignments();
