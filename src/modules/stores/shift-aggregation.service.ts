@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
@@ -63,6 +63,11 @@ export enum ShiftStatus {
   CANCELLED = 'cancelled',
 }
 
+const MAX_SHIFT_FILTER_CANDIDATES = 5000;
+const MAX_SUGGESTION_CANDIDATES = 5000;
+const MAX_SUGGESTION_SLOTS = 200;
+const MAX_SCORED_SUGGESTION_CANDIDATES = 100;
+
 // ── Response DTOs ─────────────────────────────────────────────────────────────
 
 export interface ShiftSlotResponse {
@@ -102,17 +107,20 @@ export interface ShiftSlotEmployee {
   workedMinutes: number | null;
   salary: number | null;
   assignmentId: string;
+  /** Original registration state, kept separate from attendance status. */
+  assignmentStatus?: ShiftAssignmentStatus;
 }
 
 export interface ShiftSummaryResponse {
   totalSalary: number;
   salaryChange: number;
   totalEmployees: number;
-  totalRequiredEmployees: number;
+  totalRequiredEmployees: number | null;
   employeeChange: number;
   totalHours: number;
   hoursChange: number;
   totalShifts: number;
+  totalLeaveEmployees: number;
 }
 
 export interface MonthSummaryResponse {
@@ -243,6 +251,7 @@ export class ShiftAggregationService {
 
   async getShiftSlots(params: {
     storeId: string;
+    ownerAccountId: string;
     from?: string;
     to?: string;
     type?: string;
@@ -250,8 +259,8 @@ export class ShiftAggregationService {
     page?: number;
     limit?: number;
   }): Promise<{
-    data: ShiftSlotResponse[];
-    meta: { total: number; page: number; limit: number };
+  data: ShiftSlotResponse[];
+    meta: { total: number; page: number; limit: number; truncated: boolean; hasMore: boolean };
   }> {
     const {
       storeId,
@@ -262,6 +271,21 @@ export class ShiftAggregationService {
       page = 1,
       limit = 50,
     } = params;
+
+    await this.assertOwnerStoreAccess(storeId, params.ownerAccountId);
+    this.validateDateRange(from, to);
+    if ((from && !to) || (!from && to)) {
+      throw new BadRequestException('Cần cung cấp cả ngày bắt đầu và ngày kết thúc');
+    }
+    if (!Number.isInteger(page) || page < 1 || !Number.isInteger(limit) || limit < 1 || limit > 500) {
+      throw new BadRequestException('Phân trang không hợp lệ');
+    }
+    if (staffingStatus && !Object.values(StaffingStatus).includes(staffingStatus)) {
+      throw new BadRequestException('Trạng thái nhân sự không hợp lệ');
+    }
+    if (type && !['morning', 'noon', 'evening'].includes(type)) {
+      throw new BadRequestException('Loại ca không hợp lệ');
+    }
 
     const qb = this.shiftSlotRepo
       .createQueryBuilder('slot')
@@ -283,25 +307,40 @@ export class ShiftAggregationService {
     if (from) qb.andWhere('slot.workDate >= :from', { from });
     if (to) qb.andWhere('slot.workDate <= :to', { to });
 
-    const rawSlots = await qb
+    const rules = await this.loadActivePayrollRules(storeId);
+    // Derived staffing/type filters require hydrated slot data. Bound the
+    // hydration workload and reject larger ranges instead of silently omitting
+    // slots after an arbitrary cap.
+    const batchQb = qb
       .orderBy('slot.workDate', 'ASC')
       .addOrderBy('ws.startTime', 'ASC')
-      .getMany();
-
-    const rules = await this.loadActivePayrollRules(storeId);
-    let slots = rawSlots.map((slot) => this.mapSlotToResponse(slot, rules));
-
-    if (staffingStatus) {
-      slots = slots.filter((s) => s.staffingStatus === staffingStatus);
+      .addOrderBy('slot.id', 'ASC');
+    const rawSlots = await batchQb.take(MAX_SHIFT_FILTER_CANDIDATES).getMany();
+    if (rawSlots.length === MAX_SHIFT_FILTER_CANDIDATES) {
+      // Derived filters currently require hydrated entities. Refuse a larger
+      // workload instead of silently dropping slots after an arbitrary cap.
+      const probe = await qb
+        .skip(MAX_SHIFT_FILTER_CANDIDATES)
+        .take(1)
+        .getMany();
+      if (probe.length > 0) {
+        throw new BadRequestException(
+          `Khoảng thời gian có quá nhiều ca (tối đa ${MAX_SHIFT_FILTER_CANDIDATES}). Vui lòng thu hẹp khoảng ngày`,
+        );
+      }
     }
-    if (type) {
-      slots = slots.filter((s) => s.shiftType === type);
-    }
+    const slots = rawSlots
+      .map((slot) => this.mapSlotToResponse(slot, rules))
+      .filter((s) => !staffingStatus || s.staffingStatus === staffingStatus)
+      .filter((s) => !type || s.shiftType === type);
 
     const total = slots.length;
     const paged = slots.slice((page - 1) * limit, page * limit);
 
-    return { data: paged, meta: { total, page, limit } };
+    return {
+      data: paged,
+      meta: { total, page, limit, truncated: false, hasMore: page * limit < total },
+    };
   }
 
   // ── 2. Chi tiết 1 ca ──────────────────────────────────────────────────────
@@ -309,8 +348,10 @@ export class ShiftAggregationService {
   async getShiftDetail(params: {
     storeId: string;
     shiftSlotId: string;
+    ownerAccountId: string;
   }): Promise<ShiftDetailResponse | null> {
     const { storeId, shiftSlotId } = params;
+    await this.assertOwnerStoreAccess(storeId, params.ownerAccountId);
 
     const slot = await this.shiftSlotRepo
       .createQueryBuilder('slot')
@@ -322,6 +363,9 @@ export class ShiftAggregationService {
       .leftJoinAndSelect('emp.storeRole', 'role')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('slot.id = :shiftSlotId', { shiftSlotId })
       .getOne();
 
@@ -363,7 +407,7 @@ export class ShiftAggregationService {
       ? Math.round(((currentDaySummary.totalHours - prevDaySummary.totalHours) / prevDaySummary.totalHours) * 100)
       : 0;
 
-    const daySlots = await this.getShiftSlots({ storeId, from: slot.workDate, to: slot.workDate, limit: 100 });
+    const daySlots = await this.getShiftSlots({ storeId, ownerAccountId: params.ownerAccountId, from: slot.workDate, to: slot.workDate, limit: 100 });
     
     response.todos = daySlots.data
       .filter((s) => s.insufficientCount > 0)
@@ -375,7 +419,7 @@ export class ShiftAggregationService {
         role: 'nhân viên',
       }));
 
-    const aiSugRaw = await this.getShiftSuggestions({ storeId, from: slot.workDate, to: slot.workDate, limit: 5 });
+    const aiSugRaw = await this.getShiftSuggestions({ storeId, ownerAccountId: params.ownerAccountId, from: slot.workDate, to: slot.workDate, limit: 5 });
     response.aiSuggestions = aiSugRaw.map((s) => {
       const relatedSlot = daySlots.data.find(d => d.id === s.shiftSlotId);
       const timeRange = relatedSlot ? `${relatedSlot.startTime} - ${relatedSlot.endTime}` : '';
@@ -403,8 +447,11 @@ export class ShiftAggregationService {
     storeId: string;
     from: string;
     to: string;
+    ownerAccountId: string;
   }): Promise<ShiftSummaryResponse> {
     const { storeId, from, to } = params;
+    await this.assertOwnerStoreAccess(storeId, params.ownerAccountId);
+    this.requireDateRange(from, to);
     const prevPeriod = this.getPreviousPeriod(from, to);
 
     const [current, prev] = await Promise.all([
@@ -443,6 +490,7 @@ export class ShiftAggregationService {
       totalHours: Math.round(current.totalHours * 10) / 10,
       hoursChange,
       totalShifts: current.totalShifts,
+      totalLeaveEmployees: current.totalLeaveEmployees,
     };
   }
 
@@ -452,8 +500,13 @@ export class ShiftAggregationService {
     storeId: string;
     year: number;
     month: number;
+    ownerAccountId: string;
   }): Promise<MonthSummaryResponse> {
     const { storeId, year, month } = params;
+    await this.assertOwnerStoreAccess(storeId, params.ownerAccountId);
+    if (!Number.isInteger(year) || year < 2000 || year > 2200 || !Number.isInteger(month) || month < 1 || month > 12) {
+      throw new BadRequestException('Năm hoặc tháng không hợp lệ');
+    }
     const lastDay = new Date(year, month, 0).getDate();
     const from = `${year}-${String(month).padStart(2, '0')}-01`;
     const to = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
@@ -543,15 +596,26 @@ export class ShiftAggregationService {
     storeId: string;
     from: string;
     to: string;
+    ownerAccountId: string;
     limit?: number;
   }): Promise<ShiftSuggestion[]> {
     const { storeId, from, to, limit = 3 } = params;
+    await this.assertOwnerStoreAccess(storeId, params.ownerAccountId);
+    this.requireDateRange(from, to);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
+      throw new BadRequestException('Giới hạn gợi ý không hợp lệ');
+    }
 
     // Lấy các slot thiếu nhân viên
     const insufficientRaw = await this.shiftSlotRepo
       .createQueryBuilder('slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
-      .leftJoin('slot.assignments', 'sa')
+      .leftJoin(
+        'slot.assignments',
+        'sa',
+        'sa.status != :cancelledAssignmentStatus',
+        { cancelledAssignmentStatus: ShiftAssignmentStatus.CANCELLED },
+      )
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
       .andWhere('cycle.status IN (:...cycleStatuses)', {
@@ -559,14 +623,16 @@ export class ShiftAggregationService {
       })
       .andWhere('slot.workDate >= :from', { from })
       .andWhere('slot.workDate <= :to', { to })
-      .andWhere('slot.maxStaff IS NOT NULL')
+      .andWhere(
+        'COALESCE(slot.maxStaff, ws.defaultMaxStaff) IS NOT NULL',
+      )
       .groupBy('slot.id')
       .addGroupBy('ws.id')
       .select([
         'slot.id as id',
         'slot.workDate as workDate',
         'slot.dayOfWeek as dayOfWeek',
-        'slot.maxStaff as maxStaff',
+        'COALESCE(slot.maxStaff, ws.defaultMaxStaff) as maxStaff',
         'slot.workShiftId as workShiftId',
         'slot.startTime as slotStartTime',
         'slot.endTime as slotEndTime',
@@ -574,13 +640,22 @@ export class ShiftAggregationService {
         'ws.startTime as ws_startTime',
         'COUNT(sa.id) as assignedCount',
       ])
-      .having('slot.maxStaff > COUNT(sa.id)')
+      .having('COALESCE(slot.maxStaff, ws.defaultMaxStaff) > COUNT(sa.id)')
+      .orderBy('slot.workDate', 'ASC')
+      .addOrderBy('ws.startTime', 'ASC')
+      .addOrderBy('slot.id', 'ASC')
+      .limit(MAX_SUGGESTION_SLOTS + 1)
       .getRawMany();
 
     if (!insufficientRaw || insufficientRaw.length === 0) return [];
+    if (insufficientRaw.length > MAX_SUGGESTION_SLOTS) {
+      throw new BadRequestException(
+        `Khoảng thời gian có quá nhiều ca thiếu người (tối đa ${MAX_SUGGESTION_SLOTS}). Vui lòng thu hẹp phạm vi`,
+      );
+    }
 
     // Lấy candidate employees
-    const candidates = await this.employeeProfileRepo
+    const candidatesQb = this.employeeProfileRepo
       .createQueryBuilder('emp')
       .leftJoinAndSelect('emp.account', 'account')
       .leftJoinAndSelect('emp.storeRole', 'role')
@@ -588,7 +663,18 @@ export class ShiftAggregationService {
       .andWhere('emp.employmentStatus = :status', {
         status: EmploymentStatus.ACTIVE,
       })
-      .getMany();
+      .orderBy('emp.createdAt', 'ASC')
+      .addOrderBy('emp.id', 'ASC')
+      .take(MAX_SUGGESTION_CANDIDATES);
+    const candidates = await candidatesQb.getMany();
+    if (candidates.length === MAX_SUGGESTION_CANDIDATES) {
+      const probe = await candidatesQb.skip(MAX_SUGGESTION_CANDIDATES).take(1).getMany();
+      if (probe.length > 0) {
+        throw new BadRequestException(
+          `Cửa hàng có quá nhiều nhân viên để tạo gợi ý (tối đa ${MAX_SUGGESTION_CANDIDATES}). Vui lòng thu hẹp phạm vi`,
+        );
+      }
+    }
 
     if (candidates.length === 0) return [];
 
@@ -616,22 +702,27 @@ export class ShiftAggregationService {
       .andWhere('sa.status != :cancelled', {
         cancelled: ShiftAssignmentStatus.CANCELLED,
       })
-      .select(['sa.employeeId', 'sa.shiftSlotId'])
-      .getMany();
+      .select('sa.employeeId', 'employeeId')
+      .addSelect('sa.shiftSlotId', 'shiftSlotId')
+      .getRawMany();
 
     const suggestions: ShiftSuggestion[] = [];
 
     for (const raw of insufficientRaw) {
       const slotAssigned = new Set(
         existingAssignments
-          .filter((a: any) => a.sa_shiftSlotId === raw.id)
-          .map((a: any) => a.sa_employeeId),
+          .filter((a: any) => (a.shiftSlotId ?? a.sa_shiftSlotId) === raw.id)
+          .map((a: any) => a.employeeId ?? a.sa_employeeId),
       );
 
       const eligible = candidates.filter(
         (c) => !slotAssigned.has(c.id) && !onLeaveIds.has(c.id),
       );
       if (eligible.length === 0) continue;
+      // Candidate rows are ordered by createdAt/id above. Score only a stable
+      // prefix so large stores cannot fan out unbounded DB work per slot while
+      // still returning useful suggestions instead of rejecting the request.
+      const scoredEligible = eligible.slice(0, MAX_SCORED_SUGGESTION_CANDIDATES);
 
       const shiftType = this.inferShiftType(
         raw.ws_shiftName || '',
@@ -641,7 +732,7 @@ export class ShiftAggregationService {
 
       // Chấm điểm
       const scored = await this.scoreCandidates(
-        eligible,
+        scoredEligible,
         {
           id: raw.id,
           workDate: raw.workDate,
@@ -685,8 +776,11 @@ export class ShiftAggregationService {
     employeeId: string;
     from: string;
     to: string;
+    ownerAccountId: string;
   }): Promise<EmployeeScheduleGridResponse | null> {
     const { storeId, employeeId, from, to } = params;
+    await this.assertEmployeeCalendarAccess(storeId, employeeId, params.ownerAccountId);
+    this.requireDateRange(from, to);
 
     const emp = await this.employeeProfileRepo
       .createQueryBuilder('emp')
@@ -724,7 +818,9 @@ export class ShiftAggregationService {
       .getMany();
 
     const dateRange = this.getDateRange(from, to);
-    const today = new Date().toISOString().split('T')[0];
+    const today = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+    }).format(new Date());
 
     const schedule: EmployeeScheduleDay[] = dateRange.map((date) => {
       const dateStr = date.toISOString().split('T')[0];
@@ -874,6 +970,55 @@ export class ShiftAggregationService {
     return this.payrollRuleRepo.find({ where: { storeId, isActive: true } });
   }
 
+  private async assertOwnerStoreAccess(storeId: string, ownerAccountId: string): Promise<void> {
+    const store = await this.storeRepo.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (store.ownerAccountId !== ownerAccountId) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+  }
+
+  private async assertEmployeeCalendarAccess(storeId: string, employeeId: string, accountId: string): Promise<void> {
+    const store = await this.storeRepo.findOne({ where: { id: storeId }, select: ['id', 'ownerAccountId'] });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (store.ownerAccountId === accountId) return;
+    const profile = await this.employeeProfileRepo.findOne({
+      where: { id: employeeId, storeId, accountId, employmentStatus: EmploymentStatus.ACTIVE },
+      select: ['id'],
+    });
+    if (!profile) throw new ForbiddenException('Bạn chỉ có thể xem lịch của chính mình');
+  }
+
+  private validateDateRange(from?: string, to?: string): void {
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+    if (from && !dateOnly.test(from)) throw new BadRequestException('Ngày bắt đầu không hợp lệ');
+    if (to && !dateOnly.test(to)) throw new BadRequestException('Ngày kết thúc không hợp lệ');
+    if (from && to && from > to) throw new BadRequestException('Khoảng ngày không hợp lệ');
+    for (const value of [from, to]) {
+      if (!value) continue;
+      const [year, month, day] = value.split('-').map(Number);
+      const parsed = new Date(Date.UTC(year, month - 1, day));
+      if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+        throw new BadRequestException('Ngày không tồn tại');
+      }
+    }
+    if (from && to) {
+      const start = Date.parse(`${from}T00:00:00Z`);
+      const end = Date.parse(`${to}T00:00:00Z`);
+      if (end - start > 366 * 24 * 60 * 60 * 1000) {
+        throw new BadRequestException('Khoảng ngày tối đa là 366 ngày');
+      }
+    }
+  }
+
+  private requireDateRange(from: string | undefined, to: string | undefined): asserts from is string {
+    if (!from || !to) throw new BadRequestException('Cần cung cấp ngày bắt đầu và ngày kết thúc');
+    this.validateDateRange(from, to);
+  }
+
   /**
    * Chênh lệch lương của 1 ca (thưởng/phạt) theo StorePayrollRule của cửa hàng.
    * Chỉ áp phần PHẠT map được về mức 1 ca: LATE / EARLY / ABSENT (mirror công thức
@@ -1001,6 +1146,7 @@ export class ShiftAggregationService {
           salary,
           salaryDiff,
           assignmentId: a.id,
+          assignmentStatus: a.status,
         };
       }),
       cycleId: slot.cycleId,
@@ -1008,20 +1154,45 @@ export class ShiftAggregationService {
   }
 
   private computeShiftStatus(slot: ShiftSlot): ShiftStatus {
-    const today = new Date().toISOString().split('T')[0];
-    if (slot.workDate > today) return ShiftStatus.PENDING;
-    if (slot.workDate < today) return ShiftStatus.FINISHED;
-
     const now = new Date();
-    const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(
-      now.getMinutes(),
-    ).padStart(2, '0')}`;
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(now).reduce<Record<string, string>>((result, part) => {
+      if (part.type !== 'literal') result[part.type] = part.value;
+      return result;
+    }, {});
+    const today = `${parts.year}-${parts.month}-${parts.day}`;
+    const currentTime = `${parts.hour}:${parts.minute}`;
     const startTime = slot.startTime || slot.workShift?.startTime || '';
     const endTime = slot.endTime || slot.workShift?.endTime || '';
-    if (currentTime >= startTime && currentTime <= endTime)
-      return ShiftStatus.ONGOING;
-    if (currentTime > endTime) return ShiftStatus.FINISHED;
-    return ShiftStatus.PENDING;
+    if (!startTime || !endTime) return ShiftStatus.PENDING;
+
+    const overnight = endTime < startTime;
+    const workDate = slot.workDate;
+    if (overnight) {
+      // A shift that starts yesterday remains active after midnight until its
+      // end time on the following local (Asia/Ho_Chi_Minh) day.
+      const yesterday = new Date(`${today}T00:00:00Z`);
+      yesterday.setUTCDate(yesterday.getUTCDate() - 1);
+      const yesterdayDate = yesterday.toISOString().slice(0, 10);
+      if (workDate === yesterdayDate && currentTime <= endTime) return ShiftStatus.ONGOING;
+      if (workDate === today) {
+        if (currentTime >= startTime) return ShiftStatus.ONGOING;
+        return ShiftStatus.PENDING;
+      }
+      return workDate > today ? ShiftStatus.PENDING : ShiftStatus.FINISHED;
+    }
+
+    if (workDate > today) return ShiftStatus.PENDING;
+    if (workDate < today) return ShiftStatus.FINISHED;
+    if (currentTime >= startTime && currentTime <= endTime) return ShiftStatus.ONGOING;
+    return currentTime > endTime ? ShiftStatus.FINISHED : ShiftStatus.PENDING;
   }
 
   private mapAttendanceStatus(
@@ -1066,7 +1237,7 @@ export class ShiftAggregationService {
   }
 
   private async calcSummary(storeId: string, from: string, to: string) {
-    const [assignments, slotResult] = await Promise.all([
+    const [assignments, slotResult, leaveRows] = await Promise.all([
       this.shiftAssignmentRepo
         .createQueryBuilder('sa')
         .leftJoinAndSelect('sa.shiftSlot', 'slot')
@@ -1097,8 +1268,25 @@ export class ShiftAggregationService {
         })
         .andWhere('slot.workDate >= :from', { from })
         .andWhere('slot.workDate <= :to', { to })
-        .select('COALESCE(SUM(slot.maxStaff), 0) as totalRequired')
+        // A slot inherits its work-shift default when it has no override.
+        // Any null after resolution means the period is unlimited.
+        .select(
+          `CASE WHEN COUNT(*) FILTER (WHERE COALESCE(slot.maxStaff, ws.defaultMaxStaff) IS NULL) > 0
+            THEN NULL
+            ELSE COALESCE(SUM(COALESCE(slot.maxStaff, ws.defaultMaxStaff)), 0)
+          END`,
+          'totalRequired',
+        )
+        .leftJoin('slot.workShift', 'ws')
         .getRawOne(),
+      this.leaveRequestRepo
+        .createQueryBuilder('lr')
+        .select('DISTINCT lr.employeeProfileId', 'employeeId')
+        .where('lr.storeId = :storeId', { storeId })
+        .andWhere('lr.status = :approved', { approved: 'APPROVED' })
+        .andWhere('lr.startDate <= :to', { to })
+        .andWhere('lr.endDate >= :from', { from })
+        .getRawMany(),
     ]);
 
     // Đồng nhất quy tắc: đã làm → thực tế; chưa → ước tính (giờ theo lịch, lương theo hợp đồng).
@@ -1118,7 +1306,9 @@ export class ShiftAggregationService {
       totalEmployees: employeeIds.size,
       totalHours,
       totalShifts: slotIds.size,
-      totalRequiredEmployees: Number(slotResult?.totalRequired) || 0,
+      totalRequiredEmployees:
+        slotResult?.totalRequired == null ? null : Number(slotResult.totalRequired) || 0,
+      totalLeaveEmployees: leaveRows.length,
     };
   }
 
@@ -1355,13 +1545,14 @@ export class ShiftAggregationService {
     employeeId: string;
     from: string;
     to: string;
+    ownerAccountId: string;
   }): Promise<any[]> {
     const { storeId, employeeId, from, to } = params;
+    await this.assertEmployeeCalendarAccess(storeId, employeeId, params.ownerAccountId);
+    this.requireDateRange(from, to);
 
-    const fromDate = new Date(from);
-    fromDate.setHours(0, 0, 0, 0);
-    const toDate = new Date(to);
-    toDate.setHours(23, 59, 59, 999);
+    const fromDate = new Date(`${from}T00:00:00+07:00`);
+    const toDate = new Date(`${to}T23:59:59.999+07:00`);
 
     // 1. Fetch Attendance Logs
     const attendanceLogs = await this.attendanceLogRepo
@@ -1380,7 +1571,12 @@ export class ShiftAggregationService {
       .createQueryBuilder('sa')
       .leftJoinAndSelect('sa.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoin('slot.cycle', 'cycle')
       .where('sa.employeeId = :employeeId', { employeeId })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .andWhere('sa.createdAt >= :from', { from: fromDate })
       .andWhere('sa.createdAt <= :to', { to: toDate })
       .getMany();
@@ -1423,7 +1619,13 @@ export class ShiftAggregationService {
         .leftJoinAndSelect('slot.workShift', 'ws')
         .leftJoinAndSelect('sa.employee', 'emp')
         .leftJoinAndSelect('emp.account', 'acc')
+        .leftJoin('slot.cycle', 'cycle')
         .where('sa.id IN (:...idsArray)', { idsArray })
+        .andWhere('sa.employeeId = :employeeId', { employeeId })
+        .andWhere('cycle.storeId = :storeId', { storeId })
+        .andWhere('cycle.status IN (:...cycleStatuses)', {
+          cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+        })
         .getMany();
 
       for (const a of assignments) {
@@ -1438,7 +1640,12 @@ export class ShiftAggregationService {
       const slots = await this.shiftSlotRepo
         .createQueryBuilder('slot')
         .leftJoinAndSelect('slot.workShift', 'ws')
+        .leftJoin('slot.cycle', 'cycle')
         .where('slot.id IN (:...idsArray)', { idsArray })
+        .andWhere('cycle.storeId = :storeId', { storeId })
+        .andWhere('cycle.status IN (:...cycleStatuses)', {
+          cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+        })
         .getMany();
 
       for (const s of slots) {

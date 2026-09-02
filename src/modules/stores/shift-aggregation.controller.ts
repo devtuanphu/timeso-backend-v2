@@ -1,5 +1,6 @@
 import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { GetUser } from '../auth/decorators/get-user.decorator';
 import {
   ShiftAggregationService,
   StaffingStatus,
@@ -23,6 +24,7 @@ export class ShiftAggregationController {
     @Query('staffingStatus') staffingStatus: StaffingStatus,
     @Query('page') page: string,
     @Query('limit') limit: string,
+    @GetUser() user: any,
   ) {
     return this.aggService.getShiftSlots({
       storeId,
@@ -32,6 +34,7 @@ export class ShiftAggregationController {
       staffingStatus,
       page: page ? parseInt(page, 10) : 1,
       limit: limit ? parseInt(limit, 10) : 50,
+      ownerAccountId: user.userId,
     });
   }
 
@@ -44,8 +47,9 @@ export class ShiftAggregationController {
     @Param('storeId') storeId: string,
     @Query('from') from: string,
     @Query('to') to: string,
+    @GetUser() user: any,
   ) {
-    return this.aggService.getShiftSummary({ storeId, from, to });
+    return this.aggService.getShiftSummary({ storeId, from, to, ownerAccountId: user.userId });
   }
 
   /**
@@ -57,11 +61,13 @@ export class ShiftAggregationController {
     @Param('storeId') storeId: string,
     @Query('year') year: string,
     @Query('month') month: string,
+    @GetUser() user: any,
   ) {
     return this.aggService.getMonthSummary({
       storeId,
       year: parseInt(year, 10),
       month: parseInt(month, 10),
+      ownerAccountId: user.userId,
     });
   }
 
@@ -75,12 +81,14 @@ export class ShiftAggregationController {
     @Query('from') from: string,
     @Query('to') to: string,
     @Query('limit') limit: string,
+    @GetUser() user: any,
   ) {
     return this.aggService.getShiftSuggestions({
       storeId,
       from,
       to,
       limit: limit ? parseInt(limit, 10) : 3,
+      ownerAccountId: user.userId,
     });
   }
 
@@ -92,8 +100,9 @@ export class ShiftAggregationController {
   async getShiftDetail(
     @Param('storeId') storeId: string,
     @Param('shiftSlotId') shiftSlotId: string,
+    @GetUser() user: any,
   ) {
-    return this.aggService.getShiftDetail({ storeId, shiftSlotId });
+    return this.aggService.getShiftDetail({ storeId, shiftSlotId, ownerAccountId: user.userId });
   }
 
   /**
@@ -106,12 +115,14 @@ export class ShiftAggregationController {
     @Param('empId') empId: string,
     @Query('from') from: string,
     @Query('to') to: string,
+    @GetUser() user: any,
   ) {
     return this.aggService.getEmployeeScheduleGrid({
       storeId,
       employeeId: empId,
       from,
       to,
+      ownerAccountId: user.userId,
     });
   }
 
@@ -125,12 +136,14 @@ export class ShiftAggregationController {
     @Param('empId') empId: string,
     @Query('from') from: string,
     @Query('to') to: string,
+    @GetUser() user: any,
   ) {
     return this.aggService.getEmployeeActivities({
       storeId,
       employeeId: empId,
       from,
       to,
+      ownerAccountId: user.userId,
     });
   }
 }

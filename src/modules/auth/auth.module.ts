@@ -12,6 +12,7 @@ import { ZaloModule } from '../zalo/zalo.module';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
 import { AccountRefreshToken } from '../accounts/entities/account-refresh-token.entity';
 import { StoresModule } from '../stores/stores.module';
+import { createJwtModuleOptions } from './jwt.config';
 
 @Module({
   imports: [
@@ -24,16 +25,11 @@ import { StoresModule } from '../stores/stores.module';
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
-      useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET') || 'secret',
-        signOptions: {
-          expiresIn: (configService.get<string>('JWT_EXPIRES_IN') ||
-            '1h') as any,
-        },
-      }),
+      useFactory: createJwtModuleOptions,
     }),
   ],
   providers: [AuthService, JwtStrategy],
   controllers: [AuthController],
+  exports: [JwtModule],
 })
 export class AuthModule {}

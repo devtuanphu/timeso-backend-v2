@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, JoinColumn, OneToMany } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, OneToMany, Index } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 import { WorkShift } from './work-shift.entity';
@@ -59,6 +59,13 @@ export enum WeekDaySchedule {
 
 // --- ENTITIES ---
 
+// The one-active-cycle invariant must hold across API instances. PostgreSQL
+// enforces it atomically; existing deployments must apply the equivalent
+// partial unique index through the normal migration rollout.
+@Index('uq_work_cycles_one_active_per_store', ['storeId'], {
+  unique: true,
+  where: '"status" = \'ACTIVE\'',
+})
 @Entity('work_cycles')
 export class WorkCycle extends BaseEntity {
   @Column({ name: 'store_id' })

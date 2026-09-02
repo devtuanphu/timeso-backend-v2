@@ -1,9 +1,11 @@
 import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
+  ArrayMinSize,
   ArrayUnique,
   IsArray,
   IsBoolean,
+  IsDefined,
   IsEnum,
   IsInt,
   IsNotEmpty,
@@ -89,30 +91,66 @@ export class ShiftRecurrenceDto {
   occurrenceCount?: number;
 }
 
-export class CreateShiftScheduleDto {
+export class ShiftDraftDto {
   @ApiProperty({ example: 'Ca sáng' })
   @IsString()
   @IsNotEmpty()
   @MaxLength(80)
   shiftName: string;
-
-  @ApiProperty({ example: '2026-07-17' })
-  @Matches(DATE_PATTERN)
-  startDate: string;
-
   @ApiProperty({ example: '07:00' })
   @Matches(TIME_PATTERN)
   startTime: string;
-
   @ApiProperty({ example: '11:00' })
   @Matches(TIME_PATTERN)
   endTime: string;
-
   @ApiProperty({ minimum: 1, maximum: 10000, example: 1 })
   @IsInt()
   @Min(1)
   @Max(10000)
   maxStaff: number;
+  @ApiPropertyOptional({ maxLength: 100 })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  note?: string;
+  @ApiPropertyOptional({ type: [String] })
+  @IsOptional()
+  @IsArray()
+  @ArrayUnique()
+  @ArrayMaxSize(500)
+  @IsString({ each: true })
+  employeeIds?: string[];
+}
+
+export class CreateShiftScheduleDto {
+  @ApiPropertyOptional({ example: 'Ca sáng' })
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(80)
+  shiftName?: string;
+
+  @ApiProperty({ example: '2026-07-17' })
+  @IsDefined()
+  @Matches(DATE_PATTERN)
+  startDate: string;
+
+  @ApiPropertyOptional({ example: '07:00' })
+  @IsOptional()
+  @Matches(TIME_PATTERN)
+  startTime?: string;
+
+  @ApiPropertyOptional({ example: '11:00' })
+  @IsOptional()
+  @Matches(TIME_PATTERN)
+  endTime?: string;
+
+  @ApiPropertyOptional({ minimum: 1, maximum: 10000, example: 1 })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(10000)
+  maxStaff?: number;
 
   @ApiPropertyOptional({ maxLength: 100 })
   @IsOptional()
@@ -133,9 +171,19 @@ export class CreateShiftScheduleDto {
   employeeIds?: string[];
 
   @ApiProperty({ type: ShiftRecurrenceDto })
+  @IsDefined()
   @ValidateNested()
   @Type(() => ShiftRecurrenceDto)
   recurrence: ShiftRecurrenceDto;
+
+  @ApiPropertyOptional({ type: [ShiftDraftDto], minItems: 1, maxItems: 50 })
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => ShiftDraftDto)
+  shifts?: ShiftDraftDto[];
 }
 
 export class ShiftEmployeeOptionsDto {
@@ -156,3 +204,6 @@ export class ShiftEmployeeOptionsDto {
   @Type(() => ShiftRecurrenceDto)
   recurrence: ShiftRecurrenceDto;
 }
+
+// A cycle shares its date/recurrence configuration, while each draft owns its
+// name, hours, capacity and optional assignments.

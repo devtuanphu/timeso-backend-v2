@@ -1,4 +1,12 @@
-import { IsString, IsOptional, IsEnum, IsArray, IsUUID } from 'class-validator';
+import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsString,
+  IsOptional,
+  IsEnum,
+  IsArray,
+  IsUUID,
+} from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 
 export class UpdateChatGroupDto {
@@ -22,6 +30,8 @@ export class UpdateChatGroupDto {
 
   @ApiPropertyOptional({ description: 'Danh sách ID người được gửi tin (nếu custom)' })
   @IsArray()
+  @ArrayMaxSize(200)
+  @ArrayUnique()
   @IsUUID('4', { each: true })
   @IsOptional()
   customSenderIds?: string[];

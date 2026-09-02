@@ -150,6 +150,7 @@ function mockDataSource() {
   return {
     transaction: jest.fn(async (cb) =>
       cb({
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
         find: jest.fn().mockResolvedValue([]),
         findOne: jest.fn().mockResolvedValue(null),
         create: jest.fn((entity: any, data: any) => ({
@@ -311,6 +312,11 @@ describe('StoresService - Shift Registration Count', () => {
   let dataSourceMock: ReturnType<typeof mockDataSource>;
   let service: StoresService;
   let repoMap: Map<any, ReturnType<typeof mockRepo>>;
+  let reminderServiceMock: {
+    syncEmployeeReminders: jest.Mock;
+    scheduleReminder: jest.Mock;
+    scheduleAssignmentReminder: jest.Mock;
+  };
   const shiftSlotRepo = {
     ...mockRepo(),
     find: jest.fn(),
@@ -321,6 +327,11 @@ describe('StoresService - Shift Registration Count', () => {
     dataSourceMock = mockDataSource();
     repoMap = new Map<any, ReturnType<typeof mockRepo>>();
     repoMap.set(ShiftSlot, shiftSlotRepo);
+    reminderServiceMock = {
+      syncEmployeeReminders: jest.fn(),
+      scheduleReminder: jest.fn(),
+      scheduleAssignmentReminder: jest.fn(),
+    };
 
     const providers = ENTITIES.map((entity) => {
       const mock = repoMap.has(entity) ? repoMap.get(entity)! : mockRepo();
@@ -350,15 +361,18 @@ describe('StoresService - Shift Registration Count', () => {
         },
         {
           provide: ShiftReminderService,
-          useValue: {
-            syncEmployeeReminders: jest.fn(),
-            scheduleReminder: jest.fn(),
-          },
+          useValue: reminderServiceMock,
         },
       ],
     }).compile();
 
     service = module.get<StoresService>(StoresService);
+    repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({
+      id: 'emp-1',
+      accountId: 'account-1',
+      storeId: 'store-1',
+      employmentStatus: EmploymentStatus.ACTIVE,
+    });
   });
 
   afterEach(() => {
@@ -380,6 +394,7 @@ describe('StoresService - Shift Registration Count', () => {
             shiftName: 'Ca sáng',
             startTime: '08:00',
             endTime: '12:00',
+            defaultMaxStaff: 5,
           },
           assignments: [
             {
@@ -519,6 +534,128 @@ describe('StoresService - Shift Registration Count', () => {
   });
 
   describe('registerToShiftSlot', () => {
+    it('schedules an approved assignment only after transaction commit', async () => {
+      const slot = {
+        id: 'slot-1',
+        cycleId: 'cycle-1',
+        workShiftId: 'shift-1',
+        maxStaff: 2,
+        cycle: { id: 'cycle-1', storeId: 'store-1' },
+      };
+      shiftSlotRepo.findOne.mockResolvedValue(slot);
+      repoMap.get(Store)!.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+      let committed = false;
+      let releaseCommit!: () => void;
+      let signalTransactionBodyFinished!: () => void;
+      const commitGate = new Promise<void>((resolve) => {
+        releaseCommit = resolve;
+      });
+      const transactionBodyFinished = new Promise<void>((resolve) => {
+        signalTransactionBodyFinished = resolve;
+      });
+      reminderServiceMock.scheduleAssignmentReminder.mockImplementation(
+        async () => {
+          expect(committed).toBe(true);
+        },
+      );
+      const txManager = {
+        query: jest.fn(),
+        createQueryBuilder: jest.fn(() => ({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue(slot),
+        })),
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn(async (entityType) => {
+          if (entityType === WorkCycle) {
+            return {
+              id: 'cycle-1',
+              storeId: 'store-1',
+              status: WorkCycleStatus.ACTIVE,
+            };
+          }
+          if (entityType === WorkShift) {
+            return { id: 'shift-1', defaultMaxStaff: 2 };
+          }
+          if (entityType === Store) {
+            return { id: 'store-1', ownerAccountId: 'owner-1' };
+          }
+          if (entityType === EmployeeProfile) {
+            return {
+              id: 'employee-1',
+              storeId: 'store-1',
+              accountId: 'employee-account',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            };
+          }
+          return null;
+        }),
+        create: jest.fn((_entity, value) => value),
+        save: jest.fn(async (value) => ({
+          id: 'assignment-1',
+          ...value,
+          status: ShiftAssignmentStatus.APPROVED,
+        })),
+      };
+      dataSourceMock.transaction.mockImplementation(async (callback) => {
+        const result = await callback(txManager);
+        signalTransactionBodyFinished();
+        await commitGate;
+        committed = true;
+        return result;
+      });
+
+      const registration = service.registerToShiftSlot(
+        'slot-1',
+        'employee-1',
+        undefined,
+        true,
+        'owner-1',
+      );
+      await transactionBodyFinished;
+      expect(
+        reminderServiceMock.scheduleAssignmentReminder,
+      ).not.toHaveBeenCalled();
+      releaseCommit();
+
+      await expect(registration).resolves.toEqual(
+        expect.objectContaining({ id: 'assignment-1' }),
+      );
+      expect(
+        reminderServiceMock.scheduleAssignmentReminder,
+      ).toHaveBeenCalledWith('assignment-1');
+
+      const loggerError = jest
+        .spyOn((service as any).logger, 'error')
+        .mockImplementation();
+      reminderServiceMock.scheduleAssignmentReminder.mockRejectedValueOnce(
+        new Error('private queue detail'),
+      );
+      committed = false;
+
+      await expect(
+        service.registerToShiftSlot(
+          'slot-1',
+          'employee-1',
+          undefined,
+          true,
+          'owner-1',
+        ),
+      ).resolves.toEqual(
+        expect.objectContaining({ id: 'assignment-1' }),
+      );
+      expect(committed).toBe(true);
+      expect(loggerError).toHaveBeenCalledWith(
+        'Failed to schedule registered assignment reminder',
+      );
+      expect(loggerError).not.toHaveBeenCalledWith(
+        expect.stringContaining('private queue detail'),
+      );
+    });
+
     it('should reject registration when slot is at max capacity', async () => {
       const fullSlot = {
         id: 'slot-full',
@@ -542,6 +679,7 @@ describe('StoresService - Shift Registration Count', () => {
       };
 
       const txManager = {
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
         find: jest.fn().mockResolvedValue([
           {
             id: 'existing-a1',
@@ -574,9 +712,22 @@ describe('StoresService - Shift Registration Count', () => {
       dataSourceMock.transaction.mockImplementation(async (cb) =>
         cb(txManager),
       );
+      shiftSlotRepo.findOne.mockResolvedValue(fullSlot);
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({
+        id: 'new-employee',
+        accountId: 'new-account',
+        storeId: 'store-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      });
 
       await expect(
-        service.registerToShiftSlot('slot-full', 'new-employee'),
+        service.registerToShiftSlot(
+          'slot-full',
+          'new-employee',
+          undefined,
+          false,
+          'new-account',
+        ),
       ).rejects.toThrow('Ca đã đầy người');
     });
   });
@@ -631,6 +782,89 @@ describe('StoresService - Shift Registration Count', () => {
       expect(result).toHaveLength(1);
       expect(result[0].currentCount).toBe(3);
       expect(result[0].isFull).toBe(false);
+      expect(result[0].maxStaff).toBe(4);
+      expect(result[0].effectiveMaxStaff).toBe(4);
+    });
+
+    it('exposes inherited work-shift capacity when the slot override is null', async () => {
+      const mockSlots = [
+        {
+          id: 'slot-inherited',
+          cycleId: 'cycle-1',
+          workDate: '2025-02-10',
+          maxStaff: null,
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca sáng',
+            startTime: '08:00',
+            endTime: '12:00',
+            defaultMaxStaff: 5,
+          },
+          assignments: Array.from({ length: 5 }, (_, index) => ({
+            id: `a${index}`,
+            employeeId: `e${index}`,
+            status: ShiftAssignmentStatus.APPROVED,
+          })),
+        },
+      ];
+      const qbMock: any = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        leftJoin: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(qbMock);
+
+      const result = await service.getStoreShiftSlots('store-1');
+
+      expect(result[0].maxStaff).toBeNull();
+      expect(result[0].effectiveMaxStaff).toBe(5);
+      expect(result[0].currentCount).toBe(5);
+      expect(result[0].isFull).toBe(true);
+    });
+
+    it('keeps unlimited capacity when both slot and shift defaults are null or zero', async () => {
+      const mockSlots = [
+        {
+          id: 'slot-unlimited',
+          cycleId: 'cycle-1',
+          workDate: '2025-02-10',
+          maxStaff: 0,
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca sáng',
+            startTime: '08:00',
+            endTime: '12:00',
+            defaultMaxStaff: null,
+          },
+          assignments: [
+            {
+              id: 'a1',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.APPROVED,
+            },
+          ],
+        },
+      ];
+      const qbMock: any = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        leftJoin: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(qbMock);
+
+      const result = await service.getStoreShiftSlots('store-1');
+
+      expect(result[0].maxStaff).toBe(0);
+      expect(result[0].effectiveMaxStaff).toBeNull();
+      expect(result[0].isFull).toBe(false);
     });
 
     it('should correctly mark slot as full in getStoreShiftSlots', async () => {
@@ -676,6 +910,50 @@ describe('StoresService - Shift Registration Count', () => {
 
       expect(result[0].currentCount).toBe(2);
       expect(result[0].isFull).toBe(true);
+    });
+
+    it('excludes cancelled assignments from staff calendar payload and capacity', async () => {
+      const mockSlots = [
+        {
+          id: 'slot-cancelled',
+          cycleId: 'cycle-1',
+          workDate: '2025-02-10',
+          maxStaff: 1,
+          workShift: {
+            id: 'ws-1',
+            shiftName: 'Ca sáng',
+            startTime: '08:00',
+            endTime: '12:00',
+          },
+          assignments: [
+            {
+              id: 'a-cancelled',
+              employeeId: 'e1',
+              status: ShiftAssignmentStatus.CANCELLED,
+            },
+          ],
+        },
+      ];
+      const qbMock: any = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        leftJoin: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        addOrderBy: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(qbMock);
+
+      const result = await service.getStoreShiftSlots('store-1');
+
+      expect(result[0].assignments).toEqual([]);
+      expect(result[0].currentCount).toBe(0);
+      expect(result[0].isFull).toBe(false);
+      expect(qbMock.andWhere).toHaveBeenCalledWith(
+        'cycle.status IN (:...cycleStatuses)',
+        { cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED] },
+      );
     });
   });
 
@@ -738,6 +1016,7 @@ describe('StoresService - Shift Registration Count', () => {
 
       // Mock the transaction manager
       const managerMock = {
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
         findOne: jest.fn(),
         find: jest.fn(),
         create: jest.fn(),
@@ -754,6 +1033,14 @@ describe('StoresService - Shift Registration Count', () => {
       // Employee is active
       managerMock.findOne.mockResolvedValue({
         id: 'emp-1',
+        accountId: 'account-1',
+        storeId: 'store-1',
+        employmentStatus: EmploymentStatus.ACTIVE,
+      });
+      managerMock.findOne.mockResolvedValueOnce({
+        id: 'emp-1',
+        accountId: 'account-1',
+        storeId: 'store-1',
         employmentStatus: EmploymentStatus.ACTIVE,
       });
 
@@ -807,6 +1094,10 @@ describe('StoresService - Shift Registration Count', () => {
       });
 
       expect(result).toEqual({ successCount: 2 });
+      expect(mockQueryBuilder.andWhere).toHaveBeenCalledWith(
+        'cycle.storeId = :storeId',
+        { storeId: 'store-1' },
+      );
       expect(managerMock.create).toHaveBeenCalledTimes(2);
       expect(managerMock.save).toHaveBeenCalledTimes(2);
     });
@@ -828,12 +1119,13 @@ describe('StoresService - Shift Registration Count', () => {
       });
 
       const managerMock = {
-        findOne: jest
-          .fn()
-          .mockResolvedValue({
-            id: 'emp-1',
-            employmentStatus: EmploymentStatus.ACTIVE,
-          }),
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+        findOne: jest.fn().mockResolvedValue({
+          id: 'emp-1',
+          accountId: 'account-1',
+          storeId: 'store-1',
+          employmentStatus: EmploymentStatus.ACTIVE,
+        }),
         find: jest.fn().mockResolvedValue([
           {
             id: 'a1',
@@ -863,6 +1155,198 @@ describe('StoresService - Shift Registration Count', () => {
           daysOfWeek: [1],
         }),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects batch registration when a null slot capacity inherits a full shift default', async () => {
+      const mockSlots = [
+        {
+          id: 'slot-inherited-full',
+          workDate: '2024-06-03',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+      ];
+      shiftSlotRepo.createQueryBuilder.mockReturnValue({
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      });
+      const managerMock = {
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+        findOne: jest.fn((entity) => {
+          if (entity === EmployeeProfile) {
+            return Promise.resolve({
+              id: 'emp-1',
+              accountId: 'account-1',
+              storeId: 'store-1',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            });
+          }
+          if (entity === WorkCycle) {
+            return Promise.resolve({ id: 'cycle-1', storeId: 'store-1' });
+          }
+          if (entity === WorkShift) {
+            return Promise.resolve({ id: 'ws-1', defaultMaxStaff: 5 });
+          }
+          return Promise.resolve(null);
+        }),
+        find: jest.fn().mockResolvedValue(
+          Array.from({ length: 5 }, (_, index) => ({
+            id: `a${index}`,
+            employeeId: `other-${index}`,
+            status: ShiftAssignmentStatus.APPROVED,
+          })),
+        ),
+        createQueryBuilder: jest.fn().mockReturnValue({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue({
+            id: 'slot-inherited-full',
+            cycleId: 'cycle-1',
+            workShiftId: 'ws-1',
+            maxStaff: null,
+          }),
+        }),
+      };
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => cb(managerMock));
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2024-06-01',
+          daysOfWeek: [1],
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(managerMock.find).toHaveBeenCalledWith(ShiftAssignment, {
+        where: { shiftSlotId: 'slot-inherited-full' },
+      });
+    });
+
+    it('allows batch registration for an explicit zero-capacity unlimited slot', async () => {
+      const mockSlots = [
+        {
+          id: 'slot-unlimited',
+          workDate: '2024-06-03',
+          cycle: { status: WorkCycleStatus.ACTIVE },
+        },
+      ];
+      shiftSlotRepo.createQueryBuilder.mockReturnValue({
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(mockSlots),
+      });
+      const managerMock = {
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+        findOne: jest.fn((entity) => {
+          if (entity === EmployeeProfile) {
+            return Promise.resolve({
+              id: 'emp-1',
+              accountId: 'account-1',
+              storeId: 'store-1',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            });
+          }
+          if (entity === WorkCycle) {
+            return Promise.resolve({ id: 'cycle-1', storeId: 'store-1' });
+          }
+          if (entity === WorkShift) {
+            return Promise.resolve({ id: 'ws-1', defaultMaxStaff: 5 });
+          }
+          return Promise.resolve(null);
+        }),
+        find: jest.fn().mockResolvedValue(
+          Array.from({ length: 5 }, (_, index) => ({
+            id: `a${index}`,
+            employeeId: `other-${index}`,
+            status: ShiftAssignmentStatus.APPROVED,
+          })),
+        ),
+        create: jest.fn().mockReturnValue({ id: 'new-assignment' }),
+        save: jest.fn().mockResolvedValue({ id: 'new-assignment' }),
+        createQueryBuilder: jest.fn().mockReturnValue({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue({
+            id: 'slot-unlimited',
+            cycleId: 'cycle-1',
+            workShiftId: 'ws-1',
+            maxStaff: 0,
+          }),
+        }),
+      };
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => cb(managerMock));
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2024-06-01',
+          daysOfWeek: [1],
+        }),
+      ).resolves.toEqual({ successCount: 1 });
+      expect(managerMock.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a cross-store slot even when a stale query returns it', async () => {
+      shiftSlotRepo.createQueryBuilder.mockReturnValue({
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([
+          {
+            id: 'foreign-slot',
+            workDate: '2024-06-03',
+            cycle: { storeId: 'store-2', status: WorkCycleStatus.ACTIVE },
+          },
+        ]),
+      });
+      const managerMock = {
+        query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+        findOne: jest
+          .fn()
+          .mockResolvedValueOnce({
+            id: 'emp-1',
+            accountId: 'account-1',
+            storeId: 'store-1',
+            employmentStatus: EmploymentStatus.ACTIVE,
+          })
+          .mockResolvedValueOnce({
+            id: 'foreign-cycle',
+            storeId: 'store-2',
+            status: WorkCycleStatus.ACTIVE,
+          }),
+        find: jest.fn().mockResolvedValue([]),
+        createQueryBuilder: jest.fn().mockReturnValue({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue({
+            id: 'foreign-slot',
+            cycleId: 'foreign-cycle',
+            maxStaff: 2,
+          }),
+        }),
+      };
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => cb(managerMock));
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2024-06-01',
+          daysOfWeek: [1],
+        }),
+      ).rejects.toThrow(BadRequestException);
+      expect(managerMock.find).not.toHaveBeenCalled();
     });
   });
 });

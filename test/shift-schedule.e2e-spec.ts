@@ -6,9 +6,12 @@ import {
 } from '@nestjs/common';
 import { getQueueToken } from '@nestjs/bullmq';
 import { Test } from '@nestjs/testing';
+import { PassportModule } from '@nestjs/passport';
+import { ConfigService } from '@nestjs/config';
 import request from 'supertest';
 import { AccountsService } from '../src/modules/accounts/accounts.service';
 import { JwtAuthGuard } from '../src/modules/auth/guards/jwt-auth.guard';
+import { JwtStrategy } from '../src/modules/auth/strategies/jwt.strategy';
 import { MailService } from '../src/modules/mail/mail.service';
 import { StoresController } from '../src/modules/stores/stores.controller';
 import { ShiftEndWorkflowService } from '../src/modules/stores/shift-end-workflow.service';
@@ -47,7 +50,10 @@ interface MemoryState {
 
 class MemoryScheduleDatabase {
   state: MemoryState = {
-    stores: [{ id: 'store-1', ownerAccountId: 'owner-1' }],
+    stores: [
+      { id: 'store-1', ownerAccountId: 'owner-1' },
+      { id: 'store-2', ownerAccountId: 'owner-2' },
+    ],
     shifts: [],
     cycles: [],
     slots: [],
@@ -68,9 +74,12 @@ class MemoryScheduleDatabase {
   };
 
   failNextSlotSave = false;
+  transactionCount = 0;
+  inTransaction = false;
   private transactionTail: Promise<void> = Promise.resolve();
 
   async transaction<T>(callback: (manager: any) => Promise<T>): Promise<T> {
+    this.transactionCount += 1;
     const previous = this.transactionTail;
     let release!: () => void;
     this.transactionTail = new Promise<void>((resolve) => {
@@ -80,17 +89,21 @@ class MemoryScheduleDatabase {
 
     const staged = structuredClone(this.state);
     const manager = this.createManager(staged);
+    this.inTransaction = true;
     try {
       const result = await callback(manager);
       this.state = staged;
+      this.inTransaction = false;
       return result;
     } finally {
+      this.inTransaction = false;
       release();
     }
   }
 
   private createManager(staged: MemoryState) {
     return {
+      query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
       findOne: jest.fn(async (entity: any, options: any) => {
         const where = options?.where || {};
         const source =
@@ -138,6 +151,16 @@ class MemoryScheduleDatabase {
         if (entity === ShiftAssignment) staged.assignments.push(...values);
         return value;
       }),
+      update: jest.fn(async (entity: any, criteria: any, patch: any) => {
+        const source = entity === WorkCycle ? staged.cycles : [];
+        const target = source.find((item) =>
+          typeof criteria === 'string'
+            ? item.id === criteria
+            : item.id === criteria.id,
+        );
+        if (target) Object.assign(target, patch);
+        return { affected: target ? 1 : 0 };
+      }),
     };
   }
 }
@@ -145,14 +168,42 @@ class MemoryScheduleDatabase {
 describe('Unified shift schedule flow (e2e)', () => {
   let app: INestApplication;
   let database: MemoryScheduleDatabase;
+  let storesService: StoresService;
+  let preflightOptionsMock: jest.Mock;
+  let commitAvailabilityMock: jest.Mock;
+  let batchReminderMock: jest.Mock;
+  let perAssignmentReminderMock: jest.Mock;
+  let loggerErrorMock: jest.Mock;
 
   beforeAll(async () => {
     database = new MemoryScheduleDatabase();
-    const storesService = Object.create(
-      StoresService.prototype,
-    ) as StoresService;
+    storesService = Object.create(StoresService.prototype) as StoresService;
+    loggerErrorMock = jest.fn();
+    (storesService as any).logger = { error: loggerErrorMock };
     (storesService as any).dataSource = database;
-    (storesService as any).getShiftEmployeeOptions = jest.fn(
+    (storesService as any).storeRepository = {
+      findOne: jest.fn(async ({ where }: any) =>
+        database.state.stores.find((item) => item.id === where.id),
+      ),
+    };
+    commitAvailabilityMock = jest.fn(
+      async (_manager: any, _storeId: string, drafts: any[]) => {
+        const assignedEmployeeIds = new Set(
+          database.state.assignments.map((assignment) => assignment.employeeId),
+        );
+        if (
+          drafts.some((draft) =>
+            draft.employeeIds.some((id: string) => assignedEmployeeIds.has(id)),
+          )
+        ) {
+          const { BadRequestException } = await import('@nestjs/common');
+          throw new BadRequestException('Nhân viên không còn khả dụng');
+        }
+      },
+    );
+    (storesService as any).assertShiftScheduleAvailabilityAtCommit =
+      commitAvailabilityMock;
+    preflightOptionsMock = jest.fn(
       async (_storeId: string, _ownerId: string, payload: any) => {
         const assignedEmployeeIds = new Set(
           database.state.assignments.map((assignment) => assignment.employeeId),
@@ -170,9 +221,17 @@ describe('Unified shift schedule flow (e2e)', () => {
         };
       },
     );
-    (storesService as any).scheduleReminderForAssignment = jest.fn(
-      async () => undefined,
-    );
+    (storesService as any).getShiftEmployeeOptions = preflightOptionsMock;
+    batchReminderMock = jest.fn(async (assignmentIds: string[]) => {
+      expect(database.inTransaction).toBe(false);
+      expect(database.state.assignments).toHaveLength(assignmentIds.length);
+    });
+    (storesService as any).shiftReminderService = {
+      scheduleAssignmentReminders: batchReminderMock,
+    };
+    perAssignmentReminderMock = jest.fn(async () => undefined);
+    (storesService as any).scheduleReminderForAssignment =
+      perAssignmentReminderMock;
 
     const authenticatedGuard: CanActivate = {
       canActivate(context: ExecutionContext) {
@@ -219,6 +278,12 @@ describe('Unified shift schedule flow (e2e)', () => {
     database.state.slots = [];
     database.state.assignments = [];
     database.failNextSlotSave = false;
+    database.transactionCount = 0;
+    preflightOptionsMock.mockClear();
+    commitAvailabilityMock.mockClear();
+    batchReminderMock.mockClear();
+    perAssignmentReminderMock.mockClear();
+    loggerErrorMock.mockClear();
   });
 
   const createPayload = (shiftName: string) => ({
@@ -244,6 +309,7 @@ describe('Unified shift schedule flow (e2e)', () => {
       .expect(201);
 
     expect(response.body.generatedSlotCount).toBe(3);
+    expect(response.body).not.toHaveProperty('assignmentIds');
     expect(database.state.shifts).toHaveLength(1);
     expect(database.state.cycles).toHaveLength(1);
     expect(database.state.slots).toHaveLength(3);
@@ -273,6 +339,277 @@ describe('Unified shift schedule flow (e2e)', () => {
           ['employee-1', 'employee-2'].includes(assignment.employeeId),
       ),
     ).toBe(true);
+  });
+
+  it('creates multiple independent shift drafts in one atomic request', async () => {
+    const payload = {
+      startDate: addDays(getTodayDateString(), 1),
+      recurrence: {
+        enabled: false,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount: 1,
+      },
+      shifts: [
+        {
+          shiftName: 'Ca sáng độc lập',
+          startTime: '07:00',
+          endTime: '11:00',
+          maxStaff: 2,
+          note: 'Ghi chú sáng',
+          employeeIds: ['employee-1'],
+        },
+        {
+          shiftName: 'Ca chiều độc lập',
+          startTime: '12:00',
+          endTime: '16:00',
+          maxStaff: 4,
+          note: 'Ghi chú chiều',
+          employeeIds: ['employee-2'],
+        },
+      ],
+    };
+
+    const response = await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload)
+      .expect(201);
+
+    expect(response.body.shifts).toHaveLength(2);
+    expect(response.body.shift.shiftName).toBe('Ca sáng độc lập');
+    expect(database.state.slots).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          startTime: '07:00',
+          endTime: '11:00',
+          maxStaff: 2,
+          note: 'Ghi chú sáng',
+        }),
+        expect.objectContaining({
+          startTime: '12:00',
+          endTime: '16:00',
+          maxStaff: 4,
+          note: 'Ghi chú chiều',
+        }),
+      ]),
+    );
+    expect(database.state.assignments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ employeeId: 'employee-1' }),
+        expect.objectContaining({ employeeId: 'employee-2' }),
+      ]),
+    );
+  });
+
+  it('rejects a cross-store batch for the wrong owner without persistence', async () => {
+    await request(app.getHttpServer())
+      .post('/stores/store-2/shift-schedules')
+      .send({
+        startDate: addDays(getTodayDateString(), 1),
+        recurrence: {
+          enabled: false,
+          frequency: ShiftRecurrenceFrequency.DAILY,
+          interval: 1,
+          endType: ShiftRecurrenceEndType.COUNT,
+          occurrenceCount: 1,
+        },
+        shifts: [
+          {
+            shiftName: 'Ca cửa hàng khác',
+            startTime: '07:00',
+            endTime: '11:00',
+            maxStaff: 1,
+          },
+        ],
+      })
+      .expect(403);
+    expect(database.transactionCount).toBe(0);
+    expect(database.state.shifts).toHaveLength(0);
+    expect(database.state.cycles).toHaveLength(0);
+    expect(database.state.slots).toHaveLength(0);
+  });
+
+  it('allows overlapping drafts for different employees but rejects overlap for one employee', async () => {
+    const base = {
+      startDate: addDays(getTodayDateString(), 1),
+      recurrence: {
+        enabled: false,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount: 1,
+      },
+    };
+    await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send({
+        ...base,
+        shifts: [
+          {
+            shiftName: 'Ca chồng A',
+            startTime: '07:00',
+            endTime: '12:00',
+            maxStaff: 1,
+            employeeIds: ['employee-1'],
+          },
+          {
+            shiftName: 'Ca chồng B',
+            startTime: '10:00',
+            endTime: '14:00',
+            maxStaff: 1,
+            employeeIds: ['employee-2'],
+          },
+        ],
+      })
+      .expect(201);
+
+    database.state.shifts = [];
+    database.state.cycles = [];
+    database.state.slots = [];
+    database.state.assignments = [];
+    await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send({
+        ...base,
+        shifts: [
+          {
+            shiftName: 'Ca trùng A',
+            startTime: '07:00',
+            endTime: '12:00',
+            maxStaff: 1,
+            employeeIds: ['employee-1'],
+          },
+          {
+            shiftName: 'Ca trùng B',
+            startTime: '10:00',
+            endTime: '14:00',
+            maxStaff: 1,
+            employeeIds: ['employee-1'],
+          },
+        ],
+      })
+      .expect(400);
+    expect(database.state.cycles).toHaveLength(0);
+  });
+
+  it('allows exactly 10000 generated assignments and rejects 10001 before opening a transaction', async () => {
+    const payload = (
+      employeeCount: number,
+      occurrenceCount: number,
+      shiftName: string,
+    ) => ({
+      startDate: addDays(getTodayDateString(), 1),
+      recurrence: {
+        enabled: true,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount,
+      },
+      shifts: [
+        {
+          shiftName,
+          startTime: '07:00',
+          endTime: '11:00',
+          maxStaff: employeeCount,
+          employeeIds: Array.from(
+            { length: employeeCount },
+            (_, index) => `employee-boundary-${index}`,
+          ),
+        },
+      ],
+    });
+
+    const atLimit = await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload(100, 100, 'Ca giới hạn 10000'))
+      .expect(201);
+    expect(atLimit.body.generatedAssignmentCount).toBe(10000);
+    expect(atLimit.body).not.toHaveProperty('assignmentIds');
+    expect(batchReminderMock).toHaveBeenCalledTimes(1);
+    expect(batchReminderMock.mock.calls[0][0]).toHaveLength(10000);
+    expect(perAssignmentReminderMock).not.toHaveBeenCalled();
+
+    database.state.shifts = [];
+    database.state.cycles = [];
+    database.state.slots = [];
+    database.state.assignments = [];
+    database.transactionCount = 0;
+    await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload(73, 137, 'Ca vượt 10001'))
+      .expect(400);
+    expect(database.transactionCount).toBe(0);
+  });
+
+  it('keeps the committed schedule when aggregate reminder scheduling fails', async () => {
+    batchReminderMock.mockRejectedValueOnce(
+      new Error('simulated aggregate reminder failure'),
+    );
+
+    const response = await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send({
+        ...createPayload('Ca reminder lỗi'),
+        employeeIds: ['employee-1'],
+      })
+      .expect(201);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(response.body.generatedAssignmentCount).toBe(3);
+    expect(database.state.cycles).toHaveLength(1);
+    expect(database.state.assignments).toHaveLength(3);
+    expect(loggerErrorMock).toHaveBeenCalledWith(
+      'Failed to schedule reminders for newly created shift schedule',
+    );
+    expect(loggerErrorMock.mock.calls.flat().join(' ')).not.toContain(
+      'employee-1',
+    );
+  });
+
+  it('allows exactly 10000 generated slots and rejects an over-limit fan-out before preflight or transaction', async () => {
+    const payload = (occurrenceCount: number, prefix: string) => ({
+      startDate: addDays(getTodayDateString(), 1),
+      recurrence: {
+        enabled: true,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount,
+      },
+      shifts: Array.from({ length: 50 }, (_, index) => ({
+        shiftName: `${prefix} ${index + 1}`,
+        startTime: '07:00',
+        endTime: '11:00',
+        maxStaff: 1,
+        employeeIds: [`employee-boundary-${index}`],
+      })),
+    });
+
+    const atLimit = await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload(200, 'Ca slot giới hạn'))
+      .expect(201);
+    expect(atLimit.body.generatedSlotCount).toBe(10000);
+    expect(atLimit.body.generatedAssignmentCount).toBe(10000);
+    expect(preflightOptionsMock).not.toHaveBeenCalled();
+    expect(commitAvailabilityMock).toHaveBeenCalledTimes(1);
+
+    database.state.shifts = [];
+    database.state.cycles = [];
+    database.state.slots = [];
+    database.state.assignments = [];
+    database.transactionCount = 0;
+    preflightOptionsMock.mockClear();
+    commitAvailabilityMock.mockClear();
+    await request(app.getHttpServer())
+      .post('/stores/store-1/shift-schedules')
+      .send(payload(201, 'Ca slot vượt'))
+      .expect(400);
+    expect(preflightOptionsMock).not.toHaveBeenCalled();
+    expect(commitAvailabilityMock).not.toHaveBeenCalled();
+    expect(database.transactionCount).toBe(0);
   });
 
   it('rejects an incomplete weekly rule without persisting partial data', async () => {
@@ -345,5 +682,50 @@ describe('Unified shift schedule flow (e2e)', () => {
     expect(database.state.shifts).toHaveLength(0);
     expect(database.state.cycles).toHaveLength(0);
     expect(database.state.slots).toHaveLength(0);
+  });
+});
+
+describe('Unified shift schedule authentication boundary (e2e)', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [PassportModule],
+      controllers: [StoresController],
+      providers: [
+        JwtStrategy,
+        JwtAuthGuard,
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn(() => 'shift-schedule-e2e-secret') },
+        },
+        {
+          provide: StoresService,
+          useValue: { createShiftSchedule: jest.fn() },
+        },
+        { provide: AccountsService, useValue: {} },
+        { provide: MailService, useValue: {} },
+        { provide: ShiftEndWorkflowService, useValue: {} },
+        {
+          provide: getQueueToken('attendance-background'),
+          useValue: { add: jest.fn() },
+        },
+      ],
+    }).compile();
+    app = moduleRef.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => app?.close());
+
+  it.each([
+    ['missing', undefined],
+    ['invalid', 'Bearer not-a-jwt'],
+  ])('returns 401 for %s authentication', async (_label, authorization) => {
+    const call = request(app.getHttpServer()).post(
+      '/stores/store-1/shift-schedules',
+    );
+    if (authorization) call.set('Authorization', authorization);
+    await call.send({}).expect(401);
   });
 });

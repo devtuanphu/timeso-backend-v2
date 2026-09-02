@@ -3,6 +3,7 @@ import {
   NotFoundException,
   BadRequestException,
   ForbiddenException,
+  ConflictException,
   Logger,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -10,11 +11,13 @@ import {
   Repository,
   In,
   MoreThanOrEqual,
+  LessThanOrEqual,
   Between,
   Not,
   IsNull,
   DataSource,
   EntityManager,
+  Raw,
 } from 'typeorm';
 import { isUUID } from 'class-validator';
 import * as QRCode from 'qrcode';
@@ -160,8 +163,10 @@ import { StoreTimekeepingSettingDto } from './dto/store-timekeeping-setting.dto'
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
 import {
   CreateShiftScheduleDto,
+  ShiftDraftDto,
   ShiftEmployeeOptionsDto,
 } from './dto/create-shift-schedule.dto';
+import { lockStoreShiftAvailability } from './shift-availability-lock';
 import {
   ShiftMonthlyMode,
   ShiftRecurrenceEndType,
@@ -177,6 +182,7 @@ import {
   matchesShiftRecurrence,
   parseDateOnly,
 } from './shift-schedule.utils';
+import { parseVietnamShiftStart } from './shift-reminder.utils';
 
 import { StorePayrollPaymentHistory } from './entities/store-payroll-payment-history.entity';
 import { SalaryFundHistory } from './entities/salary-fund-history.entity';
@@ -245,6 +251,15 @@ type ShiftInterval = {
 };
 
 const MAX_GENERATED_SHIFT_ASSIGNMENTS = 10000;
+// Bound the persisted slot fan-out independently from assignments. The DTO
+// currently allows at most 50 drafts, so 10,000 keeps normal long schedules
+// available while preventing an unbounded transaction when no employees are set.
+const MAX_GENERATED_SHIFT_SLOTS = 10000;
+
+type NormalizedShiftDraft = Omit<ShiftDraftDto, 'employeeIds' | 'note'> & {
+  employeeIds: string[];
+  note: string | null;
+};
 
 const timeToMinutes = (time: string): number => {
   const [hours, minutes] = time.slice(0, 5).split(':').map(Number);
@@ -268,6 +283,223 @@ const toShiftInterval = (
 
 const intervalsOverlap = (left: ShiftInterval, right: ShiftInterval) =>
   left.start < right.end && right.start < left.end;
+
+const sortIntervals = (intervals: ShiftInterval[]) =>
+  intervals.sort(
+    (left, right) => left.start - right.start || left.end - right.end,
+  );
+
+const hasInternalIntervalOverlap = (intervals: ShiftInterval[]) => {
+  sortIntervals(intervals);
+  let furthestEnd = Number.NEGATIVE_INFINITY;
+  for (const interval of intervals) {
+    if (interval.start < furthestEnd) return true;
+    if (interval.end > furthestEnd) furthestEnd = interval.end;
+  }
+  return false;
+};
+
+const intervalSetsOverlap = (
+  leftIntervals: ShiftInterval[],
+  rightIntervals: ShiftInterval[],
+) => {
+  const left = sortIntervals(leftIntervals);
+  const right = sortIntervals(rightIntervals);
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length && rightIndex < right.length) {
+    if (intervalsOverlap(left[leftIndex], right[rightIndex])) return true;
+    if (left[leftIndex].end <= right[rightIndex].start) leftIndex += 1;
+    else rightIndex += 1;
+  }
+  return false;
+};
+
+const BLOCKING_LEAVE_TYPES = new Set<LeaveType>([
+  LeaveType.SICK,
+  LeaveType.PERSONAL,
+  LeaveType.VACATION,
+  LeaveType.UNPAID,
+  LeaveType.OTHER,
+]);
+const BLOCKING_LEAVE_TYPE_VALUES = [...BLOCKING_LEAVE_TYPES];
+// The authoritative query is capped before interval construction, and partial
+// leave expansion is bounded independently. This keeps transaction-held work
+// predictable even when legacy leave ranges span many years.
+const MAX_BLOCKING_LEAVE_ROWS = 5000;
+const MAX_DERIVED_BLOCKING_LEAVE_INTERVALS = 20000;
+const BLOCKING_LEAVE_COMPLEXITY_ERROR =
+  'Phạm vi nghỉ phép quá lớn để kiểm tra lịch ca an toàn';
+
+const inclusiveDateSpan = (startDate: string, endDate: string) =>
+  Math.floor(
+    (parseDateOnly(endDate).getTime() - parseDateOnly(startDate).getTime()) /
+      86_400_000,
+  ) + 1;
+
+const assertBlockingLeaveExpansionBound = (
+  leaveRequests: EmployeeLeaveRequest[],
+  anchorRangeStart: string,
+  anchorRangeEnd: string,
+) => {
+  if (leaveRequests.length > MAX_BLOCKING_LEAVE_ROWS) {
+    throw new BadRequestException(BLOCKING_LEAVE_COMPLEXITY_ERROR);
+  }
+  let derivedIntervals = 0;
+  for (const leave of leaveRequests) {
+    if (!BLOCKING_LEAVE_TYPES.has(leave.type)) continue;
+    if (!leave.startTime || !leave.endTime) {
+      derivedIntervals += 1;
+    } else {
+      const firstAnchor =
+        leave.startDate > anchorRangeStart ? leave.startDate : anchorRangeStart;
+      const lastAnchor =
+        leave.endDate < anchorRangeEnd ? leave.endDate : anchorRangeEnd;
+      if (firstAnchor <= lastAnchor) {
+        derivedIntervals += inclusiveDateSpan(firstAnchor, lastAnchor);
+      }
+    }
+    if (derivedIntervals > MAX_DERIVED_BLOCKING_LEAVE_INTERVALS) {
+      throw new BadRequestException(BLOCKING_LEAVE_COMPLEXITY_ERROR);
+    }
+  }
+};
+
+/**
+ * Convert leave to absolute Asia/Ho_Chi_Minh wall-clock intervals. Vietnam has
+ * no DST, so date-only epoch minutes preserve ordering across midnight.
+ */
+const toBlockingLeaveIntervals = (
+  leave: Pick<
+    EmployeeLeaveRequest,
+    'type' | 'startDate' | 'endDate' | 'startTime' | 'endTime'
+  >,
+  anchorRangeStart: string,
+  anchorRangeEnd: string,
+): ShiftInterval[] => {
+  if (!BLOCKING_LEAVE_TYPES.has(leave.type)) return [];
+
+  if (!leave.startTime || !leave.endTime) {
+    return [
+      {
+        start: parseDateOnly(leave.startDate).getTime() / 60000,
+        end: parseDateOnly(addDays(leave.endDate, 1)).getTime() / 60000,
+      },
+    ];
+  }
+
+  const firstAnchor =
+    leave.startDate > anchorRangeStart ? leave.startDate : anchorRangeStart;
+  const lastAnchor =
+    leave.endDate < anchorRangeEnd ? leave.endDate : anchorRangeEnd;
+  if (firstAnchor > lastAnchor) return [];
+
+  const intervals: ShiftInterval[] = [];
+  for (
+    let anchor = firstAnchor;
+    anchor <= lastAnchor;
+    anchor = addDays(anchor, 1)
+  ) {
+    intervals.push(toShiftInterval(anchor, leave.startTime, leave.endTime));
+  }
+  return intervals;
+};
+
+const mergeIntervals = (intervals: ShiftInterval[]): ShiftInterval[] => {
+  const sorted = sortIntervals(intervals);
+  const merged: ShiftInterval[] = [];
+  for (const interval of sorted) {
+    const previous = merged[merged.length - 1];
+    if (!previous || interval.start > previous.end) {
+      merged.push({ ...interval });
+    } else if (interval.end > previous.end) {
+      previous.end = interval.end;
+    }
+  }
+  return merged;
+};
+
+const groupBlockingLeaveIntervals = (
+  leaveRequests: EmployeeLeaveRequest[],
+  anchorRangeStart: string,
+  anchorRangeEnd: string,
+) => {
+  assertBlockingLeaveExpansionBound(
+    leaveRequests,
+    anchorRangeStart,
+    anchorRangeEnd,
+  );
+  const intervalsByEmployee = new Map<string, ShiftInterval[]>();
+  for (const leave of leaveRequests) {
+    const intervals = toBlockingLeaveIntervals(
+      leave,
+      anchorRangeStart,
+      anchorRangeEnd,
+    );
+    if (!intervals.length) continue;
+    const current = intervalsByEmployee.get(leave.employeeProfileId) || [];
+    current.push(...intervals);
+    intervalsByEmployee.set(leave.employeeProfileId, current);
+  }
+  for (const [employeeId, intervals] of intervalsByEmployee) {
+    intervalsByEmployee.set(employeeId, mergeIntervals(intervals));
+  }
+  return intervalsByEmployee;
+};
+
+const normalizeActiveShiftName = (name: string) =>
+  name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('vi-VN');
+
+const assertUniqueActiveShiftNames = (
+  shifts: Array<{ shiftName: string; isActive?: boolean }>,
+) => {
+  const activeNames = shifts
+    .filter((shift) => shift.isActive !== false)
+    .map((shift) => normalizeActiveShiftName(shift.shiftName));
+  if (activeNames.some((name) => !name)) {
+    throw new BadRequestException('Tên ca là bắt buộc');
+  }
+  if (new Set(activeNames).size !== activeNames.length) {
+    throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+  }
+};
+
+const DEFAULT_TIMEKEEPING_SHIFTS = [
+  {
+    shiftName: 'Ca sáng (fulltime)',
+    startTime: '07:00:00',
+    endTime: '17:00:00',
+  },
+  {
+    shiftName: 'Ca chiều (fulltime)',
+    startTime: '12:00:00',
+    endTime: '20:00:00',
+  },
+  {
+    shiftName: 'Ca tối (parttime)',
+    startTime: '18:00:00',
+    endTime: '22:00:00',
+  },
+] as const;
+
+const sameShiftTime = (left: string, right: string) =>
+  left.slice(0, 5) === right.slice(0, 5);
+
+const defaultTimekeepingSettingData = (storeId: string) => ({
+  storeId,
+  enableFlexibleShift: false,
+  requireLocation: true,
+  allowedLateMinutes: 0,
+  deductWorkTimeIfLate: true,
+  showLateAlert: true,
+  countFullTimeIfLate: false,
+  earlyCheckinMinutes: 15,
+  lateCheckoutMinutes: 15,
+  enableOvertimeMultiplier: false,
+  overtimeMultiplier: 1.5,
+  notifyLateShift: false,
+  isActive: true,
+});
 
 @Injectable()
 export class StoresService {
@@ -487,17 +719,38 @@ export class StoresService {
     return savedStore;
   }
 
-  async updateStore(id: string, data: Partial<Store>) {
+  async updateStore(id: string, data: Partial<Store>, ownerAccountId?: string) {
     const store = await this.findById(id);
     if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (!ownerAccountId || store.ownerAccountId !== ownerAccountId) {
+      throw new ForbiddenException('Bạn không có quyền cập nhật cửa hàng này');
+    }
+
+    const allowedFields: (keyof Store)[] = [
+      'name',
+      'avatarUrl',
+      'city',
+      'ward',
+      'addressLine',
+      'taxCode',
+      'phone',
+      'email',
+      'industry',
+      'employeeRangeLabel',
+      'yearsActiveLabel',
+    ];
+    const safeData: Partial<Store> = {};
+    for (const field of allowedFields) {
+      if (data[field] !== undefined) (safeData as any)[field] = data[field];
+    }
 
     // Auto-geocode address if changed
     try {
-      if (data.addressLine || data.ward || data.city) {
+      if (safeData.addressLine || safeData.ward || safeData.city) {
         const fullAddress = [
-          data.addressLine || store.addressLine,
-          data.ward || store.ward,
-          data.city || store.city,
+          safeData.addressLine || store.addressLine,
+          safeData.ward || store.ward,
+          safeData.city || store.city,
         ]
           .filter(Boolean)
           .join(', ');
@@ -506,8 +759,8 @@ export class StoresService {
           const geocodeResult = await this.searchPlaces(fullAddress);
           if (geocodeResult.results?.length > 0) {
             const firstResult = geocodeResult.results[0];
-            data.latitude = firstResult.lat;
-            data.longitude = firstResult.lng;
+            safeData.latitude = firstResult.lat;
+            safeData.longitude = firstResult.lng;
           }
         }
       }
@@ -517,7 +770,7 @@ export class StoresService {
       );
     }
 
-    await this.storeRepository.update(id, data);
+    await this.storeRepository.update(id, safeData);
     return this.findById(id);
   }
 
@@ -714,54 +967,61 @@ export class StoresService {
     return savedSetting;
   }
 
-  async createDefaultTimekeepingSetting(storeId: string) {
-    // 1. Create Default Setting
-    const defaultSetting = this.timekeepingSettingRepository.create({
-      storeId,
-      enableFlexibleShift: false,
-      requireLocation: true,
-      allowedLateMinutes: 0,
-      deductWorkTimeIfLate: true,
-      showLateAlert: true,
-      countFullTimeIfLate: false,
-      earlyCheckinMinutes: 15,
-      lateCheckoutMinutes: 15,
-      enableOvertimeMultiplier: false,
-      overtimeMultiplier: 1.5,
-      notifyLateShift: false,
-      isActive: true,
+  private async ensureDefaultTimekeepingSetting(
+    manager: EntityManager,
+    storeId: string,
+  ) {
+    let setting = await manager.findOne(StoreTimekeepingSetting, {
+      where: { storeId },
     });
-    await this.timekeepingSettingRepository.save(defaultSetting);
+    const existingShifts = await manager.find(WorkShift, {
+      where: { storeId },
+    });
+    assertUniqueActiveShiftNames(existingShifts);
+    if (setting) return { setting, shifts: existingShifts };
 
-    // 2. Create Default Shifts (Sáng, Chiều, Tối)
-    const shiftsToCreate = [
-      {
-        shiftName: 'Ca sáng (fulltime)',
-        startTime: '07:00:00',
-        endTime: '17:00:00',
-      },
-      {
-        shiftName: 'Ca chiều (fulltime)',
-        startTime: '12:00:00',
-        endTime: '20:00:00',
-      },
-      {
-        shiftName: 'Ca tối (parttime)',
-        startTime: '18:00:00',
-        endTime: '22:00:00',
-      },
-    ];
-
-    for (const shift of shiftsToCreate) {
-      const newShift = this.workShiftRepository.create({
+    const finalActiveShifts = existingShifts.filter((shift) => shift.isActive);
+    const createdShifts: WorkShift[] = [];
+    for (const defaultShift of DEFAULT_TIMEKEEPING_SHIFTS) {
+      const normalizedName = normalizeActiveShiftName(defaultShift.shiftName);
+      const existingActive = finalActiveShifts.find(
+        (shift) => normalizeActiveShiftName(shift.shiftName) === normalizedName,
+      );
+      if (existingActive) {
+        if (
+          !sameShiftTime(existingActive.startTime, defaultShift.startTime) ||
+          !sameShiftTime(existingActive.endTime, defaultShift.endTime)
+        ) {
+          throw new BadRequestException(
+            `Ca mặc định ${defaultShift.shiftName} đã tồn tại với thời gian không tương thích`,
+          );
+        }
+        continue;
+      }
+      const newShift = manager.create(WorkShift, {
         storeId,
-        shiftName: shift.shiftName,
-        startTime: shift.startTime,
-        endTime: shift.endTime,
+        ...defaultShift,
         isActive: true,
       });
-      await this.workShiftRepository.save(newShift);
+      await manager.save(WorkShift, newShift);
+      finalActiveShifts.push(newShift);
+      createdShifts.push(newShift);
     }
+    assertUniqueActiveShiftNames(finalActiveShifts);
+
+    setting = manager.create(
+      StoreTimekeepingSetting,
+      defaultTimekeepingSettingData(storeId),
+    );
+    setting = await manager.save(StoreTimekeepingSetting, setting);
+    return { setting, shifts: existingShifts.concat(createdShifts) };
+  }
+
+  async createDefaultTimekeepingSetting(storeId: string) {
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      return this.ensureDefaultTimekeepingSetting(manager, storeId);
+    });
   }
 
   async findAllByOwner(ownerId: string) {
@@ -786,6 +1046,53 @@ export class StoresService {
     }
 
     return store;
+  }
+
+  private async assertWorkShiftsBelongToStore(
+    storeId: string,
+    workShiftIds: string[],
+  ) {
+    const uniqueIds = [...new Set(workShiftIds.filter(Boolean))];
+    if (!uniqueIds.length) return;
+    const shifts = await this.workShiftRepository.find({
+      where: { id: In(uniqueIds), storeId },
+      select: ['id'],
+    });
+    if (shifts.length !== uniqueIds.length) {
+      throw new ForbiddenException(
+        'Một hoặc nhiều ca làm không thuộc cửa hàng này',
+      );
+    }
+  }
+
+  /** Allow an owner to inspect store staff, or a staff account to inspect only itself. */
+  async assertEmployeeCalendarAccess(
+    profileId: string,
+    accountId: string,
+    expectedStoreId?: string,
+  ) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'storeId', 'accountId', 'employmentStatus'],
+    });
+    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+    if (expectedStoreId && profile.storeId !== expectedStoreId) {
+      throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
+    }
+
+    const store = await this.storeRepository.findOne({
+      where: { id: profile.storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (store.ownerAccountId === accountId) return profile;
+    if (
+      profile.accountId !== accountId ||
+      profile.employmentStatus !== EmploymentStatus.ACTIVE
+    ) {
+      throw new ForbiddenException('Bạn chỉ có thể xem lịch của chính mình');
+    }
+    return profile;
   }
 
   async assertStoreRevenueReportAccess(storeId: string, accountId: string) {
@@ -1028,48 +1335,214 @@ export class StoresService {
   }
 
   // --- Timekeeping Settings ---
-  async getTimekeepingSetting(storeId: string) {
-    let setting = await this.timekeepingSettingRepository.findOne({
-      where: { storeId },
+  private async assertTimekeepingSettingsReadAccess(
+    storeId: string,
+    accountId?: string,
+  ): Promise<'OWNER' | 'STAFF'> {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
     });
-    if (!setting) {
-      await this.createDefaultTimekeepingSetting(storeId);
-      setting = await this.timekeepingSettingRepository.findOne({
-        where: { storeId },
-      });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (store.ownerAccountId === accountId) return 'OWNER';
+    const staff = await this.profileRepository.findOne({
+      where: {
+        storeId,
+        accountId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id'],
+    });
+    if (!staff) {
+      throw new ForbiddenException('Bạn không có quyền xem cấu hình chấm công');
+    }
+    return 'STAFF';
+  }
+
+  async getTimekeepingSetting(storeId: string, accountId?: string) {
+    const access = await this.assertTimekeepingSettingsReadAccess(
+      storeId,
+      accountId,
+    );
+    const [existingSetting, existingShifts] = await Promise.all([
+      this.timekeepingSettingRepository.findOne({ where: { storeId } }),
+      this.workShiftRepository.find({ where: { storeId } }),
+    ]);
+    if (existingSetting || access === 'STAFF') {
+      return {
+        ...(existingSetting || defaultTimekeepingSettingData(storeId)),
+        shifts: existingShifts,
+      };
     }
 
-    const shifts = await this.workShiftRepository.find({ where: { storeId } });
-    return { ...setting, shifts };
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, { where: { id: storeId } });
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (store.ownerAccountId !== accountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền xem cấu hình chấm công',
+        );
+      }
+      const { setting, shifts } = await this.ensureDefaultTimekeepingSetting(
+        manager,
+        storeId,
+      );
+      return { ...setting, shifts };
+    });
   }
 
   async upsertTimekeepingSetting(
     storeId: string,
     data: StoreTimekeepingSettingDto,
+    ownerAccountId?: string,
   ) {
-    let setting = await this.timekeepingSettingRepository.findOne({
-      where: { storeId },
-    });
-
-    if (setting) {
-      Object.assign(setting, data);
-    } else {
-      setting = this.timekeepingSettingRepository.create({
-        ...data,
-        storeId,
-      });
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
     }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const result = await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, { where: { id: storeId } });
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền cập nhật cấu hình chấm công',
+        );
+      }
 
-    // Handle shifts update if present
-    if (data.shifts && Array.isArray(data.shifts)) {
-      for (const shiftData of data.shifts) {
-        if (shiftData.id) {
-          await this.workShiftRepository.update(shiftData.id, shiftData);
+      const { shifts, ...settingData } = data;
+      const shiftUpdates = shifts || [];
+      const duplicateShiftIds = shiftUpdates
+        .map((shift) => shift.id)
+        .filter((id): id is string => Boolean(id));
+      if (
+        shiftUpdates.some((shift) => !shift.id) ||
+        new Set(duplicateShiftIds).size !== duplicateShiftIds.length
+      ) {
+        throw new BadRequestException('Mỗi ca cập nhật phải có mã ca duy nhất');
+      }
+
+      const existingShifts = await manager.find(WorkShift, {
+        where: { storeId },
+      });
+      const existingById = new Map(
+        existingShifts.map((shift) => [shift.id, shift]),
+      );
+      for (const shiftData of shiftUpdates) {
+        if (!existingById.has(shiftData.id)) {
+          throw new BadRequestException('Ca làm việc không thuộc cửa hàng này');
         }
       }
-    }
+      const updatesById = new Map(
+        shiftUpdates.map((shift) => [shift.id as string, shift]),
+      );
+      const finalShifts = existingShifts.map((shift) => {
+        const update = updatesById.get(shift.id);
+        return {
+          shiftName: (update?.shiftName ?? shift.shiftName).trim(),
+          isActive: update?.isActive ?? shift.isActive,
+        };
+      });
+      assertUniqueActiveShiftNames(finalShifts);
+      const reminderShiftIds = shiftUpdates
+        .filter((shiftData) => {
+          const existing = existingById.get(shiftData.id!);
+          return (
+            (shiftData.startTime !== undefined &&
+              shiftData.startTime !== existing?.startTime) ||
+            (shiftData.isActive === true && existing?.isActive === false)
+          );
+        })
+        .map((shiftData) => shiftData.id!);
 
-    return this.timekeepingSettingRepository.save(setting);
+      let setting = await manager.findOne(StoreTimekeepingSetting, {
+        where: { storeId },
+      });
+      if (setting) Object.assign(setting, settingData);
+      else {
+        setting = manager.create(StoreTimekeepingSetting, {
+          ...settingData,
+          storeId,
+        });
+      }
+
+      for (const shiftData of shiftUpdates) {
+        const shift = existingById.get(shiftData.id)!;
+        const finalStartTime = shiftData.startTime ?? shift.startTime;
+        const finalEndTime = shiftData.endTime ?? shift.endTime;
+        if (finalStartTime === finalEndTime) {
+          throw new BadRequestException(
+            'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+          );
+        }
+        const allowedUpdate: Partial<WorkShift> = {};
+        for (const key of [
+          'shiftName',
+          'startTime',
+          'endTime',
+          'isActive',
+        ] as const) {
+          if (shiftData[key] !== undefined) {
+            (allowedUpdate as any)[key] = shiftData[key];
+          }
+        }
+        if (allowedUpdate.shiftName) {
+          allowedUpdate.shiftName = allowedUpdate.shiftName.trim();
+        }
+        await manager.update(
+          WorkShift,
+          { id: shift.id, storeId },
+          allowedUpdate,
+        );
+      }
+
+      const savedSetting = await manager.save(StoreTimekeepingSetting, setting);
+      let reminderAssignmentIds: string[] = [];
+      if (reminderShiftIds.length) {
+        const assignments = await manager.find(ShiftAssignment, {
+          where: {
+            status: ShiftAssignmentStatus.APPROVED,
+            shiftSlot: {
+              workShiftId: In(reminderShiftIds),
+              workDate: MoreThanOrEqual(getTodayDateString()),
+              cycle: { status: WorkCycleStatus.ACTIVE },
+            },
+          },
+          relations: ['shiftSlot', 'shiftSlot.workShift'],
+          select: ['id'],
+        });
+        reminderAssignmentIds = assignments
+          .filter((assignment) => {
+            const slot = assignment.shiftSlot;
+            const time = slot?.startTime || slot?.workShift?.startTime;
+            return Boolean(
+              slot?.workDate &&
+              time &&
+              parseVietnamShiftStart(slot.workDate, time).getTime() >
+                Date.now(),
+            );
+          })
+          .map((assignment) => assignment.id);
+      }
+      return { setting: savedSetting, reminderAssignmentIds };
+    });
+
+    if (result.reminderAssignmentIds.length) {
+      try {
+        await this.shiftReminderService.scheduleAssignmentReminders(
+          result.reminderAssignmentIds,
+        );
+      } catch {
+        this.logger.error(
+          'Failed to reschedule reminders after timekeeping update',
+        );
+      }
+    }
+    return result.setting;
   }
 
   // --- Payroll Settings ---
@@ -1264,7 +1737,7 @@ export class StoresService {
   async getSkills(storeId: string) {
     return this.skillRepository.find({
       where: { storeId },
-      order: { createdAt: 'DESC' },
+      order: { createdAt: 'DESC' as const },
     });
   }
 
@@ -1352,6 +1825,7 @@ export class StoresService {
     const upcomingShifts = await this.shiftAssignmentRepository.find({
       where: {
         employeeId: profileId,
+        status: ShiftAssignmentStatus.APPROVED,
       },
       relations: ['shiftSlot', 'shiftSlot.workShift'],
     });
@@ -1362,55 +1836,27 @@ export class StoresService {
       const timeStr =
         s.shiftSlot?.startTime || s.shiftSlot?.workShift?.startTime;
       if (dateStr && timeStr) {
-        return new Date(`${dateStr}T${timeStr}`).getTime() > Date.now();
+        return parseVietnamShiftStart(dateStr, timeStr).getTime() > Date.now();
       }
       return false;
     });
 
-    await this.shiftReminderService.syncEmployeeReminders(
-      profileId,
-      profile.storeId,
-      settings,
-      futureShifts,
-    );
+    try {
+      await this.shiftReminderService.syncEmployeeReminders(
+        profileId,
+        profile.storeId,
+        settings,
+        futureShifts,
+      );
+    } catch {
+      this.logger.error('Failed to synchronize employee shift reminders');
+    }
 
     return { success: true, reminderSettings: settings };
   }
 
   async scheduleReminderForAssignment(assignmentId: string) {
-    const assignment = await this.shiftAssignmentRepository.findOne({
-      where: { id: assignmentId },
-      relations: ['shiftSlot', 'shiftSlot.workShift', 'employee'],
-    });
-
-    if (
-      !assignment ||
-      !assignment.shiftSlot ||
-      !assignment.shiftSlot.workShift ||
-      !assignment.employee
-    ) {
-      return;
-    }
-
-    const { employee, shiftSlot } = assignment;
-    const settings = employee.reminderSettings;
-    if (!settings || settings.type === 'off') return;
-
-    const dateStr = shiftSlot.workDate;
-    const timeStr = shiftSlot.startTime || shiftSlot.workShift.startTime;
-
-    if (dateStr && timeStr) {
-      const shiftStart = new Date(`${dateStr}T${timeStr}`);
-      if (shiftStart.getTime() > Date.now()) {
-        await this.shiftReminderService.scheduleReminder(
-          employee.id,
-          employee.storeId,
-          shiftSlot.workShift.id,
-          shiftStart,
-          settings,
-        );
-      }
-    }
+    return this.shiftReminderService.scheduleAssignmentReminder(assignmentId);
   }
 
   async getEmployeeById(profileId: string) {
@@ -1893,7 +2339,14 @@ export class StoresService {
     return stages;
   }
 
-  async getEmployeeScheduleDetails(profileId: string, month: Date) {
+  async getEmployeeScheduleDetails(
+    profileId: string,
+    month: Date,
+    accountId?: string,
+  ) {
+    if (accountId) {
+      await this.assertEmployeeCalendarAccess(profileId, accountId);
+    }
     const startDate = new Date(month.getFullYear(), month.getMonth(), 1);
     const endDate = new Date(month.getFullYear(), month.getMonth() + 1, 0);
 
@@ -2091,37 +2544,72 @@ export class StoresService {
   }
 
   async processRequest(
-    userId: string,
+    accountId: string,
     requestId: string,
     type: 'REGISTER' | 'SWAP' | 'LEAVE',
     status: 'APPROVED' | 'REJECTED',
     reason?: string,
   ) {
-    // Check permission logic here (omitted for brevity)
-
+    if (!['APPROVED', 'REJECTED'].includes(status)) {
+      throw new BadRequestException('Trạng thái yêu cầu không hợp lệ');
+    }
     if (type === 'REGISTER') {
       const assignment = await this.shiftAssignmentRepository.findOne({
         where: { id: requestId },
+        relations: ['shiftSlot', 'shiftSlot.cycle'],
       });
       if (!assignment)
         throw new NotFoundException('Không tìm thấy yêu cầu đăng ký');
+      await this.assertOwnerStoreAccess(
+        assignment.shiftSlot?.cycle?.storeId || '',
+        accountId,
+      );
+      if (assignment.status !== ShiftAssignmentStatus.PENDING) {
+        throw new BadRequestException('Yêu cầu không còn chờ duyệt');
+      }
 
-      assignment.status =
+      const nextStatus =
         status === 'APPROVED'
           ? ShiftAssignmentStatus.APPROVED
           : ShiftAssignmentStatus.CANCELLED;
-      // If rejected, maybe save reason somewhere? Currently Note.
-      if (status === 'REJECTED' && reason) assignment.note = reason;
-
-      const savedAssignment =
-        await this.shiftAssignmentRepository.save(assignment);
+      const savedAssignment = await this.dataSource.transaction(
+        async (manager) => {
+          const storeId = assignment.shiftSlot?.cycle?.storeId || '';
+          await lockStoreShiftAvailability(manager, storeId);
+          const store = await manager.findOne(Store, {
+            where: { id: storeId },
+            select: ['id', 'ownerAccountId'],
+          });
+          if (!store || store.ownerAccountId !== accountId) {
+            throw new ForbiddenException(
+              'Bạn không có quyền duyệt yêu cầu này',
+            );
+          }
+          const result = await manager.update(
+            ShiftAssignment,
+            { id: requestId, status: ShiftAssignmentStatus.PENDING },
+            {
+              status: nextStatus,
+              ...(status === 'REJECTED' && reason ? { note: reason } : {}),
+            },
+          );
+          if (!result.affected) {
+            throw new BadRequestException(
+              'Yêu cầu đã được cập nhật, vui lòng tải lại',
+            );
+          }
+          return {
+            ...assignment,
+            status: nextStatus,
+            ...(status === 'REJECTED' && reason ? { note: reason } : {}),
+          };
+        },
+      );
 
       // Hook: Schedule reminder if approved
       if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
-        this.scheduleReminderForAssignment(savedAssignment.id).catch((err) => {
-          this.logger.error(
-            `Failed to schedule reminder for assignment ${savedAssignment.id}: ${err.message}`,
-          );
+        this.scheduleReminderForAssignment(savedAssignment.id).catch(() => {
+          this.logger.error('Failed to schedule assignment reminder');
         });
       }
 
@@ -2129,40 +2617,125 @@ export class StoresService {
     } else if (type === 'SWAP') {
       const swap = await this.shiftSwapRepository.findOne({
         where: { id: requestId },
-        relations: ['fromAssignment'],
+        relations: [
+          'fromAssignment',
+          'fromAssignment.shiftSlot',
+          'fromAssignment.shiftSlot.cycle',
+        ],
       });
       if (!swap) throw new NotFoundException('Không tìm thấy yêu cầu đổi ca');
-
-      swap.status =
-        status === 'APPROVED'
-          ? ShiftSwapStatus.APPROVED
-          : ShiftSwapStatus.REJECTED;
-      swap.note = reason;
-      await this.shiftSwapRepository.save(swap);
-
-      if (status === 'APPROVED' && swap.fromAssignment) {
-        // Thực hiện đổi ca: Cập nhật Assignment sang nhân viên mới
-        swap.fromAssignment.employeeId = swap.toEmployeeId;
-        // Nếu Assignment đang Completed (đổi bù) -> Giữ nguyên
-        // Nếu Assignment đang Confirmed -> Giữ nguyên
-        // Quan trọng: Đổi người sở hữu Assignment
-        await this.shiftAssignmentRepository.save(swap.fromAssignment);
+      await this.assertOwnerStoreAccess(
+        swap.fromAssignment?.shiftSlot?.cycle?.storeId || '',
+        accountId,
+      );
+      if (swap.status !== ShiftSwapStatus.PENDING) {
+        throw new BadRequestException('Yêu cầu không còn chờ duyệt');
       }
-      return swap;
+
+      const sourceStoreId =
+        swap.fromAssignment?.shiftSlot?.cycle?.storeId || '';
+      if (status === 'APPROVED') {
+        const target = await this.profileRepository.findOne({
+          where: {
+            id: swap.toEmployeeId,
+            storeId: sourceStoreId,
+            employmentStatus: EmploymentStatus.ACTIVE,
+          },
+          select: ['id'],
+        });
+        if (!target)
+          throw new BadRequestException(
+            'Nhân viên nhận ca không thuộc cửa hàng hoặc đã ngừng hoạt động',
+          );
+      }
+
+      return this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, sourceStoreId);
+        const store = await manager.findOne(Store, {
+          where: { id: sourceStoreId },
+          select: ['id', 'ownerAccountId'],
+        });
+        if (!store || store.ownerAccountId !== accountId) {
+          throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
+        }
+        if (status === 'APPROVED' && swap.fromAssignment) {
+          const result = await manager.update(
+            ShiftAssignment,
+            {
+              id: swap.fromAssignment.id,
+              employeeId: swap.fromAssignment.employeeId,
+            },
+            { employeeId: swap.toEmployeeId },
+          );
+          if (!result.affected)
+            throw new BadRequestException(
+              'Ca đã được thay đổi, vui lòng tải lại',
+            );
+        }
+        const nextStatus =
+          status === 'APPROVED'
+            ? ShiftSwapStatus.APPROVED
+            : ShiftSwapStatus.REJECTED;
+        const result = await manager.update(
+          ShiftSwap,
+          { id: swap.id, status: ShiftSwapStatus.PENDING },
+          { status: nextStatus, note: reason },
+        );
+        if (!result.affected)
+          throw new BadRequestException(
+            'Yêu cầu đổi ca đã được cập nhật, vui lòng tải lại',
+          );
+        return { ...swap, status: nextStatus, note: reason };
+      });
     } else if (type === 'LEAVE') {
       const leave = await this.leaveRequestRepository.findOne({
         where: { id: requestId },
       });
       if (!leave) throw new NotFoundException('Không tìm thấy đơn nghỉ phép');
+      await this.assertOwnerStoreAccess(leave.storeId, accountId);
+      if (leave.status !== LeaveRequestStatus.PENDING) {
+        throw new BadRequestException('Yêu cầu không còn chờ duyệt');
+      }
 
-      leave.status =
+      const approver = await this.profileRepository.findOne({
+        where: { accountId, storeId: leave.storeId },
+        select: ['id'],
+      });
+
+      const nextStatus =
         status === 'APPROVED'
           ? LeaveRequestStatus.APPROVED
           : LeaveRequestStatus.REJECTED;
-      leave.approvedById = userId; // Giả định userId là profileId của quản lý, cần map từ accountId nếu cần
-      if (status === 'REJECTED') leave.rejectionReason = reason || '';
-
-      return this.leaveRequestRepository.save(leave);
+      return this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, leave.storeId);
+        const store = await manager.findOne(Store, {
+          where: { id: leave.storeId },
+          select: ['id', 'ownerAccountId'],
+        });
+        if (!store || store.ownerAccountId !== accountId) {
+          throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
+        }
+        const result = await manager.update(
+          EmployeeLeaveRequest,
+          { id: requestId, status: LeaveRequestStatus.PENDING },
+          {
+            status: nextStatus,
+            approvedById: (approver?.id ?? null) as any,
+            ...(status === 'REJECTED' ? { rejectionReason: reason || '' } : {}),
+          },
+        );
+        if (!result.affected) {
+          throw new BadRequestException(
+            'Yêu cầu đã được cập nhật, vui lòng tải lại',
+          );
+        }
+        return {
+          ...leave,
+          status: nextStatus,
+          approvedById: approver?.id ?? null,
+          ...(status === 'REJECTED' ? { rejectionReason: reason || '' } : {}),
+        };
+      });
     }
 
     throw new BadRequestException('Loại yêu cầu không hợp lệ');
@@ -2363,26 +2936,66 @@ export class StoresService {
     };
   }
 
-  async deleteEmployee(profileId: string, reasonId: string) {
-    const profile = await this.profileRepository.findOne({
+  async deleteEmployee(
+    profileId: string,
+    reasonId: string,
+    ownerAccountId?: string,
+  ) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    const profileBeforeLock = await this.profileRepository.findOne({
       where: { id: profileId },
     });
-    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
-
-    // Validate reason
-    const reason = await this.terminationReasonRepository.findOne({
-      where: { id: reasonId },
+    if (!profileBeforeLock) {
+      throw new NotFoundException('Không tìm thấy nhân viên');
+    }
+    await this.assertOwnerStoreAccess(
+      profileBeforeLock.storeId,
+      ownerAccountId,
+    );
+    const reasonBeforeLock = await this.terminationReasonRepository.findOne({
+      where: { id: reasonId, storeId: profileBeforeLock.storeId },
+      select: ['id'],
     });
-    if (!reason) throw new NotFoundException('Lý do thôi việc không hợp lệ');
+    if (!reasonBeforeLock) {
+      throw new NotFoundException('Lý do thôi việc không hợp lệ');
+    }
 
-    // Cập nhật thông tin thôi việc
-    profile.employmentStatus = EmploymentStatus.TERMINATED;
-    profile.terminationReasonId = reasonId;
-    profile.leftAt = new Date();
-    await this.profileRepository.save(profile);
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, profileBeforeLock.storeId);
 
-    // Soft delete (sẽ cập nhật deleted_at)
-    return this.profileRepository.softDelete(profileId);
+      const profile = await manager.findOne(EmployeeProfile, {
+        where: { id: profileId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!profile || profile.storeId !== profileBeforeLock.storeId) {
+        throw new NotFoundException('Không tìm thấy nhân viên');
+      }
+      const store = await manager.findOne(Store, {
+        where: { id: profile.storeId },
+      });
+      if (!store || store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền cho nhân viên cửa hàng này thôi việc',
+        );
+      }
+      const reason = await manager.findOne(EmployeeTerminationReason, {
+        where: { id: reasonId, storeId: profile.storeId },
+      });
+      if (!reason) {
+        throw new NotFoundException('Lý do thôi việc không hợp lệ');
+      }
+
+      profile.employmentStatus = EmploymentStatus.TERMINATED;
+      profile.terminationReasonId = reasonId;
+      profile.leftAt = new Date();
+      await manager.save(EmployeeProfile, profile);
+      return manager.softDelete(EmployeeProfile, {
+        id: profileId,
+        storeId: profile.storeId,
+      });
+    });
   }
 
   async permanentDeleteEmployee(profileId: string) {
@@ -2583,26 +3196,61 @@ export class StoresService {
   }
 
   // Work Shift management
-  async createWorkShift(storeId: string, data: Partial<WorkShift>) {
-    // Bug 1.1 fix: Validate duplicate shift name
-    const existing = await this.workShiftRepository.findOne({
-      where: { storeId, shiftName: data.shiftName, isActive: true },
-    });
-    if (existing) {
-      throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+  async createWorkShift(
+    storeId: string,
+    data: Partial<WorkShift>,
+    ownerAccountId?: string,
+  ) {
+    if (!data.shiftName?.trim() || !data.startTime || !data.endTime) {
+      throw new BadRequestException('Tên ca và thời gian là bắt buộc');
     }
-
-    // Validate time values
-    if (data.startTime && data.endTime) {
-      if (data.startTime === data.endTime) {
-        throw new BadRequestException(
-          'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+    if (data.startTime === data.endTime) {
+      throw new BadRequestException(
+        'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+      );
+    }
+    const shiftName = data.shiftName.trim();
+    const shiftStartTime = data.startTime;
+    const shiftEndTime = data.endTime;
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, { where: { id: storeId } });
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (!ownerAccountId || store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền tạo ca cho cửa hàng này',
         );
       }
-    }
-
-    const shift = this.workShiftRepository.create({ ...data, storeId });
-    return this.workShiftRepository.save(shift);
+      const activeShifts = await manager.find(WorkShift, {
+        where: { storeId, isActive: true },
+        select: ['id', 'shiftName'],
+      });
+      const normalizedName = normalizeActiveShiftName(shiftName);
+      if (
+        activeShifts.some(
+          (shift) =>
+            normalizeActiveShiftName(shift.shiftName) === normalizedName,
+        )
+      ) {
+        throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+      }
+      const shift = manager.create(WorkShift, {
+        storeId,
+        shiftName,
+        startTime: shiftStartTime,
+        endTime: shiftEndTime,
+        defaultMaxStaff: data.defaultMaxStaff ?? null,
+        colorCode: data.colorCode ?? '#21D4D4',
+        note: data.note ?? null,
+        location: data.location ?? null,
+        isActive: data.isActive ?? true,
+      });
+      return manager.save(WorkShift, shift);
+    });
   }
 
   async getWorkShifts(storeId: string) {
@@ -2617,13 +3265,16 @@ export class StoresService {
       'startDate' | 'startTime' | 'endTime' | 'recurrence'
     >,
   ): ShiftRecurrenceRule {
+    if (!data.startDate || !data.recurrence) {
+      throw new BadRequestException('Ngày áp dụng và quy tắc lặp là bắt buộc');
+    }
     parseDateOnly(data.startDate);
 
     if (data.startDate < getTodayDateString()) {
       throw new BadRequestException('Ngày áp dụng không được ở trong quá khứ');
     }
 
-    if (data.startTime === data.endTime) {
+    if (data.startTime && data.endTime && data.startTime === data.endTime) {
       throw new BadRequestException(
         'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
       );
@@ -2775,33 +3426,40 @@ export class StoresService {
       .andWhere('leave.status = :approvedStatus', {
         approvedStatus: LeaveRequestStatus.APPROVED,
       })
-      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
-      .andWhere('leave.endDate >= :firstWorkDate', {
-        firstWorkDate: workDates[0],
+      .andWhere('leave.type IN (:...blockingLeaveTypes)', {
+        blockingLeaveTypes: BLOCKING_LEAVE_TYPE_VALUES,
       })
+      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
+      .andWhere('leave.endDate >= :rangeStart', { rangeStart })
+      .take(MAX_BLOCKING_LEAVE_ROWS + 1)
       .getMany();
 
-    const assignmentsByEmployee = new Map<string, ShiftAssignment[]>();
+    const assignmentIntervalsByEmployee = new Map<string, ShiftInterval[]>();
+    const assignmentDatesByEmployee = new Map<string, Set<string>>();
     for (const assignment of assignments) {
-      const list = assignmentsByEmployee.get(assignment.employeeId) || [];
-      list.push(assignment);
-      assignmentsByEmployee.set(assignment.employeeId, list);
+      const slot = assignment.shiftSlot;
+      if (slot?.workDate) {
+        const dates =
+          assignmentDatesByEmployee.get(assignment.employeeId) || new Set();
+        dates.add(slot.workDate);
+        assignmentDatesByEmployee.set(assignment.employeeId, dates);
+      }
+      const assignmentStart = slot?.startTime || slot?.workShift?.startTime;
+      const assignmentEnd = slot?.endTime || slot?.workShift?.endTime;
+      if (!slot?.workDate || !assignmentStart || !assignmentEnd) continue;
+      const intervals =
+        assignmentIntervalsByEmployee.get(assignment.employeeId) || [];
+      intervals.push(
+        toShiftInterval(slot.workDate, assignmentStart, assignmentEnd),
+      );
+      assignmentIntervalsByEmployee.set(assignment.employeeId, intervals);
     }
+    const leaveIntervalsByEmployee = groupBlockingLeaveIntervals(
+      leaveRequests,
+      rangeStart,
+      rangeEnd,
+    );
 
-    const leavesByEmployee = new Map<string, EmployeeLeaveRequest[]>();
-    for (const request of leaveRequests) {
-      const list = leavesByEmployee.get(request.employeeProfileId) || [];
-      list.push(request);
-      leavesByEmployee.set(request.employeeProfileId, list);
-    }
-
-    const blockingLeaveTypes = new Set<LeaveType>([
-      LeaveType.SICK,
-      LeaveType.PERSONAL,
-      LeaveType.VACATION,
-      LeaveType.UNPAID,
-      LeaveType.OTHER,
-    ]);
     const statusLabels: Record<ShiftEmployeeAvailability, string> = {
       AVAILABLE: 'Rảnh',
       OTHER_SHIFT: 'Đang làm ca khác',
@@ -2811,42 +3469,17 @@ export class StoresService {
 
     const options = employees
       .map((employee) => {
-        const employeeAssignments =
-          assignmentsByEmployee.get(employee.id) || [];
-        const employeeLeaves = leavesByEmployee.get(employee.id) || [];
-
-        const hasBlockingLeave = employeeLeaves.some((request) => {
-          if (!blockingLeaveTypes.has(request.type)) return false;
-          return workDates.some((workDate, index) => {
-            if (workDate < request.startDate || workDate > request.endDate) {
-              return false;
-            }
-            if (!request.startTime || !request.endTime) return true;
-            return intervalsOverlap(
-              proposedIntervals[index],
-              toShiftInterval(workDate, request.startTime, request.endTime),
-            );
-          });
-        });
-
-        const hasConflict = employeeAssignments.some((assignment) => {
-          const slot = assignment.shiftSlot;
-          const startTime = slot?.startTime || slot?.workShift?.startTime;
-          const endTime = slot?.endTime || slot?.workShift?.endTime;
-          if (!slot?.workDate || !startTime || !endTime) return false;
-          const existingInterval = toShiftInterval(
-            slot.workDate,
-            startTime,
-            endTime,
-          );
-          return proposedIntervals.some((interval) =>
-            intervalsOverlap(interval, existingInterval),
-          );
-        });
-
-        const hasOtherShift = employeeAssignments.some((assignment) =>
-          workDateSet.has(assignment.shiftSlot?.workDate),
+        const hasBlockingLeave = intervalSetsOverlap(
+          [...proposedIntervals],
+          leaveIntervalsByEmployee.get(employee.id) || [],
         );
+        const hasConflict = intervalSetsOverlap(
+          [...proposedIntervals],
+          assignmentIntervalsByEmployee.get(employee.id) || [],
+        );
+        const hasOtherShift = [
+          ...(assignmentDatesByEmployee.get(employee.id) || []),
+        ].some((assignmentDate) => workDateSet.has(assignmentDate));
 
         const availability: ShiftEmployeeAvailability = hasBlockingLeave
           ? 'ON_LEAVE'
@@ -2888,21 +3521,168 @@ export class StoresService {
     };
   }
 
+  private async assertShiftScheduleAvailabilityAtCommit(
+    manager: EntityManager,
+    storeId: string,
+    drafts: NormalizedShiftDraft[],
+    workDates: string[],
+  ): Promise<void> {
+    const employeeIds = [
+      ...new Set(drafts.flatMap((draft) => draft.employeeIds)),
+    ];
+    if (!employeeIds.length) return;
+
+    const employees = await manager.find(EmployeeProfile, {
+      where: {
+        id: In(employeeIds),
+        storeId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id', 'storeId', 'employmentStatus'],
+    });
+    if (employees.length !== employeeIds.length) {
+      throw new BadRequestException(
+        'Một hoặc nhiều nhân viên không còn hoạt động tại cửa hàng này',
+      );
+    }
+
+    const rangeStart = addDays(workDates[0], -1);
+    const rangeEnd = addDays(workDates[workDates.length - 1], 1);
+    const assignments = await manager
+      .createQueryBuilder(ShiftAssignment, 'assignment')
+      .leftJoinAndSelect('assignment.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'workShift')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('assignment.employeeId IN (:...employeeIds)', { employeeIds })
+      .andWhere('assignment.status != :cancelledStatus', {
+        cancelledStatus: ShiftAssignmentStatus.CANCELLED,
+      })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status = :activeCycleStatus', {
+        activeCycleStatus: WorkCycleStatus.ACTIVE,
+      })
+      .andWhere('slot.workDate BETWEEN :rangeStart AND :rangeEnd', {
+        rangeStart,
+        rangeEnd,
+      })
+      .getMany();
+    const leaveRequests = await manager
+      .createQueryBuilder(EmployeeLeaveRequest, 'leave')
+      .where('leave.storeId = :storeId', { storeId })
+      .andWhere('leave.employeeProfileId IN (:...employeeIds)', {
+        employeeIds,
+      })
+      .andWhere('leave.status = :approvedStatus', {
+        approvedStatus: LeaveRequestStatus.APPROVED,
+      })
+      .andWhere('leave.type IN (:...blockingLeaveTypes)', {
+        blockingLeaveTypes: BLOCKING_LEAVE_TYPE_VALUES,
+      })
+      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
+      .andWhere('leave.endDate >= :rangeStart', { rangeStart })
+      .take(MAX_BLOCKING_LEAVE_ROWS + 1)
+      .getMany();
+
+    const assignmentIntervalsByEmployee = new Map<string, ShiftInterval[]>();
+    for (const assignment of assignments) {
+      const slot = assignment.shiftSlot;
+      const assignmentStart = slot?.startTime || slot?.workShift?.startTime;
+      const assignmentEnd = slot?.endTime || slot?.workShift?.endTime;
+      if (!slot?.workDate || !assignmentStart || !assignmentEnd) continue;
+      const current =
+        assignmentIntervalsByEmployee.get(assignment.employeeId) || [];
+      current.push(
+        toShiftInterval(slot.workDate, assignmentStart, assignmentEnd),
+      );
+      assignmentIntervalsByEmployee.set(assignment.employeeId, current);
+    }
+    const leaveIntervalsByEmployee = groupBlockingLeaveIntervals(
+      leaveRequests,
+      rangeStart,
+      rangeEnd,
+    );
+    const proposedByEmployee = new Map<string, ShiftInterval[]>();
+    for (const draft of drafts) {
+      for (const employeeId of draft.employeeIds) {
+        for (const workDate of workDates) {
+          const current = proposedByEmployee.get(employeeId) || [];
+          current.push(
+            toShiftInterval(workDate, draft.startTime, draft.endTime),
+          );
+          proposedByEmployee.set(employeeId, current);
+        }
+      }
+    }
+    for (const employeeId of employeeIds) {
+      const proposed = proposedByEmployee.get(employeeId) || [];
+      const assignmentConflict = intervalSetsOverlap(
+        [...proposed],
+        assignmentIntervalsByEmployee.get(employeeId) || [],
+      );
+      const leaveConflict = intervalSetsOverlap(
+        [...proposed],
+        leaveIntervalsByEmployee.get(employeeId) || [],
+      );
+      if (assignmentConflict) {
+        throw new BadRequestException(
+          'Một hoặc nhiều nhân viên bị trùng với ca làm việc đang hoạt động',
+        );
+      }
+      if (leaveConflict) {
+        throw new BadRequestException(
+          'Một hoặc nhiều nhân viên có lịch nghỉ được duyệt trùng với ca làm việc',
+        );
+      }
+    }
+  }
+
   async createShiftSchedule(
     storeId: string,
     ownerAccountId: string,
     data: CreateShiftScheduleDto,
   ) {
-    const shiftName = data.shiftName.trim();
-    const employeeIds = data.employeeIds || [];
-    if (!shiftName) {
-      throw new BadRequestException('Tên ca không được để trống');
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+
+    const drafts = data.shifts?.length
+      ? data.shifts.map((draft) => ({
+          ...draft,
+          shiftName: draft.shiftName.trim(),
+          employeeIds: draft.employeeIds || [],
+          note: draft.note?.trim() || null,
+        }))
+      : ([
+          {
+            shiftName: data.shiftName?.trim() || '',
+            startTime: data.startTime || '',
+            endTime: data.endTime || '',
+            maxStaff: data.maxStaff,
+            note: data.note?.trim() || null,
+            employeeIds: data.employeeIds || [],
+          },
+        ] as NormalizedShiftDraft[]);
+    if (!data.startDate || !data.recurrence) {
+      throw new BadRequestException('Ngày áp dụng và quy tắc lặp là bắt buộc');
     }
-    if (employeeIds.length > data.maxStaff) {
+    if (
+      drafts.some(
+        (draft) =>
+          !draft.shiftName ||
+          !draft.startTime ||
+          !draft.endTime ||
+          !draft.maxStaff ||
+          draft.startTime === draft.endTime,
+      )
+    ) {
+      throw new BadRequestException(
+        'Mỗi ca phải có tên, giờ bắt đầu, giờ kết thúc khác nhau và số lượng nhân viên',
+      );
+    }
+    if (drafts.some((draft) => draft.employeeIds.length > draft.maxStaff)) {
       throw new BadRequestException(
         'Số nhân viên được chọn không được vượt quá số lượng nhân viên của ca',
       );
     }
+    assertUniqueActiveShiftNames(drafts);
 
     const recurrenceRule = this.normalizeShiftRecurrence(data);
     const workDates = generateShiftScheduleDates(
@@ -2910,12 +3690,45 @@ export class StoresService {
       recurrenceRule,
     );
     if (
-      employeeIds.length * workDates.length >
-      MAX_GENERATED_SHIFT_ASSIGNMENTS
+      drafts.length > 0 &&
+      workDates.length > Math.floor(MAX_GENERATED_SHIFT_SLOTS / drafts.length)
+    ) {
+      throw new BadRequestException(
+        `Lịch này tạo quá ${MAX_GENERATED_SHIFT_SLOTS} ô ca. Vui lòng giảm số ca hoặc số lần lặp.`,
+      );
+    }
+    const assignmentsPerDate = drafts.reduce(
+      (total, draft) => total + draft.employeeIds.length,
+      0,
+    );
+    if (
+      assignmentsPerDate > 0 &&
+      workDates.length >
+        Math.floor(MAX_GENERATED_SHIFT_ASSIGNMENTS / assignmentsPerDate)
     ) {
       throw new BadRequestException(
         `Lịch này tạo quá ${MAX_GENERATED_SHIFT_ASSIGNMENTS} lượt phân ca. Vui lòng giảm số nhân viên hoặc số lần lặp.`,
       );
+    }
+
+    const employeeIntervals = new Map<string, ShiftInterval[]>();
+    for (const draft of drafts) {
+      for (const employeeId of draft.employeeIds) {
+        const intervals = employeeIntervals.get(employeeId) || [];
+        for (const workDate of workDates) {
+          intervals.push(
+            toShiftInterval(workDate, draft.startTime, draft.endTime),
+          );
+        }
+        employeeIntervals.set(employeeId, intervals);
+      }
+    }
+    for (const intervals of employeeIntervals.values()) {
+      if (hasInternalIntervalOverlap(intervals)) {
+        throw new BadRequestException(
+          'Một nhân viên không thể được xếp vào các ca bị trùng giờ trong cùng chu kỳ',
+        );
+      }
     }
     const cycleType = !recurrenceRule.enabled
       ? CycleType.DAILY
@@ -2929,185 +3742,222 @@ export class StoresService {
           ? (recurrenceRule.endDate as string)
           : workDates[workDates.length - 1];
 
-    const result = await this.dataSource.transaction(async (manager) => {
-      const store = await manager.findOne(Store, {
-        where: { id: storeId },
-        lock: { mode: 'pessimistic_write' },
-      });
+    let result: any;
+    try {
+      result = await this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, storeId);
 
-      if (!store) {
-        throw new NotFoundException('Không tìm thấy cửa hàng');
-      }
-      if (store.ownerAccountId !== ownerAccountId) {
-        throw new ForbiddenException(
-          'Bạn không có quyền tạo lịch làm việc cho cửa hàng này',
-        );
-      }
-
-      const activeShifts = await manager.find(WorkShift, {
-        where: { storeId, isActive: true },
-        select: ['id', 'shiftName'],
-      });
-      const normalizedName = shiftName.toLocaleLowerCase('vi-VN');
-      if (
-        activeShifts.some(
-          (shift) =>
-            shift.shiftName.trim().toLocaleLowerCase('vi-VN') ===
-            normalizedName,
-        )
-      ) {
-        throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
-      }
-
-      if (employeeIds.length > 0) {
-        const activeEmployees = await manager.find(EmployeeProfile, {
-          where: {
-            storeId,
-            employmentStatus: EmploymentStatus.ACTIVE,
-          },
-          select: ['id'],
+        const store = await manager.findOne(Store, {
+          where: { id: storeId },
+          lock: { mode: 'pessimistic_write' },
         });
-        const activeEmployeeIds = new Set(
-          activeEmployees.map((employee) => employee.id),
-        );
-        if (employeeIds.some((id) => !activeEmployeeIds.has(id))) {
-          throw new BadRequestException(
-            'Có nhân viên không còn hoạt động hoặc không thuộc cửa hàng này',
+
+        if (!store) {
+          throw new NotFoundException('Không tìm thấy cửa hàng');
+        }
+        if (store.ownerAccountId !== ownerAccountId) {
+          throw new ForbiddenException(
+            'Bạn không có quyền tạo lịch làm việc cho cửa hàng này',
           );
         }
 
-        const options = await this.getShiftEmployeeOptions(
+        const activeShifts = await manager.find(WorkShift, {
+          where: { storeId, isActive: true },
+          select: ['id', 'shiftName'],
+        });
+        assertUniqueActiveShiftNames([...activeShifts, ...drafts]);
+
+        if (drafts.some((draft) => draft.employeeIds.length > 0)) {
+          await this.assertShiftScheduleAvailabilityAtCommit(
+            manager,
+            storeId,
+            drafts,
+            workDates,
+          );
+        }
+
+        const cycle = manager.create(WorkCycle, {
           storeId,
-          ownerAccountId,
-          data,
-        );
-        const optionMap = new Map(
-          options.employees.map((employee) => [employee.id, employee]),
-        );
-        const unknownEmployeeIds = employeeIds.filter(
-          (id) => !optionMap.has(id),
-        );
-        if (unknownEmployeeIds.length > 0) {
-          throw new BadRequestException(
-            'Có nhân viên không tồn tại hoặc không thuộc cửa hàng này',
+          name: drafts[0].shiftName,
+          cycleType,
+          startDate: data.startDate,
+          endDate: cycleEndDate,
+          status: WorkCycleStatus.ACTIVE,
+          workShiftId: null,
+          recurrenceRule,
+        });
+        const savedCycle = await manager.save(WorkCycle, cycle);
+        const savedShifts: WorkShift[] = [];
+        const allSlots: ShiftSlot[] = [];
+        const allAssignments: ShiftAssignment[] = [];
+        for (const draft of drafts) {
+          const savedShift = await manager.save(
+            WorkShift,
+            manager.create(WorkShift, {
+              storeId,
+              shiftName: draft.shiftName,
+              startTime: draft.startTime,
+              endTime: draft.endTime,
+              defaultMaxStaff: draft.maxStaff,
+              colorCode: '#21D4D4',
+              note: draft.note,
+              isActive: true,
+            }),
           );
-        }
-        const unavailableEmployees = employeeIds
-          .map((id) => optionMap.get(id))
-          .filter((employee) => employee && !employee.selectable);
-        if (unavailableEmployees.length > 0) {
-          throw new BadRequestException(
-            `Không thể xếp ca cho: ${unavailableEmployees
-              .map((employee) => `${employee?.name} (${employee?.statusLabel})`)
-              .join(', ')}`,
+          savedShifts.push(savedShift);
+          const slots = workDates.map((workDate) =>
+            manager.create(ShiftSlot, {
+              cycleId: savedCycle.id,
+              workShiftId: savedShift.id,
+              workDate,
+              startTime: draft.startTime,
+              endTime: draft.endTime,
+              maxStaff: draft.maxStaff,
+              note: draft.note,
+              dayOfWeek: getWeekDayForDate(workDate),
+            }),
           );
+          await manager.save(ShiftSlot, slots, { chunk: 500 });
+          allSlots.push(...slots);
+          const assignments = draft.employeeIds.flatMap((employeeId) =>
+            slots.map((slot) =>
+              manager.create(ShiftAssignment, {
+                shiftSlotId: slot.id,
+                employeeId,
+                status: ShiftAssignmentStatus.APPROVED,
+                note: 'Owner assigned during shift creation',
+              }),
+            ),
+          );
+          if (assignments.length)
+            await manager.save(ShiftAssignment, assignments, { chunk: 500 });
+          allAssignments.push(...assignments);
         }
+        await manager.update(WorkCycle, savedCycle.id, {
+          workShiftId: savedShifts[0].id,
+        });
+
+        return {
+          id: savedCycle.id,
+          storeId,
+          status: savedCycle.status,
+          shift: savedShifts[0],
+          shifts: savedShifts,
+          recurrence: recurrenceRule,
+          generatedSlotCount: allSlots.length,
+          assignedEmployeeCount: drafts.reduce(
+            (sum, draft) => sum + draft.employeeIds.length,
+            0,
+          ),
+          generatedAssignmentCount: allAssignments.length,
+          assignmentIds: allAssignments.map((assignment) => assignment.id),
+          firstWorkDate: workDates[0],
+          lastGeneratedWorkDate: workDates[workDates.length - 1],
+        };
+      });
+    } catch (error: any) {
+      if (error?.code === '23505' || error?.driverError?.code === '23505') {
+        throw new BadRequestException('Cửa hàng đã có chu kỳ đang hoạt động');
       }
-
-      const workShift = manager.create(WorkShift, {
-        storeId,
-        shiftName,
-        startTime: data.startTime,
-        endTime: data.endTime,
-        defaultMaxStaff: data.maxStaff,
-        colorCode: '#21D4D4',
-        note: data.note?.trim() || null,
-        isActive: true,
-      });
-      const savedShift = await manager.save(WorkShift, workShift);
-
-      const cycle = manager.create(WorkCycle, {
-        storeId,
-        name: shiftName,
-        cycleType,
-        startDate: data.startDate,
-        endDate: cycleEndDate,
-        status: WorkCycleStatus.ACTIVE,
-        workShiftId: savedShift.id,
-        recurrenceRule,
-      });
-      const savedCycle = await manager.save(WorkCycle, cycle);
-
-      const slots = workDates.map((workDate) =>
-        manager.create(ShiftSlot, {
-          cycleId: savedCycle.id,
-          workShiftId: savedShift.id,
-          workDate,
-          startTime: data.startTime,
-          endTime: data.endTime,
-          maxStaff: data.maxStaff,
-          note: data.note?.trim() || null,
-          dayOfWeek: getWeekDayForDate(workDate),
-        }),
-      );
-      await manager.save(ShiftSlot, slots, { chunk: 500 });
-
-      const assignments = employeeIds.flatMap((employeeId) =>
-        slots.map((slot) =>
-          manager.create(ShiftAssignment, {
-            shiftSlotId: slot.id,
-            employeeId,
-            status: ShiftAssignmentStatus.APPROVED,
-            note: 'Owner assigned during shift creation',
-          }),
-        ),
-      );
-      if (assignments.length > 0) {
-        await manager.save(ShiftAssignment, assignments, { chunk: 500 });
-      }
-
-      return {
-        id: savedCycle.id,
-        storeId,
-        status: savedCycle.status,
-        shift: savedShift,
-        recurrence: recurrenceRule,
-        generatedSlotCount: slots.length,
-        assignedEmployeeCount: employeeIds.length,
-        generatedAssignmentCount: assignments.length,
-        assignmentIds: assignments.map((assignment) => assignment.id),
-        firstWorkDate: workDates[0],
-        lastGeneratedWorkDate: workDates[workDates.length - 1],
-      };
-    });
-
-    for (const assignmentId of result.assignmentIds) {
-      this.scheduleReminderForAssignment(assignmentId).catch((error) => {
-        this.logger.error(
-          `Failed to schedule reminder for assignment ${assignmentId}: ${error.message}`,
-        );
-      });
+      throw error;
     }
 
-    return result;
+    const { assignmentIds, ...publicResult } = result;
+    if (assignmentIds.length) {
+      void this.shiftReminderService
+        .scheduleAssignmentReminders(assignmentIds)
+        .catch(() => {
+          this.logger.error(
+            'Failed to schedule reminders for newly created shift schedule',
+          );
+        });
+    }
+
+    return publicResult;
   }
 
   async updateWorkShift(
     storeId: string,
     shiftId: string,
     data: Partial<WorkShift>,
+    ownerAccountId?: string,
   ) {
-    const shift = await this.workShiftRepository.findOne({
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const shiftBeforeLock = await this.workShiftRepository.findOne({
       where: { id: shiftId, storeId },
+      select: ['id'],
     });
-
-    if (!shift) {
+    if (!shiftBeforeLock) {
       throw new NotFoundException('Không tìm thấy ca làm việc');
     }
-
-    await this.workShiftRepository.update(shiftId, data);
+    const saved = await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, { where: { id: storeId } });
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (!ownerAccountId || store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền cập nhật ca của cửa hàng này',
+        );
+      }
+      const shift = await manager.findOne(WorkShift, {
+        where: { id: shiftId, storeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!shift) throw new NotFoundException('Không tìm thấy ca làm việc');
+      const nextStart = data.startTime ?? shift.startTime;
+      const nextEnd = data.endTime ?? shift.endTime;
+      if (nextStart === nextEnd) {
+        throw new BadRequestException(
+          'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+        );
+      }
+      if (data.shiftName !== undefined) {
+        const normalizedName = normalizeActiveShiftName(data.shiftName);
+        if (!normalizedName)
+          throw new BadRequestException('Tên ca là bắt buộc');
+        const activeShifts = await manager.find(WorkShift, {
+          where: { storeId, isActive: true },
+          select: ['id', 'shiftName'],
+        });
+        if (
+          activeShifts.some(
+            (candidate) =>
+              candidate.id !== shiftId &&
+              normalizeActiveShiftName(candidate.shiftName) === normalizedName,
+          )
+        ) {
+          throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+        }
+      }
+      const allowed: Partial<WorkShift> = {};
+      for (const key of [
+        'shiftName',
+        'startTime',
+        'endTime',
+        'defaultMaxStaff',
+        'colorCode',
+        'note',
+        'isActive',
+        'location',
+      ] as const) {
+        if (data[key] !== undefined) (allowed as any)[key] = data[key];
+      }
+      if (allowed.shiftName) allowed.shiftName = allowed.shiftName.trim();
+      await manager.update(WorkShift, { id: shiftId, storeId }, allowed);
+      return manager.findOne(WorkShift, { where: { id: shiftId, storeId } });
+    });
 
     // Reschedule reminders since time might have changed
     if (data.startTime) {
-      this.rescheduleRemindersForShift(shiftId).catch((err) => {
-        this.logger.error(
-          `Error rescheduling reminders for shift ${shiftId}: ${err.message}`,
-          err.stack,
-        );
+      this.rescheduleRemindersForShift(shiftId).catch(() => {
+        this.logger.error('Failed to reschedule shift reminders');
       });
     }
 
-    return this.workShiftRepository.findOne({ where: { id: shiftId } });
+    return saved;
   }
 
   // Helper function to re-sync reminders for all employees assigned to a shift
@@ -3120,20 +3970,21 @@ export class StoresService {
       select: ['id'],
     });
 
-    for (const a of assignments) {
-      await this.scheduleReminderForAssignment(a.id);
-    }
+    await this.shiftReminderService.scheduleAssignmentReminders(
+      assignments.map((assignment) => assignment.id),
+    );
   }
 
   // ==================== WORK CYCLE MANAGEMENT ====================
 
   // Lấy chu kỳ đang active của cửa hàng (chỉ có 1 tại 1 thời điểm)
-  async getActiveCycle(storeId: string) {
+  async getActiveCycle(storeId: string, ownerAccountId?: string) {
+    if (ownerAccountId)
+      await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     return this.workCycleRepository.findOne({
       where: {
         storeId,
         status: WorkCycleStatus.ACTIVE,
-        recurrenceRule: IsNull(),
       },
       relations: [
         'slots',
@@ -3193,7 +4044,38 @@ export class StoresService {
         maxStaff?: number;
       }[];
     },
+    ownerAccountId?: string,
   ) {
+    if (ownerAccountId)
+      await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    return this.createWorkCycleInternal(storeId, data, ownerAccountId);
+  }
+
+  private async createWorkCycleInternal(
+    storeId: string,
+    data: {
+      name: string;
+      cycleType: CycleType;
+      startDate: string;
+      endDate?: string;
+      workShiftIds?: string[];
+      slots?: { workShiftId: string; workDate: string; maxStaff?: number }[];
+      templates?: {
+        workShiftId: string;
+        dayOfWeek: WeekDaySchedule;
+        maxStaff?: number;
+      }[];
+    },
+    ownerAccountId?: string,
+  ) {
+    if (ownerAccountId) {
+      const shiftIds = [
+        ...(data.workShiftIds || []),
+        ...(data.templates || []).map((template) => template.workShiftId),
+        ...(data.slots || []).map((slot) => slot.workShiftId),
+      ];
+      await this.assertWorkShiftsBelongToStore(storeId, shiftIds);
+    }
     // Kiểm tra xem có chu kỳ active không
     const activeCycle = await this.getActiveCycle(storeId);
     if (activeCycle) {
@@ -3215,7 +4097,22 @@ export class StoresService {
       endDate,
       status: WorkCycleStatus.ACTIVE,
     });
-    const savedCycle = await this.workCycleRepository.save(cycle);
+    let savedCycle: WorkCycle;
+    try {
+      savedCycle = await this.workCycleRepository.save(cycle);
+    } catch (error: any) {
+      // Concurrent requests are rejected by the partial unique index rather
+      // than leaking a database error or creating a second ACTIVE cycle.
+      if (
+        error?.code === '23505' &&
+        error?.constraint === 'uq_work_cycles_one_active_per_store'
+      ) {
+        throw new BadRequestException(
+          'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước khi tạo mới.',
+        );
+      }
+      throw error;
+    }
 
     // Nếu là INDEFINITE, tạo templates và slots cho 30 ngày tới
     if (data.cycleType === CycleType.INDEFINITE && data.templates?.length) {
@@ -3357,7 +4254,11 @@ export class StoresService {
     }
   }
 
-  async getWorkCycles(storeId: string) {
+  async getWorkCycles(storeId: string, ownerAccountId?: string) {
+    // This read is consumed by the staff calendar as well as the owner app.
+    // Mutating cycle operations remain owner-only below.
+    if (ownerAccountId)
+      await this.assertStoreRevenueReportAccess(storeId, ownerAccountId);
     return this.workCycleRepository.find({
       where: { storeId },
       order: { createdAt: 'DESC' },
@@ -3370,8 +4271,8 @@ export class StoresService {
     });
   }
 
-  async getWorkCycleById(cycleId: string) {
-    return this.workCycleRepository.findOne({
+  async getWorkCycleById(cycleId: string, ownerAccountId?: string) {
+    const cycle = await this.workCycleRepository.findOne({
       where: { id: cycleId },
       relations: [
         'slots',
@@ -3382,11 +4283,45 @@ export class StoresService {
         'templates.workShift',
       ],
     });
+    if (ownerAccountId) {
+      if (!cycle) throw new NotFoundException('Chu kỳ không tồn tại');
+      await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
+    }
+    return cycle;
   }
 
-  async updateWorkCycle(cycleId: string, data: Partial<WorkCycle>) {
-    await this.workCycleRepository.update(cycleId, data);
-    return this.getWorkCycleById(cycleId);
+  async updateWorkCycle(
+    cycleId: string,
+    data: Partial<WorkCycle>,
+    ownerAccountId?: string,
+  ) {
+    if (ownerAccountId) {
+      const cycle = await this.workCycleRepository.findOne({
+        where: { id: cycleId },
+        select: ['id', 'storeId'],
+      });
+      if (!cycle) throw new NotFoundException('Chu kỳ không tồn tại');
+      await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
+      if (data.workShiftId)
+        await this.assertWorkShiftsBelongToStore(cycle.storeId, [
+          data.workShiftId,
+        ]);
+    }
+    const allowed: Partial<WorkCycle> = {};
+    for (const key of [
+      'name',
+      'cycleType',
+      'startDate',
+      'endDate',
+      'registrationDeadline',
+      'scheduledStopAt',
+      'recurrenceRule',
+      'workShiftId',
+    ]) {
+      if (data[key] !== undefined) (allowed as any)[key] = data[key];
+    }
+    await this.workCycleRepository.update(cycleId, allowed);
+    return this.getWorkCycleById(cycleId, ownerAccountId);
   }
 
   // Dừng chu kỳ (không xóa, chỉ chuyển status)
@@ -3395,55 +4330,127 @@ export class StoresService {
     options: { stopImmediately?: boolean; scheduledStopAt?: string } = {
       stopImmediately: true,
     },
+    ownerAccountId?: string,
   ) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     const cycle = await this.workCycleRepository.findOne({
       where: { id: cycleId },
     });
     if (!cycle) {
       throw new NotFoundException('Chu kỳ không tồn tại');
     }
+    await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
     if (cycle.status !== WorkCycleStatus.ACTIVE) {
       throw new BadRequestException('Chỉ có thể dừng chu kỳ đang hoạt động');
     }
 
-    if (options.stopImmediately !== false) {
-      // Dừng ngay
-      await this.workCycleRepository.update(cycleId, {
-        status: WorkCycleStatus.STOPPED,
-        stoppedAt: new Date(),
-      });
-    } else if (options.scheduledStopAt) {
-      // Hẹn giờ dừng
-      await this.workCycleRepository.update(cycleId, {
-        scheduledStopAt: new Date(options.scheduledStopAt),
-      });
+    const stoppedAssignmentIds = await this.dataSource.transaction(
+      async (manager) => {
+        await lockStoreShiftAvailability(manager, cycle.storeId);
+        const lockedCycle = await manager.findOne(WorkCycle, {
+          where: { id: cycleId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!lockedCycle || lockedCycle.status !== WorkCycleStatus.ACTIVE) {
+          throw new BadRequestException(
+            'Chỉ có thể dừng chu kỳ đang hoạt động',
+          );
+        }
+        if (ownerAccountId) {
+          const store = await manager.findOne(Store, {
+            where: { id: lockedCycle.storeId },
+            select: ['id', 'ownerAccountId'],
+          });
+          if (!store || store.ownerAccountId !== ownerAccountId) {
+            throw new ForbiddenException('Bạn không có quyền dừng chu kỳ này');
+          }
+        }
+        if (options.stopImmediately !== false) {
+          await manager.update(WorkCycle, cycleId, {
+            status: WorkCycleStatus.STOPPED,
+            stoppedAt: new Date(),
+          });
+          const assignments = await manager.find(ShiftAssignment, {
+            where: {
+              shiftSlot: { cycleId },
+            },
+            select: ['id'],
+          });
+          return assignments.map((assignment) => assignment.id);
+        } else if (options.scheduledStopAt) {
+          await manager.update(WorkCycle, cycleId, {
+            scheduledStopAt: new Date(options.scheduledStopAt),
+          });
+        }
+        return [] as string[];
+      },
+    );
+
+    if (stoppedAssignmentIds.length) {
+      try {
+        await this.shiftReminderService.cancelAssignmentReminders(
+          stoppedAssignmentIds,
+        );
+      } catch {
+        this.logger.error('Failed to cancel reminders for stopped work cycle');
+      }
     }
 
-    return this.getWorkCycleById(cycleId);
+    return this.getWorkCycleById(cycleId, ownerAccountId);
   }
 
   // Kích hoạt chu kỳ (chuyển từ DRAFT sang ACTIVE)
-  async activateWorkCycle(cycleId: string) {
+  async activateWorkCycle(cycleId: string, ownerAccountId?: string) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     const cycle = await this.workCycleRepository.findOne({
       where: { id: cycleId },
     });
     if (!cycle) {
       throw new NotFoundException('Chu kỳ không tồn tại');
     }
+    await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
 
-    // Kiểm tra xem có chu kỳ active khác không
-    const activeCycle = await this.getActiveCycle(cycle.storeId);
-    if (activeCycle && activeCycle.id !== cycleId) {
-      throw new BadRequestException(
-        'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước.',
-      );
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, cycle.storeId);
+        const store = await manager.findOne(Store, {
+          where: { id: cycle.storeId },
+          select: ['id', 'ownerAccountId'],
+        });
+        if (ownerAccountId && store?.ownerAccountId !== ownerAccountId) {
+          throw new ForbiddenException(
+            'Bạn không có quyền kích hoạt chu kỳ này',
+          );
+        }
+        const activeCycle = await manager.findOne(WorkCycle, {
+          where: { storeId: cycle.storeId, status: WorkCycleStatus.ACTIVE },
+        });
+        if (activeCycle && activeCycle.id !== cycleId) {
+          throw new BadRequestException(
+            'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước.',
+          );
+        }
+        await manager.update(WorkCycle, cycleId, {
+          status: WorkCycleStatus.ACTIVE,
+        });
+      });
+    } catch (error: any) {
+      if (
+        error?.code === '23505' &&
+        error?.constraint === 'uq_work_cycles_one_active_per_store'
+      ) {
+        throw new BadRequestException(
+          'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước.',
+        );
+      }
+      throw error;
     }
 
-    await this.workCycleRepository.update(cycleId, {
-      status: WorkCycleStatus.ACTIVE,
-    });
-
-    return this.getWorkCycleById(cycleId);
+    return this.getWorkCycleById(cycleId, ownerAccountId);
   }
 
   // Xử lý chu kỳ hết hạn (gọi bởi cron job)
@@ -3459,8 +4466,13 @@ export class StoresService {
       .getMany();
 
     for (const cycle of expiredCycles) {
-      await this.workCycleRepository.update(cycle.id, {
-        status: WorkCycleStatus.EXPIRED,
+      await this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, cycle.storeId);
+        await manager.update(
+          WorkCycle,
+          { id: cycle.id, status: WorkCycleStatus.ACTIVE },
+          { status: WorkCycleStatus.EXPIRED },
+        );
       });
     }
 
@@ -3472,16 +4484,53 @@ export class StoresService {
       .andWhere('cycle.scheduledStopAt <= :now', { now: new Date() })
       .getMany();
 
+    let stoppedCount = 0;
     for (const cycle of scheduledStopCycles) {
-      await this.workCycleRepository.update(cycle.id, {
-        status: WorkCycleStatus.STOPPED,
-        stoppedAt: new Date(),
-      });
+      const stoppedAssignmentIds = await this.dataSource.transaction(
+        async (manager) => {
+          await lockStoreShiftAvailability(manager, cycle.storeId);
+          const updateResult = await manager.update(
+            WorkCycle,
+            {
+              id: cycle.id,
+              status: WorkCycleStatus.ACTIVE,
+              scheduledStopAt: Raw(
+                (alias) =>
+                  `${alias} IS NOT NULL AND ${alias} <= CURRENT_TIMESTAMP`,
+              ),
+            },
+            {
+              status: WorkCycleStatus.STOPPED,
+              stoppedAt: new Date(),
+            },
+          );
+          if (!updateResult.affected) return [] as string[];
+          stoppedCount += 1;
+          const assignments = await manager.find(ShiftAssignment, {
+            where: {
+              shiftSlot: { cycleId: cycle.id },
+            },
+            select: ['id'],
+          });
+          return assignments.map((assignment) => assignment.id);
+        },
+      );
+      if (stoppedAssignmentIds.length) {
+        try {
+          await this.shiftReminderService.cancelAssignmentReminders(
+            stoppedAssignmentIds,
+          );
+        } catch {
+          this.logger.error(
+            'Failed to cancel reminders for scheduled work cycle stop',
+          );
+        }
+      }
     }
 
     return {
       expiredCount: expiredCycles.length,
-      stoppedCount: scheduledStopCycles.length,
+      stoppedCount,
     };
   }
 
@@ -3508,68 +4557,67 @@ export class StoresService {
     let createdCount = 0;
 
     for (const cycle of activeCycles) {
-      // Kiểm tra xem đã có slots cho ngày mai chưa
-      const existingSlots = await this.shiftSlotRepository.find({
-        where: { cycleId: cycle.id, workDate: tomorrowStr },
-      });
-
-      if (existingSlots.length > 0) {
-        continue; // Đã có slots rồi, skip
-      }
-
-      // Lấy danh sách ca từ slot đầu tiên (giả định dùng cùng các ca)
-      const firstDaySlots = await this.shiftSlotRepository.find({
-        where: { cycleId: cycle.id, workDate: cycle.startDate },
-        relations: ['assignments'],
-      });
-
-      if (firstDaySlots.length === 0) {
-        continue; // Không có slots mẫu
-      }
-
-      // Tạo slots cho ngày mai dựa trên slots ngày đầu tiên
-      const newSlots = firstDaySlots.map((slot) =>
-        this.shiftSlotRepository.create({
-          cycleId: cycle.id,
-          workShiftId: slot.workShiftId,
-          workDate: tomorrowStr,
-          maxStaff: slot.maxStaff,
-          dayOfWeek: this.getDayOfWeek(tomorrowStr),
-        }),
-      );
-
-      const savedSlots = await this.shiftSlotRepository.save(newSlots);
-      createdCount += savedSlots.length;
-
-      // Auto-assign: copy APPROVED assignments từ slot gốc sang slot mới
-      for (let i = 0; i < firstDaySlots.length; i++) {
-        const templateSlot = firstDaySlots[i];
-        const newSlot = savedSlots[i];
-        const approvedAssignments = (templateSlot.assignments || []).filter(
-          (a) => a.status === ShiftAssignmentStatus.APPROVED,
-        );
-
-        if (approvedAssignments.length > 0) {
-          const newAssignments = approvedAssignments.map((a) =>
-            this.shiftAssignmentRepository.create({
-              shiftSlotId: newSlot.id,
-              employeeId: a.employeeId,
-              status: ShiftAssignmentStatus.APPROVED,
-              note: 'Auto-assigned from cycle',
-            }),
-          );
-          const savedAssignments =
-            await this.shiftAssignmentRepository.save(newAssignments);
-
-          // Hook: Schedule reminders for auto-assigned shifts
-          for (const a of savedAssignments) {
-            this.scheduleReminderForAssignment(a.id).catch((err) => {
-              this.logger.error(
-                `Failed to schedule reminder for auto-assignment ${a.id}: ${err.message}`,
-              );
-            });
-          }
+      const generated = await this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, cycle.storeId);
+        const lockedCycle = await manager.findOne(WorkCycle, {
+          where: { id: cycle.id, status: WorkCycleStatus.ACTIVE },
+        });
+        if (!lockedCycle)
+          return { slotCount: 0, assignmentIds: [] as string[] };
+        const existingSlots = await manager.find(ShiftSlot, {
+          where: { cycleId: cycle.id, workDate: tomorrowStr },
+        });
+        if (existingSlots.length) {
+          return { slotCount: 0, assignmentIds: [] as string[] };
         }
+        const firstDaySlots = await manager.find(ShiftSlot, {
+          where: { cycleId: cycle.id, workDate: cycle.startDate },
+          relations: ['assignments'],
+        });
+        if (!firstDaySlots.length) {
+          return { slotCount: 0, assignmentIds: [] as string[] };
+        }
+        const newSlots = firstDaySlots.map((slot) =>
+          manager.create(ShiftSlot, {
+            cycleId: cycle.id,
+            workShiftId: slot.workShiftId,
+            workDate: tomorrowStr,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            maxStaff: slot.maxStaff,
+            note: slot.note,
+            dayOfWeek: this.getDayOfWeek(tomorrowStr),
+          }),
+        );
+        const savedSlots = await manager.save(ShiftSlot, newSlots);
+        const newAssignments = firstDaySlots.flatMap((templateSlot, index) =>
+          (templateSlot.assignments || [])
+            .filter(
+              (assignment) =>
+                assignment.status === ShiftAssignmentStatus.APPROVED,
+            )
+            .map((assignment) =>
+              manager.create(ShiftAssignment, {
+                shiftSlotId: savedSlots[index].id,
+                employeeId: assignment.employeeId,
+                status: ShiftAssignmentStatus.APPROVED,
+                note: 'Auto-assigned from cycle',
+              }),
+            ),
+        );
+        const savedAssignments = newAssignments.length
+          ? await manager.save(ShiftAssignment, newAssignments)
+          : [];
+        return {
+          slotCount: savedSlots.length,
+          assignmentIds: savedAssignments.map((assignment) => assignment.id),
+        };
+      });
+      createdCount += generated.slotCount;
+      for (const assignmentId of generated.assignmentIds) {
+        this.scheduleReminderForAssignment(assignmentId).catch(() => {
+          this.logger.error('Failed to schedule automatic assignment reminder');
+        });
       }
     }
 
@@ -3606,37 +4654,39 @@ export class StoresService {
         continue;
       }
 
-      const existing = await this.shiftSlotRepository.findOne({
-        where: {
-          cycleId: cycle.id,
-          workShiftId: cycle.workShiftId as string,
-          workDate: horizonDate,
-        },
+      const cycleSlots = await this.shiftSlotRepository.find({
+        where: { cycleId: cycle.id },
+        select: ['workShiftId'],
       });
-      if (existing) continue;
-
-      const workShift = await this.workShiftRepository.findOne({
-        where: {
-          id: cycle.workShiftId as string,
-          storeId: cycle.storeId,
-          isActive: true,
-        },
-      });
-      if (!workShift) continue;
-
-      await this.shiftSlotRepository.save(
-        this.shiftSlotRepository.create({
-          cycleId: cycle.id,
-          workShiftId: workShift.id,
-          workDate: horizonDate,
-          startTime: workShift.startTime,
-          endTime: workShift.endTime,
-          maxStaff: workShift.defaultMaxStaff,
-          note: workShift.note || null,
-          dayOfWeek: getWeekDayForDate(horizonDate),
-        }),
-      );
-      createdCount += 1;
+      const shiftIds = [
+        ...new Set([
+          cycle.workShiftId as string,
+          ...cycleSlots.map((slot) => slot.workShiftId).filter(Boolean),
+        ]),
+      ];
+      for (const workShiftId of shiftIds) {
+        const existing = await this.shiftSlotRepository.findOne({
+          where: { cycleId: cycle.id, workShiftId, workDate: horizonDate },
+        });
+        if (existing) continue;
+        const workShift = await this.workShiftRepository.findOne({
+          where: { id: workShiftId, storeId: cycle.storeId, isActive: true },
+        });
+        if (!workShift) continue;
+        await this.shiftSlotRepository.save(
+          this.shiftSlotRepository.create({
+            cycleId: cycle.id,
+            workShiftId: workShift.id,
+            workDate: horizonDate,
+            startTime: workShift.startTime,
+            endTime: workShift.endTime,
+            maxStaff: workShift.defaultMaxStaff,
+            note: workShift.note || null,
+            dayOfWeek: getWeekDayForDate(horizonDate),
+          }),
+        );
+        createdCount += 1;
+      }
     }
 
     const tomorrowStr = addDays(today, 1);
@@ -3676,7 +4726,24 @@ export class StoresService {
 
   // ==================== SHIFT SLOT MANAGEMENT ====================
 
-  async createShiftSlots(cycleId: string, slotsData: Partial<ShiftSlot>[]) {
+  async createShiftSlots(
+    cycleId: string,
+    slotsData: Partial<ShiftSlot>[],
+    ownerAccountId?: string,
+  ) {
+    const cycle = await this.workCycleRepository.findOne({
+      where: { id: cycleId },
+      select: ['id', 'storeId'],
+    });
+    if (!cycle) throw new NotFoundException('Chu kỳ không tồn tại');
+    if (ownerAccountId)
+      await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
+    if (ownerAccountId) {
+      await this.assertWorkShiftsBelongToStore(
+        cycle.storeId,
+        slotsData.map((slot) => slot.workShiftId || ''),
+      );
+    }
     const slots = slotsData.map((data) =>
       this.shiftSlotRepository.create({
         ...data,
@@ -3687,7 +4754,15 @@ export class StoresService {
     return this.shiftSlotRepository.save(slots);
   }
 
-  async getShiftSlots(cycleId: string, date?: string) {
+  async getShiftSlots(cycleId: string, date?: string, ownerAccountId?: string) {
+    if (ownerAccountId) {
+      const cycle = await this.workCycleRepository.findOne({
+        where: { id: cycleId },
+        select: ['id', 'storeId'],
+      });
+      if (!cycle) throw new NotFoundException('Chu kỳ không tồn tại');
+      await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
+    }
     const where: any = { cycleId };
     if (date) {
       where.workDate = date;
@@ -3722,22 +4797,103 @@ export class StoresService {
       maxStaff?: number;
       note?: string;
     },
+    ownerAccountId?: string,
   ) {
+    const slotContext = await this.shiftSlotRepository.findOne({
+      where: { id: slotId },
+      relations: ['cycle'],
+    });
+    if (!slotContext) throw new NotFoundException('Shift slot not found');
+    const storeId = slotContext.cycle?.storeId;
+    if (!storeId)
+      throw new BadRequestException('Slot không thuộc chu kỳ hợp lệ');
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     const updateData: Partial<ShiftSlot> = {};
     if (data.startTime !== undefined) updateData.startTime = data.startTime;
     if (data.endTime !== undefined) updateData.endTime = data.endTime;
     if (data.maxStaff !== undefined) updateData.maxStaff = data.maxStaff;
     if (data.note !== undefined) updateData.note = data.note;
 
-    await this.shiftSlotRepository.update(slotId, updateData);
+    await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, {
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (
+        !ownerAccountId ||
+        !store ||
+        store.ownerAccountId !== ownerAccountId
+      ) {
+        throw new ForbiddenException('Bạn không có quyền cập nhật slot này');
+      }
+      const lockedSlot = await manager.findOne(ShiftSlot, {
+        where: { id: slotId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!lockedSlot) throw new NotFoundException('Shift slot not found');
+      const nextStart = data.startTime ?? lockedSlot.startTime;
+      const nextEnd = data.endTime ?? lockedSlot.endTime;
+      if (nextStart && nextEnd && nextStart === nextEnd) {
+        throw new BadRequestException(
+          'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+        );
+      }
+      await manager.update(ShiftSlot, slotId, updateData);
+    });
+    if (data.startTime !== undefined) {
+      const assignments = await this.shiftAssignmentRepository.find({
+        where: {
+          shiftSlotId: slotId,
+          status: ShiftAssignmentStatus.APPROVED,
+        },
+        select: ['id'],
+      });
+      try {
+        await this.shiftReminderService.scheduleAssignmentReminders(
+          assignments.map((assignment) => assignment.id),
+        );
+      } catch {
+        this.logger.error('Failed to reschedule shift slot reminders');
+      }
+    }
     return this.shiftSlotRepository.findOne({
       where: { id: slotId },
       relations: ['workShift', 'assignments', 'assignments.employee'],
     });
   }
 
-  async deleteShiftSlot(slotId: string) {
-    await this.shiftSlotRepository.delete(slotId);
+  async deleteShiftSlot(slotId: string, ownerAccountId?: string) {
+    const slotContext = await this.shiftSlotRepository.findOne({
+      where: { id: slotId },
+      relations: ['cycle'],
+    });
+    if (!slotContext) throw new NotFoundException('Shift slot not found');
+    const storeId = slotContext.cycle?.storeId;
+    if (!storeId)
+      throw new BadRequestException('Slot không thuộc chu kỳ hợp lệ');
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, {
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (
+        !ownerAccountId ||
+        !store ||
+        store.ownerAccountId !== ownerAccountId
+      ) {
+        throw new ForbiddenException('Bạn không có quyền xóa slot này');
+      }
+      await manager.delete(ShiftSlot, slotId);
+    });
     return { message: 'Shift slot deleted successfully' };
   }
 
@@ -3752,7 +4908,56 @@ export class StoresService {
     startDate?: string,
     endDate?: string,
     employeeProfileId?: string,
+    accountId?: string,
   ) {
+    // The route is authenticated, but store IDs and employee profile IDs are
+    // client-controlled. Resolve both against the caller's store membership
+    // before returning schedules or salary data.
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (accountId) {
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      const isOwner = store.ownerAccountId === accountId;
+      const activeEmployee = isOwner
+        ? null
+        : await this.profileRepository.findOne({
+            where: {
+              storeId,
+              accountId,
+              employmentStatus: EmploymentStatus.ACTIVE,
+            },
+            select: ['id'],
+          });
+      if (!isOwner && !activeEmployee) {
+        throw new ForbiddenException(
+          'Bạn không có quyền truy cập cửa hàng này',
+        );
+      }
+      if (employeeProfileId) {
+        const requestedEmployee = await this.profileRepository.findOne({
+          where: {
+            id: employeeProfileId,
+            storeId,
+            employmentStatus: EmploymentStatus.ACTIVE,
+          },
+          select: ['id', 'accountId'],
+        });
+        if (!requestedEmployee) {
+          throw new NotFoundException('Không tìm thấy nhân viên');
+        }
+        if (!isOwner && requestedEmployee.accountId !== accountId) {
+          throw new ForbiddenException(
+            'Bạn chỉ có thể xem lương của chính mình',
+          );
+        }
+      }
+    }
+
+    if (startDate || endDate) {
+      this.validateShiftSlotDateRange(startDate, endDate);
+    }
     const qb = this.shiftSlotRepository
       .createQueryBuilder('slot')
       .leftJoinAndSelect('slot.workShift', 'workShift')
@@ -3761,6 +4966,9 @@ export class StoresService {
       .leftJoinAndSelect('employee.account', 'account')
       .leftJoin('slot.cycle', 'cycle')
       .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
       .orderBy('slot.workDate', 'ASC')
       .addOrderBy('workShift.startTime', 'ASC');
 
@@ -3771,7 +4979,11 @@ export class StoresService {
       qb.andWhere('slot.workDate <= :endDate', { endDate });
     }
 
-    const slots = await qb.getMany();
+    // Keep the legacy array response while bounding this compatibility
+    // endpoint. The owner calendar uses the paginated aggregation endpoint.
+    const boundedQb =
+      typeof (qb as any).take === 'function' ? qb.take(5000) : qb;
+    const slots = await boundedQb.getMany();
 
     // If an employee is given, resolve their active contract once so each slot
     // can carry an estimated salary (for the "Đăng ký ca làm" cards).
@@ -3817,47 +5029,92 @@ export class StoresService {
       }
     };
 
-    return slots.map((slot) => ({
-      id: slot.id,
-      workDate: slot.workDate,
-      maxStaff: slot.maxStaff,
-      cycleId: slot.cycleId,
-      estimatedSalary: employeeProfileId ? slotSalary(slot) : 0,
-      workShift: slot.workShift
-        ? {
-            id: slot.workShift.id,
-            shiftName: slot.workShift.shiftName,
-            startTime: slot.workShift.startTime,
-            endTime: slot.workShift.endTime,
-            colorCode: (slot.workShift as any).colorCode || null,
-          }
-        : null,
-      assignments: (slot.assignments || []).map((a) => ({
-        id: a.id,
-        employeeId: a.employeeId,
-        status: a.status,
-        employee: a.employee
+    return slots.map((slot) => {
+      // `maxStaff` is the legacy per-slot override. A null override inherits
+      // the shift template default; null after inheritance means unlimited.
+      const configuredMaxStaff =
+        slot.maxStaff ?? slot.workShift?.defaultMaxStaff ?? null;
+      const effectiveMaxStaff =
+        configuredMaxStaff !== null && configuredMaxStaff > 0
+          ? configuredMaxStaff
+          : null;
+      const activeCount =
+        slot.assignments?.filter(
+          (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
+        ).length || 0;
+
+      return {
+        id: slot.id,
+        workDate: slot.workDate,
+        maxStaff: slot.maxStaff,
+        effectiveMaxStaff,
+        cycleId: slot.cycleId,
+        estimatedSalary: employeeProfileId ? slotSalary(slot) : 0,
+        workShift: slot.workShift
           ? {
-              id: a.employee.id,
-              fullName: a.employee.account?.fullName || null,
-              avatarUrl: a.employee.account?.avatar || null,
-              account: {
-                fullName: a.employee.account?.fullName || null,
-                avatarUrl: a.employee.account?.avatar || null,
-              },
+              id: slot.workShift.id,
+              shiftName: slot.workShift.shiftName,
+              startTime: slot.workShift.startTime,
+              endTime: slot.workShift.endTime,
+              colorCode: (slot.workShift as any).colorCode || null,
             }
           : null,
-      })),
-      currentCount: slot.assignments?.filter(
-        (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
-      ).length,
-      isFull:
-        slot.maxStaff !== null
-          ? (slot.assignments?.filter(
-              (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
-            ).length || 0) >= slot.maxStaff
-          : false,
-    }));
+        assignments: (slot.assignments || [])
+          .filter((a) => a.status !== ShiftAssignmentStatus.CANCELLED)
+          .map((a) => ({
+            id: a.id,
+            employeeId: a.employeeId,
+            status: a.status,
+            employee: a.employee
+              ? {
+                  id: a.employee.id,
+                  fullName: a.employee.account?.fullName || null,
+                  avatarUrl: a.employee.account?.avatar || null,
+                  account: {
+                    fullName: a.employee.account?.fullName || null,
+                    avatarUrl: a.employee.account?.avatar || null,
+                  },
+                }
+              : null,
+          })),
+        currentCount: activeCount,
+        isFull:
+          effectiveMaxStaff !== null && effectiveMaxStaff > 0
+            ? activeCount >= effectiveMaxStaff
+            : false,
+      };
+    });
+  }
+
+  private validateShiftSlotDateRange(
+    startDate?: string,
+    endDate?: string,
+  ): void {
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+    for (const value of [startDate, endDate]) {
+      if (!value) continue;
+      if (!dateOnly.test(value))
+        throw new BadRequestException('Ngày không hợp lệ');
+      const [year, month, day] = value.split('-').map(Number);
+      const parsed = new Date(Date.UTC(year, month - 1, day));
+      if (
+        Number.isNaN(parsed.getTime()) ||
+        parsed.getUTCFullYear() !== year ||
+        parsed.getUTCMonth() !== month - 1 ||
+        parsed.getUTCDate() !== day
+      ) {
+        throw new BadRequestException('Ngày không tồn tại');
+      }
+    }
+    if (startDate && endDate) {
+      if (startDate > endDate)
+        throw new BadRequestException('Khoảng ngày không hợp lệ');
+      const start = Date.parse(`${startDate}T00:00:00Z`);
+      const end = Date.parse(`${endDate}T00:00:00Z`);
+      if (end - start > 366 * 24 * 60 * 60 * 1000) {
+        throw new BadRequestException('Khoảng ngày tối đa là 366 ngày');
+      }
+    }
   }
 
   // ==================== SHIFT ASSIGNMENT MANAGEMENT ====================
@@ -3867,8 +5124,38 @@ export class StoresService {
     employeeId: string,
     note?: string,
     isOwnerAssign = false,
+    ownerAccountId?: string,
   ) {
-    return this.dataSource.transaction(async (manager) => {
+    const slotContext = await this.shiftSlotRepository.findOne({
+      where: { id: slotId },
+      relations: ['cycle'],
+    });
+    if (!slotContext) throw new NotFoundException('Shift slot not found');
+    const storeId = slotContext.cycle?.storeId;
+    if (!storeId) throw new BadRequestException('Ca không thuộc chu kỳ hợp lệ');
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    if (isOwnerAssign) {
+      await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    } else {
+      const caller = await this.profileRepository.findOne({
+        where: {
+          id: employeeId,
+          accountId: ownerAccountId,
+          storeId,
+          employmentStatus: EmploymentStatus.ACTIVE,
+        },
+        select: ['id'],
+      });
+      if (!caller) {
+        throw new ForbiddenException(
+          'Nhân viên chỉ có thể tự đăng ký ca của mình',
+        );
+      }
+    }
+    const savedAssignment = await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
       // Step 1: Lock the slot row to prevent race condition (no joins, FOR UPDATE only works on non-nullable side)
       const slot = await manager
         .createQueryBuilder(ShiftSlot, 'slot')
@@ -3888,6 +5175,25 @@ export class StoresService {
           where: { shiftSlotId: slotId },
         }),
       ]);
+
+      // The request flag is only a hint. Resolve the caller's role from the
+      // store and employee profile so a staff token cannot self-promote to an
+      // owner assignment (or register somebody else's profile).
+      let authorizedOwnerAssign = false;
+      if (ownerAccountId) {
+        if (isOwnerAssign) {
+          const store = await manager.findOne(Store, {
+            where: { id: cycle?.storeId || '' },
+            select: ['id', 'ownerAccountId'],
+          });
+          if (!store || store.ownerAccountId !== ownerAccountId) {
+            throw new ForbiddenException(
+              'Bạn không có quyền gán nhân viên vào ca này',
+            );
+          }
+          authorizedOwnerAssign = true;
+        }
+      }
 
       // Check if cycle is still active
       if (cycle && cycle.status !== WorkCycleStatus.ACTIVE) {
@@ -3925,6 +5231,18 @@ export class StoresService {
           'Nhân viên không còn hoạt động, không thể đăng ký ca',
         );
       }
+      if (cycle?.storeId && employee.storeId !== cycle.storeId) {
+        throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
+      }
+      if (
+        ownerAccountId &&
+        !authorizedOwnerAssign &&
+        employee.accountId !== ownerAccountId
+      ) {
+        throw new ForbiddenException(
+          'Nhân viên chỉ có thể tự đăng ký ca của mình',
+        );
+      }
 
       // Check if employee already registered (exclude cancelled)
       const existing = await manager.findOne(ShiftAssignment, {
@@ -3939,32 +5257,37 @@ export class StoresService {
         shiftSlotId: slotId,
         employeeId,
         note,
-        status: isOwnerAssign
-          ? ShiftAssignmentStatus.APPROVED
-          : ShiftAssignmentStatus.PENDING,
+        status:
+          authorizedOwnerAssign || (!ownerAccountId && isOwnerAssign)
+            ? ShiftAssignmentStatus.APPROVED
+            : ShiftAssignmentStatus.PENDING,
       });
       const saved = await manager.save(assignment);
       console.log(
         `[registerToShiftSlot] saved assignmentId=${saved.id}, slotId=${slotId}, cycleId=${slot.cycleId}, employeeId=${employeeId}, status=${saved.status}`,
       );
 
-      // Hook: Schedule reminder if approved
-      if (saved.status === ShiftAssignmentStatus.APPROVED) {
-        this.scheduleReminderForAssignment(saved.id).catch((err) => {
-          this.logger.error(
-            `Failed to schedule reminder for registered assignment ${saved.id}: ${err.message}`,
-          );
-        });
-      }
-
       return saved;
     });
+    if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
+      try {
+        await this.shiftReminderService.scheduleAssignmentReminder(
+          savedAssignment.id,
+        );
+      } catch {
+        this.logger.error('Failed to schedule registered assignment reminder');
+      }
+    }
+    return savedAssignment;
   }
 
   async getShiftAssignments(
     storeId: string,
     filters: { cycleId?: string; status?: string },
+    ownerAccountId?: string,
   ) {
+    if (ownerAccountId)
+      await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     const qb = this.shiftAssignmentRepository
       .createQueryBuilder('assignment')
       .leftJoinAndSelect('assignment.shiftSlot', 'slot')
@@ -4056,57 +5379,299 @@ export class StoresService {
     assignmentId: string,
     status: string,
     note?: string,
+    ownerAccountId?: string,
   ) {
     const assignment = await this.shiftAssignmentRepository.findOne({
       where: { id: assignmentId },
+      relations: ['shiftSlot', 'shiftSlot.cycle'],
     });
     if (!assignment) throw new NotFoundException('Assignment not found');
+    const storeId = assignment.shiftSlot?.cycle?.storeId;
+    if (!storeId)
+      throw new BadRequestException('Assignment không thuộc cửa hàng');
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    if (
+      ![
+        ShiftAssignmentStatus.APPROVED,
+        ShiftAssignmentStatus.CONFIRMED,
+        ShiftAssignmentStatus.CANCELLED,
+      ].includes(status as ShiftAssignmentStatus)
+    ) {
+      throw new BadRequestException('Trạng thái assignment không hợp lệ');
+    }
 
-    assignment.status = status as ShiftAssignmentStatus;
-    if (note) assignment.note = note;
+    const nextStatus = status as ShiftAssignmentStatus;
+    const allowedTransitions: Record<
+      ShiftAssignmentStatus,
+      ShiftAssignmentStatus[]
+    > = {
+      [ShiftAssignmentStatus.PENDING]: [
+        ShiftAssignmentStatus.APPROVED,
+        ShiftAssignmentStatus.CANCELLED,
+      ],
+      [ShiftAssignmentStatus.APPROVED]: [
+        ShiftAssignmentStatus.CONFIRMED,
+        ShiftAssignmentStatus.CANCELLED,
+      ],
+      [ShiftAssignmentStatus.CONFIRMED]: [],
+      [ShiftAssignmentStatus.COMPLETED]: [],
+      [ShiftAssignmentStatus.CANCELLED]: [],
+    };
+    if (!allowedTransitions[assignment.status]?.includes(nextStatus)) {
+      throw new BadRequestException(
+        'Không thể chuyển trạng thái assignment hiện tại',
+      );
+    }
 
-    return this.shiftAssignmentRepository.save(assignment);
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, {
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (
+        !ownerAccountId ||
+        !store ||
+        store.ownerAccountId !== ownerAccountId
+      ) {
+        throw new ForbiddenException(
+          'Bạn không có quyền cập nhật assignment này',
+        );
+      }
+      const current = await manager.findOne(ShiftAssignment, {
+        where: { id: assignmentId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!current) throw new NotFoundException('Assignment not found');
+      if (!allowedTransitions[current.status]?.includes(nextStatus)) {
+        throw new BadRequestException(
+          'Không thể chuyển trạng thái assignment hiện tại',
+        );
+      }
+      current.status = nextStatus;
+      if (note !== undefined) current.note = note;
+      return manager.save(ShiftAssignment, current);
+    });
+  }
+
+  private async assertSlotOwnerAccess(slotId: string, ownerAccountId: string) {
+    const slot = await this.shiftSlotRepository.findOne({
+      relations: ['cycle'],
+      where: { id: slotId },
+    });
+    if (!slot) throw new NotFoundException('Shift slot not found');
+    await this.assertOwnerStoreAccess(
+      slot.cycle?.storeId || '',
+      ownerAccountId,
+    );
+  }
+
+  private async assertAssignmentOwnerAccess(
+    assignmentId: string,
+    ownerAccountId: string,
+  ) {
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      relations: ['shiftSlot', 'shiftSlot.cycle'],
+      where: { id: assignmentId },
+    });
+    if (!assignment) throw new NotFoundException('Assignment not found');
+    await this.assertOwnerStoreAccess(
+      assignment.shiftSlot?.cycle?.storeId || '',
+      ownerAccountId,
+    );
   }
 
   // ==================== SHIFT SWAP MANAGEMENT ====================
 
-  async createShiftSwap(data: {
-    fromAssignmentId: string;
-    toEmployeeId: string;
-    requestedByEmployeeId: string;
-    note?: string;
-  }) {
+  async createShiftSwap(
+    data: {
+      fromAssignmentId: string;
+      toEmployeeId: string;
+      requestedByEmployeeId: string;
+      note?: string;
+    },
+    accountId?: string,
+  ) {
+    if (!accountId)
+      throw new ForbiddenException('Không xác định được tài khoản');
+    const source = await this.shiftAssignmentRepository.findOne({
+      where: { id: data.fromAssignmentId },
+      relations: ['shiftSlot', 'shiftSlot.cycle'],
+    });
+    if (!source) throw new NotFoundException('Assignment không tồn tại');
+    const storeId = source.shiftSlot?.cycle?.storeId;
+    if (!storeId)
+      throw new BadRequestException('Assignment không thuộc chu kỳ hợp lệ');
+    const requester = await this.profileRepository.findOne({
+      where: {
+        id: data.requestedByEmployeeId,
+        accountId,
+        storeId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id'],
+    });
+    if (!requester || source.employeeId !== requester.id) {
+      throw new ForbiddenException(
+        'Bạn chỉ có thể yêu cầu đổi ca của chính mình',
+      );
+    }
+    const target = await this.profileRepository.findOne({
+      where: {
+        id: data.toEmployeeId,
+        storeId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id'],
+    });
+    if (!target)
+      throw new BadRequestException(
+        'Nhân viên nhận ca không thuộc cửa hàng hoặc đã ngừng hoạt động',
+      );
+    if (source.status === ShiftAssignmentStatus.CANCELLED)
+      throw new BadRequestException('Assignment đã bị hủy');
     const swap = this.shiftSwapRepository.create({
-      fromAssignmentId: data.fromAssignmentId,
-      toEmployeeId: data.toEmployeeId,
-      requestedByEmployeeId: data.requestedByEmployeeId,
+      fromAssignmentId: source.id,
+      toEmployeeId: target.id,
+      requestedByEmployeeId: requester.id,
       note: data.note,
       status: ShiftSwapStatus.PENDING,
     });
     return this.shiftSwapRepository.save(swap);
   }
 
-  async updateShiftSwapStatus(swapId: string, status: string, note?: string) {
+  async updateShiftSwapStatus(
+    swapId: string,
+    status: string,
+    note?: string,
+    accountId?: string,
+  ) {
+    if (!accountId)
+      throw new ForbiddenException('Không xác định được tài khoản');
+    if (
+      ![ShiftSwapStatus.APPROVED, ShiftSwapStatus.REJECTED].includes(
+        status as ShiftSwapStatus,
+      )
+    ) {
+      throw new BadRequestException('Trạng thái đổi ca không hợp lệ');
+    }
+    const nextStatus = status as ShiftSwapStatus;
     const swap = await this.shiftSwapRepository.findOne({
       where: { id: swapId },
-      relations: ['fromAssignment'],
+      relations: [
+        'fromAssignment',
+        'fromAssignment.shiftSlot',
+        'fromAssignment.shiftSlot.cycle',
+      ],
     });
     if (!swap) throw new NotFoundException('Shift swap request not found');
-
-    swap.status = status as ShiftSwapStatus;
-    if (note) swap.note = note;
-    await this.shiftSwapRepository.save(swap);
-
-    // If approved, transfer the assignment
-    if (
-      (status as ShiftSwapStatus) === ShiftSwapStatus.APPROVED &&
-      swap.fromAssignment
-    ) {
-      swap.fromAssignment.employeeId = swap.toEmployeeId;
-      await this.shiftAssignmentRepository.save(swap.fromAssignment);
+    if (swap.status !== ShiftSwapStatus.PENDING)
+      throw new BadRequestException('Yêu cầu đổi ca không còn chờ duyệt');
+    const storeId = swap.fromAssignment?.shiftSlot?.cycle?.storeId || '';
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    const isOwner = store.ownerAccountId === accountId;
+    if (!isOwner) {
+      const caller = await this.profileRepository.findOne({
+        where: {
+          accountId,
+          storeId,
+          employmentStatus: EmploymentStatus.ACTIVE,
+        },
+        select: ['id'],
+      });
+      if (
+        !caller ||
+        ![swap.requestedByEmployeeId, swap.toEmployeeId].includes(caller.id)
+      ) {
+        throw new ForbiddenException(
+          'Bạn không có quyền cập nhật yêu cầu đổi ca này',
+        );
+      }
     }
-
-    return swap;
+    const target = await this.profileRepository.findOne({
+      where: {
+        id: swap.toEmployeeId,
+        storeId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id'],
+    });
+    if (!target)
+      throw new BadRequestException(
+        'Nhân viên nhận ca không thuộc cửa hàng hoặc đã ngừng hoạt động',
+      );
+    return this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const lockedStore = await manager.findOne(Store, {
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (!lockedStore) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (lockedStore.ownerAccountId !== accountId) {
+        const lockedCaller = await manager.findOne(EmployeeProfile, {
+          where: {
+            accountId,
+            storeId,
+            employmentStatus: EmploymentStatus.ACTIVE,
+          },
+          select: ['id'],
+        });
+        if (
+          !lockedCaller ||
+          ![swap.requestedByEmployeeId, swap.toEmployeeId].includes(
+            lockedCaller.id,
+          )
+        ) {
+          throw new ForbiddenException(
+            'Bạn không có quyền cập nhật yêu cầu đổi ca này',
+          );
+        }
+      }
+      const lockedTarget = await manager.findOne(EmployeeProfile, {
+        where: {
+          id: swap.toEmployeeId,
+          storeId,
+          employmentStatus: EmploymentStatus.ACTIVE,
+        },
+        select: ['id'],
+      });
+      if (!lockedTarget) {
+        throw new BadRequestException(
+          'Nhân viên nhận ca không thuộc cửa hàng hoặc đã ngừng hoạt động',
+        );
+      }
+      if (nextStatus === ShiftSwapStatus.APPROVED) {
+        const assignmentResult = await manager.update(
+          ShiftAssignment,
+          {
+            id: swap.fromAssignment.id,
+            employeeId: swap.fromAssignment.employeeId,
+          },
+          { employeeId: swap.toEmployeeId },
+        );
+        if (!assignmentResult.affected)
+          throw new BadRequestException(
+            'Ca đã được thay đổi, vui lòng tải lại',
+          );
+      }
+      const swapResult = await manager.update(
+        ShiftSwap,
+        { id: swap.id, status: ShiftSwapStatus.PENDING },
+        { status: nextStatus, note },
+      );
+      if (!swapResult.affected)
+        throw new BadRequestException(
+          'Yêu cầu đổi ca đã được cập nhật, vui lòng tải lại',
+        );
+      return { ...swap, status: nextStatus, note };
+    });
   }
 
   async createAssetsBulk(
@@ -8282,10 +9847,10 @@ export class StoresService {
       });
 
     if (halfOpenRange) {
-      query.andWhere(
-        'o.created_at >= :startDate AND o.created_at < :endDate',
-        { startDate, endDate },
-      );
+      query.andWhere('o.created_at >= :startDate AND o.created_at < :endDate', {
+        startDate,
+        endDate,
+      });
     } else {
       query.andWhere('o.created_at BETWEEN :startDate AND :endDate', {
         startDate,
@@ -11776,7 +13341,14 @@ export class StoresService {
     employeeProfileId: string,
     monthStr?: string,
     filter?: string,
+    accountId?: string,
   ) {
+    if (accountId)
+      await this.assertEmployeeCalendarAccess(
+        employeeProfileId,
+        accountId,
+        storeId,
+      );
     const now = new Date();
     let m: number, y: number;
     if (monthStr) {
@@ -11928,7 +13500,12 @@ export class StoresService {
     return this.leaveRequestRepository.save(leaveRequest);
   }
 
-  async getLeaveRequestsByEmployee(employeeProfileId: string) {
+  async getLeaveRequestsByEmployee(
+    employeeProfileId: string,
+    accountId?: string,
+  ) {
+    if (accountId)
+      await this.assertEmployeeCalendarAccess(employeeProfileId, accountId);
     return this.leaveRequestRepository.find({
       where: { employeeProfileId },
       order: { createdAt: 'DESC' },
@@ -11936,10 +13513,48 @@ export class StoresService {
     });
   }
 
-  async getLeaveRequestsByStore(storeId: string, status?: LeaveRequestStatus) {
-    const where: any = { storeId };
-    if (status) where.status = status;
-    return this.leaveRequestRepository.find({
+  async getLeaveRequestsByStore(
+    storeId: string,
+    status?: LeaveRequestStatus,
+    from?: string,
+    to?: string,
+  ) {
+    const query = this.leaveRequestRepository
+      .createQueryBuilder('lr')
+      .select([
+        'lr.id',
+        'lr.storeId',
+        'lr.employeeProfileId',
+        'lr.startDate',
+        'lr.endDate',
+        'lr.startTime',
+        'lr.endTime',
+        'lr.type',
+        'lr.reason',
+        'lr.status',
+        'lr.rejectionReason',
+        'lr.createdAt',
+        'lr.updatedAt',
+      ])
+      .leftJoinAndSelect('lr.employeeProfile', 'employeeProfile')
+      .leftJoinAndSelect('employeeProfile.account', 'employeeAccount')
+      .addSelect([
+        'employeeProfile.id',
+        'employeeProfile.employeeTypeId',
+        'employeeAccount.id',
+        'employeeAccount.fullName',
+        'employeeAccount.avatar',
+      ])
+      .leftJoinAndSelect('lr.store', 'store')
+      .addSelect(['store.id', 'store.name'])
+      .leftJoinAndSelect('lr.shiftAssignment', 'shiftAssignment')
+      .addSelect(['shiftAssignment.id'])
+      .where('lr.storeId = :storeId', { storeId });
+    if (status) query.andWhere('lr.status = :status', { status });
+    if (from) query.andWhere('lr.endDate >= :from', { from });
+    if (to) query.andWhere('lr.startDate <= :to', { to });
+    return query.orderBy('lr.createdAt', 'DESC').getMany();
+    /* return this.leaveRequestRepository.find({
       where,
       order: { createdAt: 'DESC' },
       relations: [
@@ -11949,7 +13564,7 @@ export class StoresService {
         'approvedBy.account',
         'shiftAssignment',
       ],
-    });
+    }); */
   }
 
   async cancelLeaveRequest(id: string, employeeProfileId: string) {
@@ -11968,87 +13583,379 @@ export class StoresService {
   }
 
   // ===== Shift Change Request Management =====
-  async createShiftChangeRequest(data: {
-    storeId: string;
-    employeeProfileId: string;
-    currentShiftId?: string;
-    requestedShiftId?: string;
-    requestDate: string;
-    reason?: string;
-    attachments?: string[];
-  }) {
+  private async resolveShiftChangeReferences(
+    storeId: string,
+    referenceIds: string[],
+  ) {
+    const ids = [...new Set(referenceIds.filter(Boolean))];
+    if (!ids.length) return new Map<string, Record<string, unknown>>();
+
+    // The legacy request stores opaque UUIDs. They may identify either an
+    // assignment or a slot, so resolve each bounded set in the request store.
+    const [assignments, slots] = await Promise.all([
+      this.shiftAssignmentRepository.find({
+        where: { id: In(ids), shiftSlot: { cycle: { storeId } } },
+        relations: ['shiftSlot', 'shiftSlot.workShift'],
+      }),
+      this.shiftSlotRepository.find({
+        where: { id: In(ids), cycle: { storeId } },
+        relations: ['workShift'],
+      }),
+    ]);
+    const references = new Map<string, Record<string, unknown>>();
+    for (const assignment of assignments) {
+      const slot = assignment.shiftSlot;
+      references.set(assignment.id, {
+        id: assignment.id,
+        referenceType: 'assignment',
+        assignmentId: assignment.id,
+        slotId: slot?.id,
+        shiftName: slot?.workShift?.shiftName || 'Ca làm việc',
+        workDate: slot?.workDate,
+        startTime: slot?.startTime || slot?.workShift?.startTime,
+        endTime: slot?.endTime || slot?.workShift?.endTime,
+        location: slot?.location,
+        employeeId: assignment.employeeId,
+        status: assignment.status,
+      });
+    }
+    for (const slot of slots) {
+      if (references.has(slot.id)) continue;
+      references.set(slot.id, {
+        id: slot.id,
+        referenceType: 'slot',
+        slotId: slot.id,
+        shiftName: slot.workShift?.shiftName || 'Ca làm việc',
+        workDate: slot.workDate,
+        startTime: slot.startTime || slot.workShift?.startTime,
+        endTime: slot.endTime || slot.workShift?.endTime,
+        location: slot.location,
+      });
+    }
+    return references;
+  }
+
+  async createShiftChangeRequest(
+    data: {
+      storeId: string;
+      employeeProfileId: string;
+      currentShiftId?: string;
+      requestedShiftId?: string;
+      requestDate: string;
+      reason?: string;
+      attachments?: string[];
+    },
+    accountId?: string,
+  ) {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     if (!data.currentShiftId && !data.requestedShiftId) {
       throw new BadRequestException(
         'Phải cung cấp ca hiện tại hoặc ca muốn đổi',
       );
     }
 
-    const request = this.shiftChangeRequestRepository.create({
-      storeId: data.storeId,
-      employeeProfileId: data.employeeProfileId,
-      currentShiftId: data.currentShiftId ?? undefined,
-      requestedShiftId: data.requestedShiftId ?? undefined,
-      requestDate: data.requestDate,
-      reason: data.reason ?? undefined,
-      attachments: data.attachments ? JSON.stringify(data.attachments) : null,
-      status: ShiftChangeRequestStatus.PENDING,
+    const employee = await this.profileRepository.findOne({
+      where: {
+        id: data.employeeProfileId,
+        storeId: data.storeId,
+        accountId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+      },
+      select: ['id', 'storeId', 'accountId'],
     });
-    return this.shiftChangeRequestRepository.save(request);
+    if (!employee) {
+      throw new ForbiddenException(
+        'Bạn không thể tạo yêu cầu cho nhân viên này',
+      );
+    }
+    const references = await this.resolveShiftChangeReferences(data.storeId, [
+      data.currentShiftId || '',
+      data.requestedShiftId || '',
+    ]);
+    const referenceIds = [data.currentShiftId, data.requestedShiftId].filter(
+      Boolean,
+    ) as string[];
+    if (references.size !== new Set(referenceIds).size) {
+      throw new BadRequestException(
+        'Ca làm không thuộc cửa hàng này hoặc không tồn tại',
+      );
+    }
+    const currentReference = data.currentShiftId
+      ? references.get(data.currentShiftId)
+      : undefined;
+    if (
+      currentReference?.referenceType === 'assignment' &&
+      currentReference.employeeId !== employee.id
+    ) {
+      throw new ForbiddenException('Ca hiện tại không thuộc nhân viên này');
+    }
+    if (
+      currentReference?.referenceType === 'assignment' &&
+      currentReference.status === ShiftAssignmentStatus.CANCELLED
+    ) {
+      throw new BadRequestException('Ca hiện tại đã bị hủy');
+    }
+    if (currentReference?.referenceType === 'slot') {
+      const assignment = await this.shiftAssignmentRepository.findOne({
+        where: {
+          shiftSlotId: currentReference.slotId as string,
+          employeeId: employee.id,
+          status: Not(ShiftAssignmentStatus.CANCELLED),
+        },
+        select: ['id', 'status'],
+      });
+      if (!assignment) {
+        throw new ForbiddenException('Ca hiện tại không thuộc nhân viên này');
+      }
+    }
+
+    return this.dataSource.transaction(async (manager) => {
+      // Serialize pending requests for this employee so the duplicate check
+      // remains safe when two submissions arrive concurrently.
+      const lockedEmployee = await manager.findOne(EmployeeProfile, {
+        where: {
+          id: data.employeeProfileId,
+          storeId: data.storeId,
+          accountId,
+          employmentStatus: EmploymentStatus.ACTIVE,
+        },
+        select: ['id'],
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!lockedEmployee) {
+        throw new ForbiddenException('Nhân viên không còn thuộc cửa hàng này');
+      }
+
+      const existing = await manager.findOne(ShiftChangeRequest, {
+        where: {
+          storeId: data.storeId,
+          employeeProfileId: data.employeeProfileId,
+          currentShiftId: data.currentShiftId ? data.currentShiftId : IsNull(),
+          requestedShiftId: data.requestedShiftId
+            ? data.requestedShiftId
+            : IsNull(),
+          requestDate: data.requestDate,
+          status: ShiftChangeRequestStatus.PENDING,
+        },
+      });
+      if (existing) {
+        throw new ConflictException('Yêu cầu đổi ca tương tự đang chờ duyệt');
+      }
+
+      const request = manager.create(ShiftChangeRequest, {
+        storeId: data.storeId,
+        employeeProfileId: data.employeeProfileId,
+        currentShiftId: data.currentShiftId ?? undefined,
+        requestedShiftId: data.requestedShiftId ?? undefined,
+        requestDate: data.requestDate,
+        reason: data.reason ?? undefined,
+        attachments: data.attachments ? JSON.stringify(data.attachments) : null,
+        status: ShiftChangeRequestStatus.PENDING,
+      });
+      return manager.save(ShiftChangeRequest, request);
+    });
   }
 
-  async getShiftChangeRequestsByEmployee(employeeProfileId: string) {
-    return this.shiftChangeRequestRepository.find({
-      where: { employeeProfileId },
+  async getShiftChangeRequestsByEmployee(
+    employeeProfileId: string,
+    accountId?: string,
+    expectedStoreId?: string,
+    filters?: {
+      status?: ShiftChangeRequestStatus;
+      startDate?: string;
+      endDate?: string;
+    },
+  ) {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    const profile = await this.assertEmployeeCalendarAccess(
+      employeeProfileId,
+      accountId,
+      expectedStoreId,
+    );
+
+    const where: any = {
+      employeeProfileId,
+      storeId: expectedStoreId ?? profile.storeId,
+    };
+    if (filters?.status) where.status = filters.status;
+    this.applyShiftChangeRequestDateRange(where, filters);
+    const requests = await this.shiftChangeRequestRepository.find({
+      where,
       order: { createdAt: 'DESC' },
-      relations: ['approvedBy', 'approvedBy.account'],
     });
+    // Staff may inspect their own request state, but approver profiles/accounts
+    // are owner-only data and must not cross the mobile API boundary.
+    return requests.map((request) => ({
+      id: request.id,
+      storeId: request.storeId,
+      employeeProfileId: request.employeeProfileId,
+      currentShiftId: request.currentShiftId,
+      requestedShiftId: request.requestedShiftId,
+      requestDate: request.requestDate,
+      reason: request.reason,
+      status: request.status,
+      approvedById: request.approvedById,
+      rejectionReason: request.rejectionReason,
+      attachments: request.attachments,
+      createdAt: request.createdAt,
+      updatedAt: request.updatedAt,
+    }));
   }
 
   async getShiftChangeRequestsByStore(
     storeId: string,
     status?: ShiftChangeRequestStatus,
-  ) {
+    accountId?: string,
+    pagination?: {
+      page?: number;
+      limit?: number;
+      startDate?: string;
+      endDate?: string;
+    },
+  ): Promise<
+    | ShiftChangeRequest[]
+    | { data: unknown[]; page: number; limit: number; total: number }
+  > {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, accountId);
+
     const where: any = { storeId };
     if (status) where.status = status;
-    return this.shiftChangeRequestRepository.find({
+    this.applyShiftChangeRequestDateRange(where, pagination);
+    const findOptions = {
       where,
-      order: { createdAt: 'DESC' },
+      order: { createdAt: 'DESC' as const },
       relations: [
         'employeeProfile',
         'employeeProfile.account',
         'approvedBy',
         'approvedBy.account',
       ],
-    });
+    };
+    const paginated = Boolean(pagination?.page || pagination?.limit);
+    const page = pagination?.page || 1;
+    const limit = pagination?.limit || 20;
+    const [requests, total] = paginated
+      ? await this.shiftChangeRequestRepository.findAndCount({
+          ...findOptions,
+          skip: (page - 1) * limit,
+          take: limit,
+        })
+      : [await this.shiftChangeRequestRepository.find(findOptions), 0];
+    const references = await this.resolveShiftChangeReferences(
+      storeId,
+      requests.flatMap((request) => [
+        request.currentShiftId || '',
+        request.requestedShiftId || '',
+      ]),
+    );
+    const data = requests.map((request) => ({
+      ...request,
+      currentShift: request.currentShiftId
+        ? references.get(request.currentShiftId) || null
+        : null,
+      requestedShift: request.requestedShiftId
+        ? references.get(request.requestedShiftId) || null
+        : null,
+    }));
+    return paginated ? { data, page, limit, total } : data;
   }
 
-  async approveShiftChangeRequest(id: string, approverId: string | undefined) {
-    if (!approverId)
+  private applyShiftChangeRequestDateRange(
+    where: Record<string, unknown>,
+    range?: { startDate?: string; endDate?: string },
+  ) {
+    if (range?.startDate && range.endDate) {
+      where.requestDate = Between(range.startDate, range.endDate);
+    } else if (range?.startDate) {
+      where.requestDate = MoreThanOrEqual(range.startDate);
+    } else if (range?.endDate) {
+      where.requestDate = LessThanOrEqual(range.endDate);
+    }
+  }
+
+  private async reviewShiftChangeRequest(
+    id: string,
+    ownerAccountId: string | undefined,
+    status:
+      | ShiftChangeRequestStatus.APPROVED
+      | ShiftChangeRequestStatus.REJECTED,
+    rejectionReason?: string,
+  ) {
+    if (!ownerAccountId)
       throw new BadRequestException('Không xác định được người duyệt');
     const request = await this.shiftChangeRequestRepository.findOne({
       where: { id },
     });
     if (!request) throw new NotFoundException('Không tìm thấy yêu cầu đổi ca');
-    request.status = ShiftChangeRequestStatus.APPROVED;
-    request.approvedById = approverId ?? null;
-    return this.shiftChangeRequestRepository.save(request);
+    await this.assertOwnerStoreAccess(request.storeId, ownerAccountId);
+
+    // Store owners do not necessarily have an employee profile. Scope this
+    // optional lookup to the request store and persist null when absent.
+    const ownerProfile = await this.profileRepository.findOne({
+      where: { accountId: ownerAccountId, storeId: request.storeId },
+      select: ['id'],
+    });
+    const result = await this.dataSource.transaction((manager) =>
+      manager.update(
+        ShiftChangeRequest,
+        {
+          id,
+          storeId: request.storeId,
+          status: ShiftChangeRequestStatus.PENDING,
+        },
+        {
+          status,
+          approvedById: ownerProfile?.id ?? null,
+          rejectionReason:
+            status === ShiftChangeRequestStatus.REJECTED
+              ? (rejectionReason ?? null)
+              : null,
+        },
+      ),
+    );
+    if (!result.affected) {
+      throw new BadRequestException('Yêu cầu không còn chờ duyệt');
+    }
+    return {
+      ...request,
+      status,
+      approvedById: ownerProfile?.id ?? null,
+      rejectionReason:
+        status === ShiftChangeRequestStatus.REJECTED
+          ? (rejectionReason ?? null)
+          : null,
+    };
+  }
+
+  async approveShiftChangeRequest(
+    id: string,
+    ownerAccountId: string | undefined,
+  ) {
+    return this.reviewShiftChangeRequest(
+      id,
+      ownerAccountId,
+      ShiftChangeRequestStatus.APPROVED,
+    );
   }
 
   async rejectShiftChangeRequest(
     id: string,
-    approverId: string | undefined,
+    ownerAccountId: string | undefined,
     reason?: string,
   ) {
-    if (!approverId)
-      throw new BadRequestException('Không xác định được người duyệt');
-    const request = await this.shiftChangeRequestRepository.findOne({
-      where: { id },
-    });
-    if (!request) throw new NotFoundException('Không tìm thấy yêu cầu đổi ca');
-    request.status = ShiftChangeRequestStatus.REJECTED;
-    request.approvedById = approverId ?? null;
-    request.rejectionReason = reason ?? null;
-    return this.shiftChangeRequestRepository.save(request);
+    return this.reviewShiftChangeRequest(
+      id,
+      ownerAccountId,
+      ShiftChangeRequestStatus.REJECTED,
+      reason,
+    );
   }
 
   async cancelShiftChangeRequest(
@@ -12189,7 +14096,11 @@ export class StoresService {
   }
 
   // Lấy thống kê duyệt
-  async getApprovalStats(storeId: string) {
+  async getApprovalStats(storeId: string, ownerAccountId?: string) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     const oneDayAgo = new Date();
     oneDayAgo.setDate(oneDayAgo.getDate() - 1);
 
@@ -13593,12 +15504,31 @@ export class StoresService {
       note?: string;
     },
   ) {
+    const callerProfile = await this.profileRepository.findOne({
+      where: { id: data.employeeProfileId, accountId },
+      select: ['id', 'storeId', 'employmentStatus', 'accountId'],
+    });
+    if (!callerProfile) {
+      throw new ForbiddenException(
+        'Bạn chỉ có thể đăng ký ca cho hồ sơ của mình',
+      );
+    }
+    if (callerProfile.storeId !== data.storeId) {
+      throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
+    }
+    if (callerProfile.employmentStatus !== EmploymentStatus.ACTIVE) {
+      throw new BadRequestException(
+        'Nhân viên không còn hoạt động, không thể đăng ký ca',
+      );
+    }
     // If slotId provided, delegate to existing registerToShiftSlot
     if (data.slotId) {
       return this.registerToShiftSlot(
         data.slotId,
         data.employeeProfileId,
         data.note,
+        false,
+        accountId,
       );
     }
 
@@ -13615,6 +15545,7 @@ export class StoresService {
         .where('slot.workShiftId = :workShiftId', {
           workShiftId: data.workShiftId,
         })
+        .andWhere('cycle.storeId = :storeId', { storeId: data.storeId })
         .andWhere('slot.workDate >= :startDate', { startDate: data.startDate })
         .andWhere('slot.workDate <= :endDate', {
           endDate: data.endDate || data.startDate,
@@ -13647,6 +15578,7 @@ export class StoresService {
       }
 
       return this.dataSource.transaction(async (manager) => {
+        await lockStoreShiftAvailability(manager, data.storeId);
         let successCount = 0;
 
         // Check employee status once
@@ -13661,6 +15593,12 @@ export class StoresService {
             'Nhân viên không còn hoạt động, không thể đăng ký ca',
           );
         }
+        if (
+          employee.storeId !== data.storeId ||
+          employee.accountId !== accountId
+        ) {
+          throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
+        }
 
         const now = new Date();
 
@@ -13673,6 +15611,15 @@ export class StoresService {
             .getOne();
 
           if (!lockedSlot) continue; // Should exist, but just in case
+
+          const lockedCycle = await manager.findOne(WorkCycle, {
+            where: { id: lockedSlot.cycleId },
+          });
+          if (!lockedCycle || lockedCycle.storeId !== data.storeId) continue;
+
+          const lockedWorkShift = await manager.findOne(WorkShift, {
+            where: { id: lockedSlot.workShiftId },
+          });
 
           // Check deadline
           if (
@@ -13692,10 +15639,9 @@ export class StoresService {
               (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
             ).length || 0;
 
-          if (
-            lockedSlot.maxStaff !== null &&
-            activeCount >= lockedSlot.maxStaff
-          ) {
+          const maxRequired =
+            lockedSlot.maxStaff ?? lockedWorkShift?.defaultMaxStaff ?? 0;
+          if (maxRequired > 0 && activeCount >= maxRequired) {
             continue; // Slot is full, skip
           }
 
@@ -13737,6 +15683,7 @@ export class StoresService {
         where: {
           workShiftId: data.workShiftId,
           workDate: data.startDate, // Explicitly match workDate so we get the exact slot
+          cycle: { storeId: data.storeId, status: WorkCycleStatus.ACTIVE },
         } as any,
       });
       if (slot) targetSlotId = slot.id;
@@ -13747,6 +15694,8 @@ export class StoresService {
         targetSlotId,
         data.employeeProfileId,
         data.note,
+        false,
+        accountId,
       );
     }
 
@@ -13759,11 +15708,36 @@ export class StoresService {
   /**
    * Lấy danh sách đăng ký ca (shift registrations / proposals).
    */
-  async getShiftRegistrations(filters: {
-    storeId?: string;
-    employeeProfileId?: string;
-    status?: string;
-  }) {
+  async getShiftRegistrations(
+    filters: {
+      storeId?: string;
+      employeeProfileId?: string;
+      status?: string;
+    },
+    accountId?: string,
+  ) {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+
+    let scopedStoreId = filters.storeId;
+    if (filters.employeeProfileId) {
+      const profile = await this.assertEmployeeCalendarAccess(
+        filters.employeeProfileId,
+        accountId,
+        filters.storeId,
+      );
+      // Legacy employee callers may omit storeId. Resolve it from the
+      // authorized profile so the assignment relation is still store-scoped.
+      scopedStoreId = scopedStoreId || profile.storeId;
+    } else if (scopedStoreId) {
+      await this.assertOwnerStoreAccess(scopedStoreId, accountId);
+    } else {
+      throw new BadRequestException(
+        'storeId hoặc employeeProfileId là bắt buộc',
+      );
+    }
+
     const where: any = {};
     // NOTE: ShiftAssignment entity has no storeId column (FK is through shiftSlot)
     // Only filter by employeeId and status directly
@@ -13775,13 +15749,14 @@ export class StoresService {
       }
       where.employeeId = filters.employeeProfileId;
     }
-    if (filters.storeId) {
+    if (scopedStoreId) {
       // Only count registrations on slots that belong to a live cycle
       // (ACTIVE/EXPIRED). Stopped/draft cycles' registrations are stale and
       // must not keep inflating the pending-approval badge.
       where.shiftSlot = {
-        workShift: { storeId: filters.storeId },
+        workShift: { storeId: scopedStoreId },
         cycle: {
+          storeId: scopedStoreId,
           status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]),
         },
       };

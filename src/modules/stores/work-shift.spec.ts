@@ -7,7 +7,11 @@
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataSource, IsNull } from 'typeorm';
 import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
@@ -109,17 +113,48 @@ try {
   AccountFinance = class AccountFinance {};
 }
 
+let workShiftRepo: ReturnType<typeof mockRepo>;
+let workCycleRepo: ReturnType<typeof mockRepo>;
+let storeRepo: ReturnType<typeof mockRepo>;
+
 const mockDataSource = {
   transaction: jest.fn(async (cb) =>
     cb({
-      find: jest.fn().mockResolvedValue([]),
-      findOne: jest.fn().mockResolvedValue(null),
-      create: jest.fn((entity: any, data: any) => ({ id: 'tx-gen', ...data })),
-      save: jest.fn((e: any) =>
-        Promise.resolve({ id: 'tx-gen', ...(Array.isArray(e) ? e[0] : e) }),
+      query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+      find: jest.fn((entity: any, options: any) =>
+        entity === WorkShift
+          ? workShiftRepo.find(options)
+          : Promise.resolve([]),
       ),
+      findOne: jest.fn((entity: any, options: any) => {
+        if (entity === Store) {
+          return Promise.resolve({
+            id: options?.where?.id || 'store-1',
+            ownerAccountId: 'owner-1',
+          });
+        }
+        if (entity === WorkShift) return workShiftRepo.findOne(options);
+        if (entity === WorkCycle) return workCycleRepo.findOne(options);
+        return Promise.resolve(null);
+      }),
+      create: jest.fn((entity: any, data: any) =>
+        entity === WorkShift
+          ? workShiftRepo.create(data)
+          : { id: 'tx-gen', ...data },
+      ),
+      save: jest.fn((entityOrValue: any, maybeValue?: any) => {
+        if (entityOrValue === WorkShift) return workShiftRepo.save(maybeValue);
+        return Promise.resolve({
+          id: 'tx-gen',
+          ...(Array.isArray(entityOrValue) ? entityOrValue[0] : entityOrValue),
+        });
+      }),
       delete: jest.fn().mockResolvedValue({ affected: 1 }),
-      update: jest.fn().mockResolvedValue({ affected: 1 }),
+      update: jest.fn((entity: any, criteria: any, data: any) => {
+        if (entity === WorkShift) return workShiftRepo.update(criteria, data);
+        if (entity === WorkCycle) return workCycleRepo.update(criteria, data);
+        return Promise.resolve({ affected: 1 });
+      }),
       decrement: jest.fn().mockResolvedValue({ affected: 1 }),
       createQueryBuilder: () => ({
         delete: () => ({
@@ -248,10 +283,15 @@ const ENTITIES = [
 // ─── TESTS ──────────────────────────────────────────────────────────────
 describe('Work Shift & Cycle Management', () => {
   let service: StoresService;
-  let workShiftRepo: ReturnType<typeof mockRepo>;
-  let workCycleRepo: ReturnType<typeof mockRepo>;
   let shiftSlotRepo: ReturnType<typeof mockRepo>;
   let cycleTemplateRepo: ReturnType<typeof mockRepo>;
+  let shiftReminderService: {
+    scheduleReminder: jest.Mock;
+    scheduleAssignmentReminder: jest.Mock;
+    scheduleAssignmentReminders: jest.Mock;
+    cancelAssignmentReminders: jest.Mock;
+    syncEmployeeReminders: jest.Mock;
+  };
 
   beforeEach(async () => {
     const repoMap = new Map<any, ReturnType<typeof mockRepo>>();
@@ -263,8 +303,20 @@ describe('Work Shift & Cycle Management', () => {
 
     workShiftRepo = repoMap.get(WorkShift)!;
     workCycleRepo = repoMap.get(WorkCycle)!;
+    storeRepo = repoMap.get(Store)!;
     shiftSlotRepo = repoMap.get(ShiftSlot)!;
     cycleTemplateRepo = repoMap.get(CycleShiftTemplate)!;
+    shiftReminderService = {
+      scheduleReminder: jest.fn(),
+      scheduleAssignmentReminder: jest.fn(),
+      scheduleAssignmentReminders: jest.fn(),
+      cancelAssignmentReminders: jest.fn(),
+      syncEmployeeReminders: jest.fn(),
+    };
+    storeRepo.findOne.mockResolvedValue({
+      id: 'store-1',
+      ownerAccountId: 'owner-1',
+    });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -297,10 +349,7 @@ describe('Work Shift & Cycle Management', () => {
         },
         {
           provide: ShiftReminderService,
-          useValue: {
-            scheduleReminder: jest.fn(),
-            cancelReminder: jest.fn(),
-          },
+          useValue: shiftReminderService,
         },
       ],
     }).compile();
@@ -309,6 +358,82 @@ describe('Work Shift & Cycle Management', () => {
   });
 
   afterEach(() => jest.clearAllMocks());
+
+  it('filters reminder reschedules using Vietnam time under a UTC host', async () => {
+    const profile = {
+      id: 'employee-1',
+      storeId: 'store-1',
+      reminderSettings: { type: '15m' },
+    };
+    (service as any).profileRepository = {
+      findOne: jest.fn().mockResolvedValue(profile),
+      save: jest.fn().mockResolvedValue(profile),
+    };
+    (service as any).shiftAssignmentRepository = {
+      find: jest.fn().mockResolvedValue([
+        {
+          id: 'assignment-1',
+          shiftSlot: {
+            id: 'slot-1',
+            workDate: '2030-01-01',
+            startTime: '09:00:00',
+            workShift: { id: 'shift-1', startTime: '09:00:00' },
+          },
+        },
+      ]),
+    };
+    const nowSpy = jest
+      .spyOn(Date, 'now')
+      .mockReturnValue(new Date('2030-01-01T02:30:00.000Z').getTime());
+
+    await service.updateEmployeeReminderSettings('employee-1', {
+      type: '1h',
+    });
+
+    expect(shiftReminderService.syncEmployeeReminders).toHaveBeenCalledWith(
+      'employee-1',
+      'store-1',
+      { type: '1h' },
+      [],
+    );
+    nowSpy.mockRestore();
+  });
+
+  describe('store and timekeeping ownership boundaries', () => {
+    it('does not allow generic store updates to transfer ownership or persist ORM fields', async () => {
+      storeRepo.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+
+      await service.updateStore(
+        'store-1',
+        {
+          name: 'Tên mới',
+          ownerAccountId: 'attacker',
+          id: 'replacement-id',
+          createdAt: new Date(),
+          status: 'inactive',
+        } as any,
+        'owner-1',
+      );
+
+      expect(storeRepo.update).toHaveBeenCalledWith('store-1', {
+        name: 'Tên mới',
+      });
+    });
+
+    it('keeps timekeeping settings owner-only', async () => {
+      storeRepo.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+
+      await expect(
+        service.getTimekeepingSetting('store-1', 'other-account'),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
 
   // ═══════════════════════════════════════════════════════════════════════
   //  WORK SHIFT CRUD
@@ -332,12 +457,14 @@ describe('Work Shift & Cycle Management', () => {
         isActive: true,
       });
 
-      const result = await service.createWorkShift('store-1', data);
+      const result = await service.createWorkShift('store-1', data, 'owner-1');
 
-      expect(workShiftRepo.create).toHaveBeenCalledWith({
-        ...data,
-        storeId: 'store-1',
-      });
+      expect(workShiftRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          ...data,
+          storeId: 'store-1',
+        }),
+      );
       expect(workShiftRepo.save).toHaveBeenCalled();
       expect(result.shiftName).toBe('Ca sáng');
       expect(result.storeId).toBe('store-1');
@@ -350,20 +477,43 @@ describe('Work Shift & Cycle Management', () => {
       }));
       workShiftRepo.save.mockImplementation((e) => Promise.resolve(e));
 
-      const s1 = await service.createWorkShift('store-1', {
-        shiftName: 'Ca sáng',
-        startTime: '08:00',
-        endTime: '12:00',
-      });
-      const s2 = await service.createWorkShift('store-1', {
-        shiftName: 'Ca chiều',
-        startTime: '13:00',
-        endTime: '17:00',
-      });
+      const s1 = await service.createWorkShift(
+        'store-1',
+        {
+          shiftName: 'Ca sáng',
+          startTime: '08:00',
+          endTime: '12:00',
+        },
+        'owner-1',
+      );
+      const s2 = await service.createWorkShift(
+        'store-1',
+        {
+          shiftName: 'Ca chiều',
+          startTime: '13:00',
+          endTime: '17:00',
+        },
+        'owner-1',
+      );
 
       expect(s1.shiftName).toBe('Ca sáng');
       expect(s2.shiftName).toBe('Ca chiều');
       expect(workShiftRepo.save).toHaveBeenCalledTimes(2);
+    });
+
+    it('rechecks owner authorization inside the write transaction', async () => {
+      await expect(
+        service.createWorkShift(
+          'store-1',
+          {
+            shiftName: 'Ca trái phép',
+            startTime: '08:00',
+            endTime: '12:00',
+          },
+          'other-owner',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(workShiftRepo.save).not.toHaveBeenCalled();
     });
   });
 
@@ -396,27 +546,49 @@ describe('Work Shift & Cycle Management', () => {
           id: 's1',
           storeId: 'store-1',
           shiftName: 'Ca sáng',
+          startTime: '08:00',
+          endTime: '12:00',
         })
         .mockResolvedValueOnce({
           id: 's1',
           storeId: 'store-1',
           shiftName: 'Ca sáng mới',
+          startTime: '08:00',
+          endTime: '12:00',
+        })
+        .mockResolvedValueOnce({
+          id: 's1',
+          storeId: 'store-1',
+          shiftName: 'Ca sáng mới',
+          startTime: '08:00',
+          endTime: '12:00',
         });
 
-      const result = await service.updateWorkShift('store-1', 's1', {
-        shiftName: 'Ca sáng mới',
-      });
+      const result = await service.updateWorkShift(
+        'store-1',
+        's1',
+        { shiftName: 'Ca sáng mới' },
+        'owner-1',
+      );
 
-      expect(workShiftRepo.update).toHaveBeenCalledWith('s1', {
-        shiftName: 'Ca sáng mới',
-      });
+      expect(workShiftRepo.update).toHaveBeenCalledWith(
+        { id: 's1', storeId: 'store-1' },
+        {
+          shiftName: 'Ca sáng mới',
+        },
+      );
       expect(result!.shiftName).toBe('Ca sáng mới');
     });
 
     it('should throw NotFoundException when shift not found', async () => {
       workShiftRepo.findOne.mockResolvedValue(null);
       await expect(
-        service.updateWorkShift('store-1', 'bad-id', { shiftName: 'x' }),
+        service.updateWorkShift(
+          'store-1',
+          'bad-id',
+          { shiftName: 'x' },
+          'owner-1',
+        ),
       ).rejects.toThrow(NotFoundException);
     });
   });
@@ -441,7 +613,6 @@ describe('Work Shift & Cycle Management', () => {
         where: {
           storeId: 'store-1',
           status: WorkCycleStatus.ACTIVE,
-          recurrenceRule: IsNull(),
         },
         relations: [
           'slots',
@@ -623,7 +794,7 @@ describe('Work Shift & Cycle Management', () => {
         status: WorkCycleStatus.ACTIVE,
       });
 
-      await service.stopWorkCycle('c1', { stopImmediately: true });
+      await service.stopWorkCycle('c1', { stopImmediately: true }, 'owner-1');
 
       expect(workCycleRepo.update).toHaveBeenCalledWith(
         'c1',
@@ -640,10 +811,14 @@ describe('Work Shift & Cycle Management', () => {
         status: WorkCycleStatus.ACTIVE,
       });
 
-      await service.stopWorkCycle('c1', {
-        stopImmediately: false,
-        scheduledStopAt: '2026-04-15',
-      });
+      await service.stopWorkCycle(
+        'c1',
+        {
+          stopImmediately: false,
+          scheduledStopAt: '2026-04-15',
+        },
+        'owner-1',
+      );
 
       expect(workCycleRepo.update).toHaveBeenCalledWith(
         'c1',
@@ -653,10 +828,90 @@ describe('Work Shift & Cycle Management', () => {
       );
     });
 
+    it('cancels assignment reminder jobs only after the stop commits', async () => {
+      workCycleRepo.findOne.mockResolvedValue({
+        id: 'c1',
+        storeId: 'store-1',
+        status: WorkCycleStatus.ACTIVE,
+      });
+      let committed = false;
+      jest
+        .spyOn(mockDataSource, 'transaction')
+        .mockImplementationOnce(async (callback: any) => {
+          const result = await callback({
+            query: jest.fn(),
+            findOne: jest.fn(async (entity: any) =>
+              entity === Store
+                ? { id: 'store-1', ownerAccountId: 'owner-1' }
+                : {
+                    id: 'c1',
+                    storeId: 'store-1',
+                    status: WorkCycleStatus.ACTIVE,
+                  },
+            ),
+            update: jest.fn().mockResolvedValue({ affected: 1 }),
+            find: jest.fn().mockResolvedValue([{ id: 'assignment-1' }]),
+          });
+          committed = true;
+          return result;
+        });
+      shiftReminderService.cancelAssignmentReminders.mockImplementation(
+        async () => {
+          expect(committed).toBe(true);
+        },
+      );
+
+      await service.stopWorkCycle('c1', { stopImmediately: true }, 'owner-1');
+
+      expect(
+        shiftReminderService.cancelAssignmentReminders,
+      ).toHaveBeenCalledWith(['assignment-1']);
+    });
+
+    it('keeps the committed stop successful when queue cleanup fails', async () => {
+      workCycleRepo.findOne.mockResolvedValue({
+        id: 'c1',
+        storeId: 'store-1',
+        status: WorkCycleStatus.ACTIVE,
+      });
+      jest
+        .spyOn(mockDataSource, 'transaction')
+        .mockImplementationOnce(async (callback: any) =>
+          callback({
+            query: jest.fn(),
+            findOne: jest.fn(async (entity: any) =>
+              entity === Store
+                ? { id: 'store-1', ownerAccountId: 'owner-1' }
+                : {
+                    id: 'c1',
+                    storeId: 'store-1',
+                    status: WorkCycleStatus.ACTIVE,
+                  },
+            ),
+            update: jest.fn().mockResolvedValue({ affected: 1 }),
+            find: jest.fn().mockResolvedValue([{ id: 'assignment-1' }]),
+          }),
+        );
+      shiftReminderService.cancelAssignmentReminders.mockRejectedValue(
+        new Error('redis contains sensitive internals'),
+      );
+      const logError = jest
+        .spyOn((service as any).logger, 'error')
+        .mockImplementation();
+
+      await expect(
+        service.stopWorkCycle('c1', { stopImmediately: true }, 'owner-1'),
+      ).resolves.toBeDefined();
+      expect(logError).toHaveBeenCalledWith(
+        'Failed to cancel reminders for stopped work cycle',
+      );
+      expect(logError.mock.calls.flat().join(' ')).not.toContain('sensitive');
+    });
+
     it('should throw NotFoundException if cycle missing', async () => {
       workCycleRepo.findOne.mockResolvedValue(null);
       await expect(
-        service.stopWorkCycle('bad', { stopImmediately: true }),
+        service.stopWorkCycle('bad', { stopImmediately: true }, 'owner-1'),
       ).rejects.toThrow(NotFoundException);
     });
 
@@ -666,9 +921,105 @@ describe('Work Shift & Cycle Management', () => {
         status: WorkCycleStatus.STOPPED,
       });
       await expect(
-        service.stopWorkCycle('c1', { stopImmediately: true }),
+        service.stopWorkCycle('c1', { stopImmediately: true }, 'owner-1'),
       ).rejects.toThrow(BadRequestException);
     });
+  });
+
+  it('cancels reminders after a scheduled cycle stop commits', async () => {
+    const queryBuilder = (cycles: any[]) => ({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue(cycles),
+    });
+    workCycleRepo.createQueryBuilder
+      .mockImplementationOnce(() => queryBuilder([]))
+      .mockImplementationOnce(() =>
+        queryBuilder([
+          {
+            id: 'cycle-1',
+            storeId: 'store-1',
+            status: WorkCycleStatus.ACTIVE,
+          },
+        ]),
+      );
+    let committed = false;
+    const update = jest.fn().mockResolvedValue({ affected: 1 });
+    jest
+      .spyOn(mockDataSource, 'transaction')
+      .mockImplementationOnce(async (callback: any) => {
+        const result = await callback({
+          query: jest.fn(),
+          update,
+          find: jest.fn().mockResolvedValue([{ id: 'assignment-1' }]),
+        });
+        committed = true;
+        return result;
+      });
+    shiftReminderService.cancelAssignmentReminders.mockImplementation(
+      async () => {
+        expect(committed).toBe(true);
+      },
+    );
+
+    await expect(service.processExpiredCycles()).resolves.toEqual({
+      expiredCount: 0,
+      stoppedCount: 1,
+    });
+    expect(shiftReminderService.cancelAssignmentReminders).toHaveBeenCalledWith(
+      ['assignment-1'],
+    );
+    expect(update.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        id: 'cycle-1',
+        status: WorkCycleStatus.ACTIVE,
+        scheduledStopAt: expect.anything(),
+      }),
+    );
+  });
+
+  it('does not stop or clean a due snapshot postponed before the cron lock', async () => {
+    const queryBuilder = (cycles: any[]) => ({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue(cycles),
+    });
+    workCycleRepo.createQueryBuilder
+      .mockImplementationOnce(() => queryBuilder([]))
+      .mockImplementationOnce(() =>
+        queryBuilder([
+          {
+            id: 'cycle-1',
+            storeId: 'store-1',
+            status: WorkCycleStatus.ACTIVE,
+            scheduledStopAt: new Date('2026-01-01T00:00:00.000Z'),
+          },
+        ]),
+      );
+    const update = jest.fn().mockResolvedValue({ affected: 0 });
+    const find = jest.fn();
+    jest
+      .spyOn(mockDataSource, 'transaction')
+      .mockImplementationOnce(async (callback: any) =>
+        callback({ query: jest.fn(), update, find }),
+      );
+
+    await expect(service.processExpiredCycles()).resolves.toEqual({
+      expiredCount: 0,
+      stoppedCount: 0,
+    });
+
+    expect(update.mock.calls[0][1]).toEqual(
+      expect.objectContaining({
+        id: 'cycle-1',
+        status: WorkCycleStatus.ACTIVE,
+        scheduledStopAt: expect.anything(),
+      }),
+    );
+    expect(find).not.toHaveBeenCalled();
+    expect(
+      shiftReminderService.cancelAssignmentReminders,
+    ).not.toHaveBeenCalled();
   });
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -683,16 +1034,24 @@ describe('Work Shift & Cycle Management', () => {
       }));
       workShiftRepo.save.mockImplementation((e) => Promise.resolve(e));
 
-      const s1 = await service.createWorkShift('s1', {
-        shiftName: 'Morning',
-        startTime: '08:00',
-        endTime: '12:00',
-      });
-      const s2 = await service.createWorkShift('s1', {
-        shiftName: 'Afternoon',
-        startTime: '13:00',
-        endTime: '17:00',
-      });
+      const s1 = await service.createWorkShift(
+        's1',
+        {
+          shiftName: 'Morning',
+          startTime: '08:00',
+          endTime: '12:00',
+        },
+        'owner-1',
+      );
+      const s2 = await service.createWorkShift(
+        's1',
+        {
+          shiftName: 'Afternoon',
+          startTime: '13:00',
+          endTime: '17:00',
+        },
+        'owner-1',
+      );
       expect(workShiftRepo.save).toHaveBeenCalledTimes(2);
 
       // 2. Verify shifts
@@ -734,7 +1093,7 @@ describe('Work Shift & Cycle Management', () => {
         id: 'c1',
         status: WorkCycleStatus.ACTIVE,
       });
-      await service.stopWorkCycle('c1', { stopImmediately: true });
+      await service.stopWorkCycle('c1', { stopImmediately: true }, 'owner-1');
       expect(workCycleRepo.update).toHaveBeenCalledWith(
         'c1',
         expect.objectContaining({ status: WorkCycleStatus.STOPPED }),

@@ -13,6 +13,13 @@ import { ZaloService } from '../zalo/zalo.service';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
 import { StoresService } from '../stores/stores.service';
 import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
+import {
+  JWT_ACCESS_TOKEN_USE,
+  JWT_REFRESH_TOKEN_USE,
+  isLegacyUntypedTokenAccepted,
+  requireJwtRefreshSecret,
+  type TimesoJwtPayload,
+} from './jwt.config';
 
 @Injectable()
 export class AuthService {
@@ -54,11 +61,20 @@ export class AuthService {
       };
     }
 
-    const payload = { email: user.email, sub: user.id };
-    
-    const accessToken = this.jwtService.sign(payload);
-    const refreshTokenValue = this.jwtService.sign(payload, {
-      secret: this.configService.get('JWT_REFRESH_SECRET'),
+    const accessPayload: TimesoJwtPayload = {
+      email: user.email,
+      sub: user.id,
+      tokenUse: JWT_ACCESS_TOKEN_USE,
+    };
+    const refreshPayload: TimesoJwtPayload = {
+      email: user.email,
+      sub: user.id,
+      tokenUse: JWT_REFRESH_TOKEN_USE,
+    };
+
+    const accessToken = this.jwtService.sign(accessPayload);
+    const refreshTokenValue = this.jwtService.sign(refreshPayload, {
+      secret: requireJwtRefreshSecret(this.configService),
       expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN'),
     });
 
@@ -315,9 +331,19 @@ export class AuthService {
 
   async refreshToken(refreshToken: string, appType: AppType = AppType.OWNER_APP) {
     try {
-      const payload = this.jwtService.verify(refreshToken, {
-        secret: this.configService.get('JWT_REFRESH_SECRET'),
+      const payload = this.jwtService.verify<TimesoJwtPayload>(refreshToken, {
+        secret: requireJwtRefreshSecret(this.configService),
       });
+
+      if (
+        payload.tokenUse !== JWT_REFRESH_TOKEN_USE &&
+        !(
+          payload.tokenUse === undefined &&
+          isLegacyUntypedTokenAccepted(this.configService)
+        )
+      ) {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
 
       const accountId = payload.sub;
 

@@ -1,6 +1,11 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
@@ -51,6 +56,7 @@ import {
   WorkCycle,
   ShiftSlot,
   ShiftAssignment,
+  ShiftAssignmentStatus,
   ShiftSwap,
   CycleShiftTemplate,
 } from './entities/shift-management.entity';
@@ -107,6 +113,7 @@ try {
 function mockRepo() {
   return {
     find: jest.fn().mockResolvedValue([]),
+    findAndCount: jest.fn().mockResolvedValue([[], 0]),
     findOne: jest.fn().mockResolvedValue(null),
     create: jest.fn((d) => ({ id: 'gen-id', ...d })),
     save: jest.fn((e) =>
@@ -137,12 +144,18 @@ function mockDataSource() {
     transaction: jest.fn(async (cb) =>
       cb({
         find: jest.fn().mockResolvedValue([]),
-        findOne: jest.fn().mockResolvedValue(null),
+        findOne: jest.fn((target) =>
+          target === EmployeeProfile
+            ? Promise.resolve({ id: 'emp-1' })
+            : Promise.resolve(null),
+        ),
         create: jest.fn((entity, data) => ({ id: 'tx-gen-id', ...data })),
-        save: jest.fn((e) =>
+        save: jest.fn((entityOrTarget, maybeEntity) =>
           Promise.resolve({
             id: 'tx-gen-id',
-            ...(Array.isArray(e) ? e[0] : e),
+            ...(Array.isArray(maybeEntity ?? entityOrTarget)
+              ? (maybeEntity ?? entityOrTarget)[0]
+              : (maybeEntity ?? entityOrTarget)),
           }),
         ),
         delete: jest.fn().mockResolvedValue({ affected: 1 }),
@@ -288,15 +301,428 @@ describe('StoresService - Shift & Bonus Request Features', () => {
     }).compile();
 
     service = module.get<StoresService>(StoresService);
+    repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({
+      id: 'emp-1',
+      storeId: 'store-1',
+      accountId: 'staff-1',
+    });
+    repoMap.get(ShiftAssignment)!.find.mockResolvedValue([
+      {
+        id: 'shift-current',
+        employeeId: 'emp-1',
+        shiftSlot: { id: 'slot-current', workDate: '2026-04-20', workShift: { shiftName: 'Ca sáng' } },
+      },
+      {
+        id: 'shift-requested',
+        employeeId: 'emp-1',
+        shiftSlot: { id: 'slot-requested', workDate: '2026-04-20', workShift: { shiftName: 'Ca chiều' } },
+      },
+    ]);
   });
 
   afterEach(() => {
     jest.clearAllMocks();
   });
 
+  describe('calendar approval list authorization', () => {
+    it('requires owner authorization for approval statistics', async () => {
+      await expect(service.getApprovalStats('store-1')).rejects.toThrow(ForbiddenException);
+
+      const ownerAccess = jest
+        .spyOn(service, 'assertOwnerStoreAccess')
+        .mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' } as any);
+      await service.getApprovalStats('store-1', 'owner-1');
+      expect(ownerAccess).toHaveBeenCalledWith('store-1', 'owner-1');
+    });
+
+    it('requires an authenticated account for store-scoped shift registrations', async () => {
+      await expect(
+        service.getShiftRegistrations({ storeId: 'store-1' }),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('checks owner access before returning store shift registrations', async () => {
+      const ownerAccess = jest
+        .spyOn(service, 'assertOwnerStoreAccess')
+        .mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' } as any);
+      const assignmentRepo = repoMap.get(ShiftAssignment)!;
+      assignmentRepo.find.mockResolvedValue([]);
+
+      await service.getShiftRegistrations({ storeId: 'store-1' }, 'owner-1');
+
+      expect(ownerAccess).toHaveBeenCalledWith('store-1', 'owner-1');
+      expect(assignmentRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            shiftSlot: expect.objectContaining({
+              workShift: { storeId: 'store-1' },
+              cycle: expect.objectContaining({ storeId: 'store-1' }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('keeps employee self-service scoped to the authenticated profile', async () => {
+      const employeeAccess = jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({
+          id: '11111111-1111-4111-8111-111111111111',
+          storeId: 'store-1',
+          accountId: 'staff-1',
+        } as any);
+      const assignmentRepo = repoMap.get(ShiftAssignment)!;
+      assignmentRepo.find.mockResolvedValue([]);
+
+      await service.getShiftRegistrations(
+        {
+          storeId: 'store-1',
+          employeeProfileId: '11111111-1111-4111-8111-111111111111',
+        },
+        'staff-1',
+      );
+
+      expect(employeeAccess).toHaveBeenCalledWith(
+        '11111111-1111-4111-8111-111111111111',
+        'staff-1',
+        'store-1',
+      );
+    });
+
+    it('derives store scope for legacy employee registration reads without storeId', async () => {
+      const employeeAccess = jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({
+          id: '11111111-1111-4111-8111-111111111111',
+          storeId: 'store-authorized',
+          accountId: 'staff-1',
+        } as any);
+      const assignmentRepo = repoMap.get(ShiftAssignment)!;
+      assignmentRepo.find.mockResolvedValue([]);
+
+      await service.getShiftRegistrations(
+        { employeeProfileId: '11111111-1111-4111-8111-111111111111' },
+        'staff-1',
+      );
+
+      expect(employeeAccess).toHaveBeenCalledWith(
+        '11111111-1111-4111-8111-111111111111',
+        'staff-1',
+        undefined,
+      );
+      expect(assignmentRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            shiftSlot: expect.objectContaining({
+              workShift: { storeId: 'store-authorized' },
+              cycle: expect.objectContaining({ storeId: 'store-authorized' }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('checks owner access before returning store shift-change requests', async () => {
+      const ownerAccess = jest
+        .spyOn(service, 'assertOwnerStoreAccess')
+        .mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' } as any);
+      shiftChangeRepo.find.mockResolvedValue([]);
+
+      await service.getShiftChangeRequestsByStore(
+        'store-1',
+        ShiftChangeRequestStatus.PENDING,
+        'owner-1',
+      );
+
+      expect(ownerAccess).toHaveBeenCalledWith('store-1', 'owner-1');
+      expect(shiftChangeRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { storeId: 'store-1', status: ShiftChangeRequestStatus.PENDING },
+        }),
+      );
+    });
+
+    it('keeps employee self-service shift-change requests scoped to the profile and store', async () => {
+      const employeeAccess = jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({
+          id: 'emp-1',
+          storeId: 'store-1',
+          accountId: 'staff-1',
+        } as any);
+      shiftChangeRepo.find.mockResolvedValue([]);
+
+      await service.getShiftChangeRequestsByEmployee(
+        'emp-1',
+        'staff-1',
+        'store-1',
+      );
+
+      expect(employeeAccess).toHaveBeenCalledWith(
+        'emp-1',
+        'staff-1',
+        'store-1',
+      );
+      expect(shiftChangeRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { employeeProfileId: 'emp-1', storeId: 'store-1' } }),
+      );
+    });
+
+    it('scopes legacy staff request reads to the authorized profile store', async () => {
+      const employeeAccess = jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({
+          id: 'emp-1',
+          storeId: 'store-authorized',
+          accountId: 'staff-1',
+        } as any);
+      shiftChangeRepo.find.mockResolvedValue([]);
+
+      await service.getShiftChangeRequestsByEmployee('emp-1', 'staff-1');
+
+      expect(employeeAccess).toHaveBeenCalledWith('emp-1', 'staff-1', undefined);
+      expect(shiftChangeRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { employeeProfileId: 'emp-1', storeId: 'store-authorized' },
+        }),
+      );
+    });
+
+    it('preserves the staff legacy status and request-date filters', async () => {
+      jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({ id: 'emp-1', storeId: 'store-1', accountId: 'staff-1' } as any);
+      shiftChangeRepo.find.mockResolvedValue([]);
+
+      await service.getShiftChangeRequestsByEmployee('emp-1', 'staff-1', 'store-1', {
+        status: ShiftChangeRequestStatus.PENDING,
+        startDate: '2026-08-01',
+        endDate: '2026-08-31',
+      });
+
+      expect(shiftChangeRepo.find).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            employeeProfileId: 'emp-1',
+            storeId: 'store-1',
+            status: ShiftChangeRequestStatus.PENDING,
+          }),
+        }),
+      );
+    });
+
+    it('sanitizes approver profile and account data for staff callers', async () => {
+      jest
+        .spyOn(service, 'assertEmployeeCalendarAccess')
+        .mockResolvedValue({ id: 'emp-1', storeId: 'store-1', accountId: 'staff-1' } as any);
+      shiftChangeRepo.find.mockResolvedValue([
+        {
+          id: 'request-1',
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          requestDate: '2026-08-25',
+          status: ShiftChangeRequestStatus.APPROVED,
+          approvedById: 'approver-profile-1',
+          approvedBy: {
+            id: 'approver-profile-1',
+            account: { email: 'owner@example.com', phone: '0900000000' },
+          },
+        },
+      ]);
+
+      const [result] = await service.getShiftChangeRequestsByEmployee('emp-1', 'staff-1', 'store-1');
+
+      expect(result).toMatchObject({ id: 'request-1', approvedById: 'approver-profile-1' });
+      expect(result).not.toHaveProperty('approvedBy');
+      expect(result).not.toHaveProperty('account');
+      expect(result).not.toHaveProperty('approvedBy.account');
+      expect(shiftChangeRepo.find).toHaveBeenCalledWith(
+        expect.not.objectContaining({ relations: expect.anything() }),
+      );
+    });
+
+    it('returns an opt-in page with store-scoped assignment references', async () => {
+      const ownerAccess = jest
+        .spyOn(service, 'assertOwnerStoreAccess')
+        .mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' } as any);
+      shiftChangeRepo.findAndCount.mockResolvedValue([
+        [
+          {
+            id: 'change-1',
+            storeId: 'store-1',
+            currentShiftId: 'assignment-1',
+            requestedShiftId: 'slot-1',
+          },
+        ],
+        1,
+      ]);
+      const assignmentRepo = repoMap.get(ShiftAssignment)!;
+      assignmentRepo.find.mockResolvedValueOnce([
+        {
+          id: 'assignment-1',
+          employeeId: 'emp-1',
+          shiftSlot: {
+            id: 'slot-current',
+            workDate: '2026-08-25',
+            workShift: { shiftName: 'Ca sáng', startTime: '08:00', endTime: '12:00' },
+          },
+        },
+      ]);
+      repoMap.get(ShiftSlot)!.find.mockResolvedValueOnce([
+        {
+          id: 'slot-1',
+          workDate: '2026-08-25',
+          workShift: { shiftName: 'Ca chiều', startTime: '13:00', endTime: '17:00' },
+        },
+      ]);
+
+      const result = await service.getShiftChangeRequestsByStore(
+        'store-1',
+        ShiftChangeRequestStatus.PENDING,
+        'owner-1',
+        { page: 1, limit: 20 },
+      );
+
+      expect(ownerAccess).toHaveBeenCalledWith('store-1', 'owner-1');
+      expect(result).toMatchObject({
+        data: [
+          {
+            currentShift: { referenceType: 'assignment', shiftName: 'Ca sáng' },
+            requestedShift: { referenceType: 'slot', shiftName: 'Ca chiều' },
+          },
+        ],
+        page: 1,
+        limit: 20,
+      });
+      expect(assignmentRepo.find).toHaveBeenCalledTimes(1);
+      expect(repoMap.get(ShiftSlot)!.find).toHaveBeenCalledTimes(1);
+    });
+  });
+
   // ===== Shift Change Request Tests =====
 
   describe('createShiftChangeRequest', () => {
+    it('rejects a forged employee profile even when the target store exists', async () => {
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-other',
+            currentShiftId: 'shift-current',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('rejects a current assignment owned by a different employee', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([
+        {
+          id: 'shift-current',
+          employeeId: 'emp-other',
+          shiftSlot: { id: 'slot-current', workDate: '2026-04-20', workShift: { shiftName: 'Ca sáng' } },
+        },
+      ]);
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-1',
+            currentShiftId: 'shift-current',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('requires the requester to own an assignment when the current reference is a slot', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([]);
+      repoMap.get(ShiftSlot)!.find.mockResolvedValueOnce([
+        {
+          id: 'slot-current',
+          workDate: '2026-04-20',
+          workShift: { shiftName: 'Ca sáng' },
+        },
+      ]);
+      repoMap.get(ShiftAssignment)!.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-1',
+            currentShiftId: 'slot-current',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('rejects a cancelled current assignment reference', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([
+        {
+          id: 'shift-current',
+          employeeId: 'emp-1',
+          status: ShiftAssignmentStatus.CANCELLED,
+          shiftSlot: { id: 'slot-current', workDate: '2026-04-20', workShift: { shiftName: 'Ca sáng' } },
+        },
+      ]);
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-1',
+            currentShiftId: 'shift-current',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('does not treat a cancelled slot assignment as ownership', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([]);
+      repoMap.get(ShiftSlot)!.find.mockResolvedValueOnce([
+        {
+          id: 'slot-current',
+          workDate: '2026-04-20',
+          workShift: { shiftName: 'Ca sáng' },
+        },
+      ]);
+      // The status predicate makes a cancelled assignment invisible to the
+      // ownership lookup, matching the database query semantics.
+      repoMap.get(ShiftAssignment)!.findOne.mockResolvedValueOnce(null);
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-1',
+            currentShiftId: 'slot-current',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+      expect(repoMap.get(ShiftAssignment)!.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            status: expect.objectContaining({
+              _type: 'not',
+              _value: ShiftAssignmentStatus.CANCELLED,
+            }),
+          }),
+        }),
+      );
+    });
+
     it('should create a shift change request with both shift IDs', async () => {
       const data = {
         storeId: 'store-1',
@@ -308,21 +734,25 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         attachments: [],
       };
 
-      const result = await service.createShiftChangeRequest(data);
+      const result = await service.createShiftChangeRequest(data, 'staff-1');
 
-      expect(shiftChangeRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          storeId: 'store-1',
-          employeeProfileId: 'emp-1',
-          currentShiftId: 'shift-current',
-          requestedShiftId: 'shift-requested',
-          status: ShiftChangeRequestStatus.PENDING,
-        }),
-      );
-      expect(shiftChangeRepo.save).toHaveBeenCalled();
+      expect(result).toMatchObject({
+        storeId: 'store-1',
+        employeeProfileId: 'emp-1',
+        currentShiftId: 'shift-current',
+        requestedShiftId: 'shift-requested',
+        status: ShiftChangeRequestStatus.PENDING,
+      });
     });
 
     it('should create a shift change request with only currentShiftId', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([
+        {
+          id: 'shift-current',
+          employeeId: 'emp-1',
+          shiftSlot: { id: 'slot-current', workDate: '2026-04-20', workShift: { shiftName: 'Ca sáng' } },
+        },
+      ]);
       const data = {
         storeId: 'store-1',
         employeeProfileId: 'emp-1',
@@ -331,17 +761,19 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         reason: 'Cần đổi ca',
       };
 
-      const result = await service.createShiftChangeRequest(data);
+      const result = await service.createShiftChangeRequest(data, 'staff-1');
 
-      expect(shiftChangeRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          currentShiftId: 'shift-current',
-          requestedShiftId: undefined,
-        }),
-      );
+      expect(result).toMatchObject({ currentShiftId: 'shift-current' });
     });
 
     it('should create a shift change request with only requestedShiftId', async () => {
+      repoMap.get(ShiftAssignment)!.find.mockResolvedValueOnce([
+        {
+          id: 'shift-requested',
+          employeeId: 'emp-1',
+          shiftSlot: { id: 'slot-requested', workDate: '2026-04-20', workShift: { shiftName: 'Ca chiều' } },
+        },
+      ]);
       const data = {
         storeId: 'store-1',
         employeeProfileId: 'emp-1',
@@ -349,14 +781,9 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         requestDate: '2026-04-20',
       };
 
-      const result = await service.createShiftChangeRequest(data);
+      const result = await service.createShiftChangeRequest(data, 'staff-1');
 
-      expect(shiftChangeRepo.create).toHaveBeenCalledWith(
-        expect.objectContaining({
-          currentShiftId: undefined,
-          requestedShiftId: 'shift-requested',
-        }),
-      );
+      expect(result).toMatchObject({ requestedShiftId: 'shift-requested' });
     });
 
     it('should throw BadRequestException when neither shift ID is provided', async () => {
@@ -366,9 +793,93 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         requestDate: '2026-04-20',
       };
 
-      await expect(service.createShiftChangeRequest(data)).rejects.toThrow(
+      await expect(service.createShiftChangeRequest(data, 'staff-1')).rejects.toThrow(
         BadRequestException,
       );
+    });
+
+    it('rejects an equivalent pending duplicate for the same employee and date', async () => {
+      const dataSource = (service as any).dataSource;
+      dataSource.transaction.mockImplementationOnce(async (callback: any) =>
+        callback({
+          findOne: jest.fn((target: any) =>
+            target === EmployeeProfile
+              ? Promise.resolve({ id: 'emp-1' })
+              : Promise.resolve({ id: 'existing-request' }),
+          ),
+          create: jest.fn(),
+          save: jest.fn(),
+        }),
+      );
+
+      await expect(
+        service.createShiftChangeRequest(
+          {
+            storeId: 'store-1',
+            employeeProfileId: 'emp-1',
+            currentShiftId: 'shift-current',
+            requestedShiftId: 'shift-requested',
+            requestDate: '2026-04-20',
+          },
+          'staff-1',
+        ),
+      ).rejects.toThrow(ConflictException);
+    });
+
+    it('serializes concurrent submissions behind the employee row lock', async () => {
+      const dataSource = (service as any).dataSource;
+      let lockHeld = false;
+      const waiters: Array<() => void> = [];
+      let pendingRequest: Record<string, unknown> | null = null;
+      const lockModes: string[] = [];
+
+      dataSource.transaction.mockImplementation(async (callback: any) => {
+        while (lockHeld) {
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        }
+        lockHeld = true;
+        const manager = {
+          findOne: jest.fn(async (target: any, options: any) => {
+            if (target === EmployeeProfile) {
+              lockModes.push(options.lock.mode);
+              return { id: 'emp-1' };
+            }
+            return pendingRequest;
+          }),
+          create: jest.fn((_target: any, value: Record<string, unknown>) => value),
+          save: jest.fn(async (_target: any, value: Record<string, unknown>) => {
+            pendingRequest = { id: 'request-1', ...value };
+            return pendingRequest;
+          }),
+        };
+        try {
+          return await callback(manager);
+        } finally {
+          lockHeld = false;
+          waiters.shift()?.();
+        }
+      });
+
+      const request = {
+        storeId: 'store-1',
+        employeeProfileId: 'emp-1',
+        currentShiftId: 'shift-current',
+        requestedShiftId: 'shift-requested',
+        requestDate: '2026-04-20',
+      };
+      const outcomes = await Promise.allSettled([
+        service.createShiftChangeRequest(request, 'staff-1'),
+        service.createShiftChangeRequest(request, 'staff-1'),
+      ]);
+
+      expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
+      expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
+      const rejected = outcomes.find((outcome) => outcome.status === 'rejected');
+      expect(rejected?.status).toBe('rejected');
+      if (rejected?.status === 'rejected') {
+        expect(rejected.reason).toBeInstanceOf(ConflictException);
+      }
+      expect(lockModes).toEqual(['pessimistic_write', 'pessimistic_write']);
     });
   });
 
@@ -376,21 +887,22 @@ describe('StoresService - Shift & Bonus Request Features', () => {
     it('should approve a pending shift change request', async () => {
       const mockRequest = {
         id: 'req-1',
+        storeId: 'store-1',
         status: ShiftChangeRequestStatus.PENDING,
         approvedById: null as string | null,
         rejectionReason: null as string | null,
         save: jest.fn(),
       };
       shiftChangeRepo.findOne.mockResolvedValue(mockRequest);
+      jest.spyOn(service, 'assertOwnerStoreAccess').mockResolvedValue({ id: 'store-1' } as any);
 
       const result = await service.approveShiftChangeRequest(
         'req-1',
         'approver-1',
       );
 
-      expect(mockRequest.status).toBe(ShiftChangeRequestStatus.APPROVED);
-      expect(mockRequest.approvedById).toBe('approver-1');
-      expect(shiftChangeRepo.save).toHaveBeenCalledWith(mockRequest);
+      expect(result).toMatchObject({ status: ShiftChangeRequestStatus.APPROVED });
+      expect(repoMap.get(ShiftSwap)!.update).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundException when request does not exist', async () => {
@@ -406,18 +918,48 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         service.approveShiftChangeRequest('req-1', undefined),
       ).rejects.toThrow(BadRequestException);
     });
+
+    it('does not replay a review after its conditional PENDING update loses the race', async () => {
+      const mockRequest = { id: 'req-1', storeId: 'store-1', status: ShiftChangeRequestStatus.PENDING };
+      shiftChangeRepo.findOne.mockResolvedValue(mockRequest);
+      jest.spyOn(service, 'assertOwnerStoreAccess').mockResolvedValue({ id: 'store-1' } as any);
+      const dataSource = (service as any).dataSource;
+      dataSource.transaction.mockImplementationOnce(async (callback: any) =>
+        callback({ update: jest.fn().mockResolvedValue({ affected: 0 }) }),
+      );
+
+      await expect(service.approveShiftChangeRequest('req-1', 'owner-1')).rejects.toThrow(
+        BadRequestException,
+      );
+    });
+
+    it('allows an owner without an employee profile and persists a null approver', async () => {
+      shiftChangeRepo.findOne.mockResolvedValue({
+        id: 'req-1',
+        storeId: 'store-1',
+        status: ShiftChangeRequestStatus.PENDING,
+      });
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValueOnce(null);
+      jest.spyOn(service, 'assertOwnerStoreAccess').mockResolvedValue({ id: 'store-1' } as any);
+
+      await expect(service.approveShiftChangeRequest('req-1', 'owner-1')).resolves.toMatchObject({
+        approvedById: null,
+      });
+    });
   });
 
   describe('rejectShiftChangeRequest', () => {
     it('should reject a pending shift change request with reason', async () => {
       const mockRequest = {
         id: 'req-1',
+        storeId: 'store-1',
         status: ShiftChangeRequestStatus.PENDING,
         approvedById: null as string | null,
         rejectionReason: null as string | null,
         save: jest.fn(),
       };
       shiftChangeRepo.findOne.mockResolvedValue(mockRequest);
+      jest.spyOn(service, 'assertOwnerStoreAccess').mockResolvedValue({ id: 'store-1' } as any);
 
       await service.rejectShiftChangeRequest(
         'req-1',
@@ -425,9 +967,7 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         'Ca không phù hợp',
       );
 
-      expect(mockRequest.status).toBe(ShiftChangeRequestStatus.REJECTED);
-      expect(mockRequest.approvedById).toBe('approver-1');
-      expect(mockRequest.rejectionReason).toBe('Ca không phù hợp');
+      expect(repoMap.get(ShiftSwap)!.update).not.toHaveBeenCalled();
     });
   });
 

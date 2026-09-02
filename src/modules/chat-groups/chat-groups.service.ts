@@ -5,13 +5,17 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, MoreThan, Repository } from 'typeorm';
 import { ChatGroup } from './entities/chat-group.entity';
 import { ChatGroupMember } from './entities/chat-group-member.entity';
 import { ChatMessage } from './entities/chat-message.entity';
 import { CreateChatGroupDto } from './dto/create-chat-group.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { UpdateChatGroupDto } from './dto/update-chat-group.dto';
+import { ChatAuthorizationService } from './chat-authorization.service';
+import { chatAccessDenied } from './chat-errors';
+import { validateChatGroupName } from './chat-message.utils';
+import { mapActiveChatMember } from './chat-member.mapper';
 
 @Injectable()
 export class ChatGroupsService {
@@ -22,46 +26,48 @@ export class ChatGroupsService {
     private chatGroupMemberRepository: Repository<ChatGroupMember>,
     @InjectRepository(ChatMessage)
     private chatMessageRepository: Repository<ChatMessage>,
+    private readonly dataSource: DataSource,
+    private readonly authorization: ChatAuthorizationService,
   ) {}
 
   // Create group with members
   async createGroup(dto: CreateChatGroupDto, userId: string) {
-    const group = this.chatGroupRepository.create({
-      name: dto.name,
-      storeId: dto.storeId,
-      createdBy: userId,
-      messagePermission: dto.messagePermission || 'everyone',
-      customSenderIds: dto.customSenderIds || [],
-    });
-
-    await this.chatGroupRepository.save(group);
-
-    // Add creator as member
-    const creatorMember = this.chatGroupMemberRepository.create({
-      groupId: group.id,
-      accountId: userId,
-      status: 'active',
-    });
-    await this.chatGroupMemberRepository.save(creatorMember);
-
-    // Add other members
-    if (dto.memberIds && dto.memberIds.length > 0) {
-      const members = dto.memberIds
-        .filter((id) => id !== userId) // Don't duplicate creator
-        .map((accountId) =>
-          this.chatGroupMemberRepository.create({
-            groupId: group.id,
-            accountId,
-            status: 'active',
-          }),
+    const groupId = await this.dataSource.transaction(async (manager) => {
+      await this.authorization.requireStoreOwner(dto.storeId, userId, manager);
+      const accountIds = [...new Set([userId, ...dto.memberIds])];
+      await this.authorization.requireEligibleParticipants(
+        dto.storeId,
+        accountIds,
+        userId,
+        manager,
+      );
+      const customSenderIds = dto.customSenderIds || [];
+      if (customSenderIds.some((id) => !accountIds.includes(id))) {
+        throw new BadRequestException(
+          'Người có quyền gửi phải là thành viên của nhóm',
         );
-
-      if (members.length > 0) {
-        await this.chatGroupMemberRepository.save(members);
       }
-    }
 
-    return this.getGroupDetails(group.id, userId);
+      const groups = manager.getRepository(ChatGroup);
+      const group = await groups.save(
+        groups.create({
+          name: validateChatGroupName(dto.name),
+          storeId: dto.storeId,
+          createdBy: userId,
+          messagePermission: dto.messagePermission || 'everyone',
+          customSenderIds,
+        }),
+      );
+      const members = manager.getRepository(ChatGroupMember);
+      await members.save(
+        accountIds.map((accountId) =>
+          members.create({ groupId: group.id, accountId, status: 'active' }),
+        ),
+      );
+      return group.id;
+    });
+
+    return this.getGroupDetails(groupId, userId);
   }
 
   // Get groups by store
@@ -85,9 +91,11 @@ export class ChatGroupsService {
       .orderBy('message.createdAt', 'DESC')
       .getMany();
 
+    const authorizedGroups = await this.filterAuthorizedGroups(groups, userId);
+
     // Calculate unread count for each group
     const groupsWithUnread = await Promise.all(
-      groups.map(async (group) => {
+      authorizedGroups.map(async (group) => {
         const member = group.members.find((m) => m.accountId === userId);
         const unreadCount = await this.getUnreadCount(group.id, userId, member?.lastReadAt);
 
@@ -95,9 +103,26 @@ export class ChatGroupsService {
         const lastMessage = group.messages?.[0] || null;
 
         return {
-          ...group,
+          id: group.id,
+          name: group.name,
+          avatar: group.avatar || null,
+          storeId: group.storeId,
+          createdBy: group.createdBy,
+          messagePermission: group.messagePermission,
+          customSenderIds: group.customSenderIds || [],
+          members: group.members
+            .filter((item) => item.status === 'active')
+            .map((item) => mapActiveChatMember(item, group.createdBy)),
           unreadCount,
-          lastMessage,
+          lastMessage: lastMessage
+            ? {
+                id: lastMessage.id,
+                content: lastMessage.content,
+                messageType: lastMessage.messageType,
+                senderId: lastMessage.senderId,
+                createdAt: lastMessage.createdAt,
+              }
+            : null,
         };
       }),
     );
@@ -125,9 +150,11 @@ export class ChatGroupsService {
       .orderBy('message.createdAt', 'DESC')
       .getMany();
 
+    const authorizedGroups = await this.filterAuthorizedGroups(groups, userId);
+
     // Calculate unread count for each group
     const groupsWithUnread = await Promise.all(
-      groups.map(async (group) => {
+      authorizedGroups.map(async (group) => {
         const member = group.members.find((m) => m.accountId === userId);
         const unreadCount = await this.getUnreadCount(group.id, userId, member?.lastReadAt);
 
@@ -135,9 +162,26 @@ export class ChatGroupsService {
         const lastMessage = group.messages?.[0] || null;
 
         return {
-          ...group,
+          id: group.id,
+          name: group.name,
+          avatar: group.avatar || null,
+          storeId: group.storeId,
+          createdBy: group.createdBy,
+          messagePermission: group.messagePermission,
+          customSenderIds: group.customSenderIds || [],
+          members: group.members
+            .filter((item) => item.status === 'active')
+            .map((item) => mapActiveChatMember(item, group.createdBy)),
           unreadCount,
-          lastMessage,
+          lastMessage: lastMessage
+            ? {
+                id: lastMessage.id,
+                content: lastMessage.content,
+                messageType: lastMessage.messageType,
+                senderId: lastMessage.senderId,
+                createdAt: lastMessage.createdAt,
+              }
+            : null,
         };
       }),
     );
@@ -170,25 +214,32 @@ export class ChatGroupsService {
 
   // Get group details
   async getGroupDetails(groupId: string, userId: string) {
+    const context = await this.authorization.requireGroupAccess(groupId, userId);
     const group = await this.chatGroupRepository.findOne({
       where: { id: groupId },
-      relations: ['members', 'members.account', 'members.employeeProfile', 'creator'],
     });
 
-    if (!group) {
-      throw new NotFoundException('Nhóm chat không tồn tại');
-    }
+    if (!group) throw new ForbiddenException('CHAT_ACCESS_DENIED');
+    const members = await this.chatGroupMemberRepository.find({
+      where: { groupId, status: 'active' },
+      relations: ['account'],
+      order: { createdAt: 'ASC' },
+    });
 
-    // Check if user is member
-    const isMember = group.members.some(
-      (m) => m.accountId === userId && m.status === 'active',
-    );
-
-    if (!isMember) {
-      throw new ForbiddenException('Bạn không phải thành viên của nhóm này');
-    }
-
-    return group;
+    return {
+      id: group.id,
+      name: group.name,
+      avatar: group.avatar || null,
+      storeId: group.storeId,
+      createdBy: group.createdBy,
+      messagePermission: group.messagePermission,
+      customSenderIds: group.customSenderIds || [],
+      members: members.map((member) =>
+        mapActiveChatMember(member, context.group.store.ownerAccountId),
+      ),
+      createdAt: group.createdAt,
+      updatedAt: group.updatedAt,
+    };
   }
 
   // Get messages with pagination
@@ -198,6 +249,7 @@ export class ChatGroupsService {
     page = 1,
     limit = 50,
   ) {
+    this.assertLegacyPagination(page, limit, 100);
     // Verify membership
     await this.verifyMembership(groupId, userId);
 
@@ -210,7 +262,7 @@ export class ChatGroupsService {
     });
 
     return {
-      data: messages.reverse(), // Reverse to show oldest first
+      data: messages.reverse().map((message) => this.mapLegacyMessage(message)),
       total,
       page,
       limit,
@@ -231,7 +283,8 @@ export class ChatGroupsService {
       messageType: dto.messageType || 'text',
       attachmentUrl: dto.attachmentUrl,
       attachmentName: dto.attachmentName,
-      attachmentSize: dto.attachmentSize,
+      attachmentSize:
+        dto.attachmentSize === undefined ? null : String(dto.attachmentSize),
       readBy: [userId], // Sender has read it
     });
 
@@ -289,14 +342,27 @@ export class ChatGroupsService {
     dto: UpdateChatGroupDto,
     userId: string,
   ) {
-    const group = await this.getGroupDetails(groupId, userId);
+    const context = await this.authorization.requireGroupAdmin(groupId, userId);
+    const group = context.group;
 
-    // Only creator can update settings
-    if (group.createdBy !== userId) {
-      throw new ForbiddenException('Chỉ người tạo nhóm mới có thể chỉnh sửa');
+    if (dto.customSenderIds) {
+      const activeMembers = await this.chatGroupMemberRepository.find({
+        where: { groupId, status: 'active' },
+        select: { accountId: true },
+      });
+      const activeIds = activeMembers.map((member) => member.accountId);
+      if (dto.customSenderIds.some((id) => !activeIds.includes(id))) {
+        throw new BadRequestException(
+          'Người có quyền gửi phải là thành viên của nhóm',
+        );
+      }
     }
-
-    Object.assign(group, dto);
+    Object.assign(group, {
+      ...dto,
+      ...(dto.name !== undefined
+        ? { name: validateChatGroupName(dto.name) }
+        : {}),
+    });
     await this.chatGroupRepository.save(group);
 
     return group;
@@ -304,34 +370,62 @@ export class ChatGroupsService {
 
   // Add members
   async addMembers(groupId: string, memberIds: string[], userId: string) {
-    const group = await this.getGroupDetails(groupId, userId);
-
-    // Only creator can add members
-    if (group.createdBy !== userId) {
-      throw new ForbiddenException('Chỉ người tạo nhóm mới có thể thêm thành viên');
+    if (!Array.isArray(memberIds) || memberIds.length === 0) {
+      throw new BadRequestException('CHAT_MEMBERS_REQUIRED');
     }
 
-    const newMembers = memberIds.map((accountId) =>
-      this.chatGroupMemberRepository.create({
+    await this.dataSource.transaction(async (manager) => {
+      const context = await this.authorization.requireGroupAdmin(
         groupId,
-        accountId,
-        status: 'active',
-      }),
-    );
-
-    await this.chatGroupMemberRepository.save(newMembers);
+        userId,
+        manager,
+      );
+      const lockedGroup = await manager.getRepository(ChatGroup).findOne({
+        where: { id: groupId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!lockedGroup) throw new ForbiddenException('CHAT_ACCESS_DENIED');
+      const uniqueIds = [...new Set(memberIds)];
+      const members = manager.getRepository(ChatGroupMember);
+      await this.authorization.requireEligibleParticipants(
+        context.group.storeId,
+        uniqueIds,
+        userId,
+        manager,
+      );
+      const alreadyActive = await members
+        .createQueryBuilder('member')
+        .select('member.accountId', 'accountId')
+        .where('member.groupId = :groupId', { groupId })
+        .andWhere('member.accountId IN (:...accountIds)', {
+          accountIds: uniqueIds,
+        })
+        .andWhere('member.status = :active', { active: 'active' })
+        .getRawMany<{ accountId: string }>();
+      const existing = new Set(alreadyActive.map((row) => row.accountId));
+      const newIds = uniqueIds.filter((id) => !existing.has(id));
+      const activeCount = await members.count({
+        where: { groupId, status: 'active' },
+      });
+      if (activeCount + newIds.length > 200) {
+        throw new BadRequestException('Nhóm chat không được quá 200 thành viên');
+      }
+      if (newIds.length > 0) {
+        await members.save(
+          newIds.map((accountId) =>
+            members.create({ groupId, accountId, status: 'active' }),
+          ),
+        );
+      }
+    });
 
     return this.getGroupDetails(groupId, userId);
   }
 
   // Remove member
   async removeMember(groupId: string, memberId: string, userId: string) {
-    const group = await this.getGroupDetails(groupId, userId);
-
-    // Only creator can remove members
-    if (group.createdBy !== userId) {
-      throw new ForbiddenException('Chỉ người tạo nhóm mới có thể xóa thành viên');
-    }
+    const context = await this.authorization.requireGroupAdmin(groupId, userId);
+    const group = context.group;
 
     // Can't remove creator
     if (memberId === group.createdBy) {
@@ -348,7 +442,8 @@ export class ChatGroupsService {
 
   // Leave group
   async leaveGroup(groupId: string, userId: string) {
-    const group = await this.getGroupDetails(groupId, userId);
+    const context = await this.authorization.requireGroupAccess(groupId, userId);
+    const group = context.group;
 
     // Creator can't leave
     if (group.createdBy === userId) {
@@ -365,14 +460,17 @@ export class ChatGroupsService {
 
   // Get group members
   async getGroupMembers(groupId: string, userId: string) {
-    await this.verifyMembership(groupId, userId);
+    const context = await this.authorization.requireGroupAccess(groupId, userId);
 
     const members = await this.chatGroupMemberRepository.find({
       where: { groupId, status: 'active' },
-      relations: ['account', 'employeeProfile'],
+      relations: ['account'],
+      order: { createdAt: 'ASC' },
     });
 
-    return members;
+    return members.map((member) =>
+      mapActiveChatMember(member, context.group.store.ownerAccountId),
+    );
   }
 
   // Get user's groups (for WebSocket)
@@ -382,20 +480,34 @@ export class ChatGroupsService {
       relations: ['group'],
     });
 
-    return members.map((m) => m.group);
+    return this.filterAuthorizedGroups(
+      members.map((m) => m.group),
+      userId,
+    );
+  }
+
+  private async filterAuthorizedGroups(
+    groups: ChatGroup[],
+    userId: string,
+  ): Promise<ChatGroup[]> {
+    const checked = await Promise.all(
+      groups.map(async (group) => {
+        try {
+          await this.authorization.requireGroupAccess(group.id, userId);
+          return group;
+        } catch (error) {
+          if (error instanceof ForbiddenException) return null;
+          throw error;
+        }
+      }),
+    );
+    return checked.filter((group): group is ChatGroup => group !== null);
   }
 
   // Helper: Verify membership
-  private async verifyMembership(groupId: string, userId: string) {
-    const member = await this.chatGroupMemberRepository.findOne({
-      where: { groupId, accountId: userId, status: 'active' },
-    });
-
-    if (!member) {
-      throw new ForbiddenException('Bạn không phải thành viên của nhóm này');
-    }
-
-    return member;
+  async verifyMembership(groupId: string, userId: string) {
+    const context = await this.authorization.requireGroupAccess(groupId, userId);
+    return context.member;
   }
 
   // Helper: Verify message permission
@@ -448,7 +560,7 @@ export class ChatGroupsService {
     return this.chatMessageRepository.count({
       where: {
         groupId,
-        createdAt: { $gt: lastReadAt } as any,
+        createdAt: MoreThan(lastReadAt),
       },
     });
   }
@@ -459,28 +571,57 @@ export class ChatGroupsService {
     userId: string,
     settings: { chatColor?: string; notificationsEnabled?: boolean },
   ) {
-    const member = await this.chatGroupMemberRepository.findOne({
-      where: { groupId, accountId: userId, status: 'active' },
-    });
-
-    if (!member) {
-      throw new NotFoundException('Bạn không phải thành viên của nhóm này');
-    }
+    const { member } = await this.authorization.requireGroupAccess(
+      groupId,
+      userId,
+    );
+    const updates: {
+      chatColor?: string;
+      notificationsEnabled?: boolean;
+    } = {};
 
     if (settings.chatColor !== undefined) {
-      member.chatColor = settings.chatColor;
+      updates.chatColor = settings.chatColor;
     }
 
     if (settings.notificationsEnabled !== undefined) {
-      member.notificationsEnabled = settings.notificationsEnabled;
+      updates.notificationsEnabled = settings.notificationsEnabled;
     }
 
-    await this.chatGroupMemberRepository.save(member);
+    if (Object.keys(updates).length === 0) {
+      return {
+        id: member.id,
+        chatColor: member.chatColor,
+        notificationsEnabled: member.notificationsEnabled,
+      };
+    }
+
+    const result = await this.chatGroupMemberRepository
+      .createQueryBuilder()
+      .update(ChatGroupMember)
+      .set(updates)
+      .where('id = :memberId', { memberId: member.id })
+      .andWhere('group_id = :groupId', { groupId })
+      .andWhere('account_id = :userId', { userId })
+      .andWhere("status = 'active'")
+      .andWhere('deleted_at IS NULL')
+      .returning(['id', 'chatColor', 'notificationsEnabled'])
+      .execute();
+
+    if (result.affected !== 1) {
+      throw chatAccessDenied();
+    }
+
+    const updated = result.raw[0] as {
+      id: string;
+      chat_color: string | null;
+      notifications_enabled: boolean;
+    };
 
     return {
-      id: member.id,
-      chatColor: member.chatColor,
-      notificationsEnabled: member.notificationsEnabled,
+      id: updated.id,
+      chatColor: updated.chat_color,
+      notificationsEnabled: updated.notifications_enabled,
     };
   }
 
@@ -492,6 +633,7 @@ export class ChatGroupsService {
     page: number = 1,
     limit: number = 20,
   ) {
+    this.assertLegacyPagination(page, limit, 100);
     // Verify membership
     await this.getGroupDetails(groupId, userId);
 
@@ -548,25 +690,72 @@ export class ChatGroupsService {
     page: number = 1,
     limit: number = 20,
   ) {
+    this.assertLegacyPagination(page, limit, 50);
     // Verify membership
     await this.getGroupDetails(groupId, userId);
 
-    const [messages, total] = await this.chatMessageRepository.findAndCount({
-      where: {
-        groupId,
-        content: { $like: `%${query}%` } as any,
-      },
-      relations: ['sender'],
-      order: { createdAt: 'DESC' },
-      skip: (page - 1) * limit,
-      take: limit,
-    });
+    const normalized = query.normalize('NFC').trim();
+    if (!normalized || Array.from(normalized).length > 200) {
+      throw new BadRequestException('Từ khóa tìm kiếm không hợp lệ');
+    }
+    const escaped = normalized.replace(/[\\%_]/g, (value) => `\\${value}`);
+    const [messages, total] = await this.chatMessageRepository
+      .createQueryBuilder('message')
+      .leftJoinAndSelect('message.sender', 'sender')
+      .where('message.groupId = :groupId', { groupId })
+      .andWhere(`message.content ILIKE :pattern ESCAPE '\\'`, {
+        pattern: `%${escaped}%`,
+      })
+      .orderBy('message.createdAt', 'DESC')
+      .skip((page - 1) * limit)
+      .take(Math.min(limit, 50))
+      .getManyAndCount();
 
     return {
-      messages,
+      messages: messages.map((message) => this.mapLegacyMessage(message)),
       total,
       page,
       limit,
+    };
+  }
+
+  private assertLegacyPagination(
+    page: number,
+    limit: number,
+    maxLimit: number,
+  ): void {
+    if (
+      !Number.isSafeInteger(page) ||
+      page < 1 ||
+      page > 10_000 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > maxLimit
+    ) {
+      throw new BadRequestException('Phân trang không hợp lệ');
+    }
+  }
+
+  private mapLegacyMessage(message: ChatMessage) {
+    return {
+      id: message.id,
+      groupId: message.groupId,
+      senderId: message.senderId,
+      content: message.content,
+      messageType: message.messageType,
+      attachmentUrl: message.attachmentUrl,
+      attachmentName: message.attachmentName,
+      attachmentSize: message.attachmentSize,
+      readBy: message.readBy,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      sender: message.sender
+        ? {
+            id: message.sender.id,
+            fullName: message.sender.fullName,
+            avatar: message.sender.avatar,
+          }
+        : null,
     };
   }
 }

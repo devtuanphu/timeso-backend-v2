@@ -1,237 +1,256 @@
+import { randomUUID } from 'crypto';
+
 import {
-  WebSocketGateway,
-  WebSocketServer,
-  SubscribeMessage,
-  OnGatewayInit,
-  OnGatewayConnection,
-  OnGatewayDisconnect,
+  Inject,
+  Injectable,
+  Logger,
+  OnApplicationShutdown,
+} from '@nestjs/common';
+import {
   ConnectedSocket,
   MessageBody,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  OnGatewayInit,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { Injectable, Logger } from '@nestjs/common';
-import { ChatGroupsService } from './chat-groups.service';
+
+import { ChatAuthorizationService } from './chat-authorization.service';
+import {
+  CHAT_EVENT_PUBLISHER,
+  ChatEventPublisher,
+} from './chat-event-publisher';
+import { ChatMessageCommandService } from './chat-message-command.service';
+import {
+  CHAT_REALTIME_CONFIG,
+  ChatRealtimeConfig,
+} from './chat-realtime.config';
+import { ChatRealtimeReadinessService } from './chat-realtime-readiness.service';
+import { ChatSocketAuthService } from './chat-socket-auth.service';
+import { ChatRealtimeCoordinatorService } from './chat-realtime-coordinator.service';
+import { ChatAbuseProtectionService } from './chat-abuse-protection.service';
 
 @Injectable()
-@WebSocketGateway({
-  cors: { origin: '*' },
-  namespace: '/chat',
-})
-export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+@WebSocketGateway({ cors: { origin: '*' }, namespace: '/chat' })
+export class ChatGateway
+  implements
+    OnGatewayInit,
+    OnGatewayConnection,
+    OnGatewayDisconnect,
+    OnApplicationShutdown
+{
   @WebSocketServer()
   server: Server;
 
   private readonly logger = new Logger(ChatGateway.name);
-  private userSockets = new Map<string, Set<string>>(); // userId -> Set of socketIds
+  private readonly expiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  constructor(private readonly chatGroupsService: ChatGroupsService) {
-    this.logger.log('🔌 ChatGateway instantiated — WebSocket namespace /chat');
+  constructor(
+    private readonly socketAuth: ChatSocketAuthService,
+    private readonly authorization: ChatAuthorizationService,
+    private readonly commands: ChatMessageCommandService,
+    private readonly readiness: ChatRealtimeReadinessService,
+    private readonly coordinator: ChatRealtimeCoordinatorService,
+    private readonly abuseProtection: ChatAbuseProtectionService,
+    @Inject(CHAT_EVENT_PUBLISHER)
+    private readonly publisher: ChatEventPublisher,
+    @Inject(CHAT_REALTIME_CONFIG)
+    private readonly config: ChatRealtimeConfig,
+  ) {}
+
+  afterInit(server: Server): void {
+    this.readiness.attach('legacy', server);
+    this.logger.log('Legacy chat namespace initialized');
   }
 
-  afterInit(server: Server) {
-    this.logger.log('✅ WebSocket Gateway initialized on namespace /chat');
-    this.logger.log(`🔌 Socket.io server is ready and listening for connections`);
+  onApplicationShutdown(): void {
+    if (this.server) this.readiness.detach('legacy', this.server);
+    this.expiryTimers.forEach(clearTimeout);
+    this.expiryTimers.clear();
   }
 
-  async handleConnection(client: Socket) {
+  async handleConnection(client: Socket): Promise<void> {
+    if (!this.coordinator.isActive() || !this.legacyConnectionsAllowed()) {
+      client.emit('chat:error', { code: 'CHAT_UPGRADE_REQUIRED' });
+      client.disconnect(true);
+      return;
+    }
     try {
-      const userId = client.handshake.auth.userId;
-      
-      if (!userId) {
-        this.logger.warn('Client connected without userId');
-        client.disconnect();
-        return;
-      }
-
-      this.logger.log(`User ${userId} connected with socket ${client.id}`);
-
-      // Track user's socket connections
-      if (!this.userSockets.has(userId)) {
-        this.userSockets.set(userId, new Set());
-      }
-      const userSocketSet = this.userSockets.get(userId);
-      if (userSocketSet) {
-        userSocketSet.add(client.id);
-      }
-
-      // Join user's groups
-      const groups = await this.chatGroupsService.getUserGroups(userId);
-      groups.forEach((group) => {
-        client.join(`group:${group.id}`);
-        this.logger.log(`User ${userId} joined group:${group.id}`);
-      });
-
-      // Broadcast online status
-      this.server.emit('user:online', { userId });
+      const principal = await this.socketAuth.authenticate(client, false);
+      this.abuseProtection.acquireSocket(
+        client.id,
+        principal.accountId,
+        client.handshake.address,
+      );
+      await client.join(`account:${principal.accountId}`);
+      const timer = setTimeout(
+        () => client.disconnect(true),
+        Math.max(
+          Math.min(
+            principal.expiresAt,
+            this.config.legacyCutoffAt?.getTime() || principal.expiresAt,
+          ) - Date.now(),
+          1,
+        ),
+      );
+      timer.unref?.();
+      this.expiryTimers.set(client.id, timer);
     } catch (error) {
-      this.logger.error('Error in handleConnection:', error);
-      client.disconnect();
+      const code =
+        error instanceof Error && error.message === 'CHAT_SOCKET_LIMITED'
+          ? 'CHAT_SOCKET_LIMITED'
+          : 'CHAT_SOCKET_UNAUTHORIZED';
+      client.emit('chat:error', { code });
+      client.disconnect(true);
     }
   }
 
-  async handleDisconnect(client: Socket) {
-    try {
-      const userId = client.handshake.auth.userId;
-      
-      if (userId && this.userSockets.has(userId)) {
-        const userSocketSet = this.userSockets.get(userId);
-        if (userSocketSet) {
-          userSocketSet.delete(client.id);
-
-          // If user has no more connections, mark offline
-          if (userSocketSet.size === 0) {
-            this.userSockets.delete(userId);
-            this.server.emit('user:offline', { userId });
-            this.logger.log(`User ${userId} went offline`);
-          }
-        }
-      }
-    } catch (error) {
-      this.logger.error('Error in handleDisconnect:', error);
-    }
+  handleDisconnect(client: Socket): void {
+    const timer = this.expiryTimers.get(client.id);
+    if (timer) clearTimeout(timer);
+    this.expiryTimers.delete(client.id);
+    this.abuseProtection.releaseSocket(client.id);
   }
 
-  // Send message
   @SubscribeMessage('message:send')
   async handleSendMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { groupId: string; content: string; messageType?: string },
+    @MessageBody() data: { groupId?: string; content?: string },
   ) {
+    // Released clients that authenticated only with a claimed userId cannot be
+    // accepted safely. They must be force-upgraded during the staged legacy
+    // window; this namespace remains JWT-only and never trusts auth.userId.
+    if (!this.legacyMutationsAllowed()) {
+      return { success: false, error: 'CHAT_UPGRADE_REQUIRED' };
+    }
     try {
-      const userId = client.handshake.auth.userId;
-      
-      if (!userId) {
-        return { error: 'Unauthorized' };
+      const principal = this.socketAuth.getPrincipal(client);
+      if (!data.groupId || typeof data.content !== 'string') {
+        return { success: false, error: 'CHAT_CONTENT_INVALID' };
       }
-
-      const message = await this.chatGroupsService.sendMessage(
-        {
-          groupId: data.groupId,
-          content: data.content,
-          messageType: data.messageType || 'text',
-        },
-        userId,
+      this.abuseProtection.assertHttp(
+        'send',
+        principal.accountId,
+        client.handshake.address,
       );
-
-      // Broadcast to group
-      this.server.to(`group:${data.groupId}`).emit('message:new', message);
-
-      this.logger.log(`Message sent to group ${data.groupId} by user ${userId}`);
-
-      return { success: true, message };
+      const result = await this.commands.sendTextMessage(
+        data.groupId,
+        principal.accountId,
+        { clientMessageId: randomUUID(), content: data.content },
+      );
+      return { success: true, message: result.message };
     } catch (error) {
-      this.logger.error('Error in handleSendMessage:', error);
-      return { error: error.message };
+      return {
+        success: false,
+        error: this.safeErrorCode(error),
+      };
     }
   }
 
-  // Typing indicator
   @SubscribeMessage('typing:start')
-  handleTypingStart(
+  async handleTypingStart(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { groupId: string },
+    @MessageBody() data: { groupId?: string },
   ) {
-    const userId = client.handshake.auth.userId;
-    if (!userId) return;
-
-    client.to(`group:${data.groupId}`).emit('typing:user', {
-      userId,
-      isTyping: true,
-    });
+    return this.publishLegacyTyping(client, data.groupId, true);
   }
 
   @SubscribeMessage('typing:stop')
-  handleTypingStop(
+  async handleTypingStop(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { groupId: string },
+    @MessageBody() data: { groupId?: string },
   ) {
-    const userId = client.handshake.auth.userId;
-    if (!userId) return;
-
-    client.to(`group:${data.groupId}`).emit('typing:user', {
-      userId,
-      isTyping: false,
-    });
+    return this.publishLegacyTyping(client, data.groupId, false);
   }
 
-  // Mark as read
   @SubscribeMessage('message:read')
-  async handleMarkAsRead(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { groupId: string; messageId: string },
+  handleMarkAsRead() {
+    return { success: false, error: 'CHAT_UPGRADE_REQUIRED' };
+  }
+
+  // Account rooms make membership changes visible without mutating socket rooms.
+  joinGroup(_accountId: string, _groupId: string): void {}
+
+  leaveGroup(_accountId: string, _groupId: string): void {}
+
+  isUserOnline(accountId: string): boolean {
+    return (this.server?.sockets.adapter.rooms.get(`account:${accountId}`)?.size || 0) > 0;
+  }
+
+  getOnlineUsersInGroup(_groupId: string): string[] {
+    return [];
+  }
+
+  private async publishLegacyTyping(
+    client: Socket,
+    groupId: string | undefined,
+    isTyping: boolean,
   ) {
+    if (!this.legacyMutationsAllowed()) {
+      return { success: false, error: 'CHAT_UPGRADE_REQUIRED' };
+    }
     try {
-      const userId = client.handshake.auth.userId;
-      
-      if (!userId) {
-        return { error: 'Unauthorized' };
+      if (!groupId) return { success: false, error: 'CHAT_ACCESS_DENIED' };
+      const principal = this.socketAuth.getPrincipal(client);
+      if (isTyping) {
+        this.abuseProtection.assertHttp(
+          'typing',
+          principal.accountId,
+          client.handshake.address,
+        );
       }
-
-      await this.chatGroupsService.markMessageAsRead(data.messageId, userId);
-
-      // Broadcast read receipt
-      this.server.to(`group:${data.groupId}`).emit('message:read', {
-        messageId: data.messageId,
-        userId,
-      });
-
+      await this.authorization.requireGroupAccess(groupId, principal.accountId);
+      const recipients = (
+        await this.authorization.getEligibleRecipientAccountIds(groupId)
+      ).filter((id) => id !== principal.accountId);
+      const expiresAt = Date.now() + (isTyping ? 5_000 : 0);
+      await this.publisher.publishTyping(
+        {
+          version: 1,
+          groupId,
+          accountId: principal.accountId,
+          isTyping,
+          expiresAt: new Date(expiresAt).toISOString(),
+        },
+        recipients,
+      );
       return { success: true };
     } catch (error) {
-      this.logger.error('Error in handleMarkAsRead:', error);
-      return { error: error.message };
+      return {
+        success: false,
+        error:
+          this.safeErrorCode(error) === 'CHAT_RATE_LIMITED'
+            ? 'CHAT_TYPING_REJECTED'
+            : 'CHAT_ACCESS_DENIED',
+      };
     }
   }
 
-  // Join group (when user added to group)
-  joinGroup(userId: string, groupId: string) {
-    const sockets = this.userSockets.get(userId);
-    if (sockets) {
-      sockets.forEach((socketId) => {
-        const socket = this.server.sockets.sockets.get(socketId);
-        if (socket) {
-          socket.join(`group:${groupId}`);
-          this.logger.log(`User ${userId} joined group:${groupId}`);
-        }
-      });
+  private legacyConnectionsAllowed(): boolean {
+    return (
+      this.config.legacyConnectionEnabled &&
+      !!this.config.legacyCutoffAt &&
+      Date.now() < this.config.legacyCutoffAt.getTime()
+    );
+  }
+
+  private legacyMutationsAllowed(): boolean {
+    return this.legacyConnectionsAllowed() && this.config.legacyMutationEnabled;
+  }
+
+  private safeErrorCode(error: unknown): string {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'response' in error &&
+      typeof (error as { response?: unknown }).response === 'object'
+    ) {
+      const response = (error as { response: { code?: unknown } }).response;
+      if (typeof response.code === 'string') return response.code;
     }
-  }
-
-  // Leave group
-  leaveGroup(userId: string, groupId: string) {
-    const sockets = this.userSockets.get(userId);
-    if (sockets) {
-      sockets.forEach((socketId) => {
-        const socket = this.server.sockets.sockets.get(socketId);
-        if (socket) {
-          socket.leave(`group:${groupId}`);
-          this.logger.log(`User ${userId} left group:${groupId}`);
-        }
-      });
-    }
-  }
-
-  // Check if user is online
-  isUserOnline(userId: string): boolean {
-    const userSocketSet = this.userSockets.get(userId);
-    return this.userSockets.has(userId) && !!userSocketSet && userSocketSet.size > 0;
-  }
-
-  // Get online users in group
-  getOnlineUsersInGroup(groupId: string): string[] {
-    const room = this.server.sockets.adapter.rooms.get(`group:${groupId}`);
-    if (!room) return [];
-
-    const onlineUsers: string[] = [];
-    room.forEach((socketId) => {
-      const socket = this.server.sockets.sockets.get(socketId);
-      if (socket) {
-        const userId = socket.handshake.auth.userId;
-        if (userId && !onlineUsers.includes(userId)) {
-          onlineUsers.push(userId);
-        }
-      }
-    });
-
-    return onlineUsers;
+    return 'CHAT_SEND_FAILED';
   }
 }

@@ -44,6 +44,9 @@ export class ChatGroup extends BaseEntity {
   @Column({ type: 'simple-array', nullable: true, name: 'custom_sender_ids' })
   customSenderIds: string[];
 
+  @Column({ type: 'bigint', nullable: true, name: 'next_message_sequence' })
+  nextMessageSequence: string | null;
+
   @OneToMany(() => ChatGroupMember, (member) => member.group)
   members: ChatGroupMember[];
 

@@ -10,8 +10,7 @@ import {
   UseGuards,
   Request,
   ParseUUIDPipe,
-  ParseIntPipe,
-  DefaultValuePipe,
+  Res,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -20,15 +19,34 @@ import { ChatGateway } from './chat.gateway';
 import { CreateChatGroupDto } from './dto/create-chat-group.dto';
 import { UpdateChatGroupDto } from './dto/update-chat-group.dto';
 import { AddMembersDto } from './dto/add-members.dto';
+import type { Response } from 'express';
+import { ChatMessageCommandService } from './chat-message-command.service';
+import { ChatMessageQueryService } from './chat-message-query.service';
+import {
+  CatchUpMessagesQueryDto,
+  ChatGroupListV2QueryDto,
+  HistoryMessagesQueryDto,
+  LegacyChatPaginationQueryDto,
+  LegacyChatPageQueryDto,
+  LegacyChatMediaQueryDto,
+  MarkChatGroupReadDto,
+  SearchChatMessagesQueryDto,
+  SendChatMessageDto,
+} from './dto/chat-v2.dto';
+import { ChatRuntimeHttpGuard } from './chat-runtime-http.guard';
+import { ChatAbuseProtectionService } from './chat-abuse-protection.service';
 
 @ApiTags('Chat Groups')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, ChatRuntimeHttpGuard)
 @Controller('chat-groups')
 export class ChatGroupsController {
   constructor(
     private readonly chatGroupsService: ChatGroupsService,
     private readonly chatGateway: ChatGateway,
+    private readonly messageCommands: ChatMessageCommandService,
+    private readonly messageQueries: ChatMessageQueryService,
+    private readonly abuseProtection: ChatAbuseProtectionService,
   ) {}
 
   @Post()
@@ -47,18 +65,38 @@ export class ChatGroupsController {
   @Get()
   @ApiOperation({ summary: 'Lấy danh sách nhóm chat theo cửa hàng (hoặc tất cả nếu không chỉ định)' })
   @ApiQuery({ name: 'storeId', required: false })
-  async getGroupsByStore(@Query('storeId') storeId?: string, @Request() req?) {
-    if (storeId) {
-      return this.chatGroupsService.getGroupsByStore(storeId, req.user.userId);
-    } else {
-      return this.chatGroupsService.getAllGroupsForUser(req.user.userId);
-    }
+  async getGroupsByStore(
+    @Query() query: LegacyChatPaginationQueryDto,
+    @Request() req,
+  ) {
+    this.abuseProtection.assertHttp('list', req.user.userId, req.ip);
+    const result = await this.messageQueries.getAuthorizedLegacyGroupList(
+      req.user.userId,
+      query,
+    );
+    // Released clients expect a plain array. The bounded V2 query avoids the
+    // former all-messages relation hydration while preserving that shape.
+    return result.data;
+  }
+
+  @Get('v2')
+  @ApiOperation({ summary: 'Lấy danh sách nhóm chat bằng cursor' })
+  async getGroupsV2(
+    @Query() query: ChatGroupListV2QueryDto,
+    @Request() req,
+  ) {
+    this.abuseProtection.assertHttp('list', req.user.userId, req.ip);
+    return this.messageQueries.getAuthorizedGroupListV2(
+      req.user.userId,
+      query,
+    );
   }
 
   @Get('unread/total')
   @ApiOperation({ summary: 'Lấy tổng số tin nhắn chưa đọc' })
   async getTotalUnreadCount(@Request() req) {
-    return this.chatGroupsService.getTotalUnreadCount(req.user.userId);
+    this.abuseProtection.assertHttp('unread', req.user.userId, req.ip);
+    return this.messageQueries.getTotalUnreadCount(req.user.userId);
   }
 
   @Get(':id')
@@ -154,23 +192,73 @@ export class ChatGroupsController {
   }
 
   // Messages
+  @Post(':id/messages')
+  @ApiOperation({ summary: 'Gửi tin nhắn văn bản bền vững và chống trùng' })
+  async sendMessage(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: SendChatMessageDto,
+    @Request() req,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    this.abuseProtection.assertHttp('send', req.user.userId, req.ip);
+    const result = await this.messageCommands.sendTextMessage(
+      id,
+      req.user.userId,
+      dto,
+    );
+    response.status(result.httpStatus);
+    const { httpStatus: _httpStatus, ...body } = result;
+    return body;
+  }
+
   @Get(':id/messages')
   @ApiOperation({ summary: 'Lấy lịch sử tin nhắn' })
   @ApiQuery({ name: 'page', required: false })
   @ApiQuery({ name: 'limit', required: false })
   async getMessages(
     @Param('id', ParseUUIDPipe) id: string,
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
-    @Query('limit', new DefaultValuePipe(50), ParseIntPipe) limit: number,
+    @Query() query: LegacyChatPageQueryDto,
     @Request() req,
   ) {
-    return this.chatGroupsService.getGroupMessages(id, req.user.userId, page, limit);
+    this.abuseProtection.assertHttp('history', req.user.userId, req.ip);
+    return this.chatGroupsService.getGroupMessages(
+      id,
+      req.user.userId,
+      query.page,
+      query.limit,
+    );
+  }
+
+  @Get(':id/messages/history')
+  @ApiOperation({ summary: 'Lấy lịch sử tin nhắn bằng sequence cursor' })
+  async getMessageHistory(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: HistoryMessagesQueryDto,
+    @Request() req,
+  ) {
+    this.abuseProtection.assertHttp('history', req.user.userId, req.ip);
+    return this.messageQueries.getHistory(id, req.user.userId, query);
+  }
+
+  @Get(':id/messages/catch-up')
+  @ApiOperation({ summary: 'Lấy các tin nhắn bị lỡ sau sequence' })
+  async catchUpMessages(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: CatchUpMessagesQueryDto,
+    @Request() req,
+  ) {
+    this.abuseProtection.assertHttp('history', req.user.userId, req.ip);
+    return this.messageQueries.getCatchUp(id, req.user.userId, query);
   }
 
   @Patch(':id/read')
   @ApiOperation({ summary: 'Đánh dấu tất cả tin nhắn đã đọc' })
-  async markAsRead(@Param('id', ParseUUIDPipe) id: string, @Request() req) {
-    return this.chatGroupsService.markGroupAsRead(id, req.user.userId);
+  async markAsRead(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: MarkChatGroupReadDto,
+    @Request() req,
+  ) {
+    return this.messageQueries.advanceReadCursor(id, req.user.userId, dto);
   }
 
   // Settings
@@ -197,12 +285,17 @@ export class ChatGroupsController {
   @ApiQuery({ name: 'limit', required: false })
   async getGroupMedia(
     @Param('id', ParseUUIDPipe) id: string,
-    @Query('type') type: string = 'all',
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
-    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
+    @Query() query: LegacyChatMediaQueryDto,
     @Request() req,
   ) {
-    return this.chatGroupsService.getGroupMedia(id, req.user.userId, type, page, limit);
+    this.abuseProtection.assertHttp('media', req.user.userId, req.ip);
+    return this.chatGroupsService.getGroupMedia(
+      id,
+      req.user.userId,
+      query.type,
+      query.page,
+      query.limit,
+    );
   }
 
   @Get(':id/messages/search')
@@ -212,11 +305,21 @@ export class ChatGroupsController {
   @ApiQuery({ name: 'limit', required: false })
   async searchMessages(
     @Param('id', ParseUUIDPipe) id: string,
-    @Query('query') query: string,
-    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
-    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
+    @Query() query: SearchChatMessagesQueryDto,
     @Request() req,
   ) {
-    return this.chatGroupsService.searchMessages(id, req.user.userId, query, page, limit);
+    this.abuseProtection.assertHttp('search', req.user.userId, req.ip);
+    const result = await this.messageQueries.searchMessages(
+      id,
+      req.user.userId,
+      query,
+    );
+    if ('page' in result) {
+      return { ...result, messages: result.data };
+    }
+    return {
+      ...result,
+      messages: result.data,
+    };
   }
 }

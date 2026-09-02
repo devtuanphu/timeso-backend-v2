@@ -124,6 +124,11 @@ import {
 } from './dto/salary-adjustment.dto';
 import { ConfigStatus } from './entities/salary-config.entity';
 import { ShiftChangeRequestStatus } from './entities/shift-change-request.entity';
+import {
+  CreateShiftChangeRequestDto,
+  ListShiftChangeRequestsDto,
+  ReviewShiftChangeRequestDto,
+} from './dto/shift-change-request.dto';
 import { BonusWorkRequestStatus } from './entities/bonus-work-request.entity';
 import {
   AssignAssetDto,
@@ -499,12 +504,12 @@ export class StoresController {
     @Query('storeId') storeId?: string,
     @Query('employeeProfileId') employeeProfileId?: string,
     @Query('status') status?: string,
+    @GetUser() user?: any,
   ) {
-    return this.storesService.getShiftRegistrations({
-      storeId,
-      employeeProfileId,
-      status,
-    });
+    return this.storesService.getShiftRegistrations(
+      { storeId, employeeProfileId, status },
+      user?.userId,
+    );
   }
 
   // KPI Task Management (MUST be above @Get(':id') to avoid route collision)
@@ -588,18 +593,13 @@ export class StoresController {
   @ApiOperation({ summary: 'Gửi yêu cầu đổi ca' })
   @ApiResponse({ status: 201, description: 'Yêu cầu đổi ca đã được gửi' })
   async createShiftChangeRequest(
-    @Body()
-    body: {
-      storeId: string;
-      employeeProfileId: string;
-      currentShiftId?: string;
-      requestedShiftId?: string;
-      requestDate: string;
-      reason?: string;
-      attachments?: string[];
-    },
+    @Body() body: CreateShiftChangeRequestDto,
+    @GetUser() user: any,
   ) {
-    return this.storesService.createShiftChangeRequest(body);
+    return this.storesService.createShiftChangeRequest(
+      body,
+      user?.userId ?? user?.id,
+    );
   }
 
   @Get('shift-change-requests')
@@ -608,19 +608,33 @@ export class StoresController {
   @ApiQuery({ name: 'employeeProfileId', required: false })
   @ApiQuery({ name: 'status', required: false })
   async getShiftChangeRequests(
-    @Query('storeId') storeId?: string,
-    @Query('employeeProfileId') employeeProfileId?: string,
-    @Query('status') status?: string,
+    @Query() query: ListShiftChangeRequestsDto,
+    @GetUser() user?: any,
   ) {
-    if (employeeProfileId) {
+    const accountId = user?.userId ?? user?.id;
+    if (query.employeeProfileId) {
       return this.storesService.getShiftChangeRequestsByEmployee(
-        employeeProfileId,
+        query.employeeProfileId,
+        accountId,
+        query.storeId,
+        {
+          status: query.status,
+          startDate: query.startDate,
+          endDate: query.endDate,
+        },
       );
     }
-    if (storeId) {
+    if (query.storeId) {
       return this.storesService.getShiftChangeRequestsByStore(
-        storeId,
-        status as ShiftChangeRequestStatus | undefined,
+        query.storeId,
+        query.status as ShiftChangeRequestStatus | undefined,
+        accountId,
+        {
+          page: query.page,
+          limit: query.limit,
+          startDate: query.startDate,
+          endDate: query.endDate,
+        },
       );
     }
     return [];
@@ -632,8 +646,10 @@ export class StoresController {
     @Param('id') id: string,
     @GetUser() user: any,
   ) {
-    const profile = await this.storesService.getEmployeeByAccountId(user.id);
-    return this.storesService.approveShiftChangeRequest(id, profile?.id);
+    return this.storesService.approveShiftChangeRequest(
+      id,
+      user?.userId ?? user?.id,
+    );
   }
 
   @Patch('shift-change-requests/:id/reject')
@@ -641,12 +657,11 @@ export class StoresController {
   async rejectShiftChangeRequest(
     @Param('id') id: string,
     @GetUser() user: any,
-    @Body() body: { reason?: string },
+    @Body() body: ReviewShiftChangeRequestDto,
   ) {
-    const profile = await this.storesService.getEmployeeByAccountId(user.id);
     return this.storesService.rejectShiftChangeRequest(
       id,
-      profile?.id,
+      user?.userId ?? user?.id,
       body.reason,
     );
   }
@@ -657,7 +672,8 @@ export class StoresController {
     @Param('id') id: string,
     @GetUser() user: any,
   ) {
-    const profile = await this.storesService.getEmployeeByAccountId(user.id);
+    const accountId = user?.userId ?? user?.id;
+    const profile = await this.storesService.getEmployeeByAccountId(accountId);
     return this.storesService.cancelShiftChangeRequest(id, profile?.id);
   }
 
@@ -811,6 +827,7 @@ export class StoresController {
     @Param('id') id: string,
     @Body() body: any,
     @UploadedFile() file?: Express.Multer.File,
+    @GetUser() user?: any,
   ) {
     const storeData: any = { ...body };
 
@@ -822,7 +839,7 @@ export class StoresController {
     // Remove the avatar field from body to avoid TypeORM errors
     delete storeData.avatar;
 
-    return this.storesService.updateStore(id, storeData);
+    return this.storesService.updateStore(id, storeData, user?.userId);
   }
 
   // Employee Types
@@ -1028,8 +1045,8 @@ export class StoresController {
   // Timekeeping Settings
   @Get(':id/timekeeping-settings')
   @ApiOperation({ summary: 'Lấy cấu hình chấm công' })
-  async getTimekeepingSetting(@Param('id') id: string) {
-    return this.storesService.getTimekeepingSetting(id);
+  async getTimekeepingSetting(@Param('id') id: string, @GetUser() user: any) {
+    return this.storesService.getTimekeepingSetting(id, user.userId);
   }
 
   @Put(':id/timekeeping-settings')
@@ -1037,8 +1054,9 @@ export class StoresController {
   async updateTimekeepingSetting(
     @Param('id') id: string,
     @Body() body: StoreTimekeepingSettingDto,
+    @GetUser() user: any,
   ) {
-    return this.storesService.upsertTimekeepingSetting(id, body);
+    return this.storesService.upsertTimekeepingSetting(id, body, user.userId);
   }
 
   // Shift Config (Ca làm việc)
@@ -1111,6 +1129,7 @@ export class StoresController {
     @Query('isDeleted') isDeleted?: string,
   ) {
     const sanitizedId = id?.split('?')[0];
+    await this.storesService.assertOwnerStoreAccess(sanitizedId, user.userId);
     const isDeletedBool = isDeleted === 'true';
     return this.storesService.getEmployees(
       user.userId,
@@ -1360,7 +1379,11 @@ export class StoresController {
     }
 
     // 2. Thực hiện xóa
-    return this.storesService.deleteEmployee(profileId, body.reasonId);
+    return this.storesService.deleteEmployee(
+      profileId,
+      body.reasonId,
+      user.userId,
+    );
   }
 
   @Delete('employees/:profileId/permanent')
@@ -1492,9 +1515,10 @@ export class StoresController {
   async getEmployeeSchedule(
     @Param('profileId') profileId: string,
     @Query('month') monthString?: string,
+    @GetUser() user?: any,
   ) {
     const month = monthString ? new Date(monthString) : new Date();
-    return this.storesService.getEmployeeScheduleDetails(profileId, month);
+    return this.storesService.getEmployeeScheduleDetails(profileId, month, user?.userId);
   }
 
   @Post('approvals/:requestId')
@@ -1511,17 +1535,8 @@ export class StoresController {
     @Param('requestId') requestId: string,
     @Body() body: ApprovalRequestDto,
   ) {
-    // Resolve the authenticated user's profile from their account ID
-    const accountId = req.user?.userId || req.user?.id;
-    let managerProfileId = 'unknown';
-    if (accountId) {
-      const profile =
-        await this.storesService.getEmployeeByAccountId(accountId);
-      if (profile) managerProfileId = profile.id;
-    }
-
     return this.storesService.processRequest(
-      managerProfileId,
+      req.user?.userId || req.user?.id,
       requestId,
       body.type,
       body.status,
@@ -1878,8 +1893,8 @@ export class StoresController {
     description: 'Thành công',
     type: WorkShiftResponseDto,
   })
-  async createWorkShift(@Param('id') id: string, @Body() body: any) {
-    return this.storesService.createWorkShift(id, body);
+  async createWorkShift(@Param('id') id: string, @Body() body: any, @GetUser() user: any) {
+    return this.storesService.createWorkShift(id, body, user.userId);
   }
 
   @Get(':id/work-shifts')
@@ -1908,8 +1923,9 @@ export class StoresController {
     @Param('storeId') storeId: string,
     @Param('shiftId') shiftId: string,
     @Body() body: any,
+    @GetUser() user: any,
   ) {
-    return this.storesService.updateWorkShift(storeId, shiftId, body);
+    return this.storesService.updateWorkShift(storeId, shiftId, body, user.userId);
   }
 
   // ==================== WORK CYCLE MANAGEMENT ====================
@@ -1920,8 +1936,8 @@ export class StoresController {
     description: 'Mỗi cửa hàng chỉ có 1 chu kỳ active tại 1 thời điểm',
   })
   @ApiResponse({ status: 200, description: 'Chu kỳ đang active hoặc null' })
-  async getActiveCycle(@Param('id') storeId: string) {
-    return this.storesService.getActiveCycle(storeId);
+  async getActiveCycle(@Param('id') storeId: string, @GetUser() user: any) {
+    return this.storesService.getActiveCycle(storeId, user.userId);
   }
 
   @Post(':id/work-cycles')
@@ -1931,15 +1947,15 @@ export class StoresController {
       'Tạo chu kỳ mới. Phải dừng chu kỳ cũ trước khi tạo mới. Hỗ trợ 4 loại: DAILY, WEEKLY, MONTHLY, INDEFINITE',
   })
   @ApiResponse({ status: 201, description: 'Tạo thành công' })
-  async createWorkCycle(@Param('id') storeId: string, @Body() body: any) {
-    return this.storesService.createWorkCycle(storeId, body);
+  async createWorkCycle(@Param('id') storeId: string, @Body() body: any, @GetUser() user: any) {
+    return this.storesService.createWorkCycle(storeId, body, user.userId);
   }
 
   @Get(':id/work-cycles')
   @ApiOperation({ summary: 'Lấy danh sách chu kỳ làm việc' })
   @ApiResponse({ status: 200, description: 'Danh sách chu kỳ' })
-  async getWorkCycles(@Param('id') storeId: string) {
-    return this.storesService.getWorkCycles(storeId);
+  async getWorkCycles(@Param('id') storeId: string, @GetUser() user: any) {
+    return this.storesService.getWorkCycles(storeId, user.userId);
   }
 
   @Get('work-cycles/:cycleId')
@@ -1948,15 +1964,15 @@ export class StoresController {
     status: 200,
     description: 'Chi tiết chu kỳ với slots và assignments',
   })
-  async getWorkCycleById(@Param('cycleId') cycleId: string) {
-    return this.storesService.getWorkCycleById(cycleId);
+  async getWorkCycleById(@Param('cycleId') cycleId: string, @GetUser() user: any) {
+    return this.storesService.getWorkCycleById(cycleId, user.userId);
   }
 
   @Put('work-cycles/:cycleId')
   @ApiOperation({ summary: 'Cập nhật chu kỳ làm việc' })
   @ApiResponse({ status: 200, description: 'Cập nhật thành công' })
-  async updateWorkCycle(@Param('cycleId') cycleId: string, @Body() body: any) {
-    return this.storesService.updateWorkCycle(cycleId, body);
+  async updateWorkCycle(@Param('cycleId') cycleId: string, @Body() body: any, @GetUser() user: any) {
+    return this.storesService.updateWorkCycle(cycleId, body, user.userId);
   }
 
   @Put('work-cycles/:cycleId/stop')
@@ -1969,8 +1985,9 @@ export class StoresController {
   async stopWorkCycle(
     @Param('cycleId') cycleId: string,
     @Body() body: { stopImmediately?: boolean; scheduledStopAt?: string },
+    @GetUser() user: any,
   ) {
-    return this.storesService.stopWorkCycle(cycleId, body);
+    return this.storesService.stopWorkCycle(cycleId, body, user.userId);
   }
 
   @Put('work-cycles/:cycleId/activate')
@@ -1980,8 +1997,8 @@ export class StoresController {
       'Chuyển chu kỳ từ DRAFT sang ACTIVE. Kiểm tra không có chu kỳ khác đang active.',
   })
   @ApiResponse({ status: 200, description: 'Kích hoạt thành công' })
-  async activateWorkCycle(@Param('cycleId') cycleId: string) {
-    return this.storesService.activateWorkCycle(cycleId);
+  async activateWorkCycle(@Param('cycleId') cycleId: string, @GetUser() user: any) {
+    return this.storesService.activateWorkCycle(cycleId, user.userId);
   }
 
   // ==================== SHIFT SLOT MANAGEMENT ====================
@@ -1995,29 +2012,30 @@ export class StoresController {
   async createShiftSlots(
     @Param('cycleId') cycleId: string,
     @Body() body: { slots: any[] },
+    @GetUser() user: any,
   ) {
-    return this.storesService.createShiftSlots(cycleId, body.slots);
+    return this.storesService.createShiftSlots(cycleId, body.slots, user.userId);
   }
 
   @Get('work-cycles/:cycleId/slots')
   @ApiOperation({ summary: 'Lấy danh sách slot ca trong chu kỳ' })
   @ApiResponse({ status: 200, description: 'Danh sách slot' })
-  async getShiftSlots(@Param('cycleId') cycleId: string) {
-    return this.storesService.getShiftSlots(cycleId);
+  async getShiftSlots(@Param('cycleId') cycleId: string, @GetUser() user: any) {
+    return this.storesService.getShiftSlots(cycleId, undefined, user.userId);
   }
 
   @Put('shift-slots/:slotId')
   @ApiOperation({ summary: 'Cập nhật slot ca' })
   @ApiResponse({ status: 200, description: 'Cập nhật thành công' })
-  async updateShiftSlot(@Param('slotId') slotId: string, @Body() body: any) {
-    return this.storesService.updateShiftSlot(slotId, body);
+  async updateShiftSlot(@Param('slotId') slotId: string, @Body() body: any, @GetUser() user: any) {
+    return this.storesService.updateShiftSlot(slotId, body, user.userId);
   }
 
   @Delete('shift-slots/:slotId')
   @ApiOperation({ summary: 'Xóa slot ca' })
   @ApiResponse({ status: 200, description: 'Xóa thành công' })
-  async deleteShiftSlot(@Param('slotId') slotId: string) {
-    return this.storesService.deleteShiftSlot(slotId);
+  async deleteShiftSlot(@Param('slotId') slotId: string, @GetUser() user: any) {
+    return this.storesService.deleteShiftSlot(slotId, user.userId);
   }
 
   // ==================== STORE SHIFT SLOTS (Staff App Calendar) ====================
@@ -2037,15 +2055,17 @@ export class StoresController {
   })
   async getStoreShiftSlots(
     @Param('id') storeId: string,
-    @Query('startDate') startDate?: string,
-    @Query('endDate') endDate?: string,
-    @Query('employeeProfileId') employeeProfileId?: string,
+    @GetUser() user: any,
+    @Query('startDate') startDate: string | undefined,
+    @Query('endDate') endDate: string | undefined,
+    @Query('employeeProfileId') employeeProfileId: string | undefined,
   ) {
     return this.storesService.getStoreShiftSlots(
       storeId,
       startDate,
       endDate,
       employeeProfileId,
+      user.userId,
     );
   }
 
@@ -2061,12 +2081,14 @@ export class StoresController {
     @Param('slotId') slotId: string,
     @Body()
     body: { employeeId: string; note?: string; isOwnerAssign?: boolean },
+    @GetUser() user: any,
   ) {
     return this.storesService.registerToShiftSlot(
       slotId,
       body.employeeId,
       body.note,
       body.isOwnerAssign || false,
+      user.userId,
     );
   }
 
@@ -2087,11 +2109,12 @@ export class StoresController {
     @Param('id') storeId: string,
     @Query('cycleId') cycleId?: string,
     @Query('status') status?: string,
+    @GetUser() user?: any,
   ) {
     console.log(
       `[Controller getShiftAssignments] storeId=${storeId}, cycleId=${cycleId}, status=${status}`,
     );
-    return this.storesService.getShiftAssignments(storeId, { cycleId, status });
+    return this.storesService.getShiftAssignments(storeId, { cycleId, status }, user?.userId);
   }
 
   @Put('shift-assignments/:assignmentId/status')
@@ -2103,11 +2126,13 @@ export class StoresController {
   async updateAssignmentStatus(
     @Param('assignmentId') assignmentId: string,
     @Body() body: { status: string; note?: string },
+    @GetUser() user: any,
   ) {
     return this.storesService.updateAssignmentStatus(
       assignmentId,
       body.status,
       body.note,
+      user.userId,
     );
   }
 
@@ -2119,8 +2144,8 @@ export class StoresController {
     description: 'Nhân viên yêu cầu đổi ca với nhân viên khác',
   })
   @ApiResponse({ status: 201, description: 'Tạo yêu cầu thành công' })
-  async createShiftSwap(@Body() body: any) {
-    return this.storesService.createShiftSwap(body);
+  async createShiftSwap(@Body() body: any, @GetUser() user: any) {
+    return this.storesService.createShiftSwap(body, user.userId);
   }
 
   @Put('shift-swaps/:swapId/status')
@@ -2132,11 +2157,13 @@ export class StoresController {
   async updateShiftSwapStatus(
     @Param('swapId') swapId: string,
     @Body() body: { status: string; note?: string },
+    @GetUser() user: any,
   ) {
     return this.storesService.updateShiftSwapStatus(
       swapId,
       body.status,
       body.note,
+      user.userId,
     );
   }
 
@@ -3892,12 +3919,14 @@ export class StoresController {
     @Query('employeeProfileId') employeeProfileId: string,
     @Query('month') month?: string,
     @Query('filter') filter?: string,
+    @GetUser() user?: any,
   ) {
     return this.storesService.getEmployeeShiftHours(
       storeId,
       employeeProfileId,
       month,
       filter,
+      user?.userId,
     );
   }
 
@@ -3920,17 +3949,23 @@ export class StoresController {
   @Get(':id/leave-requests')
   @ApiOperation({ summary: 'Lấy danh sách đơn xin nghỉ theo cửa hàng' })
   @ApiQuery({ name: 'status', required: false })
+  @ApiQuery({ name: 'from', required: false })
+  @ApiQuery({ name: 'to', required: false })
   async getLeaveRequestsByStore(
     @Param('id') id: string,
     @Query('status') status?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @GetUser() user?: any,
   ) {
-    return this.storesService.getLeaveRequestsByStore(id, status as any);
+    await this.storesService.assertOwnerStoreAccess(id, user?.userId);
+    return this.storesService.getLeaveRequestsByStore(id, status as any, from, to);
   }
 
   @Get('employees/:profileId/leave-requests')
   @ApiOperation({ summary: 'Lấy danh sách đơn xin nghỉ theo nhân viên' })
-  async getLeaveRequestsByEmployee(@Param('profileId') profileId: string) {
-    return this.storesService.getLeaveRequestsByEmployee(profileId);
+  async getLeaveRequestsByEmployee(@Param('profileId') profileId: string, @GetUser() user: any) {
+    return this.storesService.getLeaveRequestsByEmployee(profileId, user.userId);
   }
 
   @Patch('leave-requests/:requestId/cancel')
@@ -4216,11 +4251,11 @@ export class StoresController {
   @Get('approvals/stats')
   @ApiOperation({ summary: 'Lấy thống kê phê duyệt' })
   @ApiQuery({ name: 'storeId', required: true })
-  async getApprovalStats(@Query('storeId') storeId: string) {
+  async getApprovalStats(@Query('storeId') storeId: string, @GetUser() user: any) {
     if (!storeId) {
       throw new BadRequestException('storeId is required');
     }
-    return this.storesService.getApprovalStats(storeId);
+    return this.storesService.getApprovalStats(storeId, user?.userId ?? user?.id);
   }
 
   @Get('shift-registrations')
@@ -4232,12 +4267,12 @@ export class StoresController {
     @Query('storeId') storeId?: string,
     @Query('employeeProfileId') employeeProfileId?: string,
     @Query('status') status?: string,
+    @GetUser() user?: any,
   ) {
-    return this.storesService.getShiftRegistrations({
-      storeId,
-      employeeProfileId,
-      status,
-    });
+    return this.storesService.getShiftRegistrations(
+      { storeId, employeeProfileId, status },
+      user?.userId,
+    );
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
