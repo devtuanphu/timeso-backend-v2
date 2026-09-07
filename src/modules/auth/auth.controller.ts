@@ -11,7 +11,13 @@ import {
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
-import { LoginResponseDto, AuthMessageDto } from './dto/auth-response.dto';
+import {
+  LoginResponseDto,
+  AuthMessageDto,
+  RegisterResponseDto,
+  ResendOtpResponseDto,
+} from './dto/auth-response.dto';
+import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { GetUser } from './decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
@@ -128,7 +134,8 @@ export class AuthController {
   })
   @ApiResponse({
     status: 201,
-    description: 'Đăng ký thành công, vui lòng kiểm tra email để lấy OTP',
+    description: 'Đăng ký thành công, vui lòng kiểm tra Zalo để lấy OTP',
+    type: RegisterResponseDto,
   })
   async register(@Body() registerDto: RegisterDto) {
     return this.authService.register({
@@ -164,12 +171,13 @@ export class AuthController {
       required: ['phone', 'otp'],
     },
   })
-  async verifyOtp(
-    @Body('phone') phone: string,
-    @Body('otp') otp: string,
-    @Body('type') type: 'register' | 'forgot-password' = 'register',
-  ) {
-    return this.authService.verifyOtp(phone, otp, type);
+  async verifyOtp(@Body() body: VerifyOtpDto) {
+    return this.authService.verifyOtp(
+      body.phone,
+      body.otp,
+      body.type,
+      body.appType,
+    );
   }
 
   @Post('resend-otp')
@@ -181,7 +189,7 @@ export class AuthController {
   @ApiResponse({
     status: 200,
     description: 'Đã gửi lại mã OTP',
-    type: AuthMessageDto,
+    type: ResendOtpResponseDto,
   })
   async resendOtp(
     @Body('phone') phone: string,

@@ -4,8 +4,9 @@ import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { ChatSingleInstanceRuntimeGuardService } from './modules/chat-groups/chat-single-instance-runtime-guard.service';
 import { ChatRealtimeCoordinatorService } from './modules/chat-groups/chat-realtime-coordinator.service';
-import { CHAT_FATAL_SHUTDOWN_MS } from './modules/chat-groups/chat-realtime.config';
 import { configureRequestBodyParsers } from './request-body-parsers';
+import { listenWithChatRuntime } from './app-listen';
+import { isLocalApiOnly } from './app-runtime.config';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -38,26 +39,15 @@ async function bootstrap() {
   await app.init();
   const chatGuard = app.get(ChatSingleInstanceRuntimeGuardService);
   const chatCoordinator = app.get(ChatRealtimeCoordinatorService);
-  try {
-    await chatGuard.acquireBeforeListen();
-    await app.listen(process.env.PORT ?? 3000);
-  } catch (error) {
-    await chatGuard.release();
-    await app.close();
-    throw error;
-  }
-  chatCoordinator.activateAfterListen();
-  chatGuard.startHealthMonitor(async () => {
-    chatCoordinator.deactivate();
-    process.exitCode = 1;
-    const forcedExit = setTimeout(() => process.exit(1), CHAT_FATAL_SHUTDOWN_MS);
-    forcedExit.unref?.();
-    await app.close();
-  });
+  await listenWithChatRuntime(app, chatGuard, chatCoordinator);
   const url = await app.getUrl();
   console.log(`Application is running on: ${url}`);
   console.log(`Swagger documentation: ${url}/api/docs`);
-  console.log('Socket.io chat namespaces initialized');
+  console.log(
+    isLocalApiOnly()
+      ? 'Local API-only mode: chat, scheduled tasks and Bull workers disabled; request-driven Zalo OTP enabled'
+      : 'Socket.io chat namespaces initialized',
+  );
 }
 bootstrap().catch((error) => {
   const code =

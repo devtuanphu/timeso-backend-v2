@@ -1,6 +1,8 @@
 import { DistributedLockService } from './distributed-lock.service';
+import * as runtime from '../../app-runtime.config';
 
 describe('DistributedLockService read-only startup', () => {
+  afterEach(() => jest.restoreAllMocks());
   const repository = { create: jest.fn() };
   const dataSource = { query: jest.fn() };
 
@@ -33,5 +35,16 @@ describe('DistributedLockService read-only startup', () => {
     expect(dataSource.query).toHaveBeenCalledWith(
       expect.stringContaining('CREATE TABLE IF NOT EXISTS cron_locks'),
     );
+  });
+
+  it('does not create tables at local API-only startup', async () => {
+    jest.spyOn(runtime, 'isLocalApiOnly').mockReturnValue(true);
+    const service = new DistributedLockService(
+      repository as never,
+      dataSource as never,
+      { get: jest.fn() } as never,
+    );
+    await service.onModuleInit();
+    expect(dataSource.query).not.toHaveBeenCalled();
   });
 });

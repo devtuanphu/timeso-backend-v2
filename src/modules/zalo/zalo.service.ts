@@ -7,6 +7,7 @@ import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { ZaloToken } from './entities/zalo-token.entity';
+import { isLocalApiOnly } from '../../app-runtime.config';
 
 /**
  * ===========================================
@@ -68,7 +69,7 @@ export class ZaloService implements OnModuleInit {
   // ═══════════════════════════════════════════════════════════
 
   async onModuleInit() {
-    if (isAppReadOnlyMode(this.configService)) return;
+    if (isAppReadOnlyMode(this.configService) || isLocalApiOnly()) return;
 
     const token = await this.findLatestToken();
 

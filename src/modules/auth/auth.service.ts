@@ -1,14 +1,20 @@
-import { Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { AccountsService } from '../accounts/accounts.service';
 import * as bcrypt from 'bcrypt';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { AccountRefreshToken, AppType } from '../accounts/entities/account-refresh-token.entity';
-import { Repository, MoreThan, IsNull } from 'typeorm';
+import { DataSource, EntityManager, IsNull, MoreThan, Repository } from 'typeorm';
+import { randomInt } from 'crypto';
 import { MailService } from '../mail/mail.service';
 import { AccountOtp } from '../accounts/entities/account-otp.entity';
-import { AccountStatus } from '../accounts/entities/account.entity';
+import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import { ZaloService } from '../zalo/zalo.service';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
 import { StoresService } from '../stores/stores.service';
@@ -20,6 +26,11 @@ import {
   requireJwtRefreshSecret,
   type TimesoJwtPayload,
 } from './jwt.config';
+import {
+  normalizeEmail,
+  normalizeVietnamPhone,
+} from '../../common/utils/account-identifier';
+import { OtpDeliveryStatus } from './dto/auth-response.dto';
 
 @Injectable()
 export class AuthService {
@@ -36,12 +47,71 @@ export class AuthService {
     private readonly mailService: MailService,
     private readonly zaloService: ZaloService,
     private readonly storesService: StoresService,
+    private readonly dataSource: DataSource,
   ) {}
+
+  private generateOtp(): string {
+    return randomInt(100000, 1000000).toString();
+  }
+
+  private invalidOtp(): UnauthorizedException {
+    return new UnauthorizedException({
+      code: 'INVALID_OR_EXPIRED_OTP',
+      message: 'Mã OTP không chính xác hoặc đã hết hạn.',
+    });
+  }
+
+  private async lockRegistrationIdentifiers(
+    manager: EntityManager,
+    email: string | undefined,
+    phone: string,
+  ): Promise<void> {
+    const keys = [
+      email ? `account-identifier:email:${email}` : undefined,
+      `account-identifier:phone:${phone}`,
+    ]
+      .filter((value): value is string => Boolean(value))
+      .sort();
+    for (const key of keys) {
+      await manager.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [key],
+      );
+    }
+  }
+
+  private async deliverOtp(
+    phone: string,
+    otp: string,
+    type: 'register' | 'forgot-password',
+  ): Promise<OtpDeliveryStatus> {
+    try {
+      await this.zaloService.sendOtp(phone, otp, type);
+      return OtpDeliveryStatus.SENT;
+    } catch {
+      this.loggerDeliveryFailure(type);
+      return OtpDeliveryStatus.FAILED;
+    }
+  }
+
+  private loggerDeliveryFailure(type: string): void {
+    // Intentionally omit the phone, OTP and provider payload.
+    console.warn(`OTP delivery failed for flow=${type}`);
+  }
 
   /**
    * Validate user by email OR phone + password
    */
   async validateUser(emailOrPhone: string, pass: string): Promise<any> {
+    if (typeof emailOrPhone !== 'string' || typeof pass !== 'string') {
+      return null;
+    }
+    try {
+      if (emailOrPhone.includes('@')) normalizeEmail(emailOrPhone);
+      else normalizeVietnamPhone(emailOrPhone);
+    } catch {
+      return null;
+    }
     const user = await this.accountsService.findByEmailOrPhone(emailOrPhone);
     if (user && (await bcrypt.compare(pass, user.passwordHash))) {
       const { passwordHash, ...result } = user;
@@ -143,135 +213,193 @@ export class AuthService {
   }
 
   async register(data: any) {
+    let phone: string;
+    let email: string | undefined;
     try {
-      const user = await this.accountsService.create(data);
-      
-      // Invalidate any existing OTPs for SAFETY (though unlikely for new user, prevents edge cases)
-      await this.otpRepository.update(
-        { accountId: user.id, type: 'REGISTER', isUsed: false },
-        { isUsed: true }
-      );
-
-      // Generate 6-digit OTP
-      const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-      const otpEntity = this.otpRepository.create({
-        accountId: user.id,
-        otp: otpCode,
-        type: 'REGISTER',
-        expiresAt,
+      phone = normalizeVietnamPhone(data.phone);
+      email = data.email ? normalizeEmail(data.email) : undefined;
+    } catch {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Số điện thoại không hợp lệ.',
       });
-      await this.otpRepository.save(otpEntity);
-
-      // Send OTP via Zalo ZNS (thay vì email)
-      try {
-        await this.zaloService.sendOtp(data.phone, otpCode, 'register');
-        return {
-          message: 'Đăng ký thành công. Vui lòng kiểm tra Zalo để nhận mã xác thực.',
-          phone: data.phone,
-        };
-      } catch (error) {
-        console.error('Failed to send ZNS:', error);
-        // Fallback: gửi email nếu ZNS fail
-        // await this.mailService.sendVerificationCode(user.email, user.fullName, otpCode);
-        return {
-          message: 'Đăng ký thành công, nhưng không thể gửi OTP qua Zalo. Vui lòng thử lại.',
-          phone: data.phone,
-        };
-      }
-    } catch (error) {
-      console.error('🔴 Register error details:', error?.message || error);
-      if (error.status === 409) {
-        throw error;
-      }
-      throw new UnauthorizedException('Không thể đăng ký tài khoản. Vui lòng thử lại.');
     }
+
+    const otpCode = this.generateOtp();
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        await this.lockRegistrationIdentifiers(manager, email, phone);
+        const user = await this.accountsService.create(
+          { ...data, phone, email },
+          manager,
+        );
+        const otpRepository = manager.getRepository(AccountOtp);
+        await otpRepository.update(
+          { accountId: user.id, type: 'REGISTER', isUsed: false },
+          { isUsed: true },
+        );
+        await otpRepository.save(
+          otpRepository.create({
+            accountId: user.id,
+            otp: otpCode,
+            type: 'REGISTER',
+            expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+          }),
+        );
+      });
+    } catch (error: any) {
+      if (error instanceof ConflictException || error?.code === '23505') {
+        throw new ConflictException({
+          code: 'ACCOUNT_ALREADY_EXISTS',
+          message: 'Email hoặc số điện thoại đã được sử dụng.',
+        });
+      }
+      throw error;
+    }
+
+    const otpDelivery = await this.deliverOtp(phone, otpCode, 'register');
+    return {
+      message:
+        otpDelivery === OtpDeliveryStatus.SENT
+          ? 'Đăng ký thành công. Vui lòng kiểm tra Zalo để nhận mã xác thực.'
+          : 'Đăng ký thành công, nhưng chưa gửi được OTP qua Zalo. Vui lòng gửi lại mã.',
+      phone,
+      verificationRequired: true as const,
+      otpDelivery,
+    };
   }
 
-  async verifyOtp(phone: string, otp: string , type: 'register' | 'forgot-password' = 'register') {
-    const user = await this.accountsService.findByPhone(phone);
-    if (!user) {
-      throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
+  async verifyOtp(
+    phone: string,
+    otp: string,
+    type: 'register' | 'forgot-password' = 'register',
+    appType: AppType = AppType.OWNER_APP,
+  ) {
+    const formattedType = type === 'register' ? 'REGISTER' : 'FORGOT_PASSWORD';
+    let normalizedPhone: string;
+    try {
+      normalizedPhone = normalizeVietnamPhone(phone);
+    } catch {
+      throw this.invalidOtp();
     }
 
-    const formattedType = type === 'register' ? 'REGISTER' : 'FORGOT_PASSWORD';
-    const otpRecord = await this.otpRepository.findOne({
-      where: {
-        accountId: user.id,
-        otp,
-        type: formattedType,
-        isUsed: false,
-        expiresAt: MoreThan(new Date()),
-      },
-      order: { createdAt: 'DESC' }, // Prefer the newest one
+    const activatedAccount = await this.dataSource.transaction(async (manager) => {
+      const user = await this.accountsService.findByPhone(
+        normalizedPhone,
+        manager,
+        true,
+      );
+      if (!user) throw this.invalidOtp();
+      if (
+        formattedType === 'REGISTER' &&
+        user.status !== AccountStatus.UNVERIFIED
+      ) {
+        throw this.invalidOtp();
+      }
+
+      const otpRecord = await manager
+        .getRepository(AccountOtp)
+        .createQueryBuilder('accountOtp')
+        .where('accountOtp.accountId = :accountId', { accountId: user.id })
+        .andWhere('accountOtp.type = :type', { type: formattedType })
+        .andWhere('accountOtp.isUsed = false')
+        .orderBy('accountOtp.createdAt', 'DESC')
+        .addOrderBy('accountOtp.id', 'DESC')
+        .getOne();
+
+      if (
+        !otpRecord ||
+        otpRecord.otp !== otp ||
+        otpRecord.expiresAt.getTime() <= Date.now()
+      ) {
+        throw this.invalidOtp();
+      }
+
+      otpRecord.isUsed = true;
+      await manager.save(AccountOtp, otpRecord);
+
+      if (formattedType === 'REGISTER') {
+        await manager.update(
+          AccountOtp,
+          { accountId: user.id, type: 'REGISTER', isUsed: false },
+          { isUsed: true },
+        );
+        user.status = AccountStatus.ACTIVE;
+        return manager.save(Account, user);
+      }
+      return null;
     });
 
-    if (!otpRecord) {
-      throw new UnauthorizedException('Mã OTP không chính xác hoặc đã hết hạn.');
-    }
-
-    // Đánh dấu mã đã dùng
-    otpRecord.isUsed = true;
-    await this.otpRepository.save(otpRecord);
-
-    // Kích hoạt tài khoản (nếu đang ở luồng đăng ký và tài khoản chưa kích hoạt)
-    if (formattedType === 'REGISTER' && user.status === AccountStatus.UNVERIFIED) {
-        user.status = AccountStatus.ACTIVE;
-        await this.accountsService.update(user.id, { status: AccountStatus.ACTIVE });
-        return this.login(user); // Đăng ký xong thì login luôn cho tiện
-    }
-
+    if (activatedAccount) return this.login(activatedAccount, appType);
     return {
-      message: "Xác thực thành công. Bây giờ bạn có thể đặt lại mật khẩu mới."
-    }
+      message: 'Xác thực thành công. Bây giờ bạn có thể đặt lại mật khẩu mới.',
+    };
   }
 
   async resendOtp(phone: string, type: 'register' | 'forgot-password' = 'register') {
-    const user = await this.accountsService.findByPhone(phone);
-    if (!user) {
+    let normalizedPhone: string;
+    try {
+      normalizedPhone = normalizeVietnamPhone(phone);
+    } catch {
       throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
     }
-
-    if (type === 'register' && user.status === AccountStatus.ACTIVE) {
-      return { message: 'Tài khoản đã được xác thực trước đó.' };
-    }
-
-    // Vô hiệu hóa các OTP cũ của loại này
-    await this.otpRepository.update(
-      { accountId: user.id, type: type === 'register' ? 'REGISTER' : 'FORGOT_PASSWORD', isUsed: false },
-      { isUsed: true }
-    );
-
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-
-    const otpEntity = this.otpRepository.create({
-      accountId: user.id,
-      otp: otpCode,
-      expiresAt,
-      type: type === 'register' ? 'REGISTER' : 'FORGOT_PASSWORD',
+    const formattedType =
+      type === 'register' ? 'REGISTER' : 'FORGOT_PASSWORD';
+    const otpCode = this.generateOtp();
+    const canonicalPhone = await this.dataSource.transaction(async (manager) => {
+      const user = await this.accountsService.findByPhone(
+        normalizedPhone,
+        manager,
+        true,
+      );
+      if (!user) {
+        throw new UnauthorizedException(
+          'Không tìm thấy tài khoản với số điện thoại này.',
+        );
+      }
+      if (type === 'register' && user.status !== AccountStatus.UNVERIFIED) {
+        throw new UnauthorizedException(
+          'Không thể gửi mã xác thực cho tài khoản này.',
+        );
+      }
+      const repository = manager.getRepository(AccountOtp);
+      await repository.update(
+        { accountId: user.id, type: formattedType, isUsed: false },
+        { isUsed: true },
+      );
+      await repository.save(
+        repository.create({
+          accountId: user.id,
+          otp: otpCode,
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+          type: formattedType,
+        }),
+      );
+      return { phone: user.phone };
     });
-    await this.otpRepository.save(otpEntity);
-
-    try {
-      // Gửi OTP qua Zalo ZNS
-      await this.zaloService.sendOtp(user.phone, otpCode, type);
-      return { message: 'Mã OTP mới đã được gửi qua Zalo.', phone: user.phone };
-    } catch (error) {
-      console.error('Failed to send ZNS:', error);
-      // Fallback: gửi email nếu ZNS fail
-      // if (type === 'register') {
-      //   await this.mailService.sendVerificationCode(user.email, user.fullName, otpCode);
-      // } else {
-      //   await this.mailService.sendPasswordResetOtp(user.email, user.fullName, otpCode);
-      // }
-      return { message: 'Lỗi gửi OTP qua Zalo. Vui lòng thử lại.', phone: user.phone };
-    }
+    const otpDelivery = await this.deliverOtp(
+      canonicalPhone.phone,
+      otpCode,
+      type,
+    );
+    return {
+      message:
+        otpDelivery === OtpDeliveryStatus.SENT
+          ? 'Mã OTP mới đã được gửi qua Zalo.'
+          : 'Chưa gửi được OTP qua Zalo. Vui lòng thử lại.',
+      phone: canonicalPhone.phone,
+      otpDelivery,
+    };
   }
 
   async forgotPassword(phone: string) {
-    const user = await this.accountsService.findByPhone(phone);
+    let normalizedPhone: string;
+    try {
+      normalizedPhone = normalizeVietnamPhone(phone);
+    } catch {
+      throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
+    }
+    const user = await this.accountsService.findByPhone(normalizedPhone);
     if (!user) throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
 
     // Vô hiệu hóa các OTP cũ cho luồng quên mật khẩu
@@ -304,7 +432,19 @@ export class AuthService {
   }
 
   async resetPassword(phone: string, newPassword: string) {
-    const user = await this.accountsService.findByPhone(phone);
+    if (typeof newPassword !== 'string' || !newPassword) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Mật khẩu mới không hợp lệ.',
+      });
+    }
+    let normalizedPhone: string;
+    try {
+      normalizedPhone = normalizeVietnamPhone(phone);
+    } catch {
+      throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
+    }
+    const user = await this.accountsService.findByPhone(normalizedPhone);
     if (!user) throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
 
     // KIỂM TRA BẢO MẬT: Phải có ít nhất 1 OTP "FORGOT_PASSWORD" đã được verify (isUsed=true)

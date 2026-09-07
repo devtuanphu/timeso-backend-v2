@@ -16,10 +16,11 @@ import { ServeStaticModule } from '@nestjs/serve-static';
 import { BullModule } from '@nestjs/bullmq';
 import { join } from 'path';
 import { createAppTypeOrmOptions } from './app-database.config';
+import { getAppBullExtraOptions, getAppScheduleOptions } from './app-runtime.config';
 
 @Module({
   imports: [
-    ScheduleModule.forRoot(),
+    ScheduleModule.forRoot(getAppScheduleOptions()),
     ServeStaticModule.forRoot({
       rootPath: join(process.cwd(), 'uploads'),
       serveRoot: '/uploads',
@@ -33,6 +34,7 @@ import { createAppTypeOrmOptions } from './app-database.config';
       useFactory: createAppTypeOrmOptions,
     }),
     BullModule.forRootAsync({
+      extraOptions: getAppBullExtraOptions(),
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: async (configService: ConfigService) => ({

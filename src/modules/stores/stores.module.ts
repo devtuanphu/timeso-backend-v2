@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { getAppScheduleOptions } from '../../app-runtime.config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
@@ -177,7 +178,7 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     AccountsModule,
     MailModule,
     NotificationsModule,
-    ScheduleModule.forRoot(),
+    ScheduleModule.forRoot(getAppScheduleOptions()),
     BullModule.registerQueue({
       name: 'shift-reminders',
     }),

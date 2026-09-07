@@ -36,6 +36,12 @@ import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
 import { CreateManualEmployeeDto } from './dto/create-manual-employee.dto';
+import { StoreDiscoveryQueryDto } from './dto/store-discovery.dto';
+import {
+  AddExistingEmployeeDto,
+  ExistingEmployeeCandidateQueryDto,
+  LinkExistingEmployeeDto,
+} from './dto/add-existing-employee.dto';
 import { CreateStoreDto } from './dto/create-store.dto';
 import { CreateProductDto } from './dto/inventory.dto';
 import { CreateAssetDto } from './dto/create-asset.dto';
@@ -224,6 +230,15 @@ export class StoresController {
   })
   async findAll(@GetUser() user: any) {
     return this.storesService.findAllByOwner(user.userId);
+  }
+
+  @Get('discovery')
+  @ApiOperation({ summary: 'Tìm cửa hàng cho tài khoản nhân viên chưa được gán' })
+  async discoverStores(
+    @GetUser() user: any,
+    @Query() query: StoreDiscoveryQueryDto,
+  ) {
+    return this.storesService.discoverStores(user.userId, query);
   }
 
   @Get('monthly-salary-fund')
@@ -1092,6 +1107,30 @@ export class StoresController {
   }
 
   // Employees
+  @Get(':id/employee-account-candidate')
+  @ApiOperation({ summary: 'Tìm tài khoản nhân viên có thể thêm vào cửa hàng' })
+  async findExistingEmployeeCandidate(
+    @GetUser() user: any,
+    @Param('id') id: string,
+    @Query() query: ExistingEmployeeCandidateQueryDto,
+  ) {
+    return this.storesService.findExistingEmployeeCandidate(
+      id,
+      user.userId,
+      query.phone,
+    );
+  }
+
+  @Post(':id/employees/from-account')
+  @ApiOperation({ summary: 'Thêm nhân viên từ tài khoản đã đăng ký' })
+  async addEmployeeFromAccount(
+    @GetUser() user: any,
+    @Param('id') id: string,
+    @Body() body: AddExistingEmployeeDto,
+  ) {
+    return this.storesService.addEmployeeFromAccount(id, user.userId, body);
+  }
+
   @Post(':id/employees')
   @ApiOperation({
     summary: 'Thêm nhân viên vào cửa hàng',
@@ -1103,11 +1142,16 @@ export class StoresController {
     type: EmployeeProfileResponseDto,
   })
   async addEmployee(
+    @GetUser() user: any,
     @Param('id') id: string,
-    @Body('accountId') accountId: string,
-    @Body() body: any,
+    @Body() body: LinkExistingEmployeeDto,
   ) {
-    return this.storesService.addEmployee(id, accountId, body);
+    return this.storesService.addEmployee(
+      id,
+      body.accountId,
+      body,
+      user.userId,
+    );
   }
 
   @Get(':id/employees')
@@ -1163,6 +1207,7 @@ export class StoresController {
     type: EmployeeProfileResponseDto,
   })
   async createManualEmployee(
+    @GetUser() user: any,
     @Body() dto: CreateManualEmployeeDto,
     @UploadedFiles()
     files: {
@@ -1219,6 +1264,7 @@ export class StoresController {
       mergedDto,
       this.accountsService,
       this.mailService,
+      user.userId,
     );
   }
 
@@ -1425,8 +1471,11 @@ export class StoresController {
     status: 200,
     description: 'Nhân viên đã được khôi phục thành công',
   })
-  async restoreEmployee(@Param('profileId') profileId: string) {
-    return this.storesService.restoreEmployee(profileId);
+  async restoreEmployee(
+    @GetUser() user: any,
+    @Param('profileId') profileId: string,
+  ) {
+    return this.storesService.restoreEmployee(profileId, user.userId);
   }
 
   @Get('employees/:profileId/performance')

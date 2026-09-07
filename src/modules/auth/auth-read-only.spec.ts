@@ -54,6 +54,7 @@ const createService = (
     {} as any,
     {} as any,
     storesService as any,
+    {} as any,
   );
 
   return { service, jwtService, refreshTokenRepository, storesService };

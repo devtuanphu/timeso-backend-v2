@@ -226,7 +226,7 @@ import {
   CreatePetCareItemDto,
 } from './dto/order-management.dto';
 
-import { AccountStatus } from '../accounts/entities/account.entity';
+import { Account, AccountStatus } from '../accounts/entities/account.entity';
 
 import {
   AccountIdentityDocument,
@@ -238,6 +238,19 @@ import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
 import * as ExcelJS from 'exceljs';
+import { randomBytes } from 'crypto';
+import {
+  legacyNormalizedPhoneSql,
+  normalizeVietnamPhone,
+} from '../../common/utils/account-identifier';
+import {
+  AddExistingEmployeeDto,
+  EmployeeWorkAssignmentDto,
+} from './dto/add-existing-employee.dto';
+import {
+  StoreDiscoveryPageDto,
+  StoreDiscoveryQueryDto,
+} from './dto/store-discovery.dto';
 
 type ShiftEmployeeAvailability =
   | 'AVAILABLE'
@@ -251,6 +264,25 @@ type ShiftInterval = {
 };
 
 const MAX_GENERATED_SHIFT_ASSIGNMENTS = 10000;
+
+const VIETNAMESE_SEARCH_FROM =
+  'áàảãạăắằẳẵặâấầẩẫậéèẻẽẹêếềểễệíìỉĩịóòỏõọôốồổỗộơớờởỡợúùủũụưứừửữựýỳỷỹỵđ';
+const VIETNAMESE_SEARCH_TO =
+  `${'a'.repeat(17)}${'e'.repeat(11)}${'i'.repeat(5)}${'o'.repeat(17)}${'u'.repeat(11)}${'y'.repeat(5)}d`;
+
+export const normalizeStoreSearchText = (value: string): string =>
+  value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'd')
+    .toLocaleLowerCase('vi-VN')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+const escapeLikeToken = (value: string): string =>
+  value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 // Bound the persisted slot fan-out independently from assignments. The DTO
 // currently allows at most 50 drafts, so 10,000 keeps normal long schedules
 // available while preventing an unbounded transaction when no employees are set.
@@ -1032,6 +1064,127 @@ export class StoresService {
     return this.storeRepository.findOne({ where: { id } });
   }
 
+  async discoverStores(
+    accountId: string,
+    query: StoreDiscoveryQueryDto,
+  ): Promise<StoreDiscoveryPageDto> {
+    const account = await this.accountsService.findById(accountId);
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new ForbiddenException({
+        code: 'STORE_DISCOVERY_NOT_AVAILABLE',
+        message: 'Tìm kiếm cửa hàng không khả dụng cho tài khoản này.',
+      });
+    }
+    const activeMembership = await this.profileRepository
+      .createQueryBuilder('profile')
+      .where('profile.accountId = :accountId', { accountId })
+      .andWhere('profile.employmentStatus != :terminated', {
+        terminated: EmploymentStatus.TERMINATED,
+      })
+      .getExists();
+    if (activeMembership) {
+      throw new ForbiddenException({
+        code: 'STORE_DISCOVERY_NOT_AVAILABLE',
+        message: 'Tài khoản đã trực thuộc cửa hàng.',
+      });
+    }
+
+    const normalizedQuery = normalizeStoreSearchText(query.q);
+    const tokens = normalizedQuery.split(' ').filter(Boolean).slice(0, 20);
+    if (!tokens.length) {
+      throw new BadRequestException({
+        code: 'VALIDATION_ERROR',
+        message: 'Từ khóa tìm kiếm không hợp lệ.',
+      });
+    }
+    const expression = `trim(regexp_replace(translate(lower(concat_ws(' ', "store"."name", "store"."address_line", "store"."ward", "store"."city")), '${VIETNAMESE_SEARCH_FROM}', '${VIETNAMESE_SEARCH_TO}'), '[^a-z0-9]+', ' ', 'g'))`;
+    const builder = this.storeRepository
+      .createQueryBuilder('store')
+      .select('store.id', 'id')
+      .addSelect('store.name', 'name')
+      .addSelect('store.avatarUrl', 'avatarUrl')
+      .addSelect('store.addressLine', 'addressLine')
+      .addSelect('store.ward', 'ward')
+      .addSelect('store.city', 'city')
+      .where('store.status = :status', { status: StoreStatus.ACTIVE })
+      .andWhere('"store"."deleted_at" IS NULL');
+    tokens.forEach((token, index) => {
+      builder.andWhere(`${expression} LIKE :token${index} ESCAPE E'\\\\'`, {
+        [`token${index}`]: `%${escapeLikeToken(token)}%`,
+      });
+    });
+    const offset = (query.page - 1) * query.limit;
+    const rows = await builder
+      .orderBy(
+        `translate(lower("store"."name"), '${VIETNAMESE_SEARCH_FROM}', '${VIETNAMESE_SEARCH_TO}')`,
+        'ASC',
+      )
+      .addOrderBy('store.id', 'ASC')
+      .offset(offset)
+      .limit(query.limit + 1)
+      .getRawMany<{
+        id: string;
+        name: string;
+        avatarUrl: string | null;
+        addressLine: string | null;
+        ward: string | null;
+        city: string | null;
+      }>();
+    return {
+      items: rows.slice(0, query.limit).map((row) => ({
+        id: row.id,
+        name: row.name,
+        displayAddress:
+          [row.addressLine, row.ward, row.city].filter(Boolean).join(', ') ||
+          'Chưa cập nhật địa chỉ',
+        avatarUrl: row.avatarUrl || null,
+      })),
+      page: query.page,
+      limit: query.limit,
+      hasMore: rows.length > query.limit,
+    };
+  }
+
+  async findExistingEmployeeCandidate(
+    storeId: string,
+    ownerAccountId: string,
+    phone: string,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    let account: Account | null;
+    try {
+      account = await this.accountsService.findByPhone(phone);
+    } catch {
+      return { eligible: false as const };
+    }
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      return { eligible: false as const };
+    }
+    const profiles = await this.profileRepository
+      .createQueryBuilder('profile')
+      .withDeleted()
+      .where('profile.accountId = :accountId', { accountId: account.id })
+      .getMany();
+    const hasTargetHistory = profiles.some(
+      (profile) => profile.storeId === storeId,
+    );
+    const isAssigned = profiles.some(
+      (profile) => profile.employmentStatus !== EmploymentStatus.TERMINATED,
+    );
+    if (hasTargetHistory || isAssigned) {
+      return { eligible: false as const };
+    }
+    return {
+      eligible: true as const,
+      account: {
+        id: account.id,
+        fullName: account.fullName || null,
+        avatar: account.avatar || null,
+        phone: normalizeVietnamPhone(account.phone),
+      },
+    };
+  }
+
   async assertOwnerStoreAccess(storeId: string, ownerAccountId: string) {
     const store = await this.storeRepository.findOne({
       where: { id: storeId },
@@ -1783,30 +1936,238 @@ export class StoresService {
   // Role management is handled later in the file
 
   // Employee Profile management
-  async addEmployee(storeId: string, accountId: string, data: any) {
-    // Check probation settings
-    const probationSetting = await this.probationSettingRepository.findOne({
+  async addEmployee(
+    storeId: string,
+    accountId: string,
+    data: EmployeeWorkAssignmentDto,
+    ownerAccountId: string,
+  ) {
+    return this.attachExistingEmployee(
+      storeId,
+      ownerAccountId,
+      data,
+      { accountId },
+    );
+  }
+
+  async addEmployeeFromAccount(
+    storeId: string,
+    ownerAccountId: string,
+    data: AddExistingEmployeeDto,
+  ) {
+    return this.attachExistingEmployee(storeId, ownerAccountId, data, {
+      phone: data.phone,
+    });
+  }
+
+  private employeeAttachConflict(code = 'EMPLOYEE_ACCOUNT_NOT_ELIGIBLE') {
+    return new ConflictException({
+      code,
+      message:
+        code === 'EMPLOYEE_REHIRE_REQUIRES_RESTORE'
+          ? 'Tài khoản đã có lịch sử tại cửa hàng. Vui lòng dùng chức năng khôi phục nhân viên.'
+          : 'Tài khoản không còn đủ điều kiện để thêm vào cửa hàng.',
+    });
+  }
+
+  private async attachExistingEmployee(
+    storeId: string,
+    ownerAccountId: string,
+    data: EmployeeWorkAssignmentDto,
+    lookup: { accountId?: string; phone?: string },
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const profileId = await this.dataSource.transaction(async (manager) => {
+      const store = await manager.findOne(Store, {
+        where: { id: storeId, ownerAccountId },
+      });
+      if (!store) {
+        throw new ForbiddenException({
+          code: 'STORE_ACCESS_DENIED',
+          message: 'Bạn không có quyền truy cập cửa hàng này.',
+        });
+      }
+      let account: Account | null = null;
+      if (lookup.accountId) {
+        account = await manager.findOne(Account, {
+          where: { id: lookup.accountId },
+          lock: { mode: 'pessimistic_write' },
+        });
+      } else if (lookup.phone) {
+        try {
+          account = await this.accountsService.findByPhone(
+            lookup.phone,
+            manager,
+            true,
+          );
+        } catch {
+          account = null;
+        }
+      }
+      if (!account || account.status !== AccountStatus.ACTIVE) {
+        throw this.employeeAttachConflict();
+      }
+      const profiles = await manager
+        .getRepository(EmployeeProfile)
+        .createQueryBuilder('profile')
+        .withDeleted()
+        .where('profile.accountId = :accountId', { accountId: account.id })
+        .getMany();
+      if (profiles.some((profile) => profile.storeId === storeId)) {
+        throw this.employeeAttachConflict('EMPLOYEE_REHIRE_REQUIRES_RESTORE');
+      }
+      if (
+        profiles.some(
+          (profile) =>
+            profile.employmentStatus !== EmploymentStatus.TERMINATED,
+        )
+      ) {
+        throw this.employeeAttachConflict();
+      }
+      const profile = await this.initializeEmployeeProfile(
+        manager,
+        storeId,
+        account.id,
+        data,
+      );
+      return profile.id;
+    });
+    return this.getEmployeeById(profileId);
+  }
+
+  private invalidStoreReference(): BadRequestException {
+    return new BadRequestException({
+      code: 'INVALID_STORE_REFERENCE',
+      message: 'Thông tin công việc không thuộc cửa hàng đã chọn.',
+    });
+  }
+
+  private async assertEmployeeReferences(
+    manager: EntityManager,
+    storeId: string,
+    data: EmployeeWorkAssignmentDto,
+  ): Promise<void> {
+    const checks: Array<[string | undefined, any]> = [
+      [data.storeRoleId, StoreRole],
+      [data.employeeTypeId, StoreEmployeeType],
+      [data.workShiftId, WorkShift],
+      [data.skillId, StoreSkill],
+    ];
+    for (const [id, entity] of checks) {
+      if (!id) continue;
+      const exists = await manager.exists(entity, { where: { id, storeId } });
+      if (!exists) throw this.invalidStoreReference();
+    }
+  }
+
+  private async initializeEmployeeProfile(
+    manager: EntityManager,
+    storeId: string,
+    accountId: string,
+    data: EmployeeWorkAssignmentDto,
+  ): Promise<EmployeeProfile> {
+    await this.assertEmployeeReferences(manager, storeId, data);
+    const probationSetting = await manager.findOne(StoreProbationSetting, {
       where: { storeId },
     });
-    let probationEndsAt: Date | undefined;
-    let employmentStatus = EmploymentStatus.ACTIVE;
+    const probationDays = probationSetting?.probationDays || 0;
+    const probationEndsAt =
+      probationDays > 0
+        ? new Date(Date.now() + probationDays * 86_400_000)
+        : undefined;
+    const profile = await manager.save(
+      EmployeeProfile,
+      manager.create(EmployeeProfile, {
+        storeId,
+        accountId,
+        storeRoleId: data.storeRoleId,
+        employeeTypeId: data.employeeTypeId,
+        workShiftId: data.workShiftId,
+        skillId: data.skillId,
+        joinedAt: new Date(),
+        employmentStatus: probationEndsAt
+          ? EmploymentStatus.PROBATION
+          : EmploymentStatus.ACTIVE,
+        probationEndsAt,
+      }),
+    );
 
-    if (probationSetting && probationSetting.probationDays > 0) {
-      const now = new Date();
-      probationEndsAt = new Date(
-        now.getTime() + probationSetting.probationDays * 24 * 60 * 60 * 1000,
-      );
-      employmentStatus = EmploymentStatus.PROBATION;
+    if (data.contract) {
+      await this.createContract(profile.id, data.contract, manager);
     }
-
-    const profile = this.profileRepository.create({
-      ...data,
+    const currentDate = new Date();
+    const currentMonth = new Date(
+      currentDate.getFullYear(),
+      currentDate.getMonth(),
+      1,
+    );
+    const salaryAmount = Number(data.contract?.salaryAmount || 0);
+    await this.createOrUpdateMonthlySummary(
+      profile.id,
+      salaryAmount,
+      currentMonth,
+      manager,
+    );
+    const monthlyPayroll = await this.findOrCreateMonthlyPayroll(
       storeId,
-      accountId,
-      employmentStatus,
-      probationEndsAt,
-    });
-    return this.profileRepository.save(profile);
+      currentMonth,
+      manager,
+    );
+    await this.createEmployeeSalary(
+      {
+        employeeProfileId: profile.id,
+        month: currentMonth,
+        monthlyPayrollId: monthlyPayroll.id,
+        baseSalary: salaryAmount,
+        paymentType: data.contract?.paymentType,
+        workingHours: 0,
+        earnedBaseSalary: 0,
+      },
+      manager,
+    );
+    await this.assignInitialAssets(manager, storeId, profile.id, data.assetIds);
+    return profile;
+  }
+
+  private async assignInitialAssets(
+    manager: EntityManager,
+    storeId: string,
+    profileId: string,
+    requestedIds?: string[],
+  ): Promise<void> {
+    const assetIds = [...new Set(requestedIds || [])].sort();
+    if (!assetIds.length) return;
+    const assets = await manager
+      .getRepository(Asset)
+      .createQueryBuilder('asset')
+      .where('asset.id IN (:...assetIds)', { assetIds })
+      .andWhere('asset.storeId = :storeId', { storeId })
+      .orderBy('asset.id', 'ASC')
+      .setLock('pessimistic_write')
+      .getMany();
+    if (
+      assets.length !== assetIds.length ||
+      assets.some((asset) => Number(asset.currentStock) <= 0)
+    ) {
+      throw new ConflictException({
+        code: 'ASSET_STOCK_UNAVAILABLE',
+        message: 'Một hoặc nhiều tài sản không còn đủ tồn kho.',
+      });
+    }
+    for (const asset of assets) {
+      asset.currentStock = Number(asset.currentStock) - 1;
+      await manager.save(Asset, asset);
+      await manager.save(
+        EmployeeAssetAssignment,
+        manager.create(EmployeeAssetAssignment, {
+          employeeProfileId: profileId,
+          assetId: asset.id,
+          quantity: 1,
+          status: AssetAssignmentStatus.ASSIGNED,
+          note: 'Cấp phát ban đầu khi tạo nhân viên',
+        }),
+      );
+    }
   }
 
   async updateEmployeeReminderSettings(profileId: string, settings: any) {
@@ -3008,22 +3369,67 @@ export class StoresService {
     return this.profileRepository.delete(profileId);
   }
 
-  async restoreEmployee(profileId: string) {
-    const profile = await this.profileRepository.findOne({
+  async restoreEmployee(profileId: string, ownerAccountId: string) {
+    const profileBeforeLock = await this.profileRepository.findOne({
       where: { id: profileId },
       withDeleted: true,
     });
-    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+    if (!profileBeforeLock) {
+      throw new NotFoundException('Không tìm thấy nhân viên');
+    }
+    await this.assertOwnerStoreAccess(
+      profileBeforeLock.storeId,
+      ownerAccountId,
+    );
 
-    // Khôi phục trạng thái active
-    profile.employmentStatus = EmploymentStatus.ACTIVE;
-    profile.terminationReasonId = null;
-    profile.leftAt = null;
-    profile.deletedAt = null;
+    return this.dataSource.transaction(async (manager) => {
+      const account = await manager.findOne(Account, {
+        where: { id: profileBeforeLock.accountId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!account || account.status !== AccountStatus.ACTIVE) {
+        throw this.employeeAttachConflict();
+      }
 
-    await this.profileRepository.save(profile);
+      const profile = await manager
+        .getRepository(EmployeeProfile)
+        .createQueryBuilder('profile')
+        .withDeleted()
+        .where('profile.id = :profileId', { profileId })
+        .setLock('pessimistic_write')
+        .getOne();
+      if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
 
-    return this.profileRepository.restore(profileId);
+      const store = await manager.findOne(Store, {
+        where: { id: profile.storeId },
+      });
+      if (!store || store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền khôi phục nhân viên cửa hàng này',
+        );
+      }
+
+      const otherActiveProfile = await manager
+        .getRepository(EmployeeProfile)
+        .createQueryBuilder('otherProfile')
+        .withDeleted()
+        .where('otherProfile.accountId = :accountId', {
+          accountId: profile.accountId,
+        })
+        .andWhere('otherProfile.id != :profileId', { profileId })
+        .andWhere('otherProfile.employmentStatus != :terminated', {
+          terminated: EmploymentStatus.TERMINATED,
+        })
+        .getExists();
+      if (otherActiveProfile) throw this.employeeAttachConflict();
+
+      profile.employmentStatus = EmploymentStatus.ACTIVE;
+      profile.terminationReasonId = null;
+      profile.leftAt = null;
+      profile.deletedAt = null;
+      await manager.save(EmployeeProfile, profile);
+      return manager.restore(EmployeeProfile, profileId);
+    });
   }
 
   async assignRoleToEmployee(
@@ -3040,7 +3446,11 @@ export class StoresService {
   }
 
   // Contract management
-  async createContract(profileId: string, data: Partial<EmployeeContract>) {
+  async createContract(
+    profileId: string,
+    data: Partial<EmployeeContract> | Record<string, any>,
+    manager?: EntityManager,
+  ) {
     // Nếu data rỗng hoặc undefined, không tạo contract
     if (!data || Object.keys(data).length === 0) {
       return null;
@@ -3093,11 +3503,14 @@ export class StoresService {
       sanitizedData.contractName = 'Hợp đồng lao động';
     }
 
-    const contract = this.contractRepository.create({
+    const repository = manager
+      ? manager.getRepository(EmployeeContract)
+      : this.contractRepository;
+    const contract = repository.create({
       ...sanitizedData,
       employeeProfileId: profileId,
     });
-    return this.contractRepository.save(contract);
+    return repository.save(contract);
   }
 
   async getLatestContract(profileId: string) {
@@ -6258,172 +6671,76 @@ export class StoresService {
     data: any,
     accountsService: AccountsService,
     mailService: MailService,
+    ownerAccountId: string,
   ) {
-    // Generate random password
-    const plainPassword = Math.random().toString(36).slice(-8);
-
-    // 1. Create Account
-    const newAccount = await accountsService.create({
-      fullName: data.fullName,
-      email: data.email,
-      phone: data.phone,
-      passwordHash: plainPassword, // Passed as plain, hashed in accountsService.create
-      gender: data.gender,
-      birthday: data.birthday ? new Date(data.birthday) : undefined,
-      avatar: data.avatarUrl,
-      address: data.address,
-      maritalStatus: data.maritalStatus,
-      status: AccountStatus.ACTIVE,
-    });
-
-    // 2. Create Identity Document
-    if (
-      data.documentNumber ||
-      data.frontIdentificationUrl ||
-      data.backIdentificationUrl
-    ) {
-      await accountsService.createIdentityDocument(newAccount.id, {
-        documentNumber: data.documentNumber,
-        frontImageUrl: data.frontIdentificationUrl,
-        backImageUrl: data.backIdentificationUrl,
+    await this.assertOwnerStoreAccess(data.storeId, ownerAccountId);
+    const plainPassword = randomBytes(9).toString('base64url').slice(0, 12);
+    const result = await this.dataSource.transaction(async (manager) => {
+      const store = await manager.findOne(Store, {
+        where: { id: data.storeId, ownerAccountId },
       });
-    }
-
-    // 3. Create Finance Info
-    if (data.bankName || data.bankNumber) {
-      await accountsService.createFinance(newAccount.id, {
-        bankName: data.bankName,
-        bankNumber: data.bankNumber,
-      });
-    }
-
-    // Check probation settings
-    const probationSetting = await this.probationSettingRepository.findOne({
-      where: { storeId: data.storeId },
-    });
-    let probationEndsAt: Date | undefined;
-    let employmentStatus = EmploymentStatus.ACTIVE;
-
-    if (probationSetting && probationSetting.probationDays > 0) {
-      const now = new Date();
-      probationEndsAt = new Date(
-        now.getTime() + probationSetting.probationDays * 24 * 60 * 60 * 1000,
+      if (!store) {
+        throw new ForbiddenException({
+          code: 'STORE_ACCESS_DENIED',
+          message: 'Bạn không có quyền truy cập cửa hàng này.',
+        });
+      }
+      const newAccount = await accountsService.create(
+        {
+          fullName: data.fullName,
+          email: data.email,
+          phone: data.phone,
+          passwordHash: plainPassword,
+          gender: data.gender,
+          birthday: data.birthday ? new Date(data.birthday) : undefined,
+          avatar: data.avatarUrl,
+          address: data.address,
+          maritalStatus: data.maritalStatus,
+          status: AccountStatus.ACTIVE,
+        },
+        manager,
       );
-      employmentStatus = EmploymentStatus.PROBATION;
-    }
-
-    // 4. Create Employee Profile
-    const newProfile = this.profileRepository.create({
-      storeId: data.storeId,
-      accountId: newAccount.id,
-      storeRoleId: data.storeRoleId,
-      employeeTypeId: data.employeeTypeId,
-      workShiftId: data.workShiftId,
-      skillId: data.skillId,
-      joinedAt: new Date(),
-      employmentStatus,
-      probationEndsAt,
+      if (
+        data.documentNumber ||
+        data.frontIdentificationUrl ||
+        data.backIdentificationUrl
+      ) {
+        await accountsService.createIdentityDocument(
+          newAccount.id,
+          {
+            documentNumber: data.documentNumber,
+            frontImageUrl: data.frontIdentificationUrl,
+            backImageUrl: data.backIdentificationUrl,
+          },
+          manager,
+        );
+      }
+      if (data.bankName || data.bankNumber) {
+        await accountsService.createFinance(
+          newAccount.id,
+          { bankName: data.bankName, bankNumber: data.bankNumber },
+          manager,
+        );
+      }
+      const profile = await this.initializeEmployeeProfile(
+        manager,
+        data.storeId,
+        newAccount.id,
+        data,
+      );
+      return { account: newAccount, profileId: profile.id };
     });
 
-    const savedProfile: any = await this.profileRepository.save(newProfile);
-
-    // 5. Create Contract
-    if (data.contract) {
-      await this.createContract(savedProfile.id, data.contract);
-    }
-
-    // 6. Send Email
     try {
       await mailService.sendPasswordEmail(
-        newAccount.email,
-        newAccount.fullName,
+        result.account.email,
+        result.account.fullName,
         plainPassword,
       );
-    } catch (error) {
-      console.error('Failed to send password email:', error);
-      // We don't throw here to avoid failing the whole process
+    } catch {
+      this.logger.warn('Password email delivery failed after employee creation');
     }
-
-    // 7. Create Monthly Summary for current month
-    await this.createOrUpdateMonthlySummary(
-      savedProfile.id,
-      data.contract?.salaryAmount || 0,
-    );
-
-    // 8. Assign Assets if provided
-    if (
-      data.assetIds &&
-      Array.isArray(data.assetIds) &&
-      data.assetIds.length > 0
-    ) {
-      for (const assetId of data.assetIds) {
-        const asset = await this.assetRepository.findOne({
-          where: { id: assetId },
-        });
-        if (asset && asset.currentStock > 0) {
-          // Check for existing assignment (consistency check)
-          let assignment = await this.assetAssignmentRepository.findOne({
-            where: {
-              employeeProfileId: savedProfile.id,
-              assetId: assetId,
-              status: AssetAssignmentStatus.ASSIGNED,
-            },
-          });
-
-          if (assignment) {
-            assignment.quantity += 1;
-            await this.assetAssignmentRepository.save(assignment);
-          } else {
-            // Create assignment
-            assignment = this.assetAssignmentRepository.create({
-              employeeProfileId: savedProfile.id,
-              assetId: assetId,
-              quantity: 1,
-              assignedById: undefined, // No manager assigned — initial setup during employee creation
-              note: 'Cấp phát ban đầu khi tạo nhân viên',
-            });
-            await this.assetAssignmentRepository.save(assignment);
-          }
-
-          // Update stock
-          asset.currentStock -= 1;
-          await this.assetRepository.save(asset);
-        }
-      }
-    }
-
-    // 9. Create EmployeeSalary for current month
-    const currentDate = new Date();
-    const currentMonth = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth(),
-      1,
-    );
-
-    // Find or create monthly payroll for current month
-    let monthlyPayroll = await this.payrollRepository.findOne({
-      where: { storeId: savedProfile.storeId, month: currentMonth },
-    });
-
-    if (!monthlyPayroll) {
-      monthlyPayroll = await this.createMonthlyPayrollForStore(
-        savedProfile.storeId,
-        currentMonth,
-      );
-    }
-
-    // Create salary slip for this employee
-    await this.createEmployeeSalary({
-      employeeProfileId: savedProfile.id,
-      month: currentMonth,
-      monthlyPayrollId: monthlyPayroll.id,
-      baseSalary: data.contract?.salaryAmount || 0,
-      paymentType: data.contract?.paymentType,
-      workingHours: 0,
-      earnedBaseSalary: 0,
-    });
-
-    return this.getEmployeeById(savedProfile.id);
+    return this.getEmployeeById(result.profileId);
   }
 
   // Helper method to create or update monthly summary
@@ -6431,11 +6748,15 @@ export class StoresService {
     employeeProfileId: string,
     baseSalary: number = 0,
     month?: Date,
+    manager?: EntityManager,
   ) {
     const targetMonth =
       month || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 
-    const existing = await this.monthlySummaryRepository.findOne({
+    const repository = manager
+      ? manager.getRepository(EmployeeMonthlySummary)
+      : this.monthlySummaryRepository;
+    const existing = await repository.findOne({
       where: { employeeProfileId, month: targetMonth },
     });
 
@@ -6443,14 +6764,14 @@ export class StoresService {
       return existing;
     }
 
-    const summary = this.monthlySummaryRepository.create({
+    const summary = repository.create({
       employeeProfileId,
       month: targetMonth,
       baseSalary,
       estimatedSalary: 0, // Sẽ được tính sau khi nhân viên checkin
     });
 
-    return this.monthlySummaryRepository.save(summary);
+    return repository.save(summary);
   }
 
   // Monthly Payroll management
@@ -6502,9 +6823,17 @@ export class StoresService {
     month: Date,
     manager?: EntityManager,
   ): Promise<MonthlyPayroll> {
-    const repo = manager
-      ? manager.getRepository(MonthlyPayroll)
-      : this.payrollRepository;
+    if (!manager) {
+      return this.dataSource.transaction((transactionManager) =>
+        this.findOrCreateMonthlyPayroll(storeId, month, transactionManager),
+      );
+    }
+    const lockMonth = `${month.getFullYear()}-${month.getMonth() + 1}`;
+    await manager.query(
+      'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`monthly-payroll:${storeId}:${lockMonth}`],
+    );
+    const repo = manager.getRepository(MonthlyPayroll);
     let payroll = await repo.findOne({ where: { storeId, month } });
     if (payroll) return payroll;
 
@@ -6520,12 +6849,7 @@ export class StoresService {
       totalApproved: 0,
       isFinalized: false,
     });
-    try {
-      return await repo.save(payroll);
-    } catch (error: any) {
-      if (error?.code !== '23505') throw error;
-      return repo.findOneOrFail({ where: { storeId, month } });
-    }
+    return repo.save(payroll);
   }
 
   async createMonthlyPayrollForStore(storeId: string, date?: Date) {
@@ -7794,9 +8118,15 @@ export class StoresService {
   }
 
   // Employee Salary management
-  async createEmployeeSalary(data: Partial<EmployeeSalary>) {
-    const salary = this.employeeSalaryRepository.create(data);
-    return this.employeeSalaryRepository.save(salary);
+  async createEmployeeSalary(
+    data: Partial<EmployeeSalary>,
+    manager?: EntityManager,
+  ) {
+    const repository = manager
+      ? manager.getRepository(EmployeeSalary)
+      : this.employeeSalaryRepository;
+    const salary = repository.create(data);
+    return repository.save(salary);
   }
 
   async getEmployeeSalaries(employeeProfileId: string, month?: string) {
