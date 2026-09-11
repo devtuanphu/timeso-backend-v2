@@ -97,6 +97,9 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { AttendanceBackgroundProcessor } from './attendance-background.processor';
 import { ShiftEndWorkflow } from './entities/shift-end-workflow.entity';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
+import { JobApplication } from './entities/job-application.entity';
+import { JobApplicationService } from './job-application.service';
+import { JobApplicationController } from './job-application.controller';
 import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
 
 @Module({
@@ -173,6 +176,7 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
       BonusWorkRequest,
       CronLock,
       ShiftEndWorkflow,
+      JobApplication,
     ]),
 
     AccountsModule,
@@ -193,6 +197,7 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     StoresController,
     StoresPublicController,
     ShiftAggregationController,
+    JobApplicationController,
   ],
   providers: [
     StoresService,
@@ -205,6 +210,7 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     AttendanceBackgroundProcessor,
     ShiftEndWorkflowService,
     ShiftEndWorkflowProcessor,
+    JobApplicationService,
   ],
   exports: [
     StoresService,
@@ -212,6 +218,7 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     ShiftAggregationService,
     ShiftReminderService,
     ShiftEndWorkflowService,
+    JobApplicationService,
   ],
 })
 export class StoresModule {}

@@ -820,8 +820,19 @@ describe('StoresService - Payroll Integration', () => {
           },
         },
         {
+          // Without a working transaction, `findOrCreateMonthlyPayroll` threw
+          // and `createMonthlyPayrollsForAllStores` swallowed the error, so
+          // these assertions passed against a failure path.
           provide: DataSource,
-          useValue: {},
+          useValue: {
+            transaction: (callback: (manager: any) => unknown) =>
+              Promise.resolve(
+                callback({
+                  query: jest.fn().mockResolvedValue([]),
+                  getRepository: (entity: any) => repoMap.get(entity),
+                }),
+              ),
+          },
         },
         {
           provide: ShiftReminderService,
@@ -920,8 +931,22 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
           },
         },
         {
+          // `findOrCreateMonthlyPayroll` opens its own transaction and takes a
+          // per-(store, month) advisory lock when no manager is passed in. An
+          // empty DataSource made every test through that path fail on
+          // `this.dataSource.transaction is not a function`, so the suite never
+          // reached the upsert-protection assertions it was written for.
           provide: DataSource,
-          useValue: {},
+          useValue: {
+            transaction: (callback: (manager: any) => unknown) =>
+              Promise.resolve(
+                callback({
+                  // pg_advisory_xact_lock is a no-op against mocked repos.
+                  query: jest.fn().mockResolvedValue([]),
+                  getRepository: (entity: any) => repoMap.get(entity),
+                }),
+              ),
+          },
         },
         {
           provide: ShiftReminderService,
@@ -1082,10 +1107,16 @@ describe('StoresService - deferred checkout payroll', () => {
 
   const STORE_ID = 'store-1';
   const EMPLOYEE_ID = 'emp-1';
+  const ACCOUNT_ID = 'account-1';
 
   const baseAssignment = {
     id: 'assignment-1',
     employeeId: EMPLOYEE_ID,
+    // Attendance is self-service, so the assignment must carry its owner.
+    employee: {
+      accountId: ACCOUNT_ID,
+      employmentStatus: EmploymentStatus.ACTIVE,
+    },
     checkInTime: new Date('2026-07-01T08:00:00'),
     checkOutTime: null,
     status: ShiftAssignmentStatus.CONFIRMED,
@@ -1186,6 +1217,7 @@ describe('StoresService - deferred checkout payroll', () => {
     const result = await service.checkOutWithFace(
       'assignment-1',
       Buffer.from('fake'),
+      ACCOUNT_ID,
     );
 
     expect(result).toEqual(
@@ -1207,6 +1239,7 @@ describe('StoresService - deferred checkout payroll', () => {
     const result = await service.checkOutWithFace(
       'assignment-1',
       Buffer.from('fake'),
+      ACCOUNT_ID,
     );
 
     expect(result).toEqual(
@@ -1221,6 +1254,7 @@ describe('StoresService - deferred checkout payroll', () => {
     const result = await service.checkOutWithFace(
       'assignment-1',
       Buffer.from('fake'),
+      ACCOUNT_ID,
     );
 
     expect(result).toEqual(expect.objectContaining({ matched: false }));

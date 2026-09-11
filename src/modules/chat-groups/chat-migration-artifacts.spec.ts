@@ -14,6 +14,34 @@ describe('chat reliability migration artifacts', () => {
     expect(expand).not.toMatch(/^\s*CREATE\s+(UNIQUE\s+)?INDEX/im);
   });
 
+  it('keeps chat push rollout additive, cutoff-gated, and token-private', () => {
+    const preflight = script('migration_chat_push_delivery_preflight.sql');
+    const expand = script('migration_chat_push_delivery_expand.sql');
+    const verify = script('verify_chat_push_delivery.sql');
+    const readme = script('README_chat_push_delivery.md');
+
+    expect(preflight).toContain('\\set ON_ERROR_STOP on');
+    expect(preflight).not.toMatch(/SELECT\s+expo_push_token/i);
+    expect(expand).toContain('push_token_fingerprint char(64)');
+    expect(expand).toContain('registration_version bigint NOT NULL DEFAULT 0');
+    expect(expand).toContain('CREATE TABLE IF NOT EXISTS chat_push_deliveries');
+    expect(expand).toContain('\\set AUTOCOMMIT on');
+    expect(expand).toContain('CREATE UNIQUE INDEX CONCURRENTLY');
+    expect(expand).toContain('CREATE INDEX CONCURRENTLY');
+    expect(expand).toContain("SET lock_timeout = '3s'");
+    expect(expand).toContain('NOT VALID');
+    expect(expand).toContain(
+      'VALIDATE CONSTRAINT ck_chat_outbox_push_intent_status',
+    );
+    expect(expand).toContain('schema_row.nspname = current_schema()');
+    expect(expand).not.toMatch(
+      /UPDATE\s+user_devices\s+SET\s+push_token_fingerprint/i,
+    );
+    expect(verify).not.toContain('expo_push_token');
+    expect(readme).toContain('CHAT_PUSH_ACTIVATION_STARTED_AT');
+    expect(readme).toContain('does not backfill old chat messages');
+  });
+
   it('keeps preflight safe before additive sequence columns exist', () => {
     const preflight = script('migration_chat_reliability_v2_preflight.sql');
     expect(preflight).toContain('\\set ON_ERROR_STOP on');

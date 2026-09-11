@@ -4,7 +4,11 @@
  */
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
@@ -15,7 +19,10 @@ import { ShiftReminderService } from './shift-reminder.service';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
-import { EmployeeProfile } from './entities/employee-profile.entity';
+import {
+  EmployeeProfile,
+  EmploymentStatus,
+} from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import {
   EmployeeContract,
@@ -738,11 +745,23 @@ describe('StoresService - Check-in/Check-out Integration', () => {
 
   afterEach(() => jest.clearAllMocks());
 
+  // Attendance is self-service: the caller must own the shift assignment.
+  const SELF_ACCOUNT = 'account-self';
+  const OTHER_ACCOUNT = 'account-attacker';
+  const selfEmployee = {
+    accountId: SELF_ACCOUNT,
+    employmentStatus: EmploymentStatus.ACTIVE,
+  };
+
   describe('checkInWithFace', () => {
     it('should reject if assignment not found', async () => {
       shiftAssignmentRepo.findOne.mockResolvedValue(null);
       await expect(
-        service.checkInWithFace('nonexistent-id', Buffer.from('fake')),
+        service.checkInWithFace(
+          'nonexistent-id',
+          Buffer.from('fake'),
+          SELF_ACCOUNT,
+        ),
       ).rejects.toThrow(NotFoundException);
     });
 
@@ -751,10 +770,11 @@ describe('StoresService - Check-in/Check-out Integration', () => {
         id: 'a1',
         checkInTime: new Date(), // Already checked in
         status: ShiftAssignmentStatus.CONFIRMED,
+        employee: selfEmployee,
         shiftSlot: { workShift: { startTime: '08:00' } },
       });
       await expect(
-        service.checkInWithFace('a1', Buffer.from('fake')),
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
       ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
     });
 
@@ -763,14 +783,64 @@ describe('StoresService - Check-in/Check-out Integration', () => {
         id: 'a1',
         checkInTime: null,
         status: ShiftAssignmentStatus.PENDING,
+        employee: selfEmployee,
         shiftSlot: {
           workShift: { startTime: '08:00' },
           cycle: { storeId: 'store-1' },
         },
       });
       await expect(
-        service.checkInWithFace('a1', Buffer.from('fake')),
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    it('should reject a caller who does not own the assignment', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        checkInTime: null,
+        status: ShiftAssignmentStatus.APPROVED,
+        employee: selfEmployee,
+        shiftSlot: {
+          workShift: { startTime: '08:00' },
+          cycle: { storeId: 'store-1' },
+        },
+      });
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), OTHER_ACCOUNT),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should not leak attendance state to an unauthorized caller', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        checkInTime: new Date(),
+        status: ShiftAssignmentStatus.CONFIRMED,
+        employee: selfEmployee,
+        shiftSlot: { workShift: { startTime: '08:00' } },
+      });
+      // The already-recorded short-circuit must sit behind authorization.
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), OTHER_ACCOUNT),
+      ).rejects.toThrow(ForbiddenException);
+    });
+
+    it('should reject a terminated employee', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        checkInTime: null,
+        status: ShiftAssignmentStatus.APPROVED,
+        employee: {
+          accountId: SELF_ACCOUNT,
+          employmentStatus: EmploymentStatus.TERMINATED,
+        },
+        shiftSlot: {
+          workShift: { startTime: '08:00' },
+          cycle: { storeId: 'store-1' },
+        },
+      });
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).rejects.toThrow(ForbiddenException);
     });
   });
 
@@ -780,9 +850,10 @@ describe('StoresService - Check-in/Check-out Integration', () => {
         id: 'a1',
         checkInTime: null, // Not checked in
         status: ShiftAssignmentStatus.APPROVED,
+        employee: selfEmployee,
       });
       await expect(
-        service.checkOutWithFace('a1', Buffer.from('fake')),
+        service.checkOutWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
       ).rejects.toThrow(BadRequestException);
     });
 
@@ -792,10 +863,77 @@ describe('StoresService - Check-in/Check-out Integration', () => {
         checkInTime: new Date(),
         checkOutTime: new Date(), // Already checked out
         status: ShiftAssignmentStatus.COMPLETED,
+        employee: selfEmployee,
       });
       await expect(
-        service.checkOutWithFace('a1', Buffer.from('fake')),
+        service.checkOutWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
       ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
+    });
+
+    it('should reject a caller who does not own the assignment', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        checkInTime: new Date(),
+        checkOutTime: null,
+        status: ShiftAssignmentStatus.CONFIRMED,
+        employee: selfEmployee,
+      });
+      await expect(
+        service.checkOutWithFace('a1', Buffer.from('fake'), OTHER_ACCOUNT),
+      ).rejects.toThrow(ForbiddenException);
+    });
+  });
+
+  describe('store attendance policy', () => {
+    const approvedAssignment = {
+      id: 'a1',
+      employeeId: 'emp-1',
+      checkInTime: null,
+      status: ShiftAssignmentStatus.APPROVED,
+      employee: selfEmployee,
+      shiftSlot: {
+        workDate: '2026-05-05',
+        workShift: { startTime: '08:00', endTime: '17:00' },
+        cycle: { storeId: 'store-1' },
+      },
+    };
+
+    afterEach(() => {
+      delete process.env.ATTENDANCE_ENFORCEMENT_MODE;
+    });
+
+    it('does not reject a missing QR while enforcement is off', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({ ...approvedAssignment });
+      employeeFaceRepo.findOne.mockResolvedValue(null);
+
+      // Reaching the face step proves the policy pass allowed the request; the
+      // "Face not registered" rejection comes from the next step.
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).rejects.toThrow('Face not registered');
+    });
+
+    it('rejects a missing QR before face inference when enforcing', async () => {
+      process.env.ATTENDANCE_ENFORCEMENT_MODE = 'enforce';
+      shiftAssignmentRepo.findOne.mockResolvedValue({ ...approvedAssignment });
+      const faceService = service['faceRecognitionService'] as any;
+
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).rejects.toThrow(BadRequestException);
+      // The expensive step must not have run.
+      expect(faceService.extractDescriptor).not.toHaveBeenCalled();
+    });
+
+    it('rejects a QR belonging to another store when enforcing', async () => {
+      process.env.ATTENDANCE_ENFORCEMENT_MODE = 'enforce';
+      shiftAssignmentRepo.findOne.mockResolvedValue({ ...approvedAssignment });
+
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT, {
+          qrStoreId: 'store-2',
+        }),
+      ).rejects.toThrow(/QR không khớp/);
     });
   });
 
@@ -805,6 +943,7 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       const assignment = {
         id: 'a1',
         employeeId: 'emp-1',
+        employee: selfEmployee,
         checkInTime: null as Date | null,
         status: ShiftAssignmentStatus.APPROVED,
         lateMinutes: 0,
@@ -844,12 +983,17 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       const profileRepo = mockRepo();
       profileRepo.update.mockResolvedValue({ affected: 1 });
 
-      // Check-in 10 minutes late
-      const fixedDate = new Date('2026-05-05T08:10:00');
+      // Check-in 10 minutes late. The offset is explicit so the assertion does
+      // not depend on the timezone of the machine running the suite.
+      const fixedDate = new Date('2026-05-05T08:10:00+07:00');
       jest.useFakeTimers();
       jest.setSystemTime(fixedDate);
 
-      const result = await service.checkInWithFace('a1', Buffer.from('fake'));
+      const result = await service.checkInWithFace(
+        'a1',
+        Buffer.from('fake'),
+        SELF_ACCOUNT,
+      );
 
       expect(result.lateMinutes).toBe(10);
       expect(result.attendanceStatus).toBe(AttendanceStatus.LATE);

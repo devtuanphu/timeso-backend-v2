@@ -1,7 +1,10 @@
 import {
   BadRequestException,
   ConflictException,
+  HttpException,
+  HttpStatus,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -10,8 +13,52 @@ import * as bcrypt from 'bcrypt';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { AccountRefreshToken, AppType } from '../accounts/entities/account-refresh-token.entity';
-import { DataSource, EntityManager, IsNull, MoreThan, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  IsNull,
+  LessThan,
+  MoreThan,
+  Repository,
+} from 'typeorm';
 import { randomInt } from 'crypto';
+
+import { hashOtp, matchesStoredOtp } from './otp-hash';
+import {
+  isOverSendLimit,
+  OTP_SEND_WINDOW_MS,
+  OTP_VERIFY_LIMIT,
+  OTP_VERIFY_WINDOW_MS,
+  SlidingWindowCounter,
+} from './otp-rate-limit';
+
+/** Kept in sync with `RegisterDto.password`. */
+const MIN_PASSWORD_LENGTH = 6;
+
+/**
+ * Live refresh tokens kept per account and app.
+ *
+ * `refreshToken` cannot look a token up by value — it is stored bcrypt-hashed —
+ * so it loads every live token for the account and compares them one by one.
+ * Each comparison is deliberately expensive, and every login used to add
+ * another row that was never revoked, so the cost grew without bound. Capping
+ * the live set bounds that scan while still allowing a handful of devices.
+ */
+const MAX_LIVE_REFRESH_TOKENS = 5;
+
+/**
+ * Failed OTP verifications per account. See otp-rate-limit.ts for why this is
+ * in-process and what that trades away.
+ */
+const otpVerifyFailures = new SlidingWindowCounter({
+  limit: OTP_VERIFY_LIMIT,
+  windowMs: OTP_VERIFY_WINDOW_MS,
+});
+
+/** Test-only: clears accumulated verify failures between cases. */
+export function __resetOtpVerifyLimiterForTests(): void {
+  otpVerifyFailures.clear();
+}
 import { MailService } from '../mail/mail.service';
 import { AccountOtp } from '../accounts/entities/account-otp.entity';
 import { Account, AccountStatus } from '../accounts/entities/account.entity';
@@ -24,6 +71,7 @@ import {
   JWT_REFRESH_TOKEN_USE,
   isLegacyUntypedTokenAccepted,
   requireJwtRefreshSecret,
+  requireJwtSecret,
   type TimesoJwtPayload,
 } from './jwt.config';
 import {
@@ -34,6 +82,8 @@ import { OtpDeliveryStatus } from './dto/auth-response.dto';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly accountsService: AccountsService,
     private readonly jwtService: JwtService,
@@ -50,6 +100,16 @@ export class AuthService {
     private readonly dataSource: DataSource,
   ) {}
 
+  /** Server secret keying the OTP HMAC; required at startup already. */
+  private otpHashSecret(): string {
+    return requireJwtSecret(this.configService);
+  }
+
+  /** Codes are persisted hashed; the plaintext is only sent to the user. */
+  private storedOtpValue(code: string): string {
+    return hashOtp(code, this.otpHashSecret());
+  }
+
   private generateOtp(): string {
     return randomInt(100000, 1000000).toString();
   }
@@ -59,6 +119,83 @@ export class AuthService {
       code: 'INVALID_OR_EXPIRED_OTP',
       message: 'Mã OTP không chính xác hoặc đã hết hạn.',
     });
+  }
+
+  /**
+   * Revokes live refresh tokens beyond the most recent
+   * `MAX_LIVE_REFRESH_TOKENS` for an account/app, and clears out rows that are
+   * already dead. Keeps the per-refresh bcrypt scan bounded.
+   */
+  private async revokeStaleRefreshTokens(
+    accountId: string,
+    appType: AppType,
+  ): Promise<void> {
+    try {
+      const live = await this.refreshTokenRepository.find({
+        where: { accountId, appType, revokedAt: IsNull() },
+        order: { issuedAt: 'DESC' },
+        select: ['id'],
+      });
+
+      const stale = live.slice(MAX_LIVE_REFRESH_TOKENS).map((row) => row.id);
+      if (stale.length) {
+        await this.refreshTokenRepository.update(stale, {
+          revokedAt: new Date(),
+        });
+      }
+
+      // Housekeeping: drop rows that can never match again.
+      await this.refreshTokenRepository.delete({
+        accountId,
+        appType,
+        expiresAt: LessThan(new Date()),
+      });
+    } catch (error) {
+      // Never fail a login because housekeeping failed.
+      this.logger.warn(
+        `Refresh token pruning failed for account ${accountId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  private tooManyRequests(message: string): HttpException {
+    return new HttpException(
+      { code: 'TOO_MANY_REQUESTS', message },
+      HttpStatus.TOO_MANY_REQUESTS,
+    );
+  }
+
+  /**
+   * Caps how many codes one account can request in the send window. Derived
+   * from persisted `created_at`, so it holds across processes and restarts.
+   */
+  private async assertOtpSendAllowed(
+    accountId: string,
+    type: 'REGISTER' | 'FORGOT_PASSWORD',
+  ): Promise<void> {
+    const recentSends = await this.otpRepository.count({
+      where: {
+        accountId,
+        type,
+        createdAt: MoreThan(new Date(Date.now() - OTP_SEND_WINDOW_MS)),
+      },
+    });
+    if (isOverSendLimit(recentSends)) {
+      throw this.tooManyRequests(
+        'Bạn đã yêu cầu mã quá nhiều lần. Vui lòng thử lại sau ít phút.',
+      );
+    }
+  }
+
+  /** Bounds brute force against a six-digit code. */
+  private assertOtpVerifyAllowed(accountId: string): void {
+    if (otpVerifyFailures.count(accountId) >= OTP_VERIFY_LIMIT) {
+      throw this.tooManyRequests(
+        'Bạn đã nhập sai mã quá nhiều lần. Vui lòng thử lại sau ít phút.',
+      );
+    }
   }
 
   private async lockRegistrationIdentifiers(
@@ -160,6 +297,7 @@ export class AuthService {
         expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days matching .env
       });
       await this.refreshTokenRepository.save(refreshTokenEntity);
+      await this.revokeStaleRefreshTokens(user.id, appType);
     }
 
     const { passwordHash, ...cleanUser } = user;
@@ -241,7 +379,7 @@ export class AuthService {
         await otpRepository.save(
           otpRepository.create({
             accountId: user.id,
-            otp: otpCode,
+            otp: this.storedOtpValue(otpCode),
             type: 'REGISTER',
             expiresAt: new Date(Date.now() + 10 * 60 * 1000),
           }),
@@ -290,6 +428,8 @@ export class AuthService {
         true,
       );
       if (!user) throw this.invalidOtp();
+      // Bound brute force before comparing the code.
+      this.assertOtpVerifyAllowed(user.id);
       if (
         formattedType === 'REGISTER' &&
         user.status !== AccountStatus.UNVERIFIED
@@ -309,12 +449,16 @@ export class AuthService {
 
       if (
         !otpRecord ||
-        otpRecord.otp !== otp ||
+        !matchesStoredOtp(otpRecord.otp, otp, this.otpHashSecret()) ||
         otpRecord.expiresAt.getTime() <= Date.now()
       ) {
+        // Count the miss so repeated guesses eventually trip the limit.
+        otpVerifyFailures.hit(user.id);
         throw this.invalidOtp();
       }
 
+      // A correct code clears the account's failure budget.
+      otpVerifyFailures.reset(user.id);
       otpRecord.isUsed = true;
       await manager.save(AccountOtp, otpRecord);
 
@@ -362,6 +506,7 @@ export class AuthService {
           'Không thể gửi mã xác thực cho tài khoản này.',
         );
       }
+      await this.assertOtpSendAllowed(user.id, formattedType);
       const repository = manager.getRepository(AccountOtp);
       await repository.update(
         { accountId: user.id, type: formattedType, isUsed: false },
@@ -370,7 +515,7 @@ export class AuthService {
       await repository.save(
         repository.create({
           accountId: user.id,
-          otp: otpCode,
+          otp: this.storedOtpValue(otpCode),
           expiresAt: new Date(Date.now() + 10 * 60 * 1000),
           type: formattedType,
         }),
@@ -402,18 +547,22 @@ export class AuthService {
     const user = await this.accountsService.findByPhone(normalizedPhone);
     if (!user) throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
 
+    await this.assertOtpSendAllowed(user.id, 'FORGOT_PASSWORD');
+
     // Vô hiệu hóa các OTP cũ cho luồng quên mật khẩu
     await this.otpRepository.update(
       { accountId: user.id, type: 'FORGOT_PASSWORD', isUsed: false },
       { isUsed: true }
     );
 
-    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    // Math.random() is not a CSPRNG. Password reset is the flow that most needs
+    // an unpredictable code, and register/resend already use this helper.
+    const otpCode = this.generateOtp();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     const otpEntity = this.otpRepository.create({
       accountId: user.id,
-      otp: otpCode,
+      otp: this.storedOtpValue(otpCode),
       expiresAt,
       type: 'FORGOT_PASSWORD',
     });
@@ -432,10 +581,16 @@ export class AuthService {
   }
 
   async resetPassword(phone: string, newPassword: string) {
-    if (typeof newPassword !== 'string' || !newPassword) {
+    // Mirrors RegisterDto's rule, which this path bypassed entirely: any
+    // non-empty string was accepted, so a reset could weaken an account below
+    // the floor enforced at sign-up.
+    if (
+      typeof newPassword !== 'string' ||
+      newPassword.length < MIN_PASSWORD_LENGTH
+    ) {
       throw new BadRequestException({
         code: 'VALIDATION_ERROR',
-        message: 'Mật khẩu mới không hợp lệ.',
+        message: `Mật khẩu phải ít nhất ${MIN_PASSWORD_LENGTH} ký tự`,
       });
     }
     let normalizedPhone: string;

@@ -1,4 +1,6 @@
-import { Controller, Post, Body, Get, Query, HttpCode, HttpStatus, Res } from '@nestjs/common';
+import { Controller, Post, Body, Get, Query, HttpCode, HttpStatus, Res, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth } from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ApiTags, ApiOperation, ApiBody, ApiQuery, ApiProperty } from '@nestjs/swagger';
 import { IsString, IsNumber } from 'class-validator';
 import { Response } from 'express';
@@ -28,6 +30,8 @@ export class ZaloController {
   ) {}
 
   @Post('init-token')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Khởi tạo Zalo token lần đầu (manual)' })
   @ApiBody({ type: InitTokenDto })
@@ -40,6 +44,8 @@ export class ZaloController {
   }
 
   @Get('oauth-url')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
   @ApiOperation({ summary: 'Lấy URL để authorize Zalo OAuth (production flow)' })
   getOAuthUrl() {
     const appId = this.configService.get('ZALO_APP_ID');
@@ -119,6 +125,8 @@ export class ZaloController {
   }
 
   @Get('token-status')
+  @UseGuards(JwtAuthGuard)
+  @ApiBearerAuth()
   @ApiOperation({ summary: 'Kiểm tra trạng thái token hiện tại' })
   async getTokenStatus() {
     return this.zaloService.getTokenStatus();

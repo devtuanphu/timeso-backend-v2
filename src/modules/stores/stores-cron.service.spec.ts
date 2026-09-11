@@ -13,15 +13,18 @@ describe('StoresCronService read-only guards', () => {
     };
     const lockService = { withLock: jest.fn() };
     const shiftEndWorkflowService = { reconcileActiveAssignments: jest.fn() };
+    const jobApplicationService = { redactStaleContactDetails: jest.fn() };
     const service = new StoresCronService(
       storesService as any,
       lockService as any,
       shiftEndWorkflowService as any,
+      jobApplicationService as any,
       { get: jest.fn().mockReturnValue('true') } as any,
     );
 
     await Promise.all([
       service.handleReconcileShiftEndWorkflows(),
+      service.handleRedactStaleJobApplications(),
       service.handleCreateDailyReports(),
       service.handleCreateMonthlyPayrolls(),
       service.handleCreateMonthlySummaries(),
@@ -32,6 +35,8 @@ describe('StoresCronService read-only guards', () => {
     ]);
 
     expect(lockService.withLock).not.toHaveBeenCalled();
+
+    expect(jobApplicationService.redactStaleContactDetails).not.toHaveBeenCalled();
     expect(shiftEndWorkflowService.reconcileActiveAssignments).not.toHaveBeenCalled();
     Object.values(storesService).forEach((operation) => {
       expect(operation).not.toHaveBeenCalled();

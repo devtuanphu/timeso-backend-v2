@@ -237,6 +237,16 @@ import { AccountsService } from '../accounts/accounts.service';
 
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import {
+  calculateEarlyMinutes,
+  calculateLateMinutes,
+  resolveShiftBoundaries,
+} from './attendance-time.utils';
+import {
+  describeAttendanceViolation,
+  evaluateAttendanceRules,
+  resolveAttendanceEnforcementMode,
+} from './attendance-enforcement';
 import * as ExcelJS from 'exceljs';
 import { randomBytes } from 'crypto';
 import {
@@ -1244,6 +1254,64 @@ export class StoresService {
       profile.employmentStatus !== EmploymentStatus.ACTIVE
     ) {
       throw new ForbiddenException('Bạn chỉ có thể xem lịch của chính mình');
+    }
+    return profile;
+  }
+
+  /**
+   * Attendance is a self-service action: only the employee who owns the shift
+   * assignment may check in or out on it. Owners have separate manual-attendance
+   * routes and must never be able to drive face attendance for someone else.
+   */
+  private assertAttendanceSelfAccess(
+    assignment: ShiftAssignment,
+    accountId: string,
+  ) {
+    const employee = assignment.employee;
+    if (!accountId || !employee || employee.accountId !== accountId) {
+      throw new ForbiddenException(
+        'Bạn chỉ có thể chấm công cho ca làm việc của chính mình',
+      );
+    }
+    if (employee.employmentStatus === EmploymentStatus.TERMINATED) {
+      throw new ForbiddenException(
+        'Nhân viên đã ngừng làm việc tại cửa hàng này',
+      );
+    }
+    return employee;
+  }
+
+  /**
+   * Strict self-service access to an employee profile. Used by operations that
+   * only the employee may perform for themselves — face enrollment (which
+   * replaces the biometric template attendance relies on) and submitting or
+   * cancelling their own requests. The owning store is resolved from the
+   * profile rather than trusted from the request body.
+   */
+  private async assertEmployeeSelfAccess(
+    employeeProfileId: string,
+    accountId: string,
+    expectedStoreId?: string,
+    message = 'Bạn chỉ có thể thao tác cho chính mình',
+  ) {
+    if (!employeeProfileId) {
+      throw new BadRequestException('Thiếu thông tin nhân viên');
+    }
+    const profile = await this.profileRepository.findOne({
+      where: { id: employeeProfileId },
+      select: ['id', 'storeId', 'accountId', 'employmentStatus'],
+    });
+    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+    if (!accountId || profile.accountId !== accountId) {
+      throw new ForbiddenException(message);
+    }
+    if (expectedStoreId && profile.storeId !== expectedStoreId) {
+      throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
+    }
+    if (profile.employmentStatus === EmploymentStatus.TERMINATED) {
+      throw new ForbiddenException(
+        'Nhân viên đã ngừng làm việc tại cửa hàng này',
+      );
     }
     return profile;
   }
@@ -8876,14 +8944,32 @@ export class StoresService {
       const report = await this.ensureDailyReportForStore(storeId);
       if (!report) return;
 
-      // Tránh duplicate
-      if (!report[field].includes(employeeId)) {
-        report[field].push(employeeId);
-        await this.dailyReportRepository.save(report);
-        this.logger.debug(
-          `[DailyReport] Appended ${employeeId} to ${field} for store ${storeId}`,
-        );
+      // Atomic append. Loading the row, pushing onto the JSONB array and saving
+      // the whole entity is a read-modify-write: two employees checking in at
+      // the same store concurrently would each save their own copy and one
+      // append would be lost. A single conditional UPDATE has no such window,
+      // and `NOT @>` keeps it idempotent so retries cannot duplicate an id.
+      const column =
+        this.dailyReportRepository.metadata.findColumnWithPropertyName(
+          field,
+        )?.databaseName;
+      if (!column) {
+        this.logger.warn(`[DailyReport] unknown field ${field}`);
+        return;
       }
+
+      const result = await this.dailyReportRepository.query(
+        `UPDATE ${this.dailyReportRepository.metadata.tableName}
+            SET "${column}" = COALESCE("${column}", '[]'::jsonb) || to_jsonb($2::text)
+          WHERE id = $1
+            AND NOT (COALESCE("${column}", '[]'::jsonb) @> to_jsonb($2::text))`,
+        [report.id, employeeId],
+      );
+      this.logger.debug(
+        `[DailyReport] Appended ${employeeId} to ${field} for store ${storeId} (changed=${
+          Array.isArray(result) ? result.length : result
+        })`,
+      );
     } catch (error) {
       this.logger.warn(
         `[DailyReport] append ${field} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -13811,9 +13897,21 @@ export class StoresService {
 
   // Leave Request Management (Staff)
   async createLeaveRequest(
-    data: Partial<EmployeeLeaveRequest>,
+    storeId: string,
+    data: Record<string, any>,
+    accountId: string,
     files?: Express.Multer.File[],
   ) {
+    // Employees submit their own requests. Binding the profile to the JWT stops
+    // a client from filing (or, via a supplied `id`, overwriting) someone
+    // else's request.
+    await this.assertEmployeeSelfAccess(
+      data?.employeeProfileId,
+      accountId,
+      storeId,
+      'Bạn chỉ có thể gửi đơn cho chính mình',
+    );
+
     const attachments: string[] = [];
     if (files && files.length > 0) {
       files.forEach((file) => {
@@ -13821,12 +13919,23 @@ export class StoresService {
       });
     }
 
+    // Explicit allowlist. The previous `create({ ...data })` spread let a
+    // client set `id` (turning the save into an update of an arbitrary row),
+    // `approvedById`, `approvedAt` and every other column.
     const leaveRequest = this.leaveRequestRepository.create({
-      ...data,
-      attachments:
-        attachments.length > 0 ? attachments : data.attachments || [],
+      storeId,
+      employeeProfileId: data.employeeProfileId,
+      type: data.type,
+      startDate: data.startDate,
+      endDate: data.endDate,
+      startTime: data.startTime,
+      endTime: data.endTime,
+      reason: data.reason,
+      leaveDays: data.leaveDays,
+      shiftAssignmentId: data.shiftAssignmentId || undefined,
+      attachments,
       status: LeaveRequestStatus.PENDING,
-    });
+    } as Partial<EmployeeLeaveRequest>);
     return this.leaveRequestRepository.save(leaveRequest);
   }
 
@@ -13897,14 +14006,20 @@ export class StoresService {
     }); */
   }
 
-  async cancelLeaveRequest(id: string, employeeProfileId: string) {
+  async cancelLeaveRequest(id: string, accountId: string) {
     const request = await this.leaveRequestRepository.findOne({
       where: { id },
     });
     if (!request) throw new NotFoundException('Không tìm thấy đơn xin nghỉ');
-    if (request.employeeProfileId !== employeeProfileId) {
-      throw new BadRequestException('Bạn không có quyền hủy đơn này');
-    }
+    // The owning profile is read from the stored request and matched against
+    // the caller's account. Previously the profile id came from the request
+    // body, so anyone could cancel anyone else's request.
+    await this.assertEmployeeSelfAccess(
+      request.employeeProfileId,
+      accountId,
+      undefined,
+      'Bạn không có quyền hủy đơn này',
+    );
     if (request.status !== LeaveRequestStatus.PENDING) {
       throw new BadRequestException('Chỉ có thể hủy đơn đang chờ duyệt');
     }
@@ -14640,9 +14755,94 @@ export class StoresService {
   // ATTENDANCE & FACE RECOGNITION
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+  /**
+   * Applies the store's configured QR and location policy, and records the
+   * caller's distance from the store.
+   *
+   * Runs before face inference so a policy rejection does not cost a
+   * TensorFlow pass. Whether a violation actually rejects the request is
+   * governed by ATTENDANCE_ENFORCEMENT_MODE — see attendance-enforcement.ts.
+   */
+  private async applyAttendancePolicy(
+    label: 'CheckIn' | 'CheckOut',
+    storeId: string | undefined,
+    employeeProfileId: string | undefined,
+    options?: { latitude?: number; longitude?: number; qrStoreId?: string },
+  ): Promise<{
+    checkinDistance: number | null;
+    checkinLatitude: number | null;
+    checkinLongitude: number | null;
+  }> {
+    let checkinDistance: number | null = null;
+    let checkinLatitude: number | null = null;
+    let checkinLongitude: number | null = null;
+
+    const hasLocationFix =
+      options?.latitude != null && options?.longitude != null;
+
+    const [timekeeping, shiftConfig, store] = await Promise.all([
+      storeId
+        ? this.timekeepingSettingRepository.findOne({ where: { storeId } })
+        : null,
+      storeId
+        ? this.shiftConfigRepository.findOne({ where: { storeId } })
+        : null,
+      storeId && hasLocationFix
+        ? this.storeRepository.findOne({ where: { id: storeId } })
+        : null,
+    ]);
+
+    if (hasLocationFix) {
+      checkinLatitude = options!.latitude!;
+      checkinLongitude = options!.longitude!;
+      if (store?.latitude != null && store?.longitude != null) {
+        checkinDistance = this.calculateDistance(
+          checkinLatitude,
+          checkinLongitude,
+          store.latitude,
+          store.longitude,
+        );
+      }
+    }
+
+    const violations = evaluateAttendanceRules({
+      requirement: shiftConfig?.timekeepingRequirement,
+      requireQrScan: timekeeping?.requireQrScan,
+      requireLocation: timekeeping?.requireLocation,
+      attendanceRadius: timekeeping?.attendanceRadius,
+      locationExempt: Boolean(
+        employeeProfileId &&
+          timekeeping?.locationExceptionEmployeeIds?.includes(
+            employeeProfileId,
+          ),
+      ),
+      qrStoreId: options?.qrStoreId,
+      expectedStoreId: storeId,
+      distanceMeters: checkinDistance,
+      hasLocationFix,
+    });
+
+    if (violations.length) {
+      const mode = resolveAttendanceEnforcementMode(process.env);
+      const summary = violations.join(',');
+      if (mode === 'enforce') {
+        throw new BadRequestException(
+          describeAttendanceViolation(violations[0]),
+        );
+      }
+      // Observation mode: surface what a rollout to `enforce` would reject.
+      this.logger.warn(
+        `[${label}] attendance policy not satisfied (mode=off, would reject): ${summary}`,
+      );
+    }
+
+    return { checkinDistance, checkinLatitude, checkinLongitude };
+  }
+
   async checkInWithFace(
     assignmentId: string,
     imageBuffer: Buffer,
+    accountId: string,
     options?: {
       latitude?: number;
       longitude?: number;
@@ -14661,6 +14861,9 @@ export class StoresService {
       ],
     });
     if (!assignment) throw new NotFoundException('Shift assignment not found');
+    // Authorize before any state is revealed, including the already-recorded
+    // short-circuit below.
+    this.assertAttendanceSelfAccess(assignment, accountId);
     if (assignment.checkInTime) {
       return {
         matched: true,
@@ -14679,15 +14882,15 @@ export class StoresService {
 
     const storeId = assignment.shiftSlot?.cycle?.storeId;
 
-    // ===== Step 1: QR Verification =====
-    if (options?.qrStoreId && storeId) {
-      if (options.qrStoreId !== storeId) {
-        throw new BadRequestException(
-          'Mã QR không khớp với cửa hàng của ca làm việc này',
-        );
-      }
-      this.logger.debug(`[CheckIn] QR verified — storeId match`);
-    }
+    // ===== Step 1: Store policy (QR + location) =====
+    // Evaluated before face inference so a policy rejection is cheap.
+    const { checkinDistance, checkinLatitude, checkinLongitude } =
+      await this.applyAttendancePolicy(
+        'CheckIn',
+        storeId,
+        assignment.employeeId,
+        options,
+      );
 
     // ===== Step 2: Face Verification =====
     const employeeFace = await this.employeeFaceRepository.findOne({
@@ -14723,47 +14926,18 @@ export class StoresService {
       `[CheckIn] Face verified — distance=${matchResult.distance}`,
     );
 
-    // ===== Step 3: GPS — record distance only (never block) =====
-    let checkinDistance: number | null = null;
-    let checkinLatitude: number | null = null;
-    let checkinLongitude: number | null = null;
-
-    if (options?.latitude != null && options?.longitude != null) {
-      checkinLatitude = options.latitude;
-      checkinLongitude = options.longitude;
-
-      if (storeId) {
-        const store = await this.storeRepository.findOne({
-          where: { id: storeId },
-        });
-        if (store?.latitude != null && store?.longitude != null) {
-          checkinDistance = this.calculateDistance(
-            options.latitude,
-            options.longitude,
-            store.latitude,
-            store.longitude,
-          );
-          this.logger.debug(
-            `[CheckIn] GPS recorded — distance=${Math.round(checkinDistance)}m`,
-          );
-        }
-      }
-    }
-
-    // Calculate late minutes
+    // Calculate late minutes against the slot's work date in Vietnam time, so
+    // the result does not depend on the server timezone and overnight shifts
+    // are measured against the correct calendar day.
     const now = new Date();
-    const workShift = assignment.shiftSlot?.workShift;
-    let lateMinutes = 0;
-
-    if (workShift?.startTime) {
-      const [h, m] = workShift.startTime.split(':').map(Number);
-      const shiftStart = new Date(now);
-      shiftStart.setHours(h, m, 0, 0);
-      lateMinutes = Math.max(
-        0,
-        Math.floor((now.getTime() - shiftStart.getTime()) / 60000),
-      );
-    }
+    const slot = assignment.shiftSlot;
+    const workShift = slot?.workShift;
+    const { start: shiftStart } = resolveShiftBoundaries(
+      slot?.workDate,
+      slot?.startTime || workShift?.startTime,
+      slot?.endTime || workShift?.endTime,
+    );
+    const lateMinutes = calculateLateMinutes(shiftStart, now);
 
     const attendanceStatus =
       lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
@@ -14856,6 +15030,7 @@ export class StoresService {
   async checkOutWithFace(
     assignmentId: string,
     imageBuffer: Buffer,
+    accountId: string,
     options?: {
       latitude?: number;
       longitude?: number;
@@ -14874,6 +15049,9 @@ export class StoresService {
       ],
     });
     if (!assignment) throw new NotFoundException('Shift assignment not found');
+    // Authorize before any state is revealed, including the already-recorded
+    // short-circuit below.
+    this.assertAttendanceSelfAccess(assignment, accountId);
     if (!assignment.checkInTime)
       throw new BadRequestException('Must check in first');
     if (assignment.checkOutTime) {
@@ -14893,15 +15071,15 @@ export class StoresService {
 
     const storeId = assignment.shiftSlot?.cycle?.storeId;
 
-    // ===== Step 1: QR Verification =====
-    if (options?.qrStoreId && storeId) {
-      if (options.qrStoreId !== storeId) {
-        throw new BadRequestException(
-          'Mã QR không khớp với cửa hàng của ca làm việc này',
-        );
-      }
-      this.logger.debug(`[CheckOut] QR verified — storeId match`);
-    }
+    // ===== Step 1: Store policy (QR + location) =====
+    // Evaluated before face inference so a policy rejection is cheap.
+    const { checkinDistance, checkinLatitude, checkinLongitude } =
+      await this.applyAttendancePolicy(
+        'CheckOut',
+        storeId,
+        assignment.employeeId,
+        options,
+      );
 
     // ===== Step 2: Face Verification =====
     const employeeFace = await this.employeeFaceRepository.findOne({
@@ -14935,47 +15113,18 @@ export class StoresService {
       `[CheckOut] Face verified — distance=${matchResult.distance}`,
     );
 
-    // ===== Step 3: GPS — record distance only (never block) =====
-    let checkinDistance: number | null = null;
-    let checkinLatitude: number | null = null;
-    let checkinLongitude: number | null = null;
-
-    if (options?.latitude != null && options?.longitude != null) {
-      checkinLatitude = options.latitude;
-      checkinLongitude = options.longitude;
-
-      if (storeId) {
-        const store = await this.storeRepository.findOne({
-          where: { id: storeId },
-        });
-        if (store?.latitude != null && store?.longitude != null) {
-          checkinDistance = this.calculateDistance(
-            options.latitude,
-            options.longitude,
-            store.latitude,
-            store.longitude,
-          );
-          this.logger.debug(
-            `[CheckOut] GPS recorded — distance=${Math.round(checkinDistance)}m`,
-          );
-        }
-      }
-    }
-
-    // Calculate early minutes and worked minutes
+    // Calculate early minutes and worked minutes. Same Vietnam-anchored
+    // boundaries as check-in, so an overnight shift ending at 06:00 is compared
+    // against the following morning rather than the current calendar day.
     const now = new Date();
-    const workShift = assignment.shiftSlot?.workShift;
-    let earlyMinutes = 0;
-
-    if (workShift?.endTime) {
-      const [h, m] = workShift.endTime.split(':').map(Number);
-      const shiftEnd = new Date(now);
-      shiftEnd.setHours(h, m, 0, 0);
-      earlyMinutes = Math.max(
-        0,
-        Math.floor((shiftEnd.getTime() - now.getTime()) / 60000),
-      );
-    }
+    const slot = assignment.shiftSlot;
+    const workShift = slot?.workShift;
+    const { end: shiftEnd } = resolveShiftBoundaries(
+      slot?.workDate,
+      slot?.startTime || workShift?.startTime,
+      slot?.endTime || workShift?.endTime,
+    );
+    const earlyMinutes = calculateEarlyMinutes(shiftEnd, now);
 
     const workedMinutes = Math.floor(
       (now.getTime() - new Date(assignment.checkInTime).getTime()) / 60000,
@@ -15471,12 +15620,21 @@ export class StoresService {
 
   async registerFace(
     employeeProfileId: string,
-    storeId: string,
     imageBuffers: Buffer[],
+    accountId: string,
   ) {
     const startTime = Date.now();
-    console.log(
-      `🔵 [FaceRegistration] START — employee=${employeeProfileId}, store=${storeId}, images=${imageBuffers.length}`,
+    // Self-service only, and the owning store comes from the profile so a
+    // client cannot point the enrollment at a store it does not belong to.
+    const profile = await this.assertEmployeeSelfAccess(
+      employeeProfileId,
+      accountId,
+      undefined,
+      'Bạn chỉ có thể đăng ký khuôn mặt cho chính mình',
+    );
+    const storeId = profile.storeId;
+    this.logger.debug(
+      `[FaceRegistration] START — images=${imageBuffers.length}`,
     );
 
     if (imageBuffers.length < 3) {

@@ -75,8 +75,9 @@ export class ChatOutboxDispatcherService {
         WITH expired AS (
           SELECT id
           FROM chat_outbox_events
-          WHERE (status = 'published' AND published_at < NOW() - INTERVAL '24 hours')
-             OR (status = 'dead' AND dead_at < NOW() - INTERVAL '7 days')
+          WHERE ((status = 'published' AND published_at < NOW() - INTERVAL '24 hours')
+             OR (status = 'dead' AND dead_at < NOW() - INTERVAL '7 days'))
+            AND (push_intent_status IS NULL OR push_intent_status IN ('completed', 'dead'))
           ORDER BY COALESCE(published_at, dead_at) ASC
           LIMIT 500
         )

@@ -37,7 +37,7 @@ export async function listenWithChatRuntime(
     await app.close();
     throw error;
   }
-  chatCoordinator.activateAfterListen();
+  await chatCoordinator.activateAfterListen();
   chatGuard.startHealthMonitor(async () => {
     chatCoordinator.deactivate();
     process.exitCode = 1;

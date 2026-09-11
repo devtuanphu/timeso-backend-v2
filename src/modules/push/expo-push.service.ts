@@ -1,10 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 
-interface PushMessage {
+export interface PushMessage {
   to: string;
   title: string;
   body: string;
-  data?: Record<string, any>;
+  data?: Record<string, unknown>;
   sound?: string;
   badge?: number;
   categoryId?: string;
@@ -12,21 +12,52 @@ interface PushMessage {
   channelId?: string;
 }
 
-interface PushTicket {
-  status: 'ok' | 'error';
-  id?: string;
-  message?: string;
-  details?: any;
+export type PushDeliveryResult =
+  | { outcome: 'accepted'; ticketId: string }
+  | { outcome: 'retryable'; errorCode: string }
+  | { outcome: 'permanent'; errorCode: string; deviceInvalid: boolean };
+
+export type PushReceiptResult =
+  | { outcome: 'delivered' }
+  | { outcome: 'pending' }
+  | { outcome: 'retryable'; errorCode: string }
+  | { outcome: 'permanent'; errorCode: string; deviceInvalid: boolean };
+
+interface ExpoTicket {
+  status?: unknown;
+  id?: unknown;
+  details?: { error?: unknown };
 }
+
+const normalizeProviderCode = (value: unknown, fallback: string): string => {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 48);
+  return normalized || fallback;
+};
+
+const isDeviceInvalidCode = (code: string): boolean =>
+  code === 'DeviceNotRegistered';
+
+const isPermanentTicketCode = (code: string): boolean =>
+  isDeviceInvalidCode(code) ||
+  code === 'MessageTooBig' ||
+  code === 'MismatchSenderId' ||
+  code === 'InvalidCredentials';
 
 @Injectable()
 export class ExpoPushService {
   private readonly logger = new Logger(ExpoPushService.name);
-  private readonly EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+  private readonly sendUrl = 'https://exp.host/--/api/v2/push/send';
+  private readonly receiptUrl = 'https://exp.host/--/api/v2/push/getReceipts';
+  private readonly timeoutMs = 10_000;
 
-  async sendPushNotification(message: PushMessage): Promise<boolean> {
+  async sendDeviceNotification(
+    message: PushMessage,
+  ): Promise<PushDeliveryResult> {
     try {
-      const response = await fetch(this.EXPO_PUSH_URL, {
+      const { response, payload } = await this.fetchJsonWithTimeout<{
+        data?: ExpoTicket | ExpoTicket[];
+      }>(this.sendUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -35,82 +66,149 @@ export class ExpoPushService {
         },
         body: JSON.stringify(message),
       });
-
       if (!response.ok) {
-        this.logger.error(`Expo push failed: ${response.status}`);
-        return false;
+        if (response.status === 429 || response.status >= 500) {
+          return {
+            outcome: 'retryable',
+            errorCode: `EXPO_HTTP_${response.status}`,
+          };
+        }
+        return {
+          outcome: 'permanent',
+          errorCode: `EXPO_HTTP_${response.status}`,
+          deviceInvalid: false,
+        };
       }
 
-      const result = await response.json();
-      const ticket: PushTicket = result.data?.[0] || result;
-
-      if (ticket.status === 'error') {
-        this.logger.error(`Push ticket error: ${ticket.message}`);
-        return false;
+      const ticket = Array.isArray(payload?.data)
+        ? payload.data[0]
+        : payload?.data;
+      if (
+        ticket?.status === 'ok' &&
+        typeof ticket.id === 'string' &&
+        ticket.id
+      ) {
+        return { outcome: 'accepted', ticketId: ticket.id };
       }
-
-      this.logger.log(`✅ Push sent successfully: ${ticket.id}`);
-      return true;
-    } catch (error) {
-      this.logger.error('Failed to send push notification:', error);
-      return false;
+      const code = normalizeProviderCode(
+        ticket?.details?.error,
+        'EXPO_TICKET_ERROR',
+      );
+      if (code === 'MessageRateExceeded') {
+        return { outcome: 'retryable', errorCode: code };
+      }
+      if (isPermanentTicketCode(code)) {
+        return {
+          outcome: 'permanent',
+          errorCode: code,
+          deviceInvalid: isDeviceInvalidCode(code),
+        };
+      }
+      return { outcome: 'retryable', errorCode: code };
+    } catch {
+      return { outcome: 'retryable', errorCode: 'EXPO_REQUEST_FAILED' };
     }
   }
 
-  async sendToMultiple(tokens: string[], notification: {
-    title: string;
-    body: string;
-    data?: Record<string, any>;
-    categoryId?: string;
-    priority?: 'default' | 'normal' | 'high';
-    channelId?: string;
-  }): Promise<void> {
-    this.logger.log(`📤 Sending push to ${tokens.length} device(s)...`);
-    this.logger.log(`Tokens: ${JSON.stringify(tokens)}`);
-    this.logger.log(`Notification: ${JSON.stringify(notification)}`);
-
-    const messages: PushMessage[] = tokens.map(token => ({
-      to: token,
-      title: notification.title,
-      body: notification.body,
-      data: notification.data,
-      sound: 'default',
-      categoryId: notification.categoryId,
-      priority: notification.priority,
-      channelId: notification.channelId,
-    }));
-
-    // Send in batches of 100 (Expo limit)
-    for (let i = 0; i < messages.length; i += 100) {
-      const batch = messages.slice(i, i + 100);
-      
-      try {
-        this.logger.log(`Sending batch ${i / 100 + 1}...`);
-        const response = await fetch(this.EXPO_PUSH_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify(batch),
-        });
-
-        const result = await response.json();
-        this.logger.log(`✅ Expo response: ${JSON.stringify(result)}`);
-
-        // Check for errors in tickets
-        if (result.data) {
-          result.data.forEach((ticket: any, index: number) => {
-            if (ticket.status === 'error') {
-              this.logger.error(`❌ Push failed for token ${tokens[index]}: ${ticket.message}`);
-            } else {
-              this.logger.log(`✅ Push sent successfully: ${ticket.id}`);
-            }
-          });
-        }
-      } catch (error) {
-        this.logger.error(`❌ Batch ${i / 100 + 1} failed:`, error);
+  async getPushReceipts(
+    ticketIds: string[],
+  ): Promise<Record<string, PushReceiptResult>> {
+    if (ticketIds.length === 0) return {};
+    try {
+      const { response, payload } = await this.fetchJsonWithTimeout<{
+        data?: Record<string, ExpoTicket>;
+      }>(this.receiptUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ ids: ticketIds.slice(0, 100) }),
+      });
+      if (!response.ok) {
+        const code = `EXPO_RECEIPT_HTTP_${response.status}`;
+        return Object.fromEntries(
+          ticketIds.map((id) => [
+            id,
+            { outcome: 'retryable', errorCode: code },
+          ]),
+        );
       }
+      const data =
+        payload?.data && typeof payload.data === 'object' ? payload.data : {};
+      return Object.fromEntries(
+        ticketIds.map((id) => {
+          const receipt = data[id];
+          if (!receipt) return [id, { outcome: 'pending' }];
+          if (receipt.status === 'ok') return [id, { outcome: 'delivered' }];
+          const code = normalizeProviderCode(
+            receipt.details?.error,
+            'EXPO_RECEIPT_ERROR',
+          );
+          if (code === 'MessageRateExceeded') {
+            return [id, { outcome: 'retryable', errorCode: code }];
+          }
+          return [
+            id,
+            {
+              outcome: 'permanent',
+              errorCode: code,
+              deviceInvalid: isDeviceInvalidCode(code),
+            },
+          ];
+        }),
+      );
+    } catch {
+      return Object.fromEntries(
+        ticketIds.map((id) => [
+          id,
+          { outcome: 'retryable', errorCode: 'EXPO_RECEIPT_REQUEST_FAILED' },
+        ]),
+      );
+    }
+  }
+
+  async sendPushNotification(message: PushMessage): Promise<boolean> {
+    return (await this.sendDeviceNotification(message)).outcome === 'accepted';
+  }
+
+  async sendToMultiple(
+    tokens: string[],
+    notification: Omit<PushMessage, 'to' | 'sound' | 'badge'>,
+  ): Promise<void> {
+    let accepted = 0;
+    for (let index = 0; index < tokens.length; index += 20) {
+      const batch = tokens.slice(index, index + 20);
+      const results = await Promise.all(
+        batch.map((token) =>
+          this.sendDeviceNotification({
+            ...notification,
+            to: token,
+            sound: 'default',
+          }),
+        ),
+      );
+      accepted += results.filter(
+        (result) => result.outcome === 'accepted',
+      ).length;
+    }
+    this.logger.log(
+      `Push batch complete (${accepted}/${tokens.length} accepted)`,
+    );
+  }
+
+  private async fetchJsonWithTimeout<T>(
+    url: string,
+    init: RequestInit,
+  ): Promise<{ response: Response; payload: T | undefined }> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await fetch(url, { ...init, signal: controller.signal });
+      const payload = response.ok ? ((await response.json()) as T) : undefined;
+      return { response, payload };
+    } finally {
+      clearTimeout(timeout);
     }
   }
 }

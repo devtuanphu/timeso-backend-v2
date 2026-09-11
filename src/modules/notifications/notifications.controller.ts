@@ -1,11 +1,8 @@
 import {
   Controller,
   Get,
-  Post,
-  Put,
   Patch,
   Delete,
-  Body,
   Param,
   Query,
   UseGuards,
@@ -14,8 +11,7 @@ import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiQuery } from '@ne
 import { NotificationsService } from './notifications.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { GetUser } from '../auth/decorators/get-user.decorator';
-import { GetNotificationsQueryDto, CreateNotificationDto } from './dto/notification.dto';
-import { SendPushNotificationDto } from './dto/send-push.dto';
+import { GetNotificationsQueryDto } from './dto/notification.dto';
 
 @ApiTags('Notifications')
 @ApiBearerAuth()
@@ -24,41 +20,15 @@ import { SendPushNotificationDto } from './dto/send-push.dto';
 export class NotificationsController {
   constructor(private readonly notificationsService: NotificationsService) {}
 
-  @Post()
-  @ApiOperation({ summary: 'Tạo thông báo mới' })
-  async create(@Body() body: CreateNotificationDto) {
-    return this.notificationsService.create(body);
-  }
-
-  @Post('broadcast')
-  @ApiOperation({ summary: 'Gửi thông báo tới tất cả người dùng' })
-  async broadcast(@Body() body: CreateNotificationDto) {
-    return this.notificationsService.broadcast(body);
-  }
-
-  @Post('send-push')
-  @ApiOperation({ 
-    summary: 'Gửi push notification đơn giản (chỉ cần accountId, title, body)',
-    description: 'Gửi push notification trực tiếp tới tất cả devices của user mà không tạo notification record trong DB'
-  })
-  @ApiResponse({ 
-    status: 200, 
-    description: 'Push notification đã được gửi',
-    schema: {
-      example: {
-        sent: true,
-        devicesCount: 2
-      }
-    }
-  })
-  async sendPush(@Body() dto: SendPushNotificationDto) {
-    return this.notificationsService.sendPushOnly(
-      dto.accountId,
-      dto.title,
-      dto.body,
-      dto.data
-    );
-  }
+  // Notification writes are producer-side concerns. They are driven internally
+  // through NotificationsService by the shift reminder processor and the
+  // shift-end workflow, never by a client. Previously these were exposed as
+  // POST /, POST /broadcast and POST /send-push behind JwtAuthGuard only, which
+  // let any authenticated account write a notification for an arbitrary
+  // accountId, push to that account's devices, or broadcast to every active
+  // account. No client consumes them, so the routes are removed rather than
+  // guarded; reintroduce them behind an operator-scoped guard if ops tooling
+  // ever needs them.
 
   @Get()
   @ApiOperation({ summary: 'Lấy danh sách thông báo với filter' })

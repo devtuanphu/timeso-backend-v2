@@ -8,6 +8,7 @@ import {
   EmploymentStatus,
 } from '../stores/entities/employee-profile.entity';
 import { Store, StoreStatus } from '../stores/entities/store.entity';
+import { UserDevice } from '../devices/entities/user-device.entity';
 import { chatAccessDenied } from './chat-errors';
 import { ChatGroupMember } from './entities/chat-group-member.entity';
 import { ChatGroup } from './entities/chat-group.entity';
@@ -17,6 +18,18 @@ export interface AuthorizedChatContext {
   member: ChatGroupMember;
   isOwner: boolean;
 }
+
+export interface EligibleChatPushDevice {
+  userDeviceId: string;
+  accountId: string;
+  deviceId: string;
+  tokenFingerprint: string;
+  registrationVersion: string;
+}
+
+export type PushDeliveryEligibility =
+  | { eligible: true; expoPushToken: string }
+  | { eligible: false; reason: string };
 
 @Injectable()
 export class ChatAuthorizationService {
@@ -195,5 +208,107 @@ export class ChatAuthorizationService {
       .getRawMany<{ accountId: string }>();
 
     return [...new Set(rows.map((row) => row.accountId))];
+  }
+
+  async getEligiblePushDevices(
+    groupId: string,
+    senderAccountId: string,
+    manager?: EntityManager,
+  ): Promise<EligibleChatPushDevice[]> {
+    const executor = manager || this.memberRepository.manager;
+    const rows = await executor.query(
+      `SELECT device.id AS "userDeviceId",
+              member.account_id AS "accountId",
+              device.device_id AS "deviceId",
+              device.push_token_fingerprint AS "tokenFingerprint",
+              device.registration_version::text AS "registrationVersion"
+       FROM chat_group_members member
+       JOIN chat_groups chat_group
+         ON chat_group.id = member.group_id AND chat_group.deleted_at IS NULL
+       JOIN stores store
+         ON store.id = chat_group.store_id
+        AND store.status = 'active' AND store.deleted_at IS NULL
+       JOIN accounts account
+         ON account.id = member.account_id
+        AND account.status = 'active' AND account.deleted_at IS NULL
+       LEFT JOIN employee_profiles employee
+         ON employee.store_id = chat_group.store_id
+        AND employee.account_id = member.account_id
+        AND employee.deleted_at IS NULL
+       JOIN user_devices device
+         ON device.user_id = member.account_id::text
+        AND device.is_active = true
+        AND device.deleted_at IS NULL
+        AND device.push_token_fingerprint IS NOT NULL
+       WHERE member.group_id = $1
+         AND member.account_id != $2
+         AND member.status = 'active'
+         AND member.deleted_at IS NULL
+         AND member.notifications_enabled = true
+         AND (store.owner_account_id = member.account_id
+              OR employee.employment_status != 'terminated')`,
+      [groupId, senderAccountId],
+    );
+    return rows as EligibleChatPushDevice[];
+  }
+
+  async requirePushDeliveryEligibility(
+    delivery: {
+      groupId: string;
+      intendedAccountId: string;
+      userDeviceId: string;
+      expectedDeviceId: string;
+      expectedTokenFingerprint: string;
+      expectedRegistrationVersion: string;
+      senderAccountId: string;
+    },
+    manager?: EntityManager,
+  ): Promise<PushDeliveryEligibility> {
+    const executor = manager || this.memberRepository.manager;
+    const rows = await executor.query(
+      `SELECT device.expo_push_token AS "expoPushToken"
+       FROM chat_group_members member
+       JOIN chat_groups chat_group
+         ON chat_group.id = member.group_id AND chat_group.deleted_at IS NULL
+       JOIN stores store
+         ON store.id = chat_group.store_id
+        AND store.status = 'active' AND store.deleted_at IS NULL
+       JOIN accounts account
+         ON account.id = member.account_id
+        AND account.status = 'active' AND account.deleted_at IS NULL
+       LEFT JOIN employee_profiles employee
+         ON employee.store_id = chat_group.store_id
+        AND employee.account_id = member.account_id
+        AND employee.deleted_at IS NULL
+       JOIN user_devices device ON device.id = $3
+       WHERE member.group_id = $1
+         AND member.account_id = $2
+         AND member.account_id != $7
+         AND member.status = 'active'
+         AND member.deleted_at IS NULL
+         AND member.notifications_enabled = true
+         AND (store.owner_account_id = member.account_id
+              OR employee.employment_status != 'terminated')
+         AND device.user_id = member.account_id::text
+         AND device.device_id = $4
+         AND device.push_token_fingerprint = $5
+         AND device.registration_version = $6::bigint
+         AND device.is_active = true
+         AND device.deleted_at IS NULL
+       LIMIT 1`,
+      [
+        delivery.groupId,
+        delivery.intendedAccountId,
+        delivery.userDeviceId,
+        delivery.expectedDeviceId,
+        delivery.expectedTokenFingerprint,
+        delivery.expectedRegistrationVersion,
+        delivery.senderAccountId,
+      ],
+    );
+    const token = rows[0]?.expoPushToken;
+    return typeof token === 'string' && token
+      ? { eligible: true, expoPushToken: token }
+      : { eligible: false, reason: 'DELIVERY_NO_LONGER_ELIGIBLE' };
   }
 }

@@ -29,16 +29,27 @@ import { ChatSocketAuthService } from './chat-socket-auth.service';
 import { ChatRuntimeHttpGuard } from './chat-runtime-http.guard';
 import { AuthModule } from '../auth/auth.module';
 import { ChatAbuseProtectionService } from './chat-abuse-protection.service';
+import { ChatPushDelivery } from './entities/chat-push-delivery.entity';
+import { ChatPushIntentDispatcherService } from './chat-push-intent-dispatcher.service';
+import { ChatPushDispatcherService } from './chat-push-dispatcher.service';
+import { ChatPushReceiptDispatcherService } from './chat-push-receipt-dispatcher.service';
+import { DevicesModule } from '../devices/devices.module';
+import { PushModule } from '../push/push.module';
+import { UserDevice } from '../devices/entities/user-device.entity';
 
 @Module({
   imports: [
     ConfigModule,
     AuthModule,
+    DevicesModule,
+    PushModule,
     TypeOrmModule.forFeature([
       ChatGroup,
       ChatGroupMember,
       ChatMessage,
       ChatOutboxEvent,
+      ChatPushDelivery,
+      UserDevice,
       Store,
       EmployeeProfile,
       Account,
@@ -67,6 +78,9 @@ import { ChatAbuseProtectionService } from './chat-abuse-protection.service';
       useExisting: LocalSocketChatEventPublisher,
     },
     ChatOutboxDispatcherService,
+    ChatPushIntentDispatcherService,
+    ChatPushDispatcherService,
+    ChatPushReceiptDispatcherService,
     ChatSingleInstanceRuntimeGuardService,
     ChatRealtimeCoordinatorService,
   ],

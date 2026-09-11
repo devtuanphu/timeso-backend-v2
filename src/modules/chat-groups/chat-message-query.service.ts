@@ -1,5 +1,5 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
 
 import { ChatAuthorizationService } from './chat-authorization.service';
 import { mapChatMessage } from './chat-message.mapper';
@@ -414,8 +414,11 @@ export class ChatMessageQueryService {
     );
   }
 
-  async getTotalUnreadCount(accountId: string): Promise<{ totalUnread: number }> {
-    const rows = await this.dataSource.query(
+  async getTotalUnreadCount(
+    accountId: string,
+    manager?: EntityManager,
+  ): Promise<{ totalUnread: number }> {
+    const rows = await (manager || this.dataSource).query(
       `SELECT COUNT(message.id)::int AS "totalUnread"
        FROM chat_group_members membership
        JOIN chat_groups chat_group

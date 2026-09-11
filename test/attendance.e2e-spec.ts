@@ -15,8 +15,12 @@ import {
   AttendanceStatus,
   ShiftAssignmentStatus,
 } from '../src/modules/stores/entities/shift-management.entity';
+import { EmploymentStatus } from '../src/modules/stores/entities/employee-profile.entity';
 
 jest.mock('uuid', () => ({ v4: () => 'test-upload-id' }));
+
+// Attendance is self-service, so every call is made as the assignment's owner.
+const TEST_ACCOUNT_ID = 'account-1';
 
 function createConcurrentAttendanceService(mode: 'check-in' | 'check-out') {
   const assignment: any = {
@@ -37,7 +41,10 @@ function createConcurrentAttendanceService(mode: 'check-in' | 'check-out') {
       workShift: { startTime: '00:00', endTime: '23:59' },
       cycle: { storeId: 'store-1' },
     },
-    employee: {},
+    employee: {
+      accountId: TEST_ACCOUNT_ID,
+      employmentStatus: EmploymentStatus.ACTIVE,
+    },
   };
   const logs: any[] = [];
   const service = Object.create(StoresService.prototype) as any;
@@ -61,6 +68,13 @@ function createConcurrentAttendanceService(mode: 'check-in' | 'check-out') {
     update: jest.fn().mockResolvedValue(undefined),
   };
   service.storeRepository = { findOne: jest.fn() };
+  // Store attendance policy lookups. No rows configured means the entity
+  // defaults apply; enforcement stays in observation mode unless
+  // ATTENDANCE_ENFORCEMENT_MODE=enforce, so these calls never reject here.
+  service.timekeepingSettingRepository = {
+    findOne: jest.fn().mockResolvedValue(null),
+  };
+  service.shiftConfigRepository = { findOne: jest.fn().mockResolvedValue(null) };
   service.appendToDailyReport = jest.fn();
   service.dataSource = {
     transaction: jest.fn(async (callback) => {
@@ -112,7 +126,13 @@ describe('Attendance flow (e2e)', () => {
   };
 
   beforeAll(async () => {
-    const allowAll: CanActivate = { canActivate: () => true };
+    const allowAll: CanActivate = {
+      canActivate: (context) => {
+        // Attendance routes now resolve the caller from the request principal.
+        context.switchToHttp().getRequest().user = { userId: TEST_ACCOUNT_ID };
+        return true;
+      },
+    };
     const moduleRef = await Test.createTestingModule({
       controllers: [StoresController],
       providers: [
@@ -159,6 +179,7 @@ describe('Attendance flow (e2e)', () => {
     expect(storesService.checkInWithFace).toHaveBeenCalledWith(
       'assignment-1',
       expect.any(Buffer),
+      TEST_ACCOUNT_ID,
       expect.objectContaining({ orientationNormalized: true }),
     );
     expect(queue.add).not.toHaveBeenCalled();
@@ -307,7 +328,7 @@ describe('Attendance flow (e2e)', () => {
     const { service, logs } = createConcurrentAttendanceService('check-in');
     const results = await Promise.all(
       Array.from({ length: 20 }, () =>
-        service.checkInWithFace('assignment-1', Buffer.from('photo'), {
+        service.checkInWithFace('assignment-1', Buffer.from('photo'), TEST_ACCOUNT_ID, {
           orientationNormalized: true,
         }),
       ),
@@ -322,7 +343,7 @@ describe('Attendance flow (e2e)', () => {
     const { service, logs } = createConcurrentAttendanceService('check-out');
     const results = await Promise.all(
       Array.from({ length: 20 }, () =>
-        service.checkOutWithFace('assignment-1', Buffer.from('photo'), {
+        service.checkOutWithFace('assignment-1', Buffer.from('photo'), TEST_ACCOUNT_ID, {
           orientationNormalized: true,
         }),
       ),

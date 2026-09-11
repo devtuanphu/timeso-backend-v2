@@ -1,4 +1,4 @@
-import { Controller, Post, Body, UseGuards } from '@nestjs/common';
+import { Controller, Post, Body, UseGuards, Delete, Param, HttpCode } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { GetUser } from '../auth/decorators/get-user.decorator';
@@ -16,5 +16,15 @@ export class DevicesController {
   @ApiOperation({ summary: 'Đăng ký device cho push notifications' })
   async register(@GetUser() user: any, @Body() dto: RegisterDeviceDto) {
     return this.devicesService.register(user.userId, dto);
+  }
+
+  @Delete(':deviceId')
+  @HttpCode(204)
+  @ApiOperation({ summary: 'Gỡ đăng ký push của thiết bị thuộc tài khoản hiện tại' })
+  async unregister(
+    @GetUser() user: any,
+    @Param('deviceId') deviceId: string,
+  ): Promise<void> {
+    await this.devicesService.disableOwnedDevice(user.userId, deviceId);
   }
 }

@@ -30,7 +30,10 @@ const persistedMessage = (content = 'Xin chào') =>
     createdAt: new Date('2026-08-29T00:00:00.000Z'),
   }) as ChatMessage;
 
-const createHarness = (existing: ChatMessage | null) => {
+const createHarness = (
+  existing: ChatMessage | null,
+  configValues: Record<string, unknown> = {},
+) => {
   const idempotencyBuilder = {
     withDeleted: jest.fn().mockReturnThis(),
     leftJoinAndSelect: jest.fn().mockReturnThis(),
@@ -80,7 +83,7 @@ const createHarness = (existing: ChatMessage | null) => {
     }),
   } as unknown as ChatAuthorizationService;
   const configService = {
-    get: jest.fn().mockReturnValue(false),
+    get: jest.fn((key: string) => configValues[key]),
   } as unknown as ConfigService;
   return {
     service: new ChatMessageCommandService(
@@ -134,5 +137,22 @@ describe('ChatMessageCommandService', () => {
       expect.objectContaining({ content: expect.anything() }),
     );
   });
-});
 
+  it('atomically enrolls only newly accepted messages after the push cutoff', async () => {
+    const { service, outboxRepository } = createHarness(null, {
+      CHAT_PUSH_DELIVERY_ENABLED: 'true',
+      CHAT_PUSH_ACTIVATION_STARTED_AT: '2026-01-01T00:00:00Z',
+    });
+    await service.sendTextMessage(ids.group, ids.account, {
+      clientMessageId: ids.client,
+      content: 'Xin chào',
+    });
+    expect(outboxRepository.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        pushIntentStatus: 'pending',
+        pushIntentAttemptCount: 0,
+        pushIntentAvailableAt: expect.any(Date),
+      }),
+    );
+  });
+});

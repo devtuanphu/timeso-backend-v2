@@ -24,6 +24,13 @@ export enum ChatOutboxStatus {
   DEAD = 'dead',
 }
 
+export enum ChatPushIntentStatus {
+  PENDING = 'pending',
+  PROCESSING = 'processing',
+  COMPLETED = 'completed',
+  DEAD = 'dead',
+}
+
 @Entity('chat_outbox_events')
 @Check(
   'ck_chat_outbox_event_identity',
@@ -97,4 +104,32 @@ export class ChatOutboxEvent extends BaseEntity {
 
   @Column({ type: 'varchar', length: 64, nullable: true, name: 'error_code' })
   errorCode: string | null;
+
+  @Column({
+    type: 'enum',
+    enum: ChatPushIntentStatus,
+    nullable: true,
+    name: 'push_intent_status',
+  })
+  pushIntentStatus: ChatPushIntentStatus | null;
+
+  @Column({ type: 'integer', default: 0, name: 'push_intent_attempt_count' })
+  pushIntentAttemptCount: number;
+
+  @Column({ type: 'timestamptz', nullable: true, name: 'push_intent_available_at' })
+  pushIntentAvailableAt: Date | null;
+
+  @Column({ type: 'timestamptz', nullable: true, name: 'push_intent_locked_at' })
+  pushIntentLockedAt: Date | null;
+
+  @Column({ type: 'uuid', nullable: true, name: 'push_intent_claim_token' })
+  pushIntentClaimToken: string | null;
+
+  @Column({
+    type: 'varchar',
+    length: 64,
+    nullable: true,
+    name: 'push_intent_error_code',
+  })
+  pushIntentErrorCode: string | null;
 }

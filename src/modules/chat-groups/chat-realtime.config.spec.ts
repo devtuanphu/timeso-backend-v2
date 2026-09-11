@@ -11,6 +11,25 @@ describe('chat realtime configuration', () => {
       legacyConnectionEnabled: false,
       legacyMutationEnabled: false,
       singletonGuardMode: 'required',
+      pushDeliveryEnabled: false,
+      pushActivationStartedAt: null,
+    });
+  });
+
+  it('requires an activation cutoff before enabling chat push', () => {
+    expect(() =>
+      createChatRealtimeConfig(config({ CHAT_PUSH_DELIVERY_ENABLED: 'true' })),
+    ).toThrow(/CHAT_PUSH_ACTIVATION_STARTED_AT/);
+    expect(
+      createChatRealtimeConfig(
+        config({
+          CHAT_PUSH_DELIVERY_ENABLED: 'true',
+          CHAT_PUSH_ACTIVATION_STARTED_AT: '2026-09-07T00:00:00Z',
+        }),
+      ),
+    ).toMatchObject({
+      pushDeliveryEnabled: true,
+      pushActivationStartedAt: new Date('2026-09-07T00:00:00Z'),
     });
   });
 

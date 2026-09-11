@@ -1,7 +1,28 @@
-import { Controller, Get, Post, Body, UseGuards, Put, UseInterceptors, UploadedFiles, UploadedFile } from '@nestjs/common';
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  UseGuards,
+  Put,
+  UseInterceptors,
+  UploadedFiles,
+  UploadedFile,
+  Param,
+  Res,
+  NotFoundException,
+  ForbiddenException,
+} from '@nestjs/common';
+import type { Response } from 'express';
+import { createReadStream, existsSync } from 'fs';
+import { join, resolve as resolvePath } from 'path';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiConsumes, ApiBody } from '@nestjs/swagger';
 import { FileFieldsInterceptor, FileInterceptor } from '@nestjs/platform-express';
-import { multerConfig } from '../../common/utils/multer-config';
+import {
+  multerConfig,
+  identityMulterConfig,
+  IDENTITY_UPLOAD_DIR,
+} from '../../common/utils/multer-config';
 import { AccountsService } from './accounts.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { GetUser } from '../auth/decorators/get-user.decorator';
@@ -61,11 +82,55 @@ export class AccountsController {
     return { avatar: avatarUrl };
   }
 
+  @Get('identity/image/:filename')
+  @ApiOperation({
+    summary: 'Tải ảnh giấy tờ định danh',
+    description:
+      'Chỉ chủ tài khoản mới đọc được ảnh giấy tờ của chính mình. Ảnh không nằm trong thư mục tĩnh công khai.',
+  })
+  async getIdentityImage(
+    @Param('filename') filename: string,
+    @GetUser() user: any,
+    @Res() res: Response,
+  ) {
+    // The filename is the only path input, so reject anything that is not a
+    // bare name before it reaches the filesystem.
+    if (!/^[A-Za-z0-9._-]+$/.test(filename) || filename.includes('..')) {
+      throw new NotFoundException('Không tìm thấy ảnh giấy tờ');
+    }
+
+    const document = await this.identityRepository.findOne({
+      where: { accountId: user.userId },
+    });
+    if (!document) throw new NotFoundException('Không tìm thấy ảnh giấy tờ');
+
+    // Ownership: the requested file must be one of this account's own images.
+    const owned = [document.frontImageUrl, document.backImageUrl].some((url) =>
+      typeof url === 'string' ? url.endsWith(`/${filename}`) : false,
+    );
+    if (!owned) {
+      throw new ForbiddenException('Bạn không có quyền xem ảnh giấy tờ này');
+    }
+
+    const directory = resolvePath(IDENTITY_UPLOAD_DIR);
+    const absolutePath = resolvePath(join(directory, filename));
+    if (!absolutePath.startsWith(`${directory}/`) || !existsSync(absolutePath)) {
+      throw new NotFoundException('Không tìm thấy ảnh giấy tờ');
+    }
+
+    res.setHeader(
+      'Content-Type',
+      absolutePath.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg',
+    );
+    res.setHeader('Cache-Control', 'private, no-store');
+    createReadStream(absolutePath).pipe(res);
+  }
+
   @Post('identity')
   @UseInterceptors(FileFieldsInterceptor([
     { name: 'frontImage', maxCount: 1 },
     { name: 'backImage', maxCount: 1 },
-  ], multerConfig))
+  ], identityMulterConfig))
   @ApiConsumes('multipart/form-data')
   @ApiOperation({ summary: 'Cập nhật định danh (ID/CCCD)', description: 'Cập nhật thông tin và tải lên ảnh mặt trước/sau của giấy tờ định danh' })
   @ApiResponse({ status: 200, description: 'Cập nhật định danh thành công', type: IdentityResponseDto })
@@ -75,8 +140,13 @@ export class AccountsController {
     @UploadedFiles() files: { frontImage?: Express.Multer.File[], backImage?: Express.Multer.File[] }
   ) {
     const data: any = { ...body, accountId: user.userId };
-    if (files.frontImage?.[0]) data.frontImageUrl = `/uploads/${files.frontImage[0].filename}`;
-    if (files.backImage?.[0]) data.backImageUrl = `/uploads/${files.backImage[0].filename}`;
+    // Sensitive scans are addressed through the authenticated route below, not
+    // the public `/uploads` mount. Documents stored by earlier builds keep
+    // their `/uploads/...` URL and continue to resolve.
+    if (files.frontImage?.[0])
+      data.frontImageUrl = `/api/accounts/identity/image/${files.frontImage[0].filename}`;
+    if (files.backImage?.[0])
+      data.backImageUrl = `/api/accounts/identity/image/${files.backImage[0].filename}`;
 
     // Remove file objects from data to avoid TypeORM errors
     delete data.frontImage;

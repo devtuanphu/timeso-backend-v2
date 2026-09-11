@@ -39,7 +39,13 @@ describe('AuthService staff registration', () => {
     const service = new AuthService(
       accountsService as never,
       { sign: jest.fn() } as never,
-      { get: jest.fn() } as never,
+      // OTP codes are persisted as an HMAC keyed from JWT_SECRET, so the
+      // service needs one even in registration-only tests.
+      {
+        get: jest.fn((key: string) =>
+          key === 'JWT_SECRET' ? 'test-jwt-secret' : undefined,
+        ),
+      } as never,
       {} as never,
       {} as never,
       employeeProfileRepository as never,

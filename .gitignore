@@ -60,3 +60,6 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 /public
 /uploads
 yarn.lock
+
+# Identity documents are sensitive and are never served statically.
+/uploads-private/

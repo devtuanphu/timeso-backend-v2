@@ -5,6 +5,7 @@ import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { StoresService } from './stores.service';
 import { DistributedLockService } from './distributed-lock.service';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
+import { JobApplicationService } from './job-application.service';
 
 @Injectable()
 export class StoresCronService {
@@ -14,11 +15,28 @@ export class StoresCronService {
     private readonly storesService: StoresService,
     private readonly lockService: DistributedLockService,
     private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
+    private readonly jobApplicationService: JobApplicationService,
     private readonly configService: ConfigService,
   ) {}
 
   private isReadOnlyMode(): boolean {
     return isAppReadOnlyMode(this.configService);
+  }
+
+  /**
+   * Chạy 00:35 mỗi ngày: xoá thông tin liên hệ của các đơn ứng tuyển đã xử lý
+   * quá thời hạn lưu trữ. Giữ lại bản ghi và quyết định, chỉ bỏ dữ liệu cá nhân.
+   */
+  @Cron('35 0 * * *', {
+    name: 'redact-stale-job-applications',
+    timeZone: 'Asia/Ho_Chi_Minh',
+  })
+  async handleRedactStaleJobApplications() {
+    if (this.isReadOnlyMode()) return;
+
+    await this.lockService.withLock('cron:redact-stale-job-applications', 300, () =>
+      this.jobApplicationService.redactStaleContactDetails(),
+    );
   }
 
   @Cron(CronExpression.EVERY_MINUTE, {

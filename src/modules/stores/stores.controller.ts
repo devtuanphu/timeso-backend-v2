@@ -3988,9 +3988,12 @@ export class StoresController {
     @Param('id') id: string,
     @Body() body: any,
     @UploadedFiles() files: Express.Multer.File[],
+    @GetUser() user?: any,
   ) {
     return this.storesService.createLeaveRequest(
-      { ...body, storeId: id },
+      id,
+      body,
+      user?.userId,
       files,
     );
   }
@@ -4021,9 +4024,10 @@ export class StoresController {
   @ApiOperation({ summary: 'Hủy đơn xin nghỉ phép' })
   async cancelLeaveRequest(
     @Param('requestId') requestId: string,
-    @Body('employeeProfileId') employeeProfileId: string,
+    @GetUser() user: any,
   ) {
-    return this.storesService.cancelLeaveRequest(requestId, employeeProfileId);
+    // The owning employee is resolved from the stored request, not the body.
+    return this.storesService.cancelLeaveRequest(requestId, user?.userId);
   }
 
   // Feedback
@@ -4084,6 +4088,7 @@ export class StoresController {
   async checkIn(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
+    @GetUser() user: any,
     @Body()
     body: {
       latitude?: string;
@@ -4095,12 +4100,17 @@ export class StoresController {
     if (!photo) throw new BadRequestException('Photo is required');
     const imageBuffer = photo.buffer;
     if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
-    const result = await this.storesService.checkInWithFace(id, imageBuffer, {
-      latitude: body.latitude ? parseFloat(body.latitude) : undefined,
-      longitude: body.longitude ? parseFloat(body.longitude) : undefined,
-      qrStoreId: body.qrStoreId,
-      orientationNormalized: body.orientationNormalized === 'true',
-    });
+    const result = await this.storesService.checkInWithFace(
+      id,
+      imageBuffer,
+      user?.userId,
+      {
+        latitude: body.latitude ? parseFloat(body.latitude) : undefined,
+        longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+        qrStoreId: body.qrStoreId,
+        orientationNormalized: body.orientationNormalized === 'true',
+      },
+    );
     if (result.matched) {
       void this.shiftEndWorkflowService
         .scheduleForAssignment(id)
@@ -4119,6 +4129,7 @@ export class StoresController {
   async checkOut(
     @Param('id') id: string,
     @UploadedFile() photo: Express.Multer.File,
+    @GetUser() user: any,
     @Body()
     body: {
       latitude?: string;
@@ -4130,12 +4141,17 @@ export class StoresController {
     if (!photo) throw new BadRequestException('Photo is required');
     const imageBuffer = photo.buffer;
     if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
-    const result = await this.storesService.checkOutWithFace(id, imageBuffer, {
-      latitude: body.latitude ? parseFloat(body.latitude) : undefined,
-      longitude: body.longitude ? parseFloat(body.longitude) : undefined,
-      qrStoreId: body.qrStoreId,
-      orientationNormalized: body.orientationNormalized === 'true',
-    });
+    const result = await this.storesService.checkOutWithFace(
+      id,
+      imageBuffer,
+      user?.userId,
+      {
+        latitude: body.latitude ? parseFloat(body.latitude) : undefined,
+        longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+        qrStoreId: body.qrStoreId,
+        orientationNormalized: body.orientationNormalized === 'true',
+      },
+    );
 
     if (result.matched) {
       void this.shiftEndWorkflowService.markCompletedByEmployee(id);
@@ -4189,7 +4205,7 @@ export class StoresController {
   async registerFace(
     @Param('employeeId') employeeId: string,
     @UploadedFiles() photos: Express.Multer.File[],
-    @Body('storeId') storeId: string,
+    @GetUser() user: any,
   ) {
     if (!photos || photos.length < 3) {
       throw new BadRequestException('At least 3 face photos required');
@@ -4204,8 +4220,8 @@ export class StoresController {
     });
     const result = await this.storesService.registerFace(
       employeeId,
-      storeId,
       buffers,
+      user?.userId,
     );
     // Clean up temp files
     photos.forEach((p) => {

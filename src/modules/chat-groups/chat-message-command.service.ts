@@ -9,6 +9,7 @@ import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import { ChatAuthorizationService } from './chat-authorization.service';
 import { chatIdempotencyConflict, chatNotReady } from './chat-errors';
+import { isChatPushIntentEnabled } from './chat-realtime.config';
 import { mapChatMessage } from './chat-message.mapper';
 import { validateChatContent } from './chat-message.utils';
 import {
@@ -21,6 +22,7 @@ import {
   ChatOutboxEvent,
   ChatOutboxEventType,
   ChatOutboxStatus,
+  ChatPushIntentStatus,
 } from './entities/chat-outbox-event.entity';
 
 interface SendResult extends SendChatMessageResponseDto {
@@ -103,6 +105,11 @@ export class ChatMessageCommandService {
           .andWhere('status = :active', { active: 'active' })
           .execute();
 
+        const acceptedAt = new Date();
+        const pushIntentEnabled = isChatPushIntentEnabled(
+          this.configService,
+          acceptedAt,
+        );
         const outbox = manager.getRepository(ChatOutboxEvent).create({
           eventType: ChatOutboxEventType.MESSAGE_CREATED_V1,
           groupId,
@@ -111,7 +118,12 @@ export class ChatMessageCommandService {
           sequence: persisted.sequence,
           status: ChatOutboxStatus.PENDING,
           attemptCount: 0,
-          availableAt: new Date(),
+          availableAt: acceptedAt,
+          pushIntentStatus: pushIntentEnabled
+            ? ChatPushIntentStatus.PENDING
+            : null,
+          pushIntentAttemptCount: 0,
+          pushIntentAvailableAt: pushIntentEnabled ? acceptedAt : null,
         });
         await manager.getRepository(ChatOutboxEvent).save(outbox);
 

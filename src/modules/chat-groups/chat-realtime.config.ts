@@ -1,4 +1,5 @@
 import { ConfigService } from '@nestjs/config';
+import { isLocalApiOnly } from '../../app-runtime.config';
 
 export const CHAT_REALTIME_CONFIG = Symbol('CHAT_REALTIME_CONFIG');
 
@@ -13,6 +14,8 @@ export interface ChatRealtimeConfig {
   legacyWindowStartedAt: Date | null;
   legacyCutoffAt: Date | null;
   singletonGuardMode: 'required' | 'disabled';
+  pushDeliveryEnabled: boolean;
+  pushActivationStartedAt: Date | null;
 }
 
 const parseStrictBoolean = (value: unknown, name: string): boolean => {
@@ -104,11 +107,46 @@ export const createChatRealtimeConfig = (
     );
   }
 
+  let pushDeliveryEnabled = parseStrictBoolean(
+    config.get<string | boolean>('CHAT_PUSH_DELIVERY_ENABLED'),
+    'CHAT_PUSH_DELIVERY_ENABLED',
+  );
+  let pushActivationStartedAt: Date | null = null;
+  if (pushDeliveryEnabled) {
+    pushActivationStartedAt = parseDate(
+      config.get('CHAT_PUSH_ACTIVATION_STARTED_AT'),
+      'CHAT_PUSH_ACTIVATION_STARTED_AT',
+    );
+    if (isLocalApiOnly()) {
+      pushDeliveryEnabled = false;
+      pushActivationStartedAt = null;
+    }
+  }
+
   return {
     legacyConnectionEnabled,
     legacyMutationEnabled,
     legacyWindowStartedAt,
     legacyCutoffAt,
     singletonGuardMode: guardValue,
+    pushDeliveryEnabled,
+    pushActivationStartedAt,
   };
+};
+
+export const isChatPushIntentEnabled = (
+  config: ConfigService,
+  acceptedAt: Date,
+): boolean => {
+  if (isLocalApiOnly()) return false;
+  const enabled = parseStrictBoolean(
+    config.get<string | boolean>('CHAT_PUSH_DELIVERY_ENABLED'),
+    'CHAT_PUSH_DELIVERY_ENABLED',
+  );
+  if (!enabled) return false;
+  const activation = parseDate(
+    config.get('CHAT_PUSH_ACTIVATION_STARTED_AT'),
+    'CHAT_PUSH_ACTIVATION_STARTED_AT',
+  );
+  return acceptedAt.getTime() >= activation.getTime();
 };
