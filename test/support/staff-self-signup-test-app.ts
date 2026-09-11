@@ -57,6 +57,8 @@ import {
 import { WorkShift } from '../../src/modules/stores/entities/work-shift.entity';
 import { ShiftEndWorkflowService } from '../../src/modules/stores/shift-end-workflow.service';
 import { StoresController } from '../../src/modules/stores/stores.controller';
+import { StoreAccessGuard } from '../../src/modules/stores/guards/store-access.guard';
+import { StoreResourceAccessGuard } from '../../src/modules/stores/guards/store-resource-access.guard';
 import { StoresService } from '../../src/modules/stores/stores.service';
 
 export const STAFF_SIGNUP_STORE_ID = '11111111-1111-4111-8111-111111111111';
@@ -516,7 +518,16 @@ export async function createStaffSignupTestApp(
         JwtStrategy,
         JwtAuthGuard,
       ],
-    }).compile();
+    })
+      // StoresController declares two tenancy guards that resolve a store from
+      // the database. This suite predates them and asserts a different concern,
+      // so the tenancy boundary is stubbed open to preserve its prior scope;
+      // the guards carry their own unit tests.
+      .overrideGuard(StoreAccessGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
     app = module.createNestApplication();
     app.useGlobalPipes(new ValidationPipe({ transform: true, whitelist: true }));
     app.useGlobalInterceptors({

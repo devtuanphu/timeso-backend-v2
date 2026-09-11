@@ -1,3 +1,4 @@
+import type { INestApplication } from '@nestjs/common';
 import express from 'express';
 import request from 'supertest';
 
@@ -5,7 +6,9 @@ import { configureRequestBodyParsers } from './request-body-parsers';
 
 const createApp = () => {
   const app = express();
-  configureRequestBodyParsers(app);
+  // The helper only needs `use`; express types it with a different return
+  // value than INestApplication, which is irrelevant to what is asserted here.
+  configureRequestBodyParsers(app as unknown as Pick<INestApplication, 'use'>);
   app.post('/api/chat-groups/test', (req, res) =>
     res.status(200).json({ parsed: req.body?.content?.length ?? null }),
   );

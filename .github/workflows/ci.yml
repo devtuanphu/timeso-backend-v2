@@ -1,0 +1,83 @@
+name: CI
+
+# Runs on every pull request and on pushes to the default branch.
+# This is the gate that was missing: nothing previously enforced that the
+# backend still builds, type-checks, or passes its tests.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  # A newer push to the same branch cancels the in-flight run.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: build + typecheck + unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Business dates are Asia/Ho_Chi_Minh. Pinning the runner to UTC keeps
+      # results reproducible and surfaces any code that silently depends on the
+      # host clock, rather than passing only on a machine that happens to be
+      # in +07.
+      TZ: UTC
+      # Required by src/modules/auth/jwt.config.ts at module load. These are
+      # throwaway values for type-checking and unit tests; the suite never
+      # reaches a real token exchange.
+      JWT_SECRET: ci-access-secret-not-used-anywhere-else
+      JWT_REFRESH_SECRET: ci-refresh-secret-not-used-anywhere-else
+      # Keep schema management inert. `managed` means synchronize stays off.
+      DATABASE_SCHEMA_MODE: managed
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # `npm ci` requires package-lock.json to match package.json. The repo
+      # carries both a package-lock.json and a yarn.lock; npm is the one the
+      # lockfile here is authoritative for.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Hard gate: production sources must type-check. `tsconfig.build.json`
+      # excludes test files, which is the same scope `nest build` compiles.
+      - name: Type check (production sources)
+        run: npx tsc -p tsconfig.build.json --noEmit
+
+      # Hard gate: the whole repository, tests included, type-checks. This
+      # started report-only against ~20 pre-existing errors in *.spec.ts and
+      # test/; those are now fixed, so it blocks.
+      - name: Type check (including tests)
+        run: npx tsc --noEmit
+
+      # Non-fixing lint. The repo's own `npm run lint` script passes --fix,
+      # which would rewrite files in CI instead of reporting.
+      - name: Lint (report only)
+        run: npx eslint "{src,apps,libs,test}/**/*.ts"
+        continue-on-error: true
+
+      - name: Unit tests
+        run: npm test -- --ci --runInBand
+
+      # The e2e suites that run without a database: they drive the real Nest
+      # controllers over HTTP against in-memory fakes. These catch wiring
+      # breakage — a new controller-level guard that the test modules cannot
+      # resolve, for instance — which the unit suites do not see.
+      - name: E2E tests (no database required)
+        run: npm run test:e2e -- --ci --runInBand
+
+  # Database-backed e2e tests are deliberately not run here. They require an
+  # isolated Postgres whose name ends in _test plus TIMESO_ISOLATED_DB=true,
+  # and they skip themselves without it — a green run would be misleading.
+  # Add a job with a postgres service container when that is wired up.

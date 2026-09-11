@@ -23,6 +23,8 @@ describe('LocalSocketChatEventPublisher legacy cutoff', () => {
       legacyWindowStartedAt: new Date('2026-08-20T00:00:00.000Z'),
       legacyCutoffAt: new Date('2026-08-30T00:00:00.000Z'),
       singletonGuardMode: 'required',
+      pushDeliveryEnabled: false,
+      pushActivationStartedAt: null,
     };
     const readiness = new ChatRealtimeReadinessService(config);
     const v2 = server();

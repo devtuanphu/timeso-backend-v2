@@ -4,6 +4,8 @@ import { getQueueToken } from '@nestjs/bullmq';
 import request from 'supertest';
 import { StoresController } from '../src/modules/stores/stores.controller';
 import { StoresService } from '../src/modules/stores/stores.service';
+import { StoreAccessGuard } from '../src/modules/stores/guards/store-access.guard';
+import { StoreResourceAccessGuard } from '../src/modules/stores/guards/store-resource-access.guard';
 import { AccountsService } from '../src/modules/accounts/accounts.service';
 import { MailService } from '../src/modules/mail/mail.service';
 import { JwtAuthGuard } from '../src/modules/auth/guards/jwt-auth.guard';
@@ -145,6 +147,14 @@ describe('Attendance flow (e2e)', () => {
     })
       .overrideGuard(JwtAuthGuard)
       .useValue(allowAll)
+      // StoresController declares two tenancy guards that resolve a store from
+      // the database. This suite predates them and asserts a different concern,
+      // so the tenancy boundary is stubbed open to preserve its prior scope;
+      // the guards carry their own unit tests.
+      .overrideGuard(StoreAccessGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -283,6 +293,12 @@ describe('Attendance flow (e2e)', () => {
       findOne: jest.fn().mockResolvedValue(null),
     };
     service.payrollRuleRepository = { find: jest.fn().mockResolvedValue([]) };
+    // Base salary now derives standard working days from the store's weekly
+    // days off. No config here means the calendar-day fallback, which is the
+    // behaviour this assertion was written against.
+    service.shiftConfigRepository = {
+      findOne: jest.fn().mockResolvedValue(null),
+    };
     service.calculateBaseSalary = jest.fn().mockReturnValue(400000);
     service.findOrCreateMonthlyPayroll = jest
       .fn()

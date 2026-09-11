@@ -9,6 +9,8 @@ const requiredConfig: ChatRealtimeConfig = {
   legacyWindowStartedAt: null,
   legacyCutoffAt: null,
   singletonGuardMode: 'required',
+  pushDeliveryEnabled: false,
+  pushActivationStartedAt: null,
 };
 
 describe('ChatSingleInstanceRuntimeGuardService', () => {

@@ -129,6 +129,26 @@ export class JobApplicationService {
 
     await this.assertApplyRateLimit(accountId);
 
+    // Any prior profile at this store — including a soft-deleted or terminated
+    // one — blocks the attach flow with EMPLOYEE_REHIRE_REQUIRES_RESTORE. Left
+    // unchecked here, a former employee could apply, wait, and have the owner
+    // fill in the entire three-step hiring form before the backend refused it,
+    // losing the form on every retry. Refuse at submission time instead, with
+    // an error the applicant can act on.
+    const priorProfile = await this.profileRepository
+      .createQueryBuilder('profile')
+      .withDeleted()
+      .where('profile.accountId = :accountId', { accountId })
+      .andWhere('profile.storeId = :storeId', { storeId })
+      .getOne();
+    if (priorProfile) {
+      throw new ConflictException({
+        code: 'JOB_APPLICATION_REHIRE_REQUIRES_RESTORE',
+        message:
+          'Bạn đã từng làm việc tại cửa hàng này. Vui lòng liên hệ chủ cửa hàng để được khôi phục hồ sơ.',
+      });
+    }
+
     if (store.ownerAccountId === accountId) {
       throw new ForbiddenException({
         code: 'JOB_APPLICATION_NOT_AVAILABLE',
@@ -292,26 +312,54 @@ export class JobApplicationService {
         ownerAccountId,
       );
     } catch (error) {
-      // Release the claim so the owner can correct the input and retry.
-      await this.applicationRepository.update(
-        { id: application.id, status: JobApplicationStatus.ACCEPTED },
-        {
-          status: JobApplicationStatus.PENDING,
-          reviewedById: null,
-          reviewedAt: null,
-        },
+      // A throw here does NOT prove the hire did not happen.
+      // `attachExistingEmployee` commits its transaction and only then runs a
+      // large read to build the response; a failure in that read leaves the
+      // employee, contract, salary row and asset assignments durably created.
+      //
+      // Blindly releasing the claim in that case put the row back to PENDING
+      // while the applicant was already employed, so every retry then failed
+      // with EMPLOYEE_REHIRE_REQUIRES_RESTORE and the application could never
+      // be accepted again. Check first.
+      const hired = await this.profileRepository.findOne({
+        where: { accountId: application.accountId, storeId },
+        select: ['id'],
+      });
+
+      if (!hired) {
+        await this.releaseClaim(application.id, error);
+        throw error;
+      }
+
+      this.logger.warn(
+        `[JobApplication] ${application.id}: hire committed but the follow-up read failed; completing the acceptance. ${
+          error instanceof Error ? error.message : String(error)
+        }`,
       );
-      throw error;
+      employee = { profile: { id: hired.id } };
     }
 
     // `addEmployee` resolves to `{ profile, monthlySummary, recentActivities }`,
     // so the id lives under `profile`, not at the top level.
     const employeeProfileId: string | undefined = employee?.profile?.id;
+
+    // The durable outcome — employee hired, application ACCEPTED — is already
+    // achieved. Recording the link and notifying are bookkeeping: a failure in
+    // either must not surface as a failed hire, because the owner would retry
+    // and be told the application was already reviewed.
     if (employeeProfileId) {
-      await this.applicationRepository.update(
-        { id: application.id },
-        { employeeProfileId },
-      );
+      try {
+        await this.applicationRepository.update(
+          { id: application.id },
+          { employeeProfileId },
+        );
+      } catch (linkError) {
+        this.logger.error(
+          `[JobApplication] ${application.id}: hired ${employeeProfileId} but could not record the link: ${
+            linkError instanceof Error ? linkError.message : String(linkError)
+          }`,
+        );
+      }
     } else {
       this.logger.warn(
         `[JobApplication] accepted ${application.id} but could not resolve the created profile id`,
@@ -328,6 +376,40 @@ export class JobApplicationService {
       status: JobApplicationStatus.ACCEPTED,
       employeeProfileId: employeeProfileId ?? null,
     };
+  }
+
+  /**
+   * Puts a claimed application back to PENDING after a hire that never
+   * committed. Never throws: the caller is already propagating the real
+   * failure, and losing that in favour of a secondary error would hide the
+   * cause. A release can legitimately fail — for instance if the applicant
+   * submitted a fresh application to the same store in the meantime, which the
+   * partial unique index rejects — so it is logged with the row id instead.
+   */
+  private async releaseClaim(
+    applicationId: string,
+    cause: unknown,
+  ): Promise<void> {
+    try {
+      await this.applicationRepository.update(
+        { id: applicationId, status: JobApplicationStatus.ACCEPTED },
+        {
+          status: JobApplicationStatus.PENDING,
+          reviewedById: null,
+          reviewedAt: null,
+        },
+      );
+    } catch (releaseError) {
+      this.logger.error(
+        `[JobApplication] ${applicationId}: could not release the claim after a failed hire (${
+          cause instanceof Error ? cause.message : String(cause)
+        }); release failed with: ${
+          releaseError instanceof Error
+            ? releaseError.message
+            : String(releaseError)
+        }`,
+      );
+    }
   }
 
   async reject(
@@ -348,7 +430,7 @@ export class JobApplicationService {
         rejectionReason: dto.reason ?? null,
         // The decision is final, so the applicant's contact details serve no
         // further purpose for this store.
-        ...REDACTED_CONTACT,
+        ...redactedContact(),
       },
     );
     if (!claimed.affected) {
@@ -389,7 +471,7 @@ export class JobApplicationService {
       {
         status: JobApplicationStatus.CANCELLED,
         reviewedAt: new Date(),
-        ...REDACTED_CONTACT,
+        ...redactedContact(),
       },
     );
     if (!claimed.affected) {
@@ -412,18 +494,44 @@ export class JobApplicationService {
     const cutoff = new Date(
       now.getTime() - CONTACT_RETENTION_DAYS * 24 * 60 * 60 * 1000,
     );
-    const result = await this.applicationRepository.update(
+
+    // Reviewed applications: keyed on when the decision was made.
+    const reviewed = await this.applicationRepository.update(
       {
         status: Not(JobApplicationStatus.PENDING),
         reviewedAt: LessThan(cutoff),
         contactRedactedAt: IsNull(),
       },
-      { ...REDACTED_CONTACT },
+      redactedContact(),
     );
-    const affected = result.affected ?? 0;
+
+    // Applications nobody ever acted on. These matched neither condition above
+    // — a PENDING row has a null `reviewed_at` — so a store that went quiet
+    // kept every applicant's phone, email and free-text introduction forever,
+    // contradicting the retention policy this job exists to enforce.
+    //
+    // They are expired rather than only redacted: without contact details the
+    // owner cannot act on them anyway, and leaving them PENDING would keep the
+    // slot occupied against the one-open-application-per-store index and stop
+    // the applicant reapplying. The applicant sees the store become available
+    // again in discovery.
+    const abandoned = await this.applicationRepository.update(
+      {
+        status: JobApplicationStatus.PENDING,
+        createdAt: LessThan(cutoff),
+      },
+      {
+        status: JobApplicationStatus.CANCELLED,
+        ...redactedContact(),
+      },
+    );
+
+    const affected = (reviewed.affected ?? 0) + (abandoned.affected ?? 0);
     if (affected) {
       this.logger.log(
-        `[JobApplication] redacted contact details on ${affected} application(s)`,
+        `[JobApplication] redacted ${reviewed.affected ?? 0} reviewed and expired ${
+          abandoned.affected ?? 0
+        } abandoned application(s)`,
       );
     }
     return affected;
@@ -560,15 +668,28 @@ const APPLY_WINDOW_MS = 60 * 60 * 1000;
  */
 const CONTACT_RETENTION_DAYS = 90;
 
-/** The contact fields cleared by a withdrawal, a rejection, or the sweep. */
-const REDACTED_CONTACT = {
+/**
+ * The contact fields cleared by a withdrawal, a rejection, or the sweep.
+ *
+ * This must be a function. As an object literal the `new Date()` was evaluated
+ * once when the module was first imported, so every redacted row recorded the
+ * process start time instead of the moment of redaction — producing rows whose
+ * `contact_redacted_at` predated their own `created_at`, and making the column
+ * useless as evidence that the retention policy ran.
+ */
+const redactedContact = () => ({
   phone: null,
   email: null,
   introduction: null,
   contactRedactedAt: new Date(),
-} as const;
+});
 
-/** Owner app route showing the applications inbox. */
-const OWNER_APPLICATIONS_ROUTE = '/(home)/recruitment';
+/**
+ * Owner app route showing the applications inbox.
+ *
+ * The tab matters: the recruitment screen defaults to the job-postings tab, so
+ * without it the owner lands somewhere the candidate list is not even mounted.
+ */
+const OWNER_APPLICATIONS_ROUTE = '/(home)/recruitment?tab=candidates';
 /** Staff app root; a newly hired staff lands on their store home. */
 const STAFF_HOME_ROUTE = '/';

@@ -5,6 +5,7 @@ import {
   HttpStatus,
   Injectable,
   Logger,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -572,11 +573,17 @@ export class AuthService {
     try {
       await this.zaloService.sendOtp(user.phone, otpCode, 'forgot-password');
       return { message: 'Mã OTP đặt lại mật khẩu đã được gửi qua Zalo.', phone: user.phone };
-    } catch (error) {
-      console.error('Failed to send ZNS:', error);
-      // Fallback email nếu cần
-      // await this.mailService.sendPasswordResetOtp(user.email, user.fullName, otpCode);
-      return { message: 'Lỗi gửi OTP. Vui lòng thử lại.', phone: user.phone };
+    } catch {
+      // The axios error carries `config.data` (the recipient phone and the OTP)
+      // and the provider Authorization header, so it must never be logged whole.
+      // `loggerDeliveryFailure` records only the flow.
+      this.loggerDeliveryFailure('forgot-password');
+      // Previously returned HTTP 200 with an error message, so a failed
+      // delivery was indistinguishable from success to the client.
+      throw new ServiceUnavailableException({
+        code: 'OTP_DELIVERY_FAILED',
+        message: 'Lỗi gửi OTP. Vui lòng thử lại.',
+      });
     }
   }
 

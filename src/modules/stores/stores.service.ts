@@ -237,6 +237,8 @@ import { AccountsService } from '../accounts/accounts.service';
 
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { calculateShiftEarnings } from './shift-earnings.utils';
+import { countWorkingDaysForMonthDate } from './working-days.utils';
 import {
   calculateEarlyMinutes,
   calculateLateMinutes,
@@ -1064,6 +1066,79 @@ export class StoresService {
       await lockStoreShiftAvailability(manager, storeId);
       return this.ensureDefaultTimekeepingSetting(manager, storeId);
     });
+  }
+
+  /**
+   * Store ids the account may read data for: stores it owns, plus stores where
+   * it holds a non-terminated employee profile.
+   *
+   * Used to scope list endpoints whose filters are all optional, so that
+   * "no filter supplied" means "my data" rather than "every tenant's data".
+   */
+  /**
+   * The acting user's employee profile in the store that owns `profileId`,
+   * or null when they have none (a store owner typically has no employee
+   * profile of their own).
+   *
+   * Asset custody routes previously stamped a hardcoded profile UUID as the
+   * actor, so every handover in the system attributed to one fabricated
+   * identity and the audit trail was meaningless.
+   */
+  async resolveActingProfileId(
+    accountId: string | undefined,
+    targetProfileId: string,
+  ): Promise<string | null> {
+    if (!accountId) return null;
+    const target = await this.profileRepository.findOne({
+      where: { id: targetProfileId },
+      select: ['id', 'storeId'],
+    });
+    if (!target) return null;
+    const acting = await this.profileRepository.findOne({
+      where: { accountId, storeId: target.storeId },
+      select: ['id'],
+    });
+    return acting?.id ?? null;
+  }
+
+  /** Same as `resolveActingProfileId`, addressed by an asset assignment. */
+  async resolveActingProfileIdForAssignment(
+    accountId: string | undefined,
+    assignmentId: string,
+  ): Promise<string | null> {
+    if (!accountId) return null;
+    const assignment = await this.assetAssignmentRepository.findOne({
+      where: { id: assignmentId },
+      select: ['id', 'employeeProfileId'],
+    });
+    if (!assignment) return null;
+    return this.resolveActingProfileId(
+      accountId,
+      assignment.employeeProfileId,
+    );
+  }
+
+  async getAccessibleStoreIds(accountId: string): Promise<string[]> {
+    if (!accountId) return [];
+    const [owned, employed] = await Promise.all([
+      this.storeRepository.find({
+        where: { ownerAccountId: accountId },
+        select: ['id'],
+      }),
+      this.profileRepository.find({
+        where: {
+          accountId,
+          employmentStatus: Not(EmploymentStatus.TERMINATED),
+        },
+        select: ['storeId'],
+      }),
+    ]);
+    return [
+      ...new Set([
+        ...owned.map((store) => store.id),
+        ...employed.map((profile) => profile.storeId),
+      ]),
+    ];
   }
 
   async findAllByOwner(ownerId: string) {
@@ -5488,26 +5563,17 @@ export class StoresService {
       const durationHours = (end - start) / 3600000;
       const base = Number(activeContract.salaryAmount);
 
-      switch (activeContract.paymentType) {
-        case PaymentType.HOUR:
-          return Math.round(base * durationHours);
-        case PaymentType.SHIFT:
-        case PaymentType.DAY:
-          return Math.round(base);
-        case PaymentType.WEEK:
-          return Math.round(base / 7);
-        case PaymentType.MONTH: {
-          const date = new Date(slot.workDate);
-          const daysInMonth = new Date(
-            date.getFullYear(),
-            date.getMonth() + 1,
-            0,
-          ).getDate();
-          return Math.round(base / daysInMonth);
-        }
-        default:
-          return 0;
-      }
+      // Shared with the payroll path so the quoted estimate and the amount
+      // actually persisted at check-out can never diverge again. `?? 0`
+      // preserves this path's original behaviour for an unknown payment type.
+      return (
+        calculateShiftEarnings({
+          paymentType: activeContract.paymentType,
+          baseSalary: base,
+          hours: durationHours,
+          referenceDate: new Date(slot.workDate),
+        }) ?? 0
+      );
     };
 
     return slots.map((slot) => {
@@ -5787,72 +5853,11 @@ export class StoresService {
     }
 
     const result = await qb.getMany();
-    console.log(
-      `[getShiftAssignments] storeId=${storeId}, filters=${JSON.stringify(filters)}, rawCount=${result.length}`,
-    );
-    // Debug: count all assignments for this store grouped by status
-    try {
-      // Debug 1: count via slot.cycleId -> WorkCycle
-      const viaCycleQb = this.shiftAssignmentRepository
-        .createQueryBuilder('assignment')
-        .leftJoin('assignment.shiftSlot', 'slot')
-        .leftJoin('slot.cycle', 'cycle')
-        .where('cycle.store_id = :storeId', { storeId });
-      const viaCycle = await viaCycleQb.getMany();
-
-      // Debug 2: count via shiftSlot.cycleId -> WorkCycle.store_id
-      const viaSlotQb = this.shiftAssignmentRepository
-        .createQueryBuilder('assignment')
-        .leftJoin('assignment.shiftSlot', 'slot')
-        .leftJoin('slot.cycle', 'cycle')
-        .where('slot.cycle_id = cycle.id AND cycle.store_id = :storeId', {
-          storeId,
-        });
-      const viaSlot = await viaSlotQb.getMany();
-
-      // Debug 3: raw count all assignments
-      const allRaw = await this.shiftAssignmentRepository.find({
-        select: ['id', 'shiftSlotId', 'status'],
-      });
-      console.log(
-        `[getShiftAssignments] DEBUG: viaCycle.count=${viaCycle.length}, viaSlot.count=${viaSlot.length}, allRaw.count=${allRaw.length}`,
-      );
-
-      // Show first few raw assignments
-      for (let i = 0; i < Math.min(allRaw.length, 5); i++) {
-        console.log(
-          `[getShiftAssignments] DEBUG raw[${i}]: id=${allRaw[i].id}, slotId=${allRaw[i].shiftSlotId}, status=${allRaw[i].status}`,
-        );
-      }
-
-      // Debug 4: resolve the slot and cycle for each raw assignment
-      for (let i = 0; i < Math.min(allRaw.length, 5); i++) {
-        const a = allRaw[i];
-        const slot = await this.shiftSlotRepository.findOne({
-          where: { id: a.shiftSlotId },
-          relations: ['cycle'],
-        });
-        if (slot) {
-          console.log(
-            `[getShiftAssignments] DEBUG resolved[${i}]: slotId=${slot.id}, slot.cycleId=${slot.cycleId}, cycle.storeId=${slot.cycle?.storeId}, wantedStoreId=${storeId}`,
-          );
-        } else {
-          console.log(
-            `[getShiftAssignments] DEBUG resolved[${i}]: slot NOT FOUND for slotId=${a.shiftSlotId}`,
-          );
-        }
-      }
-    } catch (e) {
-      console.log(
-        `[getShiftAssignments] Debug query error: ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
-    for (let i = 0; i < Math.min(result.length, 3); i++) {
-      const a = result[i];
-      console.log(
-        `[getShiftAssignments] item[${i}]: id=${a.id}, status=${a.status}`,
-      );
-    }
+    // A debug block used to run here on every call: two extra aggregate
+    // queries, an unfiltered `find()` over the whole shift_assignments
+    // table across all tenants, and per-row console output. It was a
+    // full-table scan and a cross-tenant leak into the logs on a hot read
+    // path. Removed; the query above is the actual result.
     return result;
   }
 
@@ -6949,6 +6954,8 @@ export class StoresService {
     const payrollSetting = await this.payrollSettingRepository.findOne({
       where: { storeId, isActive: true },
     });
+    // Loaded once per store, not per employee.
+    const workingDaysInMonth = await this.getWorkingDaysInMonth(storeId, month);
 
     // 4. Get all active employees
     const employees = await this.profileRepository.find({
@@ -7060,6 +7067,7 @@ export class StoresService {
         attendanceSummary,
         payrollSetting,
         month,
+        workingDaysInMonth,
       );
 
       // ========== APPLY PAYROLL RULES (Bonus/Penalty) ==========
@@ -7118,7 +7126,12 @@ export class StoresService {
           )
         : 0;
       const totalIncome = calculatedSalary + allowancesTotal + bonus;
-      const advancePayment = 0; // Will be filled from salary advance requests
+      // Advances already approved against this payslip must survive a
+      // regeneration. This used to be hardcoded to 0, so re-running payroll
+      // after an advance was approved restored the full net salary and the
+      // employee was paid both the advance and the whole month.
+      // A payslip that does not exist yet cannot have advances against it.
+      const advancePayment = await this.sumApprovedAdvances(existingSalary?.id);
       const otherDeductions = 0;
       const totalDeductions = penalty + advancePayment + otherDeductions;
       const netSalary = Math.max(0, totalIncome - totalDeductions);
@@ -7152,10 +7165,7 @@ export class StoresService {
       } else {
         await this.createEmployeeSalary(salaryPayload);
       }
-
-      console.log(
-        `✅ [Payroll] ${employee.id}: salary=${calculatedSalary.toFixed(0)}, bonus=${bonus.toFixed(0)}, penalty=${penalty.toFixed(0)}, net=${netSalary.toFixed(0)}`,
-      );
+      // Per-employee net salary is not log material.
 
       totalEstimatedPayment += netSalary;
       totalBonus += bonus;
@@ -7230,6 +7240,11 @@ export class StoresService {
           where: { storeId, isActive: true },
         }),
       ]);
+      // Loaded once per store, not per employee.
+      const workingDaysInMonth = await this.getWorkingDaysInMonth(
+        storeId,
+        month,
+      );
 
       // 4. Get active employees via manager
       const employees = await manager.find(EmployeeProfile, {
@@ -7322,6 +7337,7 @@ export class StoresService {
           attendanceSummary,
           payrollSetting,
           month,
+          workingDaysInMonth,
         );
 
         let bonus = 0;
@@ -7371,7 +7387,13 @@ export class StoresService {
             )
           : 0;
         const totalIncome = calculatedSalary + allowancesTotal + bonus;
-        const totalDeductions = penalty;
+        // `advancePayment` was missing from this path entirely, so a
+        // recalculation silently cleared any approved advance from the
+        // payslip and restored the full net salary.
+        const advancePayment = await this.sumApprovedAdvances(
+          existingSalary?.id,
+        );
+        const totalDeductions = penalty + advancePayment;
         const netSalary = Math.max(0, totalIncome - totalDeductions);
 
         const salaryPayload = {
@@ -7388,6 +7410,7 @@ export class StoresService {
           totalIncome,
           totalDeductions,
           netSalary,
+          advancePayment,
           earnedBaseSalary: calculatedSalary,
         };
         if (existingSalary) {
@@ -7499,12 +7522,34 @@ export class StoresService {
   /**
    * Helper method to calculate base salary accurately based on PaymentType
    */
+  /**
+   * Standard working days for a store in the month marked by `monthDate`
+   * (a local-time `new Date(y, m, 1)`), from its configured weekly days off.
+   * Falls back to calendar days when the store has no shift config.
+   */
+  private async getWorkingDaysInMonth(
+    storeId: string,
+    monthDate: Date,
+  ): Promise<number> {
+    const config = await this.shiftConfigRepository.findOne({
+      where: { storeId },
+      select: ['id', 'daysOff'],
+    });
+    return countWorkingDaysForMonthDate(monthDate, config?.daysOff);
+  }
+
   private calculateBaseSalary(
     currentBaseSalary: number,
     paymentType: PaymentType,
     attendanceSummary: any,
     payrollSetting: any,
     now: Date,
+    /**
+     * Standard working days in the month, from the store's configured days
+     * off. Omitted falls back to calendar days, preserving prior behaviour
+     * for stores with no weekly schedule.
+     */
+    workingDaysInMonth?: number,
   ): number {
     if (attendanceSummary.hasShiftEarnings) {
       return attendanceSummary.totalShiftEarnings;
@@ -7529,12 +7574,14 @@ export class StoresService {
       return currentBaseSalary * attendanceSummary.completedShifts;
     }
 
-    // Default to PaymentType.MONTH logic
-    const daysInMonth = new Date(
-      now.getFullYear(),
-      now.getMonth() + 1,
-      0,
-    ).getDate();
+    // Default to PaymentType.MONTH logic.
+    // Prorated across the store's WORKING days. Using calendar days meant an
+    // employee who worked every scheduled shift still received only 71-84% of
+    // their contracted monthly salary.
+    const daysInMonth =
+      workingDaysInMonth && workingDaysInMonth > 0
+        ? workingDaysInMonth
+        : new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
 
     if (daysInMonth > 0 && attendanceSummary.completedShifts > 0) {
       return (
@@ -8294,6 +8341,7 @@ export class StoresService {
         attendanceSummary,
         payrollSetting,
         monthStart,
+        await this.getWorkingDaysInMonth(storeId, monthStart),
       );
     }
 
@@ -8490,8 +8538,18 @@ export class StoresService {
       month?: string;
       rating?: string;
     } = {},
+    accountId?: string,
   ) {
     const { employeeProfileId, storeId, month, rating } = filters;
+
+    const accessibleStoreIds = await this.getAccessibleStoreIds(
+      accountId as string,
+    );
+    if (!accessibleStoreIds.length) {
+      // Not an owner and not employed anywhere: nothing is in scope.
+      return { data: [], ratingCount: {} };
+    }
+
     const query = this.employeeKpiRepository
       .createQueryBuilder('kpi')
       .leftJoinAndSelect('kpi.employeeProfile', 'profile')
@@ -8503,7 +8561,13 @@ export class StoresService {
       .leftJoinAndSelect('tasks.kpiUnit', 'kpiUnit')
       .leftJoinAndSelect('tasks.kpiPeriod', 'kpiPeriod')
       .leftJoinAndSelect('tasks.store', 'taskStore')
-      .where('1=1');
+      // Previously `.where('1=1')` — with every filter optional, a bare
+      // `GET /stores/kpis` returned every KPI row in the database along with
+      // the joined employee names and avatars. The caller's accessible stores
+      // are now the outer bound, and the optional filters narrow within it.
+      .where('kpi.store_ids && :accessibleStoreIds::uuid[]', {
+        accessibleStoreIds,
+      });
 
     if (employeeProfileId) {
       query.andWhere('kpi.employee_profile_id = :employeeProfileId', {
@@ -11517,7 +11581,17 @@ export class StoresService {
 
     // Nếu duyệt (APPROVED), cập nhật EmployeeSalary
     if (data.status === AdvanceRequestStatus.APPROVED) {
-      const approvedAmount = data.approvedAmount || request.requestedAmount;
+      // `||` treated a deliberate 0 as "not supplied" and granted the full
+      // request. `??` distinguishes "omitted" from "approved for nothing".
+      const approvedAmount = Number(
+        data.approvedAmount ?? request.requestedAmount,
+      );
+      if (!Number.isFinite(approvedAmount) || approvedAmount < 0) {
+        throw new BadRequestException({
+          code: 'VALIDATION_ERROR',
+          message: 'Số tiền duyệt không hợp lệ.',
+        });
+      }
 
       // Kiểm tra lại điều kiện
       const totalAdvanced = await this.calculateTotalAdvanced(
@@ -11545,8 +11619,12 @@ export class StoresService {
       const currentPenalty = Number(request.employeeSalary.penalty || 0);
       const newTotalDeductions =
         currentPenalty + newAdvancePayment + currentOtherDeductions;
-      const newNetSalary =
-        Number(request.employeeSalary.totalIncome) - newTotalDeductions;
+      // Floored like every other net-salary computation in this file; without
+      // it a negative deduction would push net pay above total income.
+      const newNetSalary = Math.max(
+        0,
+        Number(request.employeeSalary.totalIncome) - newTotalDeductions,
+      );
 
       await this.employeeSalaryRepository.update(request.employeeSalaryId, {
         advancePayment: newAdvancePayment,
@@ -11587,6 +11665,31 @@ export class StoresService {
 
     request.status = AdvanceRequestStatus.CANCELLED;
     return this.salaryAdvanceRequestRepository.save(request);
+  }
+
+  /**
+   * Advances already granted against a payslip.
+   *
+   * Distinct from `calculateTotalAdvanced`, which also counts PENDING requests
+   * because it answers "how much is committed" for the approval cap. Only
+   * APPROVED money has actually left the business, so only that is deducted.
+   */
+  private async sumApprovedAdvances(
+    employeeSalaryId: string | undefined | null,
+  ): Promise<number> {
+    if (!employeeSalaryId) return 0;
+    const approved = await this.salaryAdvanceRequestRepository.find({
+      where: {
+        employeeSalaryId,
+        status: AdvanceRequestStatus.APPROVED,
+      },
+      select: ['approvedAmount', 'requestedAmount'],
+    });
+    return approved.reduce(
+      (sum, request) =>
+        sum + Number(request.approvedAmount ?? request.requestedAmount ?? 0),
+      0,
+    );
   }
 
   private async calculateTotalAdvanced(
@@ -14487,7 +14590,17 @@ export class StoresService {
         // relations: ['approvedBy', 'approvedBy.account'],
       });
     } catch (e: any) {
-      throw new BadRequestException('DEBUG ERROR: ' + e.message);
+      // Was `'DEBUG ERROR: ' + e.message`, which returned raw TypeORM/Postgres
+      // text (table and column names, SQL fragments) to the caller.
+      this.logger.error(
+        `[BonusWorkRequests] query failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+      throw new BadRequestException({
+        code: 'BONUS_WORK_REQUEST_QUERY_FAILED',
+        message: 'Không tải được danh sách yêu cầu tăng ca.',
+      });
     }
   }
 
@@ -15275,27 +15388,15 @@ export class StoresService {
       const workedHours = Number(assignment.workedMinutes || 0) / 60;
       let shiftEarnings: number | null = null;
 
-      switch (activeContract.paymentType) {
-        case PaymentType.HOUR:
-          shiftEarnings = Math.round(baseSalary * workedHours);
-          break;
-        case PaymentType.SHIFT:
-        case PaymentType.DAY:
-          shiftEarnings = baseSalary;
-          break;
-        case PaymentType.WEEK:
-          shiftEarnings = Math.round(baseSalary / 6);
-          break;
-        case PaymentType.MONTH: {
-          const daysInMonth = new Date(
-            checkoutTime.getFullYear(),
-            checkoutTime.getMonth() + 1,
-            0,
-          ).getDate();
-          shiftEarnings = Math.round(baseSalary / daysInMonth);
-          break;
-        }
-      }
+      // Shared with the shift-estimate path. A null result means no rule
+      // covers this payment type; the stored figure is then left untouched,
+      // exactly as the previous default-less switch did.
+      shiftEarnings = calculateShiftEarnings({
+        paymentType: activeContract.paymentType,
+        baseSalary,
+        hours: workedHours,
+        referenceDate: checkoutTime,
+      });
 
       if (shiftEarnings != null && assignment.shiftEarnings !== shiftEarnings) {
         assignment.shiftEarnings = shiftEarnings;
@@ -15372,6 +15473,7 @@ export class StoresService {
       attendanceSummary,
       payrollSetting,
       checkoutTime,
+      await this.getWorkingDaysInMonth(storeId, checkoutTime),
     );
     const payrollRules = await this.payrollRuleRepository.find({
       where: { storeId, isActive: true },
@@ -15574,9 +15676,7 @@ export class StoresService {
     }
 
     await this.storeRepository.save(store);
-    console.log(
-      `📍 [Store] Location updated: ${latitude}, ${longitude} — QR: ${store.qrCode}`,
-    );
+    // Coordinates and the attendance QR path are not log material.
     return store;
   }
 

@@ -8,6 +8,8 @@ import {
   ShiftSlot,
 } from '../stores/entities/shift-management.entity';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
+import { Store } from '../stores/entities/store.entity';
+import { StoreOwnerGuard } from './store-owner.guard';
 
 @Module({
   imports: [
@@ -16,10 +18,11 @@ import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
       ShiftAssignment,
       ShiftSlot,
       EmployeeProfile,
+      Store,
     ]),
   ],
   controllers: [AiReportsController],
-  providers: [AiReportsService],
+  providers: [AiReportsService, StoreOwnerGuard],
   exports: [AiReportsService],
 })
 export class AiReportsModule {}

@@ -48,7 +48,9 @@ describeSocketIntegration('Chat /chat-v2 live Socket.IO integration', () => {
   const ownerId = randomUUID();
   const staffId = randomUUID();
   const groupId = randomUUID();
-  const statuses = new Map([
+  // Annotated: randomUUID() returns a `${string}-${string}-...` literal type,
+  // so an inferred Map would reject the plain strings looked up below.
+  const statuses = new Map<string, AccountStatus>([
     [ownerId, AccountStatus.ACTIVE],
     [staffId, AccountStatus.ACTIVE],
   ]);
@@ -82,6 +84,8 @@ describeSocketIntegration('Chat /chat-v2 live Socket.IO integration', () => {
       legacyWindowStartedAt: null,
       legacyCutoffAt: null,
       singletonGuardMode: 'required',
+      pushDeliveryEnabled: false,
+      pushActivationStartedAt: null,
     });
     publisher = new LocalSocketChatEventPublisher(readiness);
     const authorization = {

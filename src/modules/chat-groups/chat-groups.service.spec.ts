@@ -214,7 +214,7 @@ describe('ChatGroupsService member settings authorization', () => {
     const memberRepository = {
       createQueryBuilder: jest.fn(() => builder),
       save: jest.fn(),
-    };
+    } as unknown as Partial<Repository<ChatGroupMember>>;
     const authorization = {
       requireGroupAccess: jest.fn().mockResolvedValue({ member }),
     };
@@ -269,7 +269,9 @@ describe('ChatGroupsService member settings authorization', () => {
       ],
     });
     const service = createService(
-      { createQueryBuilder: jest.fn(() => builder) },
+      { createQueryBuilder: jest.fn(() => builder) } as unknown as Partial<
+        Repository<ChatGroupMember>
+      >,
       { requireGroupAccess: jest.fn().mockResolvedValue({ member }) },
     );
 
@@ -314,7 +316,9 @@ describe('ChatGroupsService member settings authorization', () => {
     });
     const builder = updateBuilder({ affected: 0, raw: [] });
     const service = createService(
-      { createQueryBuilder: jest.fn(() => builder), save: jest.fn() },
+      { createQueryBuilder: jest.fn(() => builder), save: jest.fn() } as unknown as Partial<
+        Repository<ChatGroupMember>
+      >,
       { requireGroupAccess: jest.fn().mockResolvedValue({ member }) },
     );
 

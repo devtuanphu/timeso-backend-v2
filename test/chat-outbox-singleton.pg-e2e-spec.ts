@@ -38,6 +38,8 @@ const realtimeConfig: ChatRealtimeConfig = {
   legacyWindowStartedAt: null,
   legacyCutoffAt: null,
   singletonGuardMode: 'required',
+  pushDeliveryEnabled: false,
+  pushActivationStartedAt: null,
 };
 
 describeWithIsolatedChatDatabase(

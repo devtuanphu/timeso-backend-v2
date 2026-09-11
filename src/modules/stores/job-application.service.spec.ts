@@ -49,11 +49,18 @@ function build() {
     }),
   };
   const profileRepository: any = {
+    // `apply` uses this twice: once for "employed anywhere" (getExists) and
+    // once for "any prior profile at this store, including soft-deleted"
+    // (withDeleted + getOne).
     createQueryBuilder: jest.fn(() => ({
+      withDeleted: jest.fn().mockReturnThis(),
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       getExists: jest.fn().mockResolvedValue(false),
+      getOne: jest.fn().mockResolvedValue(null),
     })),
+    // `accept` checks whether the hire actually committed before compensating.
+    findOne: jest.fn().mockResolvedValue(null),
   };
   const accountsService: any = {
     findById: jest.fn().mockResolvedValue({
@@ -102,10 +109,14 @@ describe('JobApplicationService.apply', () => {
       expect.objectContaining({
         accountId: OWNER,
         title: 'Có nhân viên ứng tuyển',
+        // The recruitment screen defaults to the job-postings tab, so the
+        // deep link must name the candidates tab or the owner lands where the
+        // applicant list is not mounted.
+        actionUrl: '/(home)/recruitment?tab=candidates',
         metadata: expect.objectContaining({
           type: 'JOB_APPLICATION_SUBMITTED',
           // The owner app's push router reads `screen`.
-          screen: '/(home)/recruitment',
+          screen: '/(home)/recruitment?tab=candidates',
         }),
       }),
     );
@@ -393,17 +404,36 @@ describe('JobApplicationService.withdraw', () => {
 });
 
 describe('JobApplicationService.redactStaleContactDetails', () => {
-  it('clears contact fields on reviewed applications past the window', async () => {
+  it('redacts reviewed applications and expires abandoned pending ones', async () => {
     const t = build();
-    t.applicationRepository.update.mockResolvedValue({ affected: 3 });
+    t.applicationRepository.update
+      .mockResolvedValueOnce({ affected: 3 }) // reviewed
+      .mockResolvedValueOnce({ affected: 2 }); // abandoned
 
-    await expect(t.service.redactStaleContactDetails()).resolves.toBe(3);
-    const [criteria, changes] = t.applicationRepository.update.mock.calls[0];
-    // Pending applications are never touched.
-    expect(criteria.status).toBeDefined();
-    expect(criteria.reviewedAt).toBeDefined();
-    expect(changes).toEqual(
+    await expect(t.service.redactStaleContactDetails()).resolves.toBe(5);
+
+    const [reviewedCriteria, reviewedChanges] =
+      t.applicationRepository.update.mock.calls[0];
+    // Keyed on the decision date, and only rows not yet redacted.
+    expect(reviewedCriteria.reviewedAt).toBeDefined();
+    expect(reviewedCriteria.contactRedactedAt).toBeDefined();
+    expect(reviewedChanges).toEqual(
       expect.objectContaining({ phone: null, email: null, introduction: null }),
+    );
+
+    // Regression: a PENDING row has a null reviewed_at, so it matched neither
+    // condition and kept the applicant's contact details indefinitely.
+    const [abandonedCriteria, abandonedChanges] =
+      t.applicationRepository.update.mock.calls[1];
+    expect(abandonedCriteria.status).toBe(JobApplicationStatus.PENDING);
+    expect(abandonedCriteria.createdAt).toBeDefined();
+    expect(abandonedChanges).toEqual(
+      expect.objectContaining({
+        status: JobApplicationStatus.CANCELLED,
+        phone: null,
+        email: null,
+        introduction: null,
+      }),
     );
   });
 
@@ -411,6 +441,27 @@ describe('JobApplicationService.redactStaleContactDetails', () => {
     const t = build();
     t.applicationRepository.update.mockResolvedValue({ affected: 0 });
     await expect(t.service.redactStaleContactDetails()).resolves.toBe(0);
+  });
+
+  // Regression: the redaction payload was an object literal, so `new Date()`
+  // was evaluated once at module load and every row recorded the process
+  // start time instead of the moment of redaction.
+  it('stamps the redaction time per call, not once per process', async () => {
+    const t = build();
+    t.applicationRepository.update.mockResolvedValue({ affected: 1 });
+
+    await t.service.redactStaleContactDetails();
+    const first = t.applicationRepository.update.mock.calls[0][1]
+      .contactRedactedAt as Date;
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    t.applicationRepository.update.mockClear();
+    await t.service.redactStaleContactDetails();
+    const second = t.applicationRepository.update.mock.calls[0][1]
+      .contactRedactedAt as Date;
+
+    expect(second.getTime()).toBeGreaterThan(first.getTime());
   });
 });
 
@@ -442,6 +493,125 @@ describe('JobApplicationService.reject', () => {
         introduction: null,
       }),
     );
+  });
+});
+
+describe('JobApplicationService.accept — hire committed before the failure', () => {
+  const pendingRow = {
+    id: APPLICATION,
+    storeId: STORE,
+    accountId: APPLICANT,
+    phone: form.phone,
+    fullName: form.fullName,
+    status: JobApplicationStatus.PENDING,
+    createdAt: new Date('2026-05-05T00:00:00Z'),
+    reviewedAt: null,
+    rejectionReason: null,
+    email: null,
+    introduction: null,
+  };
+
+  // Regression: `attachExistingEmployee` commits, then runs a large read to
+  // build its response. A failure in that read used to be treated as "hiring
+  // failed", so the claim was released while the applicant was already
+  // employed — and every retry then hit EMPLOYEE_REHIRE_REQUIRES_RESTORE,
+  // leaving the application permanently stuck and the applicant unnotified.
+  it('completes the acceptance when the employee was already created', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.storesService.addEmployee.mockRejectedValue(new Error('read failed'));
+    t.profileRepository.findOne.mockResolvedValue({ id: 'profile-created' });
+
+    const result = await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: JobApplicationStatus.ACCEPTED,
+        employeeProfileId: 'profile-created',
+      }),
+    );
+    // The claim must NOT be released.
+    const revert = t.applicationRepository.update.mock.calls.find(
+      ([, changes]: any[]) => changes?.status === JobApplicationStatus.PENDING,
+    );
+    expect(revert).toBeUndefined();
+    // And the applicant must still be told.
+    expect(t.notificationsService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: APPLICANT }),
+    );
+  });
+
+  it('still releases the claim when no employee was created', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.storesService.addEmployee.mockRejectedValue(
+      new ConflictException('ASSET_STOCK_UNAVAILABLE'),
+    );
+    t.profileRepository.findOne.mockResolvedValue(null);
+
+    await expect(
+      t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+    ).rejects.toThrow(ConflictException);
+
+    expect(t.applicationRepository.update).toHaveBeenCalledWith(
+      { id: APPLICATION, status: JobApplicationStatus.ACCEPTED },
+      expect.objectContaining({ status: JobApplicationStatus.PENDING }),
+    );
+    expect(t.notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  // Regression: a failure releasing the claim replaced the real cause with a
+  // secondary error, hiding why the hire failed.
+  it('surfaces the original error even if releasing the claim fails', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.storesService.addEmployee.mockRejectedValue(new Error('original cause'));
+    t.profileRepository.findOne.mockResolvedValue(null);
+    t.applicationRepository.update
+      .mockResolvedValueOnce({ affected: 1 }) // the claim
+      .mockRejectedValueOnce(new Error('release failed'));
+
+    await expect(
+      t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+    ).rejects.toThrow('original cause');
+  });
+
+  // Bookkeeping must not turn a successful hire into a reported failure.
+  it('does not fail the hire when recording the link fails', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.applicationRepository.update
+      .mockResolvedValueOnce({ affected: 1 }) // the claim
+      .mockRejectedValueOnce(new Error('link write failed'));
+
+    await expect(
+      t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+    ).resolves.toEqual(
+      expect.objectContaining({ status: JobApplicationStatus.ACCEPTED }),
+    );
+    expect(t.notificationsService.create).toHaveBeenCalled();
+  });
+});
+
+describe('JobApplicationService.apply — prior history at the store', () => {
+  // Regression: a terminated ex-employee could apply, but the attach flow
+  // always refused with EMPLOYEE_REHIRE_REQUIRES_RESTORE — after the owner had
+  // filled in the whole three-step hiring form.
+  it('refuses an applicant who already has a profile at that store', async () => {
+    const t = build();
+    t.profileRepository.createQueryBuilder.mockReturnValue({
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getExists: jest.fn().mockResolvedValue(false),
+      getOne: jest.fn().mockResolvedValue({ id: 'old-profile' }),
+    });
+
+    await expect(t.service.apply(APPLICANT, STORE, form)).rejects.toThrow(
+      ConflictException,
+    );
+    expect(t.applicationRepository.save).not.toHaveBeenCalled();
+    expect(t.notificationsService.create).not.toHaveBeenCalled();
   });
 });
 

@@ -1,7 +1,7 @@
 import { readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 import { join } from 'path';
-import { DataSource, EntityTarget } from 'typeorm';
+import { DataSource, EntitySchema } from 'typeorm';
 
 import { ChatAuthorizationService } from '../src/modules/chat-groups/chat-authorization.service';
 import { ChatMessageQueryService } from '../src/modules/chat-groups/chat-message-query.service';
@@ -98,7 +98,7 @@ describeWithIsolatedChatDatabase(
     };
 
     const createDataSource = async (
-      entities: EntityTarget<unknown>[] = [],
+      entities: (string | Function | EntitySchema<any>)[] = [],
     ): Promise<DataSource> => {
       if (!guardedChatDatabaseUrl)
         throw new Error('CHAT_E2E_DATABASE_GUARD_NOT_ENABLED');

@@ -261,7 +261,9 @@ describe('ShiftReminderService identity', () => {
       }),
       addBulk: jest.fn(),
     });
-    const authoritativeStates = [
+    // Each findOne consumes one state via shift(), so this must stay mutable;
+    // `as const` typed it readonly and shift() did not exist on it.
+    const authoritativeStates: [string, { type: string }][] = [
       ['09:00:00', { type: '15m' }],
       ['09:30:00', { type: '30m' }],
       ['09:30:00', { type: '30m' }],
@@ -269,7 +271,7 @@ describe('ShiftReminderService identity', () => {
       ['11:00:00', { type: '30m' }],
       ['12:00:00', { type: '1h' }],
       ['13:00:00', { type: '30m' }],
-    ] as const;
+    ];
     let lastAuthoritativeState: readonly [string, any] = authoritativeStates[0];
     const assignmentRepository = {
       findOne: jest.fn(async () => {

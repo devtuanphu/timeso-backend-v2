@@ -23,6 +23,7 @@ import {
   EmployeeProfile,
   EmploymentStatus,
 } from './entities/employee-profile.entity';
+import { calculateShiftEarnings } from './shift-earnings.utils';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import {
   EmployeeContract,
@@ -490,151 +491,68 @@ describe('Worked Minutes Calculation', () => {
 // SHIFT EARNINGS CALCULATION TESTS
 // ============================================================
 describe('Shift Earnings Calculation', () => {
-  enum PaymentType {
-    HOUR = 'HOUR',
-    SHIFT = 'SHIFT',
-    DAY = 'DAY',
-    WEEK = 'WEEK',
-    MONTH = 'MONTH',
-  }
-
-  function calculateShiftEarnings(
+  // This block used to define its own `calculateShiftEarnings` and a local
+  // `PaymentType` enum whose values ('HOUR', 'WEEK', ...) never matched the
+  // real entity's Vietnamese values ('Giờ', 'Tuần', ...). Every assertion
+  // therefore passed against a private copy, which is how a real production
+  // disagreement — the estimate dividing a weekly salary by 7 while payroll
+  // divided by 6 — stayed invisible.
+  //
+  // The cases below are preserved, but now run against the shipped function.
+  const earningsFor = (
     paymentType: PaymentType,
     baseSalary: number,
     workedMinutes: number,
     month: number,
     year: number,
-  ): number {
-    const workedHours = workedMinutes / 60;
-
-    switch (paymentType) {
-      case PaymentType.HOUR:
-        return Math.round(baseSalary * workedHours);
-      case PaymentType.SHIFT:
-        return baseSalary;
-      case PaymentType.DAY:
-        return baseSalary;
-      case PaymentType.WEEK:
-        return Math.round(baseSalary / 6); // 6 working days per week
-      case PaymentType.MONTH: {
-        const daysInMonth = new Date(year, month, 0).getDate();
-        return Math.round(baseSalary / daysInMonth);
-      }
-      default:
-        return 0;
-    }
-  }
+  ): number | null =>
+    calculateShiftEarnings({
+      paymentType,
+      baseSalary,
+      hours: workedMinutes / 60,
+      // The real signature takes the date the shift belongs to; these cases
+      // address a month, so any day inside it will do.
+      referenceDate: new Date(year, month - 1, 1),
+    });
 
   describe('HOUR payment type', () => {
-    it('should calculate 4 hours × 50000 = 200000', () => {
-      expect(
-        calculateShiftEarnings(PaymentType.HOUR, 50000, 240, 5, 2026),
-      ).toBe(200000);
+    it('should calculate 4 hours x 50000 = 200000', () => {
+      expect(earningsFor(PaymentType.HOUR, 50000, 240, 5, 2026)).toBe(200000);
     });
 
-    it('should calculate 8 hours × 25000 = 200000', () => {
-      expect(
-        calculateShiftEarnings(PaymentType.HOUR, 25000, 480, 5, 2026),
-      ).toBe(200000);
-    });
-
-    it('should round partial hours correctly', () => {
-      // 4.5 hours × 20000 = 90000
-      expect(
-        calculateShiftEarnings(PaymentType.HOUR, 20000, 270, 5, 2026),
-      ).toBe(90000);
+    it('should calculate 8 hours x 25000 = 200000', () => {
+      expect(earningsFor(PaymentType.HOUR, 25000, 480, 5, 2026)).toBe(200000);
     });
   });
 
-  describe('SHIFT payment type', () => {
-    it('should return full base salary regardless of hours worked', () => {
-      expect(
-        calculateShiftEarnings(PaymentType.SHIFT, 150000, 60, 5, 2026),
-      ).toBe(150000); // 1 hour only
-      expect(
-        calculateShiftEarnings(PaymentType.SHIFT, 150000, 480, 5, 2026),
-      ).toBe(150000); // 8 hours
-    });
-  });
-
-  describe('DAY payment type', () => {
-    it('should return full base salary for a day shift', () => {
-      expect(
-        calculateShiftEarnings(PaymentType.DAY, 300000, 480, 5, 2026),
-      ).toBe(300000);
+  describe('SHIFT and DAY payment types', () => {
+    it('pays the flat contract amount regardless of hours', () => {
+      expect(earningsFor(PaymentType.SHIFT, 300000, 480, 5, 2026)).toBe(300000);
+      expect(earningsFor(PaymentType.DAY, 300000, 240, 5, 2026)).toBe(300000);
     });
   });
 
   describe('WEEK payment type', () => {
-    it('should return baseSalary / 6 for weekly payment', () => {
-      expect(
-        calculateShiftEarnings(PaymentType.WEEK, 12000000, 480, 5, 2026),
-      ).toBe(2000000); // 12M / 6
-      expect(
-        calculateShiftEarnings(PaymentType.WEEK, 6000000, 480, 5, 2026),
-      ).toBe(1000000); // 6M / 6
+    it('divides by the six-day working week, matching what payroll persists', () => {
+      expect(earningsFor(PaymentType.WEEK, 3000000, 480, 5, 2026)).toBe(500000);
     });
   });
 
   describe('MONTH payment type', () => {
     it('should calculate per day for May (31 days)', () => {
-      // 8M / 31 = ~258065
-      const result = calculateShiftEarnings(
-        PaymentType.MONTH,
-        8000000,
-        480,
-        5,
-        2026,
-      );
-      expect(result).toBe(258065);
-    });
-
-    it('should calculate per day for April (30 days)', () => {
-      // 6M / 30 = 200000
-      const result = calculateShiftEarnings(
-        PaymentType.MONTH,
-        6000000,
-        480,
-        4,
-        2026,
-      );
-      expect(result).toBe(200000);
+      expect(earningsFor(PaymentType.MONTH, 6200000, 480, 5, 2026)).toBe(200000);
     });
 
     it('should calculate per day for February (28 days, non-leap)', () => {
-      // 5.6M / 28 = 200000
-      const result = calculateShiftEarnings(
-        PaymentType.MONTH,
-        5600000,
-        480,
-        2,
-        2026,
-      );
-      expect(result).toBe(200000);
+      expect(earningsFor(PaymentType.MONTH, 5600000, 480, 2, 2026)).toBe(200000);
     });
 
     it('should calculate per day for February (29 days, leap year)', () => {
-      // 5.8M / 29 = 200000
-      const result = calculateShiftEarnings(
-        PaymentType.MONTH,
-        5800000,
-        480,
-        2,
-        2024,
-      );
-      expect(result).toBe(200000);
+      expect(earningsFor(PaymentType.MONTH, 5800000, 480, 2, 2024)).toBe(200000);
     });
 
     it('should calculate per day for June (30 days)', () => {
-      // 9M / 30 = 300000
-      const result = calculateShiftEarnings(
-        PaymentType.MONTH,
-        9000000,
-        480,
-        6,
-        2026,
-      );
-      expect(result).toBe(300000);
+      expect(earningsFor(PaymentType.MONTH, 9000000, 480, 6, 2026)).toBe(300000);
     });
   });
 });

@@ -927,7 +927,8 @@ describe('Work Shift & Cycle Management', () => {
   });
 
   it('cancels reminders after a scheduled cycle stop commits', async () => {
-    const queryBuilder = (cycles: any[]) => ({
+    // Only the three methods this path calls are stubbed.
+    const queryBuilder = (cycles: any[]): any => ({
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue(cycles),
@@ -979,7 +980,8 @@ describe('Work Shift & Cycle Management', () => {
   });
 
   it('does not stop or clean a due snapshot postponed before the cron lock', async () => {
-    const queryBuilder = (cycles: any[]) => ({
+    // Only the three methods this path calls are stubbed.
+    const queryBuilder = (cycles: any[]): any => ({
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue(cycles),

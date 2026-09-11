@@ -1,16 +1,17 @@
 import {
-  Controller,
-  Get,
-  Post,
-  Patch,
-  Delete,
   Body,
+  Controller,
+  Delete,
+  Get,
+  NotImplementedException,
   Param,
-  Query,
-  UseGuards,
-  Request,
   ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+  Request,
   Res,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -121,8 +122,13 @@ export class ChatGroupsController {
   @Delete(':id')
   @ApiOperation({ summary: 'Xóa nhóm chat' })
   async deleteGroup(@Param('id', ParseUUIDPipe) id: string, @Request() req) {
-    // TODO: Implement soft delete
-    return { message: 'Feature coming soon' };
+    // Not implemented. This previously answered HTTP 200 with a message, so a
+    // client could not tell a no-op from a successful delete; 501 states
+    // plainly that the route exists but does nothing yet.
+    throw new NotImplementedException({
+      code: 'CHAT_GROUP_DELETE_NOT_IMPLEMENTED',
+      message: 'Tính năng xoá nhóm chat chưa khả dụng.',
+    });
   }
 
   // Members

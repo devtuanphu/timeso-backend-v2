@@ -28,7 +28,7 @@ const persistedMessage = (content = 'Xin chào') =>
     attachmentSize: null,
     sender: { id: ids.account, fullName: 'Member', avatar: null },
     createdAt: new Date('2026-08-29T00:00:00.000Z'),
-  }) as ChatMessage;
+  }) as unknown as ChatMessage;
 
 const createHarness = (
   existing: ChatMessage | null,

@@ -27,6 +27,10 @@ import {
 import { Store } from '../src/modules/stores/entities/store.entity';
 import { WorkShift } from '../src/modules/stores/entities/work-shift.entity';
 import { StoresService } from '../src/modules/stores/stores.service';
+import { getRepositoryToken } from '@nestjs/typeorm';
+import { Account } from '../src/modules/accounts/entities/account.entity';
+import { StoreAccessGuard } from '../src/modules/stores/guards/store-access.guard';
+import { StoreResourceAccessGuard } from '../src/modules/stores/guards/store-resource-access.guard';
 import {
   ShiftRecurrenceEndType,
   ShiftRecurrenceFrequency,
@@ -255,6 +259,15 @@ describe('Unified shift schedule flow (e2e)', () => {
     })
       .overrideGuard(JwtAuthGuard)
       .useValue(authenticatedGuard)
+      // StoresController declares two tenancy guards that resolve a store from
+      // the database. This suite drives an in-memory fake and asserts service
+      // behaviour, so the tenancy boundary is stubbed open here; it has its own
+      // unit tests, and the cross-store rejection below still comes from the
+      // service's own owner check.
+      .overrideGuard(StoreAccessGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -706,12 +719,26 @@ describe('Unified shift schedule authentication boundary (e2e)', () => {
         { provide: AccountsService, useValue: {} },
         { provide: MailService, useValue: {} },
         { provide: ShiftEndWorkflowService, useValue: {} },
+        // JwtStrategy re-reads the account on every request, so it cannot be
+        // constructed without this repository. Its absence is why this suite
+        // failed to build its module before the tenancy guards existed.
+        {
+          provide: getRepositoryToken(Account),
+          useValue: { findOne: jest.fn().mockResolvedValue(null) },
+        },
         {
           provide: getQueueToken('attendance-background'),
           useValue: { add: jest.fn() },
         },
       ],
-    }).compile();
+    })
+      // Nest instantiates every declared guard when the module is built, even
+      // though JwtAuthGuard rejects first and these never run for a 401.
+      .overrideGuard(StoreAccessGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
     app = moduleRef.createNestApplication();
     await app.init();
   });

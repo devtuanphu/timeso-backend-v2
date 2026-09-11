@@ -32,6 +32,8 @@ import {
 } from '@nestjs/swagger';
 import { StoresService } from './stores.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { StoreAccessGuard } from './guards/store-access.guard';
+import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
@@ -152,8 +154,10 @@ import {
   attendanceMulterConfig,
   multerConfig,
 } from '../../common/utils/multer-config';
-import { AssetMultipartInterceptor } from './interceptors/asset-multipart.interceptor';
-import { ProductMultipartInterceptor } from './interceptors/product-multipart.interceptor';
+import {
+  AssetMultipartInterceptor,
+  ProductMultipartInterceptor,
+} from './interceptors/multipart.interceptor';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
 import {
   CreateShiftScheduleDto,
@@ -171,7 +175,10 @@ import { InventoryReportStatus } from './entities/inventory-report.entity';
 @ApiTags('Cửa hàng & Vận hành (Stores)')
 @ApiBearerAuth()
 @Controller('stores')
-@UseGuards(JwtAuthGuard)
+// StoreAccessGuard scopes every store-addressed route (`:id/...`, `:storeId/...`)
+// to the owner or a current employee of that store. Routes addressed by a
+// sub-resource id pass through it untouched — see the guard's own docs.
+@UseGuards(JwtAuthGuard, StoreAccessGuard, StoreResourceAccessGuard)
 export class StoresController {
   private readonly logger = new Logger(StoresController.name);
 
@@ -308,17 +315,16 @@ export class StoresController {
   @Get('kpis')
   @ApiOperation({ summary: 'Lấy danh sách bảng KPI (có filter)' })
   async getEmployeeKpis(
+    @GetUser() user: any,
     @Query('employeeProfileId') employeeProfileId?: string,
     @Query('storeId') storeId?: string,
     @Query('month') month?: string,
     @Query('rating') rating?: string,
   ) {
-    return this.storesService.getEmployeeKpis({
-      employeeProfileId,
-      storeId,
-      month,
-      rating,
-    });
+    return this.storesService.getEmployeeKpis(
+      { employeeProfileId, storeId, month, rating },
+      user?.userId,
+    );
   }
 
   @Patch('employee-kpis/:id/status')
@@ -809,6 +815,18 @@ export class StoresController {
     );
     await this.shiftEndWorkflowService.resumeAfterOvertime(request);
     return request;
+  }
+
+  // MUST stay above @Get(':id') — Express matches in registration order, so
+  // a single-segment route declared after the catch-all is unreachable.
+  @Get('inventory-reports')
+  @ApiOperation({ summary: 'Lấy danh sách báo cáo sự cố kho' })
+  async getInventoryReports(
+    @Query('storeId') storeId?: string,
+    @Query('status') status?: InventoryReportStatus,
+    @Query('type') type?: string,
+  ) {
+    return this.storesService.getInventoryReports({ storeId, status, type });
   }
 
   @Get(':id')
@@ -1615,8 +1633,15 @@ export class StoresController {
     @Body() body: AssignAssetDto,
     @Req() req,
   ) {
-    // Temporal manager ID
-    const managerProfileId = 'ec7e3feb-985c-416a-870c-88c470a17ac6';
+    // The acting user, not a hardcoded identity. Null when the caller has no
+    // employee profile in that store (e.g. the owner); the audit column is
+    // nullable, so an unknown actor is recorded as unknown rather than as
+    // somebody else.
+    const managerProfileId =
+      (await this.storesService.resolveActingProfileId(
+        req?.user?.userId,
+        profileId,
+      )) ?? undefined;
     return this.storesService.assignAssetToEmployee(
       profileId,
       body.assetId,
@@ -1638,7 +1663,11 @@ export class StoresController {
     @Body() body: ExchangeAssetDto,
     @Req() req,
   ) {
-    const managerProfileId = 'ec7e3feb-985c-416a-870c-88c470a17ac6';
+    const managerProfileId =
+      (await this.storesService.resolveActingProfileIdForAssignment(
+        req?.user?.userId,
+        assignmentId,
+      )) ?? undefined;
     return this.storesService.exchangeAsset(
       assignmentId,
       body.newAssetId,
@@ -1677,7 +1706,11 @@ export class StoresController {
     @Body() body: ReassignAssetDto,
     @Req() req,
   ) {
-    const managerProfileId = 'ec7e3feb-985c-416a-870c-88c470a17ac6';
+    const managerProfileId =
+      (await this.storesService.resolveActingProfileIdForAssignment(
+        req?.user?.userId,
+        assignmentId,
+      )) ?? undefined;
     return this.storesService.reassignAsset(
       assignmentId,
       body.quantity,
@@ -3374,16 +3407,6 @@ export class StoresController {
     return this.storesService.createInventoryReports(reports, files);
   }
 
-  @Get('inventory-reports')
-  @ApiOperation({ summary: 'Lấy danh sách báo cáo sự cố kho' })
-  async getInventoryReports(
-    @Query('storeId') storeId?: string,
-    @Query('status') status?: InventoryReportStatus,
-    @Query('type') type?: string,
-  ) {
-    return this.storesService.getInventoryReports({ storeId, status, type });
-  }
-
   @Patch('inventory-reports/:id/handle')
   @ApiOperation({ summary: 'Xử lý báo cáo sự cố kho (Duyệt/Từ chối)' })
   async handleInventoryReport(
@@ -4154,7 +4177,18 @@ export class StoresController {
     );
 
     if (result.matched) {
-      void this.shiftEndWorkflowService.markCompletedByEmployee(id);
+      // Unguarded, this was the only floating promise in the file without a
+      // handler; an unhandled rejection terminates the process by default on
+      // Node >= 15, on one of the hottest employee-facing routes.
+      void this.shiftEndWorkflowService
+        .markCompletedByEmployee(id)
+        .catch((error) =>
+          this.logger.error(
+            `[CheckOut] Unable to complete shift-end workflow for ${id}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
       void this.attendanceQueue
         .add(
           'process-checkout-payroll',

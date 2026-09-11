@@ -17,6 +17,8 @@ describe('chat rejection in local API-only mode', () => {
       legacyMutationEnabled: true,
       legacyWindowStartedAt: null,
       legacyCutoffAt: null,
+      pushDeliveryEnabled: false,
+      pushActivationStartedAt: null,
     };
     const guard = new ChatSingleInstanceRuntimeGuardService(dataSource as never, realtimeConfig);
     const readiness = { setActive: jest.fn(), isActive: jest.fn(), namespacesReady: jest.fn() };

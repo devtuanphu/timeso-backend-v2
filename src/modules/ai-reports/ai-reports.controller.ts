@@ -6,11 +6,14 @@ import {
 } from '@nestjs/swagger';
 import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { StoreOwnerGuard } from './store-owner.guard';
 import { AiReportsService } from './ai-reports.service';
 
 @ApiTags('AI Báo cáo (AI Reports)')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+// Every route here is scoped to the `:id` store, so ownership is enforced once
+// at the class level rather than per handler.
+@UseGuards(JwtAuthGuard, StoreOwnerGuard)
 @Controller('stores')
 export class AiReportsController {
   constructor(private readonly aiReportsService: AiReportsService) {}

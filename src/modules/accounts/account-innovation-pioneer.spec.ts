@@ -1,6 +1,6 @@
 import 'reflect-metadata';
 
-import { plainToInstance } from 'class-transformer';
+import { plainToInstance, type ClassConstructor } from 'class-transformer';
 import { validate } from 'class-validator';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -109,7 +109,9 @@ describe('Account innovation pioneer contract', () => {
   ])(
     'rejects isInnovationPioneer on writable %p input',
     async (Dto, validInput) => {
-      const input = plainToInstance(Dto, {
+      // it.each widens Dto to a union of the three constructors, which no
+      // single plainToInstance overload accepts.
+      const input = plainToInstance(Dto as ClassConstructor<object>, {
         ...validInput,
         isInnovationPioneer: false,
       });

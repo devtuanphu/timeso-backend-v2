@@ -100,6 +100,9 @@ import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 import { JobApplication } from './entities/job-application.entity';
 import { JobApplicationService } from './job-application.service';
 import { JobApplicationController } from './job-application.controller';
+import { StoreAccessGuard } from './guards/store-access.guard';
+import { StoreAccessResolver } from './guards/store-access.resolver';
+import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
 
 @Module({
@@ -211,6 +214,9 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     ShiftEndWorkflowService,
     ShiftEndWorkflowProcessor,
     JobApplicationService,
+    StoreAccessGuard,
+    StoreAccessResolver,
+    StoreResourceAccessGuard,
   ],
   exports: [
     StoresService,

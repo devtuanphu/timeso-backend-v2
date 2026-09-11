@@ -115,7 +115,7 @@ export class ZaloController {
         <body>
           <div class="container">
             <h1>❌ Lỗi khởi tạo Token</h1>
-            <p class="error">${error.message}</p>
+            <p class="error">Không thể hoàn tất kết nối Zalo.</p>
             <p>Vui lòng thử lại bằng cách gọi <code>GET /zalo/oauth-url</code></p>
           </div>
         </body>
