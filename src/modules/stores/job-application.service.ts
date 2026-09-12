@@ -11,7 +11,7 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
 
-import { AccountStatus } from '../accounts/entities/account.entity';
+import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import { AccountsService } from '../accounts/accounts.service';
 import {
   NotificationPriority,
@@ -176,6 +176,8 @@ export class JobApplicationService {
           phone: dto.phone,
           email: dto.email ?? null,
           introduction: dto.introduction ?? null,
+          gender: dto.gender ?? null,
+          birthday: dto.birthday ?? null,
           status: JobApplicationStatus.PENDING,
         }),
       );
@@ -190,6 +192,7 @@ export class JobApplicationService {
       throw error;
     }
 
+    await this.openPendingProfile(saved);
     await this.notifyOwnerOfApplication(store.ownerAccountId, store.name, saved);
     return this.toItem(saved, null);
   }
@@ -343,6 +346,8 @@ export class JobApplicationService {
     // so the id lives under `profile`, not at the top level.
     const employeeProfileId: string | undefined = employee?.profile?.id;
 
+    await this.backfillAccountIdentity(application);
+
     // The durable outcome — employee hired, application ACCEPTED — is already
     // achieved. Recording the link and notifying are bookkeeping: a failure in
     // either must not surface as a failed hire, because the owner would retry
@@ -440,6 +445,8 @@ export class JobApplicationService {
       });
     }
 
+    await this.closePendingProfile(application);
+
     const updated = await this.applicationRepository.findOne({
       where: { id: application.id },
     });
@@ -480,6 +487,7 @@ export class JobApplicationService {
         message: 'Đơn ứng tuyển đã được xử lý.',
       });
     }
+    await this.closePendingProfile(application);
     return { storeId, status: JobApplicationStatus.CANCELLED };
   }
 
@@ -627,6 +635,104 @@ export class JobApplicationService {
     );
   }
 
+  /**
+   * Opens the store-side profile the moment the application is sent.
+   *
+   * The owner's employee list is driven by EmployeeProfile rows, so an
+   * applicant had no record at the store until the hire completed. Creating it
+   * up front — as PENDING, which is deliberately not an employed status — gives
+   * the application a real profile that acceptance then promotes in place.
+   *
+   * Best effort: the application is the durable record, and acceptance still
+   * creates a profile from scratch when this row is missing, so a failure here
+   * must not cost the applicant their submission.
+   */
+  private async openPendingProfile(application: JobApplication) {
+    // Identity first: every employee list reads account.fullName, and this is
+    // the point at which the applicant has told us who they are.
+    await this.backfillAccountIdentity(application);
+    try {
+      await this.profileRepository.save(
+        this.profileRepository.create({
+          storeId: application.storeId,
+          accountId: application.accountId,
+          employmentStatus: EmploymentStatus.PENDING,
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `[JobApplication] ${application.id}: could not open the pending profile: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Removes the placeholder profile when an application ends without a hire.
+   *
+   * Hard delete, not soft: `apply` refuses a new application whenever *any*
+   * profile for this (store, account) exists, deleted ones included, so a
+   * tombstone here would lock a rejected applicant out of ever re-applying.
+   */
+  private async closePendingProfile(application: JobApplication) {
+    try {
+      await this.profileRepository.delete({
+        storeId: application.storeId,
+        accountId: application.accountId,
+        employmentStatus: EmploymentStatus.PENDING,
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[JobApplication] ${application.id}: could not close the pending profile: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Copies the identity the applicant typed onto their own account, but only
+   * into fields that are still empty.
+   *
+   * `EmployeeProfile` stores no name of its own — every screen that lists
+   * employees reads `account.fullName`. An account created by phone-only
+   * signup has none, so a hire made through this flow showed up nameless in
+   * the owner's employee list. The application form is the one place the
+   * person has actually told us who they are.
+   *
+   * Never overwrites: a value already on the account was set by its owner and
+   * outranks anything typed into an application form.
+   */
+  private async backfillAccountIdentity(application: JobApplication) {
+    try {
+      const account = await this.accountsService.findById(application.accountId);
+      if (!account) return;
+
+      const patch: Partial<Account> = {};
+      if (!account.fullName?.trim() && application.fullName?.trim()) {
+        patch.fullName = application.fullName.trim();
+      }
+      if (!account.gender && application.gender) {
+        patch.gender = application.gender;
+      }
+      if (!account.birthday && application.birthday) {
+        patch.birthday = application.birthday as unknown as Date;
+      }
+      if (Object.keys(patch).length === 0) return;
+
+      await this.accountsService.update(application.accountId, patch);
+    } catch (error) {
+      // Bookkeeping, exactly like the link and the notification below: the
+      // hire has already committed and must not be reported as failed.
+      this.logger.warn(
+        `[JobApplication] ${application.id}: hired but could not backfill account identity: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   private toItem(
     row: JobApplication,
     avatarUrl: string | null,
@@ -639,6 +745,8 @@ export class JobApplicationService {
       phone: row.phone,
       email: row.email,
       introduction: row.introduction,
+      gender: row.gender,
+      birthday: row.birthday,
       status: row.status,
       createdAt: row.createdAt.toISOString(),
       reviewedAt: row.reviewedAt ? row.reviewedAt.toISOString() : null,
@@ -681,6 +789,10 @@ const redactedContact = () => ({
   phone: null,
   email: null,
   introduction: null,
+  // Gender and birthday are personal data the store no longer needs once the
+  // decision is final, so they are cleared on the same schedule as the rest.
+  gender: null,
+  birthday: null,
   contactRedactedAt: new Date(),
 });
 

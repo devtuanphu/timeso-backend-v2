@@ -1,0 +1,43 @@
+-- =============================================
+-- Trạng thái nhân sự "pending" cho hồ sơ tạo từ đơn ứng tuyển
+-- =============================================
+-- Khi nhân viên gửi đơn ứng tuyển, hệ thống tạo luôn EmployeeProfile ở cửa
+-- hàng đó với trạng thái `pending`. Chủ cửa hàng duyệt thì hồ sơ chuyển sang
+-- `active`/`probation` như một nhân viên bình thường.
+--
+-- `pending` KHÔNG phải là đang làm việc: người đó chưa được vào cửa hàng, chưa
+-- hiện trong danh sách nhân viên, và không được tự chặn chính mình khi chủ bấm
+-- nhận vào làm. Phía code, mọi kiểm tra dùng `EMPLOYED_STATUSES` thay vì so
+-- sánh với `terminated`.
+--
+-- ADD VALUE lên enum không chạy được trong transaction ở Postgres cũ, và
+-- IF NOT EXISTS khiến chạy lại nhiều lần vẫn an toàn, nên file này cố ý không
+-- bọc BEGIN/COMMIT.
+
+-- Tên type do TypeORM sinh theo quy ước <bảng>_<cột>_enum.
+ALTER TYPE employee_profiles_employment_status_enum ADD VALUE IF NOT EXISTS 'pending';
+
+-- =============================================
+-- Kiểm tra
+-- =============================================
+-- SELECT unnest(enum_range(NULL::employee_profiles_employment_status_enum));
+-- Kỳ vọng: active, probation, on_leave, terminated, pending
+
+-- =============================================
+-- Rollback
+-- =============================================
+-- Postgres không hỗ trợ DROP một giá trị khỏi enum. Muốn gỡ phải tạo type mới
+-- không có 'pending', chuyển cột sang type đó rồi xoá type cũ — và trước đó
+-- phải xử lý hết các hàng đang mang giá trị 'pending':
+--
+-- BEGIN;
+-- DELETE FROM employee_profiles WHERE employment_status = 'pending';
+-- ALTER TYPE employee_profiles_employment_status_enum
+--   RENAME TO employee_profiles_employment_status_enum_old;
+-- CREATE TYPE employee_profiles_employment_status_enum
+--   AS ENUM ('active', 'probation', 'on_leave', 'terminated');
+-- ALTER TABLE employee_profiles
+--   ALTER COLUMN employment_status TYPE employee_profiles_employment_status_enum
+--   USING employment_status::text::employee_profiles_employment_status_enum;
+-- DROP TYPE employee_profiles_employment_status_enum_old;
+-- COMMIT;

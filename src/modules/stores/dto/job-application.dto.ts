@@ -1,6 +1,7 @@
 import { Transform, Type } from 'class-transformer';
 import {
   IsEnum,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -20,6 +21,21 @@ import { JobApplicationStatus } from '../entities/job-application.entity';
 
 const trimmed = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
+
+/** The values both apps already render for a person's gender. */
+export const GENDER_VALUES = ['Nam', 'Nữ', 'Khác'] as const;
+
+/**
+ * `DD/MM/YYYY` -> `YYYY-MM-DD`, leaving anything else untouched so the format
+ * validator below is the single place that rejects bad input.
+ */
+const toIsoDate = ({ value }: { value: unknown }) => {
+  if (typeof value !== 'string') return value;
+  const trimmedValue = value.trim();
+  if (!trimmedValue) return undefined;
+  const match = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(trimmedValue);
+  return match ? `${match[3]}-${match[2]}-${match[1]}` : trimmedValue;
+};
 
 /**
  * `fullName` reaches the store owner's notification body and push payload, so
@@ -62,6 +78,21 @@ export class CreateJobApplicationDto {
   @IsString()
   @MaxLength(1000)
   introduction?: string;
+
+  @Transform(trimmed)
+  @IsOptional()
+  @IsIn(GENDER_VALUES, { message: 'Giới tính không hợp lệ' })
+  gender?: string;
+
+  /**
+   * Accepted as the `DD/MM/YYYY` the staff app already uses for a birthday and
+   * normalised to the `YYYY-MM-DD` Postgres wants. An ISO date passes through
+   * unchanged, so an API client is not forced into the UI's format.
+   */
+  @Transform(toIsoDate)
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'Ngày sinh không hợp lệ' })
+  birthday?: string;
 }
 
 /** Owner inbox filter. */
@@ -109,6 +140,8 @@ export interface JobApplicationItemDto {
   phone: string | null;
   email: string | null;
   introduction: string | null;
+  gender: string | null;
+  birthday: string | null;
   status: JobApplicationStatus;
   createdAt: string;
   reviewedAt: string | null;

@@ -23,7 +23,32 @@ export enum EmploymentStatus {
   PROBATION = 'probation',
   ON_LEAVE = 'on_leave',
   TERMINATED = 'terminated',
+  /**
+   * Created by a job application, not yet approved by the owner.
+   *
+   * The person is NOT an employee: they may not reach any store data, must not
+   * appear in staff lists, and must not block their own hire. Use
+   * `isEmployedStatus` / `EMPLOYED_STATUSES` instead of comparing against
+   * TERMINATED, which is what every pre-existing check did.
+   */
+  PENDING = 'pending',
 }
+
+/**
+ * The statuses that mean "this person works here".
+ *
+ * PENDING and TERMINATED are both excluded: one has not started, the other has
+ * finished. Checks used to be written as `!== TERMINATED`, which silently
+ * counted a pending applicant as staff the moment PENDING existed.
+ */
+export const EMPLOYED_STATUSES = [
+  EmploymentStatus.ACTIVE,
+  EmploymentStatus.PROBATION,
+  EmploymentStatus.ON_LEAVE,
+] as const;
+
+export const isEmployedStatus = (status: EmploymentStatus): boolean =>
+  (EMPLOYED_STATUSES as readonly EmploymentStatus[]).includes(status);
 
 export enum WorkingStatus {
   IDLE = 'idle', // Trống ca / Chờ ca

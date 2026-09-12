@@ -43,8 +43,10 @@ import { Store, StoreStatus } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
 import {
+  EMPLOYED_STATUSES,
   EmployeeProfile,
   EmploymentStatus,
+  isEmployedStatus,
   WorkingStatus,
 } from './entities/employee-profile.entity';
 import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
@@ -1128,7 +1130,8 @@ export class StoresService {
       this.profileRepository.find({
         where: {
           accountId,
-          employmentStatus: Not(EmploymentStatus.TERMINATED),
+          // A store the account merely applied to is not one they belong to.
+          employmentStatus: In([...EMPLOYED_STATUSES]),
         },
         select: ['storeId'],
       }),
@@ -1253,8 +1256,11 @@ export class StoresService {
     const hasTargetHistory = profiles.some(
       (profile) => profile.storeId === storeId,
     );
-    const isAssigned = profiles.some(
-      (profile) => profile.employmentStatus !== EmploymentStatus.TERMINATED,
+    // Only real employment blocks a new application. A PENDING profile is the
+    // applicant's own pending request, and counting it would have stopped them
+    // applying anywhere else — including re-applying after a rejection.
+    const isAssigned = profiles.some((profile) =>
+      isEmployedStatus(profile.employmentStatus),
     );
     if (hasTargetHistory || isAssigned) {
       return { eligible: false as const };
@@ -2156,15 +2162,28 @@ export class StoresService {
         .withDeleted()
         .where('profile.accountId = :accountId', { accountId: account.id })
         .getMany();
-      if (profiles.some((profile) => profile.storeId === storeId)) {
-        throw this.employeeAttachConflict('EMPLOYEE_REHIRE_REQUIRES_RESTORE');
-      }
+      // A live PENDING profile at this store is the applicant's own job
+      // application waiting to be approved — and approving it is exactly what
+      // this call does. It is promoted in place rather than read as a prior
+      // stint, which would have made every acceptance fail with
+      // EMPLOYEE_REHIRE_REQUIRES_RESTORE.
+      const pendingAtStore = profiles.find(
+        (profile) =>
+          profile.storeId === storeId &&
+          profile.employmentStatus === EmploymentStatus.PENDING &&
+          !profile.deletedAt,
+      );
       if (
         profiles.some(
           (profile) =>
-            profile.employmentStatus !== EmploymentStatus.TERMINATED,
+            profile.storeId === storeId && profile.id !== pendingAtStore?.id,
         )
       ) {
+        throw this.employeeAttachConflict('EMPLOYEE_REHIRE_REQUIRES_RESTORE');
+      }
+      // The applicant's own PENDING profile must not read as "already hired",
+      // or accepting their application would fail with a conflict.
+      if (profiles.some((profile) => isEmployedStatus(profile.employmentStatus))) {
         throw this.employeeAttachConflict();
       }
       const profile = await this.initializeEmployeeProfile(
@@ -2172,6 +2191,7 @@ export class StoresService {
         storeId,
         account.id,
         data,
+        pendingAtStore?.id,
       );
       return profile.id;
     });
@@ -2208,6 +2228,12 @@ export class StoresService {
     storeId: string,
     accountId: string,
     data: EmployeeWorkAssignmentDto,
+    /**
+     * Id of the PENDING profile this hire approves, when it came through a job
+     * application. Passing it makes `save` update that row instead of
+     * inserting a second profile for the same (store, account).
+     */
+    promoteProfileId?: string,
   ): Promise<EmployeeProfile> {
     await this.assertEmployeeReferences(manager, storeId, data);
     const probationSetting = await manager.findOne(StoreProbationSetting, {
@@ -2221,6 +2247,7 @@ export class StoresService {
     const profile = await manager.save(
       EmployeeProfile,
       manager.create(EmployeeProfile, {
+        ...(promoteProfileId ? { id: promoteProfileId } : {}),
         storeId,
         accountId,
         storeRoleId: data.storeRoleId,
@@ -3280,7 +3307,12 @@ export class StoresService {
         typeCounts: [{ name: 'All', count: 0 }],
       };
     }
-    const contextWhere: any = {};
+    const contextWhere: any = {
+      // A PENDING profile belongs to a job application the owner has not
+      // approved yet. It is reviewed on the recruitment screen, and listing it
+      // here would show applicants as staff and inflate every headcount below.
+      employmentStatus: Not(EmploymentStatus.PENDING),
+    };
     if (storeId) {
       contextWhere.storeId = storeId;
     } else {

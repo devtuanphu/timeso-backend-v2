@@ -9,6 +9,7 @@ import { HttpException } from '@nestjs/common';
 import { JobApplicationService } from './job-application.service';
 import { JobApplicationStatus } from './entities/job-application.entity';
 import { AccountStatus } from '../accounts/entities/account.entity';
+import { EmploymentStatus } from './entities/employee-profile.entity';
 import { StoreStatus } from './entities/store.entity';
 
 const APPLICANT = 'account-applicant';
@@ -61,12 +62,20 @@ function build() {
     })),
     // `accept` checks whether the hire actually committed before compensating.
     findOne: jest.fn().mockResolvedValue(null),
+    // `apply` opens the PENDING profile; `reject`/`withdraw` remove it again.
+    create: jest.fn((row: any) => row),
+    save: jest.fn().mockResolvedValue({ id: 'pending-profile-1' }),
+    delete: jest.fn().mockResolvedValue({ affected: 1 }),
   };
   const accountsService: any = {
     findById: jest.fn().mockResolvedValue({
       id: APPLICANT,
       status: AccountStatus.ACTIVE,
     }),
+    // Acceptance backfills the applicant's identity onto their account. Without
+    // this the call threw and the service's own try/catch swallowed it, so the
+    // backfill looked fine while doing nothing.
+    update: jest.fn().mockResolvedValue({}),
   };
   const notificationsService: any = { create: jest.fn().mockResolvedValue({}) };
   const storesService: any = {
@@ -186,6 +195,81 @@ describe('JobApplicationService.apply', () => {
   });
 });
 
+describe('JobApplicationService — hồ sơ PENDING', () => {
+  it('opens a pending profile at the store as soon as the form is sent', async () => {
+    const t = build();
+
+    await t.service.apply(APPLICANT, STORE, form);
+
+    expect(t.profileRepository.save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        storeId: STORE,
+        accountId: APPLICANT,
+        employmentStatus: EmploymentStatus.PENDING,
+      }),
+    );
+  });
+
+  // Every employee list reads account.fullName, so the name has to land there
+  // at apply time for the pending profile to be identifiable at all.
+  it('writes the applied name onto an account that has none', async () => {
+    const t = build();
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: null,
+    });
+
+    await t.service.apply(APPLICANT, STORE, form);
+
+    expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+      fullName: form.fullName,
+    });
+  });
+
+  // The application is the durable record; a placeholder profile is not worth
+  // losing a submission over.
+  it('still accepts the application when the profile cannot be opened', async () => {
+    const t = build();
+    t.profileRepository.save.mockRejectedValue(new Error('profile write failed'));
+
+    await expect(t.service.apply(APPLICANT, STORE, form)).resolves.toMatchObject({
+      status: JobApplicationStatus.PENDING,
+    });
+  });
+
+  // `apply` refuses a new application whenever any profile for this
+  // (store, account) exists, soft-deleted included — so this must be a hard
+  // delete or a rejected applicant could never re-apply.
+  it.each([
+    ['reject', (t: any) => t.service.reject(STORE, APPLICATION, OWNER, {})],
+    ['withdraw', (t: any) => t.service.withdraw(STORE, APPLICATION, APPLICANT)],
+  ])('removes the pending profile on %s', async (_label, act) => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      id: APPLICATION,
+      storeId: STORE,
+      accountId: APPLICANT,
+      status: JobApplicationStatus.PENDING,
+      createdAt: new Date('2026-05-05T00:00:00Z'),
+      fullName: form.fullName,
+      phone: form.phone,
+      email: null,
+      introduction: null,
+      reviewedAt: null,
+      rejectionReason: null,
+    });
+
+    await act(t);
+
+    expect(t.profileRepository.delete).toHaveBeenCalledWith({
+      storeId: STORE,
+      accountId: APPLICANT,
+      employmentStatus: EmploymentStatus.PENDING,
+    });
+  });
+});
+
 describe('JobApplicationService.accept', () => {
   const pending = {
     id: APPLICATION,
@@ -200,6 +284,88 @@ describe('JobApplicationService.accept', () => {
     email: null,
     introduction: null,
   };
+
+  // EmployeeProfile stores no name: every employee list reads account.fullName.
+  // A phone-only signup has none, so without this backfill a hire made through
+  // this flow showed up nameless in the owner's employee list.
+  it('fills the applicant name onto an account that has none', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      gender: 'Nữ',
+      birthday: '1999-03-02',
+    });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: null,
+      gender: null,
+      birthday: null,
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+      fullName: form.fullName,
+      gender: 'Nữ',
+      birthday: '1999-03-02',
+    });
+  });
+
+  // What the account already holds was set by its owner and outranks anything
+  // typed into an application form.
+  it('never overwrites identity the account already has', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      gender: 'Nữ',
+      birthday: '1999-03-02',
+    });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: 'Tên Đã Có',
+      gender: 'Nam',
+      birthday: '1990-01-01',
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).not.toHaveBeenCalled();
+  });
+
+  // A blank-but-present name is as useless as a missing one.
+  it('treats a whitespace-only account name as missing', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pending });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: '   ',
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+      fullName: form.fullName,
+    });
+  });
+
+  // The hire has already committed; a bookkeeping failure must not undo it.
+  it('still reports a successful hire when the backfill throws', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pending });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: null,
+    });
+    t.accountsService.update.mockRejectedValue(new Error('account write failed'));
+
+    await expect(
+      t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+    ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+  });
 
   it('hires through the existing attach flow and notifies the applicant', async () => {
     const t = build();

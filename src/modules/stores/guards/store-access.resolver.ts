@@ -1,10 +1,10 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Not, Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 
 import {
+  EMPLOYED_STATUSES,
   EmployeeProfile,
-  EmploymentStatus,
 } from '../entities/employee-profile.entity';
 import { Store } from '../entities/store.entity';
 
@@ -44,7 +44,10 @@ export class StoreAccessResolver {
       where: {
         accountId,
         storeId,
-        employmentStatus: Not(EmploymentStatus.TERMINATED),
+        // Whitelist, not `Not(TERMINATED)`: a job application creates a PENDING
+        // profile at this store, and a blacklist would have handed every
+        // applicant the store's payroll, orders and stock.
+        employmentStatus: In([...EMPLOYED_STATUSES]),
       },
     });
     if (isEmployed) return true;

@@ -1,6 +1,7 @@
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { PATH_METADATA } from '@nestjs/common/constants';
 
+import { EmploymentStatus } from '../entities/employee-profile.entity';
 import { StoreAccessGuard } from './store-access.guard';
 import { StoreAccessResolver } from './store-access.resolver';
 
@@ -49,6 +50,24 @@ describe('StoreAccessGuard', () => {
       await expect(
         guard.canActivate(contextFor(':id/work-shifts', { id: STORE }, STAFF)),
       ).resolves.toBe(true);
+    });
+
+    // A job application now creates a PENDING profile at the store. The
+    // membership check used to be `Not(TERMINATED)`, which would have handed
+    // every applicant the store's payroll, orders and stock the moment they
+    // pressed send.
+    it('does not count a pending applicant as a member of the store', async () => {
+      await expect(
+        guard.canActivate(contextFor(':id/payrolls', { id: STORE }, STAFF)),
+      ).rejects.toThrow(ForbiddenException);
+
+      const where = profileRepository.exists.mock.calls[0][0].where;
+      const allowed = where.employmentStatus.value as string[];
+      expect(allowed).toContain(EmploymentStatus.ACTIVE);
+      expect(allowed).toContain(EmploymentStatus.PROBATION);
+      expect(allowed).toContain(EmploymentStatus.ON_LEAVE);
+      expect(allowed).not.toContain(EmploymentStatus.PENDING);
+      expect(allowed).not.toContain(EmploymentStatus.TERMINATED);
     });
 
     // The reason the guard exists.

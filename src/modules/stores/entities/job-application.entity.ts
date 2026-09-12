@@ -66,6 +66,16 @@ export class JobApplication extends BaseEntity {
   @Column({ name: 'introduction', type: 'text', nullable: true })
   introduction: string | null;
 
+  // Named to match `Account.gender` / `Account.birthday` so acceptance can copy
+  // them straight across without a translation layer.
+  @Column({ name: 'gender', type: 'text', nullable: true })
+  gender: string | null;
+
+  // `date` comes back from pg as 'YYYY-MM-DD', so it is typed as a string
+  // rather than repeating Account's inaccurate `Date` declaration.
+  @Column({ name: 'birthday', type: 'date', nullable: true })
+  birthday: string | null;
+
   @Column({
     type: 'enum',
     enum: JobApplicationStatus,
