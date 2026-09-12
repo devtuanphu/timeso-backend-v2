@@ -8,6 +8,7 @@ import {
   Body,
   UseGuards,
   Param,
+  ParseUUIDPipe,
   Query,
   UseInterceptors,
   UploadedFile,
@@ -4314,7 +4315,11 @@ export class StoresController {
   })
   async getNextShiftAssignment(
     @Param('employeeId') employeeId: string,
-    @Query('storeId') storeId: string,
+    // Required, and validated here: an empty or malformed value used to reach
+    // Postgres as a uuid literal and come back as a 500 with a driver message
+    // (22P02, `invalid input syntax for type uuid: ""`).
+    @Query('storeId', new ParseUUIDPipe({ errorHttpStatusCode: 400 }))
+    storeId: string,
   ) {
     return this.storesService.getNextShiftAssignment(employeeId, storeId);
   }

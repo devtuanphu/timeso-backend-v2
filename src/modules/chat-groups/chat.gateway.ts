@@ -177,7 +177,13 @@ export class ChatGateway
   leaveGroup(_accountId: string, _groupId: string): void {}
 
   isUserOnline(accountId: string): boolean {
-    return (this.server?.sockets.adapter.rooms.get(`account:${accountId}`)?.size || 0) > 0;
+    // Every hop is optional. `?.` guarded only `this.server`, so once the
+    // namespace existed without an initialised adapter — which is the state
+    // this gateway sits in while the legacy connection is disabled — reading
+    // `.rooms` threw and turned GET /chat-groups/:id/members into a 500.
+    // Not knowing means "not online", never an exception.
+    const rooms = this.server?.sockets?.adapter?.rooms;
+    return (rooms?.get(`account:${accountId}`)?.size ?? 0) > 0;
   }
 
   getOnlineUsersInGroup(_groupId: string): string[] {
