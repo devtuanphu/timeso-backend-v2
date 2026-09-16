@@ -96,6 +96,7 @@ import { Feedback } from './entities/feedback.entity';
 import { ShiftChangeRequest } from './entities/shift-change-request.entity';
 import { BonusWorkRequest } from './entities/bonus-work-request.entity';
 import { ShiftReminderService } from './shift-reminder.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 // Check if AccountIdentityDocument and AccountFinance exist
 let AccountIdentityDocument: any;
@@ -350,6 +351,13 @@ describe('Work Shift & Cycle Management', () => {
         {
           provide: ShiftReminderService,
           useValue: shiftReminderService,
+        },
+        {
+          // Appended to the StoresService constructor so shift self-registration
+          // can tell the owner. Stubbed here: these suites assert service logic,
+          // not delivery.
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
         },
       ],
     }).compile();

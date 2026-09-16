@@ -51,15 +51,30 @@ function build() {
   };
   const profileRepository: any = {
     // `apply` uses this twice: once for "employed anywhere" (getExists) and
-    // once for "any prior profile at this store, including soft-deleted"
-    // (withDeleted + getOne).
-    createQueryBuilder: jest.fn(() => ({
-      withDeleted: jest.fn().mockReturnThis(),
-      where: jest.fn().mockReturnThis(),
-      andWhere: jest.fn().mockReturnThis(),
-      getExists: jest.fn().mockResolvedValue(false),
-      getOne: jest.fn().mockResolvedValue(null),
-    })),
+    // once for "currently employed at THIS store" (getOne). The second query
+    // no longer uses withDeleted — a finished stint must not bar a new
+    // application — so the clauses it builds are captured for assertion.
+    builtClauses: [] as string[],
+    usedWithDeleted: false,
+    createQueryBuilder: jest.fn(function (this: any) {
+      const builder: any = {
+        withDeleted: jest.fn(() => {
+          profileRepository.usedWithDeleted = true;
+          return builder;
+        }),
+        where: jest.fn((clause: string) => {
+          profileRepository.builtClauses.push(clause);
+          return builder;
+        }),
+        andWhere: jest.fn((clause: string) => {
+          profileRepository.builtClauses.push(clause);
+          return builder;
+        }),
+        getExists: jest.fn().mockResolvedValue(false),
+        getOne: jest.fn().mockResolvedValue(null),
+      };
+      return builder;
+    }),
     // `accept` checks whether the hire actually committed before compensating.
     findOne: jest.fn().mockResolvedValue(null),
     // `apply` opens the PENDING profile; `reject`/`withdraw` remove it again.
@@ -192,6 +207,48 @@ describe('JobApplicationService.apply', () => {
     await expect(t.service.apply(APPLICANT, STORE, form)).resolves.toEqual(
       expect.objectContaining({ status: JobApplicationStatus.PENDING }),
     );
+  });
+});
+
+describe('JobApplicationService.apply — người từng làm việc', () => {
+  /**
+   * The production bug: `apply` rejected on *any* prior profile at the store,
+   * soft-deleted rows included, so a former employee was locked out for good.
+   * Every attempt came back 409 while the message told them to ask the owner
+   * for a restore that no flow provided — and the app swallowed the 409, so
+   * nothing was shown at all.
+   */
+  it('does not consult soft-deleted profiles', async () => {
+    const t = build();
+
+    await t.service.apply(APPLICANT, STORE, form);
+
+    expect(t.profileRepository.usedWithDeleted).toBe(false);
+  });
+
+  it('narrows the store check to someone currently employed', async () => {
+    const t = build();
+
+    await t.service.apply(APPLICANT, STORE, form);
+
+    expect(t.profileRepository.builtClauses).toContain(
+      'profile.employmentStatus IN (:...employed)',
+    );
+  });
+
+  it('still refuses someone who works there right now', async () => {
+    const t = build();
+    t.profileRepository.createQueryBuilder.mockImplementation(() => ({
+      withDeleted: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      getExists: jest.fn().mockResolvedValue(false),
+      getOne: jest.fn().mockResolvedValue({ id: 'profile-1' }),
+    }));
+
+    await expect(t.service.apply(APPLICANT, STORE, form)).rejects.toMatchObject({
+      response: { code: 'JOB_APPLICATION_ALREADY_EMPLOYED' },
+    });
   });
 });
 

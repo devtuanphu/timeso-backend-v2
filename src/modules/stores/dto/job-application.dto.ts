@@ -147,11 +147,49 @@ export interface JobApplicationItemDto {
   reviewedAt: string | null;
   rejectionReason: string | null;
   avatarUrl: string | null;
+  /**
+   * Set when this applicant already has a profile at this store that has ended
+   * — terminated, or soft-deleted when the owner removed them from the list.
+   *
+   * Accepting such an application revives that profile rather than creating a
+   * second one, so the owner is deciding a rehire, not a new hire, and the card
+   * says so.
+   */
+  formerEmployment: FormerEmployment | null;
+}
+
+/** Attendance of a past stint, summed over its monthly rows. */
+export interface FormerEmploymentRecord {
+  completedShifts: number;
+  lateArrivals: number;
+  unauthorizedLeaves: number;
+}
+
+/**
+ * What the store already knows about an applicant who worked here before.
+ *
+ * None of it is new exposure — the owner can see all of it on the deleted
+ * employee screen. It is surfaced on the application card because that is
+ * where the rehire decision is actually made.
+ */
+export interface FormerEmployment {
+  joinedAt: string | null;
+  leftAt: string | null;
+  /** e.g. "Hết hạn hợp đồng", "Đuổi việc". Null when none was recorded. */
+  terminationReason: string | null;
+  /** Null when the stint produced no monthly summary rows. */
+  record: FormerEmploymentRecord | null;
 }
 
 export interface MyJobApplicationDto {
   id: string;
   storeId: string;
+  /**
+   * Included so the applicant's own history is readable. Without it the list
+   * could only show store ids, which say nothing to the person who applied.
+   */
+  storeName: string;
+  storeAddress: string | null;
   status: JobApplicationStatus;
   createdAt: string;
 }

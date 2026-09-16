@@ -236,6 +236,11 @@ import {
 } from '../accounts/entities/account-identity-document.entity';
 import { AccountFinance } from '../accounts/entities/account-finance.entity';
 import { AccountsService } from '../accounts/accounts.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import {
+  NotificationPriority,
+  NotificationType,
+} from '../notifications/entities/notification.entity';
 
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
@@ -700,6 +705,9 @@ export class StoresService {
     private readonly faceRecognitionService: FaceRecognitionService,
     private readonly dataSource: DataSource,
     private readonly shiftReminderService: ShiftReminderService,
+    // Appended deliberately: this constructor is positional and long, so a new
+    // dependency goes on the end where it cannot shift any existing argument.
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   // Store management
@@ -1488,7 +1496,60 @@ export class StoresService {
   async getEmployeeTypes(storeId: string) {
     return this.employeeTypeRepository.find({
       where: { storeId, isActive: true },
+      // `level` is the rung on the promotion ladder, so the list is only
+      // meaningful in that order — the progression screen reads it this way.
+      order: { level: 'ASC' },
     });
+  }
+
+  /**
+   * Edits one rung of the store's promotion ladder.
+   *
+   * The ladder is not a table of its own: `getEmployeeProgression` derives it
+   * from the store's employee types ordered by `level`, and the requirement
+   * columns on each type are its promotion criteria. Owners could create types
+   * but never change or remove one, so a ladder was write-once.
+   */
+  async updateEmployeeType(
+    storeId: string,
+    typeId: string,
+    data: Partial<StoreEmployeeType>,
+  ) {
+    const type = await this.employeeTypeRepository.findOne({
+      where: { id: typeId, storeId },
+    });
+    if (!type) throw new NotFoundException('Không tìm thấy loại nhân viên');
+
+    // storeId and id are fixed by the route; anything else in the body would
+    // let a caller move a rung into another store.
+    const { id: _id, storeId: _storeId, ...patch } = data as any;
+    Object.assign(type, patch);
+    return this.employeeTypeRepository.save(type);
+  }
+
+  /**
+   * Retires a rung. Soft-disabled rather than deleted, because employee
+   * profiles reference it — a hard delete would orphan every employee holding
+   * that type and break their progression view.
+   */
+  async deleteEmployeeType(storeId: string, typeId: string) {
+    const type = await this.employeeTypeRepository.findOne({
+      where: { id: typeId, storeId },
+    });
+    if (!type) throw new NotFoundException('Không tìm thấy loại nhân viên');
+
+    const inUse = await this.profileRepository.count({
+      where: { storeId, employeeTypeId: typeId },
+    });
+    if (inUse > 0) {
+      // Hidden from the ladder but still resolvable for the people on it.
+      type.isActive = false;
+      await this.employeeTypeRepository.save(type);
+      return { id: typeId, deactivated: true, employeesAffected: inUse };
+    }
+
+    await this.employeeTypeRepository.remove(type);
+    return { id: typeId, deactivated: false, employeesAffected: 0 };
   }
 
   // Employee Termination Reason management
@@ -2173,10 +2234,20 @@ export class StoresService {
           profile.employmentStatus === EmploymentStatus.PENDING &&
           !profile.deletedAt,
       );
+      // A former employee's profile — terminated, or soft-deleted when they
+      // were removed from the list. Hiring them again revives that row rather
+      // than refusing, so a past stint is not a permanent ban.
+      const formerAtStore = profiles.find(
+        (profile) =>
+          profile.storeId === storeId &&
+          profile.id !== pendingAtStore?.id &&
+          (profile.employmentStatus === EmploymentStatus.TERMINATED ||
+            !!profile.deletedAt),
+      );
+      const reusableId = pendingAtStore?.id ?? formerAtStore?.id;
       if (
         profiles.some(
-          (profile) =>
-            profile.storeId === storeId && profile.id !== pendingAtStore?.id,
+          (profile) => profile.storeId === storeId && profile.id !== reusableId,
         )
       ) {
         throw this.employeeAttachConflict('EMPLOYEE_REHIRE_REQUIRES_RESTORE');
@@ -2191,7 +2262,7 @@ export class StoresService {
         storeId,
         account.id,
         data,
-        pendingAtStore?.id,
+        reusableId,
       );
       return profile.id;
     });
@@ -2259,6 +2330,17 @@ export class StoresService {
           ? EmploymentStatus.PROBATION
           : EmploymentStatus.ACTIVE,
         probationEndsAt,
+        // Reviving a former employee's row has to undo what ended it. Saving
+        // the fields above alone left `deleted_at` in place, so the rehired
+        // employee stayed invisible in the store's list and sat in the deleted
+        // list instead — hired on paper, gone from every screen.
+        ...(promoteProfileId
+          ? {
+              deletedAt: null,
+              leftAt: null,
+              terminationReasonId: null,
+            }
+          : {}),
       }),
     );
 
@@ -5723,7 +5805,13 @@ export class StoresService {
           id: employeeId,
           accountId: ownerAccountId,
           storeId,
-          employmentStatus: EmploymentStatus.ACTIVE,
+          // Probation is a working state — someone on probation is rostered
+          // like anyone else. Requiring ACTIVE alone locked every new hire out
+          // of signing up for their own shifts.
+          employmentStatus: In([
+            EmploymentStatus.ACTIVE,
+            EmploymentStatus.PROBATION,
+          ]),
         },
         select: ['id'],
       });
@@ -5857,7 +5945,69 @@ export class StoresService {
         this.logger.error('Failed to schedule registered assignment reminder');
       }
     }
+    // Only a self-registration needs announcing — when the owner assigns a
+    // shift they already know. Best effort: the registration has committed and
+    // must not be rolled back because a notification failed.
+    if (!isOwnerAssign) {
+      await this.notifyOwnerOfShiftRegistration(storeId, employeeId, slotId);
+    }
+
     return savedAssignment;
+  }
+
+  /**
+   * Tells the store owner that an employee signed themselves up for a shift.
+   *
+   * Registration previously wrote the assignment and returned, so the owner had
+   * to notice it by opening the schedule.
+   */
+  private async notifyOwnerOfShiftRegistration(
+    storeId: string,
+    employeeId: string,
+    slotId: string,
+  ): Promise<void> {
+    try {
+      const [store, profile, slot] = await Promise.all([
+        this.storeRepository.findOne({
+          where: { id: storeId },
+          select: ['id', 'name', 'ownerAccountId'],
+        }),
+        this.profileRepository.findOne({
+          where: { id: employeeId },
+          relations: ['account'],
+        }),
+        this.shiftSlotRepository.findOne({
+          where: { id: slotId },
+          relations: ['workShift'],
+        }),
+      ]);
+      if (!store?.ownerAccountId) return;
+
+      const who = profile?.account?.fullName?.trim() || 'Một nhân viên';
+      const shiftName = slot?.workShift?.shiftName || 'ca làm việc';
+      const when = slot?.workDate ? ` ngày ${slot.workDate}` : '';
+
+      await this.notificationsService.create({
+        accountId: store.ownerAccountId,
+        storeId,
+        title: 'Nhân viên đăng ký ca',
+        content: `${who} vừa đăng ký ${shiftName}${when}.`,
+        type: NotificationType.SYSTEM,
+        priority: NotificationPriority.NORMAL,
+        metadata: {
+          type: 'SHIFT_REGISTRATION',
+          storeId,
+          slotId,
+          employeeProfileId: employeeId,
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[registerToShiftSlot] could not notify the owner of store ${storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async getShiftAssignments(
@@ -8285,7 +8435,16 @@ export class StoresService {
     return this.employeeSalaryRepository.find({
       where,
       order: { month: 'DESC' },
-      relations: ['employeeProfile', 'monthlyPayroll'],
+      // The staff payslip screen renders the employee's name, position and
+      // employment type. Loading only `employeeProfile` left all three
+      // undefined, so the screen showed "---" for every one of them.
+      relations: [
+        'employeeProfile',
+        'employeeProfile.account',
+        'employeeProfile.storeRole',
+        'employeeProfile.employeeType',
+        'monthlyPayroll',
+      ],
     });
   }
 
@@ -13719,6 +13878,11 @@ export class StoresService {
     let totalMinutes = 0;
     let checkIn = '--:--';
     let checkOut = '--:--';
+    // Minutes the employee was late in / early out on the assignment the times
+    // above came from. The report returned only the clock readings, so the app
+    // had nothing to say whether 10:02 was on time or two minutes late.
+    let lateMinutes = 0;
+    let earlyMinutes = 0;
     let warning = '';
     const shiftsCount = assignments.length;
 
@@ -13727,10 +13891,12 @@ export class StoresService {
         if (a.checkInTime) {
           const cin = new Date(a.checkInTime);
           checkIn = `${String(cin.getHours()).padStart(2, '0')}:${String(cin.getMinutes()).padStart(2, '0')}`;
+          lateMinutes = Number(a.lateMinutes) || 0;
         }
         if (a.checkOutTime) {
           const cout = new Date(a.checkOutTime);
           checkOut = `${String(cout.getHours()).padStart(2, '0')}:${String(cout.getMinutes()).padStart(2, '0')}`;
+          earlyMinutes = Number(a.earlyMinutes) || 0;
         }
         totalMinutes += Number(a.workedMinutes || 0);
 
@@ -13779,6 +13945,8 @@ export class StoresService {
       income: dailyIncome,
       trendPercent: 0,
       trendUp: false,
+      lateMinutes,
+      earlyMinutes,
       shifts: shiftsCount,
       hours,
       minutes,
@@ -15968,6 +16136,21 @@ export class StoresService {
       })
       .getCount();
 
+    const now = new Date();
+    // Comparison happens on real instants: `endTime` is a bare clock time, and
+    // resolveShiftBoundaries anchors it to the work date in Asia/Ho_Chi_Minh,
+    // rolling a 22:00-02:00 shift onto the following day.
+    const hasEnded = (assignment: ShiftAssignment): boolean => {
+      const shift = assignment.shiftSlot?.workShift;
+      const { end } = resolveShiftBoundaries(
+        assignment.shiftSlot?.workDate ?? todayStr,
+        assignment.shiftSlot?.startTime ?? shift?.startTime,
+        assignment.shiftSlot?.endTime ?? shift?.endTime,
+      );
+      // No usable end time means we cannot prove it is over, so it stays open.
+      return end !== null && end.getTime() <= now.getTime();
+    };
+
     // 1) Check if there's an active assignment (checked in but not checked out) in this store
     const activeAssignment = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
@@ -16000,12 +16183,22 @@ export class StoresService {
         lateMinutes: activeAssignment.lateMinutes || 0,
         location: activeAssignment.shiftSlot?.location || ws?.location || '',
         note: activeAssignment.shiftSlot?.note || '',
+        // Still checked in after the shift's end time — the app can prompt to
+        // check out rather than letting it run silently past closing.
+        shiftEnded: hasEnded(activeAssignment),
+        missed: false,
         totalShiftsToday,
       };
     }
 
-    // 2) Find next approved assignment for TODAY in this store
-    const approvedAssignment = await this.shiftAssignmentRepository
+    // 2) Find the next approved assignment for TODAY in this store.
+    //
+    //    Every candidate is loaded rather than just the earliest, because a
+    //    shift whose end time has already passed must not be offered for
+    //    check-in. Previously this query had no notion of the current time at
+    //    all, so at 15:00 it still invited the employee into a 10:00-12:00
+    //    shift they had missed, with nothing anywhere saying it was over.
+    const approvedCandidates = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
       .leftJoinAndSelect('a.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
@@ -16018,7 +16211,11 @@ export class StoresService {
       .andWhere('slot.workDate = :todayStr', { todayStr })
       .andWhere('cycle.storeId = :storeId', { storeId })
       .orderBy('ws.startTime', 'ASC')
-      .getOne();
+      .getMany();
+
+    const approvedAssignment = approvedCandidates.find((a) => !hasEnded(a));
+    // Approved, never checked into, and the clock has run out on it.
+    const missedAssignment = approvedCandidates.find(hasEnded);
 
     if (approvedAssignment) {
       const ws = approvedAssignment.shiftSlot?.workShift;
@@ -16037,6 +16234,34 @@ export class StoresService {
         lateMinutes: 0,
         location: approvedAssignment.shiftSlot?.location || ws?.location || '',
         note: approvedAssignment.shiftSlot?.note || '',
+        shiftEnded: false,
+        missed: false,
+        totalShiftsToday,
+      };
+    }
+
+    // 2b) Nothing left to act on, but a shift today was missed outright. Report
+    //     it instead of silently falling through, so the app can say so rather
+    //     than showing "no shift today" to someone who did have one.
+    if (missedAssignment) {
+      const ws = missedAssignment.shiftSlot?.workShift;
+      this.logger.log(
+        `[getNextShiftAssignment] Shift ${missedAssignment.id} ended without a check-in`,
+      );
+      return {
+        assignmentId: missedAssignment.id,
+        mode: 'done' as const,
+        shiftName: ws?.shiftName || '',
+        startTime: ws?.startTime || '',
+        endTime: ws?.endTime || '',
+        workDate: missedAssignment.shiftSlot?.workDate || todayStr,
+        shiftSlotId: missedAssignment.shiftSlot?.id || null,
+        checkInTime: null,
+        lateMinutes: 0,
+        location: missedAssignment.shiftSlot?.location || ws?.location || '',
+        note: missedAssignment.shiftSlot?.note || '',
+        shiftEnded: true,
+        missed: true,
         totalShiftsToday,
       };
     }
@@ -16061,7 +16286,9 @@ export class StoresService {
           ShiftAssignmentStatus.COMPLETED,
         ],
       })
-      .orderBy('ws.startTime', 'ASC')
+      // Latest first: on a two-shift day the card should reflect where the
+      // employee actually is now, not the shift they finished this morning.
+      .orderBy('ws.startTime', 'DESC')
       .getOne();
 
     if (doneAssignment) {
@@ -16079,6 +16306,9 @@ export class StoresService {
         shiftSlotId: doneAssignment.shiftSlot?.id || null,
         checkInTime: doneAssignment.checkInTime?.toISOString() || null,
         lateMinutes: doneAssignment.lateMinutes || 0,
+        shiftEnded: hasEnded(doneAssignment),
+        // Status is COMPLETED but nothing was ever recorded against it.
+        missed: !doneAssignment.checkInTime,
         location: doneAssignment.shiftSlot?.location || ws?.location || '',
         note: doneAssignment.shiftSlot?.note || '',
         totalShiftsToday,
@@ -16111,6 +16341,63 @@ export class StoresService {
    * Nếu có slotId → gắn vào slot cụ thể (registerToShiftSlot flow).
    * Nếu không có slotId → tạo ShiftRegistration dạng đề xuất tổng quát.
    */
+  /**
+   * Cancels an employee's upcoming shift registrations at a store.
+   *
+   * A "fixed" registration is not a record of its own — it fans out into one
+   * ShiftAssignment per matching slot with nothing tying them together. So
+   * turning the fixed schedule off cannot delete "the registration"; what it
+   * can do, and what this does, is withdraw the shifts it produced that have
+   * not started yet.
+   *
+   * Deliberately narrow:
+   *   - today and later only, so worked history is never rewritten;
+   *   - APPROVED with no check-in, so a shift already under way is untouched;
+   *   - scoped to the caller's own profile.
+   */
+  async cancelUpcomingShiftRegistrations(
+    storeId: string,
+    employeeProfileId: string,
+    callerAccountId: string,
+    workShiftId?: string,
+  ): Promise<{ cancelled: number }> {
+    const caller = await this.profileRepository.findOne({
+      where: { id: employeeProfileId, accountId: callerAccountId, storeId },
+      select: ['id'],
+    });
+    if (!caller) {
+      throw new ForbiddenException('Bạn chỉ có thể huỷ ca của chính mình');
+    }
+
+    // Local date parts, not toISOString(): at UTC+7 the UTC day is still
+    // yesterday for the first seven hours, which would cancel today's shift.
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const query = this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoin('a.shiftSlot', 'slot')
+      .leftJoin('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('a.status = :status', {
+        status: ShiftAssignmentStatus.APPROVED,
+      })
+      .andWhere('a.checkInTime IS NULL')
+      .andWhere('slot.workDate >= :today', { today });
+    if (workShiftId) {
+      query.andWhere('slot.workShiftId = :workShiftId', { workShiftId });
+    }
+
+    const doomed = await query.select(['a.id']).getMany();
+    if (doomed.length === 0) return { cancelled: 0 };
+
+    await this.shiftAssignmentRepository.update(
+      { id: In(doomed.map((a) => a.id)) },
+      { status: ShiftAssignmentStatus.CANCELLED },
+    );
+    return { cancelled: doomed.length };
+  }
+
   async createShiftRegistration(
     accountId: string,
     data: {

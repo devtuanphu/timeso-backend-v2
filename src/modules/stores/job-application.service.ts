@@ -23,13 +23,17 @@ import {
   JobApplicationStatus,
 } from './entities/job-application.entity';
 import {
+  EMPLOYED_STATUSES,
   EmployeeProfile,
   EmploymentStatus,
 } from './entities/employee-profile.entity';
+import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { Store, StoreStatus } from './entities/store.entity';
 import { StoresService } from './stores.service';
 import { sanitizeDisplayName } from './job-application.text';
 import {
+  FormerEmployment,
+  FormerEmploymentRecord,
   AcceptJobApplicationDto,
   CreateJobApplicationDto,
   JobApplicationItemDto,
@@ -135,17 +139,25 @@ export class JobApplicationService {
     // fill in the entire three-step hiring form before the backend refused it,
     // losing the form on every retry. Refuse at submission time instead, with
     // an error the applicant can act on.
+    // Only a live job blocks a new application.
+    //
+    // This used to reject on *any* prior profile, soft-deleted ones included,
+    // so anyone who had ever worked at the store was locked out of applying
+    // again for good — every attempt came back 409 while the message told them
+    // to ask the owner for a restore that no flow provided. Acceptance now
+    // revives the old profile instead, which is what that message promised.
     const priorProfile = await this.profileRepository
       .createQueryBuilder('profile')
-      .withDeleted()
       .where('profile.accountId = :accountId', { accountId })
       .andWhere('profile.storeId = :storeId', { storeId })
+      .andWhere('profile.employmentStatus IN (:...employed)', {
+        employed: [...EMPLOYED_STATUSES],
+      })
       .getOne();
     if (priorProfile) {
       throw new ConflictException({
-        code: 'JOB_APPLICATION_REHIRE_REQUIRES_RESTORE',
-        message:
-          'Bạn đã từng làm việc tại cửa hàng này. Vui lòng liên hệ chủ cửa hàng để được khôi phục hồ sơ.',
+        code: 'JOB_APPLICATION_ALREADY_EMPLOYED',
+        message: 'Bạn đang làm việc tại cửa hàng này.',
       });
     }
 
@@ -221,7 +233,16 @@ export class JobApplicationService {
     const rows = await this.applicationRepository.find({
       where: { accountId },
       order: { createdAt: 'DESC', id: 'DESC' },
-      select: ['id', 'storeId', 'status', 'createdAt'],
+      // `store` is joined for its name: the applicant's history is unreadable
+      // as a list of uuids.
+      relations: ['store'],
+      select: {
+        id: true,
+        storeId: true,
+        status: true,
+        createdAt: true,
+        store: { id: true, name: true, addressLine: true },
+      },
       // The row count grows with every store applied to; keep it bounded.
       take: MAX_MY_APPLICATIONS,
     });
@@ -232,6 +253,9 @@ export class JobApplicationService {
       newestByStore.set(row.storeId, {
         id: row.id,
         storeId: row.storeId,
+        // A store deleted since the application still leaves a readable row.
+        storeName: row.store?.name || 'Cửa hàng không còn tồn tại',
+        storeAddress: row.store?.addressLine ?? null,
         status: row.status,
         createdAt: row.createdAt.toISOString(),
       });
@@ -264,10 +288,20 @@ export class JobApplicationService {
       .limit(query.limit + 1)
       .getMany();
 
+    const page = rows.slice(0, query.limit);
+    const history = await this.loadFormerEmployment(
+      storeId,
+      [...new Set(page.map((row) => row.accountId))],
+    );
+
     return {
-      items: rows
-        .slice(0, query.limit)
-        .map((row) => this.toItem(row, row.account?.avatar ?? null)),
+      items: page.map((row) =>
+        this.toItem(
+          row,
+          row.account?.avatar ?? null,
+          history.get(row.accountId) ?? null,
+        ),
+      ),
       page: query.page,
       limit: query.limit,
       hasMore: rows.length > query.limit,
@@ -733,9 +767,100 @@ export class JobApplicationService {
     }
   }
 
+  /**
+   * Past-employment context for a batch of applicants at one store.
+   *
+   * Looked up once for the whole page rather than per row, and `withDeleted`
+   * on purpose: an owner who removed someone from the list soft-deletes the
+   * profile, and that is exactly the history the card needs to surface.
+   */
+  private async loadFormerEmployment(
+    storeId: string,
+    accountIds: string[],
+  ): Promise<Map<string, FormerEmployment>> {
+    const found = new Map<string, FormerEmployment>();
+    if (accountIds.length === 0) return found;
+
+    const profiles = await this.profileRepository
+      .createQueryBuilder('profile')
+      .withDeleted()
+      // Why they left is the single most decision-changing fact here:
+      // "hết hạn hợp đồng" and "đuổi việc" point opposite ways on a rehire.
+      .leftJoinAndSelect('profile.terminationReason', 'terminationReason')
+      .where('profile.storeId = :storeId', { storeId })
+      .andWhere('profile.accountId IN (:...accountIds)', { accountIds })
+      .getMany();
+
+    const ended = profiles.filter(
+      // Only a finished stint counts. Someone still employed is refused at
+      // apply time, so a live profile here would be a stale row, not history.
+      (profile) =>
+        !!profile.deletedAt ||
+        profile.employmentStatus === EmploymentStatus.TERMINATED,
+    );
+    if (ended.length === 0) return found;
+
+    const record = await this.loadPastRecord(ended.map((p) => p.id));
+
+    for (const profile of ended) {
+      found.set(profile.accountId, {
+        joinedAt: profile.joinedAt ? profile.joinedAt.toISOString() : null,
+        leftAt: (profile.leftAt ?? profile.deletedAt)?.toISOString() ?? null,
+        terminationReason: profile.terminationReason?.name ?? null,
+        record: record.get(profile.id) ?? null,
+      });
+    }
+    return found;
+  }
+
+  /**
+   * The attendance record of a past stint, summed across its monthly rows.
+   *
+   * One grouped query for the whole page. Resolved through the profile
+   * repository's manager rather than a new constructor argument — this
+   * service is wired positionally in several specs, and widening the
+   * constructor has broken them before.
+   */
+  private async loadPastRecord(
+    profileIds: string[],
+  ): Promise<Map<string, FormerEmploymentRecord>> {
+    const byProfile = new Map<string, FormerEmploymentRecord>();
+    if (profileIds.length === 0) return byProfile;
+
+    const rows = await this.profileRepository.manager
+      .getRepository(EmployeeMonthlySummary)
+      .createQueryBuilder('summary')
+      .select('summary.employeeProfileId', 'profileId')
+      .addSelect('COALESCE(SUM(summary.completedShifts), 0)', 'completedShifts')
+      .addSelect('COALESCE(SUM(summary.lateArrivalsCount), 0)', 'lateArrivals')
+      .addSelect(
+        'COALESCE(SUM(summary.unauthorizedLeavesCount), 0)',
+        'unauthorizedLeaves',
+      )
+      .where('summary.employeeProfileId IN (:...profileIds)', { profileIds })
+      .groupBy('summary.employeeProfileId')
+      .getRawMany<{
+        profileId: string;
+        completedShifts: string;
+        lateArrivals: string;
+        unauthorizedLeaves: string;
+      }>();
+
+    for (const row of rows) {
+      byProfile.set(row.profileId, {
+        // SUM comes back as a string from pg.
+        completedShifts: Number(row.completedShifts) || 0,
+        lateArrivals: Number(row.lateArrivals) || 0,
+        unauthorizedLeaves: Number(row.unauthorizedLeaves) || 0,
+      });
+    }
+    return byProfile;
+  }
+
   private toItem(
     row: JobApplication,
     avatarUrl: string | null,
+    formerEmployment: FormerEmployment | null = null,
   ): JobApplicationItemDto {
     return {
       id: row.id,
@@ -752,6 +877,7 @@ export class JobApplicationService {
       reviewedAt: row.reviewedAt ? row.reviewedAt.toISOString() : null,
       rejectionReason: row.rejectionReason,
       avatarUrl,
+      formerEmployment,
     };
   }
 }

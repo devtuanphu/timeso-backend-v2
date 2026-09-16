@@ -14,6 +14,7 @@ import { StoresService } from './stores.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { NotificationsService } from '../notifications/notifications.service';
 
 // Import all entities
 import { Store } from './entities/store.entity';
@@ -654,6 +655,13 @@ describe('StoresService - Check-in/Check-out Integration', () => {
             syncEmployeeReminders: jest.fn(),
             scheduleReminder: jest.fn(),
           },
+        },
+        {
+          // Appended to the StoresService constructor so shift self-registration
+          // can tell the owner. Stubbed here: these suites assert service logic,
+          // not delivery.
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
         },
       ],
     }).compile();

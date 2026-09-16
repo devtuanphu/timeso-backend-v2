@@ -5,6 +5,7 @@ import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { PaymentType } from './entities/employee-contract.entity';
 import {
   PayrollRuleCategory,
@@ -838,6 +839,13 @@ describe('StoresService - Payroll Integration', () => {
           provide: ShiftReminderService,
           useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
         },
+        {
+          // Appended to the StoresService constructor so shift self-registration
+          // can tell the owner. Stubbed here: these suites assert service logic,
+          // not delivery.
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
+        },
       ],
     }).compile();
 
@@ -951,6 +959,10 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
         {
           provide: ShiftReminderService,
           useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+        },
+        {
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
         },
       ],
     }).compile();
@@ -1190,6 +1202,10 @@ describe('StoresService - deferred checkout payroll', () => {
         {
           provide: ShiftReminderService,
           useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+        },
+        {
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
         },
       ],
     }).compile();

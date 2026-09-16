@@ -5,6 +5,7 @@ import { StoresService } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
@@ -362,6 +363,13 @@ describe('StoresService - Shift Registration Count', () => {
         {
           provide: ShiftReminderService,
           useValue: reminderServiceMock,
+        },
+        {
+          // Appended to the StoresService constructor so shift self-registration
+          // can tell the owner. Stubbed here: these suites assert service logic,
+          // not delivery.
+          provide: NotificationsService,
+          useValue: { create: jest.fn().mockResolvedValue({}) },
         },
       ],
     }).compile();

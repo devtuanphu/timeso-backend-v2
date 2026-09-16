@@ -891,6 +891,33 @@ export class StoresController {
     return this.storesService.createEmployeeType(id, body);
   }
 
+  @Patch(':id/employee-types/:typeId')
+  @ApiOperation({
+    summary: 'Sửa một bậc trong lộ trình thăng tiến',
+    description:
+      'Loại nhân viên chính là bậc thăng tiến: level là thứ tự, các cột req* là điều kiện lên bậc.',
+  })
+  async updateEmployeeType(
+    @Param('id') id: string,
+    @Param('typeId', ParseUUIDPipe) typeId: string,
+    @Body() body: any,
+  ) {
+    return this.storesService.updateEmployeeType(id, typeId, body);
+  }
+
+  @Delete(':id/employee-types/:typeId')
+  @ApiOperation({
+    summary: 'Gỡ một bậc khỏi lộ trình',
+    description:
+      'Còn nhân viên đang giữ bậc thì chỉ ẩn khỏi lộ trình, không xoá, để hồ sơ của họ không mất tham chiếu.',
+  })
+  async deleteEmployeeType(
+    @Param('id') id: string,
+    @Param('typeId', ParseUUIDPipe) typeId: string,
+  ) {
+    return this.storesService.deleteEmployeeType(id, typeId);
+  }
+
   @Get(':id/employee-types')
   @ApiOperation({ summary: 'Lấy danh sách loại nhân viên của cửa hàng' })
   @ApiResponse({
@@ -4328,6 +4355,52 @@ export class StoresController {
   // SHIFT REGISTRATION (Nhân viên đăng ký ca)
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+  @Delete('shift-registrations/upcoming')
+  @ApiOperation({
+    summary: 'Huỷ các ca sắp tới mà nhân viên đã đăng ký',
+    description:
+      'Dùng khi nhân viên tắt đăng ký ca cố định. Lịch cố định không phải một bản ghi riêng — nó sinh ra từng ca rời — nên thao tác này rút lại các ca chưa bắt đầu, không đụng vào lịch sử đã làm.',
+  })
+  async cancelUpcomingShiftRegistrations(
+    @Query('employeeProfileId', ParseUUIDPipe) employeeProfileId: string,
+    @Query('storeId', ParseUUIDPipe) storeId: string,
+    @Query('workShiftId') workShiftId: string | undefined,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.cancelUpcomingShiftRegistrations(
+      storeId,
+      employeeProfileId,
+      user?.userId,
+      workShiftId,
+    );
+  }
+
+  /**
+   * Duplicate of `getShiftRegistrationsEarly` above.
+   *
+   * The copy near the top of the file is the one NestJS actually matches —
+   * it has to be declared before the `:id/...` routes or the parameterised
+   * patterns swallow this path. This one is kept at the natural place among
+   * the other shift-registration handlers, and `stores-owner-reports.controller.spec`
+   * asserts both forward the authenticated owner so they cannot drift apart.
+   */
+  @Get('shift-registrations')
+  @ApiOperation({ summary: 'Lấy danh sách đề xuất đăng ký ca' })
+  @ApiQuery({ name: 'storeId', required: false })
+  @ApiQuery({ name: 'employeeProfileId', required: false })
+  @ApiQuery({ name: 'status', required: false })
+  async getShiftRegistrations(
+    @Query('storeId') storeId?: string,
+    @Query('employeeProfileId') employeeProfileId?: string,
+    @Query('status') status?: string,
+    @GetUser() user?: any,
+  ) {
+    return this.storesService.getShiftRegistrations(
+      { storeId, employeeProfileId, status },
+      user?.userId,
+    );
+  }
+
   @Post('shift-registrations')
   @ApiOperation({
     summary: 'Nhân viên gửi đề xuất đăng ký ca làm việc',
@@ -4362,22 +4435,6 @@ export class StoresController {
     return this.storesService.getApprovalStats(storeId, user?.userId ?? user?.id);
   }
 
-  @Get('shift-registrations')
-  @ApiOperation({ summary: 'Lấy danh sách đề xuất đăng ký ca' })
-  @ApiQuery({ name: 'storeId', required: false })
-  @ApiQuery({ name: 'employeeProfileId', required: false })
-  @ApiQuery({ name: 'status', required: false })
-  async getShiftRegistrations(
-    @Query('storeId') storeId?: string,
-    @Query('employeeProfileId') employeeProfileId?: string,
-    @Query('status') status?: string,
-    @GetUser() user?: any,
-  ) {
-    return this.storesService.getShiftRegistrations(
-      { storeId, employeeProfileId, status },
-      user?.userId,
-    );
-  }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   // SALARY INQUIRIES (Nhân viên hỏi về lương)
