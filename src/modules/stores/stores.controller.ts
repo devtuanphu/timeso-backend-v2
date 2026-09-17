@@ -1672,6 +1672,20 @@ export class StoresController {
     );
   }
 
+  @Get('employees/:profileId/career-summary')
+  @ApiOperation({
+    summary: 'Tóm tắt lộ trình của chính nhân viên (cho app nhân viên)',
+    description:
+      'Chủ cửa hàng hoặc chính nhân viên đó mới xem được; đồng nghiệp bị từ chối.',
+  })
+  async getCareerSummary(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.careerLadderService.assertCanViewOwnCareer(profileId, user.userId);
+    return this.careerLadderService.getCareerSummary(profileId);
+  }
+
   @Get('employees/:profileId/career-history')
   @ApiOperation({ summary: 'Lịch sử nghề nghiệp của nhân viên' })
   async getCareerHistory(

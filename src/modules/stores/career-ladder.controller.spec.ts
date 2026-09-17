@@ -39,6 +39,12 @@ function build() {
   };
   const careerLadderService = {
     storeIdOfProfile: jest.fn().mockResolvedValue(STORE),
+    assertCanViewOwnCareer: jest.fn(async (_profileId: string, accountId: string) => {
+      if (accountId !== OWNER && accountId !== EMPLOYEE) {
+        throw new ForbiddenException('Bạn chỉ có thể xem lộ trình của chính mình');
+      }
+    }),
+    getCareerSummary: jest.fn().mockResolvedValue({ ladders: [] }),
     getLadders: jest.fn().mockResolvedValue([]),
     createLadder: jest.fn().mockResolvedValue({}),
     createRung: jest.fn().mockResolvedValue({}),
@@ -161,5 +167,21 @@ describe('lộ trình — chỉ chủ cửa hàng mới được thao tác', () 
   ])('%s từ chối nhân viên', async (_name, call) => {
     const { controller } = build();
     await expect(call(controller)).rejects.toThrow(ForbiddenException);
+  });
+
+  // Route tóm tắt dành cho app nhân viên: không dùng kiểm chủ, mà kiểm
+  // "chủ hoặc chính mình" — và phải kiểm TRƯỚC khi đọc dữ liệu.
+  it('career-summary kiểm quyền trước khi đọc dữ liệu', async () => {
+    const { controller, careerLadderService } = build();
+
+    await controller.getCareerSummary(PROFILE, asEmployee);
+    expect(careerLadderService.assertCanViewOwnCareer).toHaveBeenCalledWith(PROFILE, EMPLOYEE);
+    expect(careerLadderService.getCareerSummary).toHaveBeenCalledWith(PROFILE);
+
+    careerLadderService.getCareerSummary.mockClear();
+    await expect(
+      controller.getCareerSummary(PROFILE, { userId: 'account-coworker' }),
+    ).rejects.toThrow(ForbiddenException);
+    expect(careerLadderService.getCareerSummary).not.toHaveBeenCalled();
   });
 });

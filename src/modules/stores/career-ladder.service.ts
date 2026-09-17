@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -27,6 +28,7 @@ import { EmployeeCapabilityEntry } from './entities/employee-capability-entry.en
 import {
   EmployeeProfile,
   EmploymentStatus,
+  isEmployedStatus,
 } from './entities/employee-profile.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
@@ -719,6 +721,107 @@ export class CareerLadderService {
   }
 
   /** Các bậc đi tới được từ bậc hiện tại, kèm tiến độ của từng bậc. */
+  /**
+   * Chủ cửa hàng của hồ sơ, hoặc chính nhân viên đó khi còn đang làm.
+   *
+   * Các route lộ trình khác chỉ cho chủ. Route tóm tắt dành cho app nhân viên
+   * cần cho chính người đó xem — nhưng không được cho đồng nghiệp xem, việc mà
+   * guard "thuộc cửa hàng" vẫn cho qua.
+   */
+  async assertCanViewOwnCareer(profileId: string, accountId: string) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'storeId', 'accountId', 'employmentStatus'],
+    });
+    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+
+    const store = await this.dataSource.manager.query(
+      'SELECT owner_account_id FROM stores WHERE id = $1 LIMIT 1',
+      [profile.storeId],
+    );
+    if (store?.[0]?.owner_account_id === accountId) return profile;
+
+    if (profile.accountId === accountId && isEmployedStatus(profile.employmentStatus)) {
+      return profile;
+    }
+    throw new ForbiddenException('Bạn chỉ có thể xem lộ trình của chính mình');
+  }
+
+  /**
+   * Tóm tắt lộ trình cho app nhân viên: mỗi lộ trình một dòng, gồm bậc đang
+   * giữ và bậc kế tiếp gần nhất kèm tiến độ và điều kiện thật.
+   *
+   * Với lộ trình phân nhánh, bậc kế là bậc đi tới được có tiến độ cao nhất —
+   * đó là bước nhân viên gần đạt nhất, thứ đáng hiện trên trang chủ.
+   */
+  async getCareerSummary(profileId: string) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+    });
+    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+
+    const ladders = await this.ladderRepository.find({
+      where: { storeId: profile.storeId, isActive: true },
+      order: { dimension: 'ASC' },
+    });
+
+    const result: Array<{
+      ladderId: string;
+      ladderName: string;
+      dimension: LadderDimension;
+      currentName: string | null;
+      next: {
+        rungId: string;
+        name: string | null;
+        progress: number;
+        passed: boolean;
+        items: Array<{
+          label: string;
+          kind: string;
+          met: boolean;
+          isRequired: boolean;
+        }>;
+      } | null;
+    }> = [];
+
+    for (const ladder of ladders) {
+      const current = await this.currentRung(profile, ladder);
+      const currentNames = current
+        ? await this.targetNames(ladder.dimension, [current.targetId])
+        : new Map<string, string>();
+      const candidates = await this.nextRungs(profile.id, ladder.id);
+      const best =
+        [...candidates].sort(
+          (a, b) => b.progress - a.progress || a.level - b.level,
+        )[0] ?? null;
+
+      result.push({
+        ladderId: ladder.id,
+        ladderName: ladder.name,
+        dimension: ladder.dimension,
+        currentName: current ? (currentNames.get(current.targetId) ?? null) : null,
+        next: best
+          ? {
+              rungId: best.rungId,
+              name: best.targetName,
+              progress: best.progress,
+              passed: best.passed,
+              // Chỉ nhãn và trạng thái: số đo thô của chỉ số không cần cho
+              // trang chủ, và bớt lộ dữ liệu không dùng.
+              items: best.items.map((item) => ({
+                label: item.label,
+                kind: item.kind,
+                met: item.met,
+                isRequired: item.isRequired,
+              })),
+            }
+          : null,
+      });
+    }
+
+    return { ladders: result };
+  }
+
   async nextRungs(profileId: string, ladderId: string) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },

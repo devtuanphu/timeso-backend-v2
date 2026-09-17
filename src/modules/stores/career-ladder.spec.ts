@@ -586,3 +586,102 @@ describe('planRungRemoval — gỡ bậc không được làm đứt lộ trình
     expect(plan).toEqual({ detachEdgeIds: ['e1'], bridges: [] });
   });
 });
+
+describe('assertCanViewOwnCareer — chỉ chủ hoặc chính nhân viên', () => {
+  const ME = 'account-me';
+  const OWNER = 'account-owner';
+  const build = (profile: any) => {
+    const service = Object.create(CareerLadderService.prototype) as any;
+    service.profileRepository = { findOne: jest.fn().mockResolvedValue(profile) };
+    service.dataSource = {
+      manager: {
+        query: jest.fn().mockResolvedValue([{ owner_account_id: OWNER }]),
+      },
+    };
+    return service;
+  };
+  const myProfile = (over = {}) => ({
+    id: 'p-me',
+    storeId: 'store-1',
+    accountId: ME,
+    employmentStatus: EmploymentStatus.ACTIVE,
+    ...over,
+  });
+
+  it('nhân viên xem được lộ trình của chính mình', async () => {
+    await expect(build(myProfile()).assertCanViewOwnCareer('p-me', ME)).resolves.toBeTruthy();
+  });
+
+  it('chủ cửa hàng xem được', async () => {
+    await expect(build(myProfile()).assertCanViewOwnCareer('p-me', OWNER)).resolves.toBeTruthy();
+  });
+
+  // Guard "thuộc cửa hàng" cho đồng nghiệp đi qua; phải chặn ở đây.
+  it('đồng nghiệp cùng cửa hàng bị từ chối', async () => {
+    await expect(
+      build(myProfile()).assertCanViewOwnCareer('p-me', 'account-coworker'),
+    ).rejects.toThrow('Bạn chỉ có thể xem lộ trình của chính mình');
+  });
+
+  it('người đã nghỉ việc không xem được hồ sơ cũ', async () => {
+    await expect(
+      build(myProfile({ employmentStatus: EmploymentStatus.TERMINATED })).assertCanViewOwnCareer(
+        'p-me',
+        ME,
+      ),
+    ).rejects.toThrow();
+  });
+
+  it('hồ sơ không tồn tại thì 404', async () => {
+    await expect(build(null).assertCanViewOwnCareer('p-x', ME)).rejects.toThrow(
+      'Không tìm thấy nhân viên',
+    );
+  });
+});
+
+describe('getCareerSummary', () => {
+  it('mỗi lộ trình trả bậc đang giữ và bậc kế có tiến độ cao nhất, không lộ số đo thô', async () => {
+    const service = Object.create(CareerLadderService.prototype) as any;
+    service.profileRepository = {
+      findOne: jest.fn().mockResolvedValue(profile({ employeeTypeId: 'type-probation' })),
+    };
+    service.ladderRepository = {
+      find: jest.fn().mockResolvedValue([
+        ladder({ id: 'L-emp', dimension: LadderDimension.EMPLOYMENT_TYPE, name: 'Lộ trình nhân sự' }),
+      ]),
+    };
+    service.currentRung = jest.fn().mockResolvedValue(rung({ id: 'r1', targetId: 'type-probation' }));
+    service.targetNames = jest.fn().mockResolvedValue(new Map([['type-probation', 'Thử việc']]));
+    service.nextRungs = jest.fn().mockResolvedValue([
+      { rungId: 'r-a', targetName: 'Nhánh A', level: 2, progress: 20, passed: false, items: [] },
+      {
+        rungId: 'r-b',
+        targetName: 'Chính thức',
+        level: 2,
+        progress: 80,
+        passed: false,
+        items: [
+          { label: 'Đủ 30 ngày', kind: 'tenure', met: true, isRequired: true, current: 45, target: 30 },
+        ],
+      },
+    ]);
+
+    const result = await service.getCareerSummary('profile-1');
+
+    expect(result.ladders).toEqual([
+      {
+        ladderId: 'L-emp',
+        ladderName: 'Lộ trình nhân sự',
+        dimension: LadderDimension.EMPLOYMENT_TYPE,
+        currentName: 'Thử việc',
+        next: {
+          rungId: 'r-b',
+          name: 'Chính thức',
+          progress: 80,
+          passed: false,
+          items: [{ label: 'Đủ 30 ngày', kind: 'tenure', met: true, isRequired: true }],
+        },
+      },
+    ]);
+  });
+});
