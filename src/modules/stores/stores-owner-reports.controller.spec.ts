@@ -27,6 +27,7 @@ describe('StoresController owner report forwarding', () => {
     {} as any,
     {} as any,
     {} as any,
+    {} as any,
   );
 
   beforeEach(() => {

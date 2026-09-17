@@ -14,11 +14,13 @@ describe('StoresCronService read-only guards', () => {
     const lockService = { withLock: jest.fn() };
     const shiftEndWorkflowService = { reconcileActiveAssignments: jest.fn() };
     const jobApplicationService = { redactStaleContactDetails: jest.fn() };
+    const careerLadderService = { sweepEligibleEmployees: jest.fn() };
     const service = new StoresCronService(
       storesService as any,
       lockService as any,
       shiftEndWorkflowService as any,
       jobApplicationService as any,
+      careerLadderService as any,
       { get: jest.fn().mockReturnValue('true') } as any,
     );
 

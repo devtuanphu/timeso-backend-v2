@@ -3,10 +3,11 @@ import { NotFoundException } from '@nestjs/common';
 import { StoresService } from './stores.service';
 
 /**
- * The promotion ladder has no table of its own: `getEmployeeProgression`
- * derives it from the store's employee types ordered by `level`, and the
- * `req*` columns on each type are its promotion criteria. These two methods are
- * what let an owner shape that ladder.
+ * `store_employee_types` used to double as the promotion ladder: it carried a
+ * `level` and four `req_*` columns, so the catalogue of employment types and
+ * the ladder were the same rows. Both moved to `store_ladder_rungs` and
+ * `store_rung_criteria`; what stays here is plain catalogue CRUD, and these
+ * tests hold it to that.
  */
 const STORE = 'store-1';
 const TYPE = 'type-1';
@@ -32,7 +33,7 @@ const rung = (over: Record<string, unknown> = {}) => ({
   id: TYPE,
   storeId: STORE,
   name: 'Thợ chính',
-  level: 2,
+  isProbation: false,
   isActive: true,
   ...over,
 });
@@ -43,11 +44,10 @@ describe('updateEmployeeType', () => {
 
     const result = await service.updateEmployeeType(STORE, TYPE, {
       name: 'Thợ cả',
-      level: 3,
-      reqOnTimePercent: 95,
+      isProbation: true,
     });
 
-    expect(result).toMatchObject({ name: 'Thợ cả', level: 3, reqOnTimePercent: 95 });
+    expect(result).toMatchObject({ name: 'Thợ cả', isProbation: true });
     expect(service.employeeTypeRepository.save).toHaveBeenCalled();
   });
 
@@ -108,13 +108,15 @@ describe('deleteEmployeeType', () => {
 
 describe('getEmployeeTypes', () => {
   // The list is the ladder, so its order carries meaning.
-  it('returns the rungs ordered by level', async () => {
+  it('returns the catalogue ordered by name', async () => {
     const service = build(null);
 
     await service.getEmployeeTypes(STORE);
 
+    // Thứ tự bậc nay thuộc về store_ladder_rungs.level; danh mục chỉ cần một
+    // thứ tự ổn định để hiển thị.
     expect(service.employeeTypeRepository.find).toHaveBeenCalledWith(
-      expect.objectContaining({ order: { level: 'ASC' } }),
+      expect.objectContaining({ order: { name: 'ASC' } }),
     );
   });
 });

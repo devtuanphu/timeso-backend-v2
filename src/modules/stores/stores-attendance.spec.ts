@@ -25,7 +25,6 @@ import {
   EmploymentStatus,
 } from './entities/employee-profile.entity';
 import { calculateShiftEarnings } from './shift-earnings.utils';
-import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import {
   EmployeeContract,
   PaymentType,
@@ -192,7 +191,6 @@ const ENTITIES = [
   StoreEmployeeType,
   StoreRole,
   EmployeeProfile,
-  EmployeeProfileRole,
   EmployeeContract,
   ContractTemplate,
   WorkShift,

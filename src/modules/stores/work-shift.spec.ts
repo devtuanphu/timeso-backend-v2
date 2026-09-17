@@ -22,7 +22,6 @@ import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreRole } from './entities/store-role.entity';
 import { EmployeeProfile } from './entities/employee-profile.entity';
-import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import { EmployeeContract } from './entities/employee-contract.entity';
 import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
@@ -212,7 +211,6 @@ const ENTITIES = [
   StoreEmployeeType,
   StoreRole,
   EmployeeProfile,
-  EmployeeProfileRole,
   EmployeeContract,
   ContractTemplate,
   WorkShift,

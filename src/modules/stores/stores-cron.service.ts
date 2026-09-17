@@ -6,6 +6,7 @@ import { StoresService } from './stores.service';
 import { DistributedLockService } from './distributed-lock.service';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 import { JobApplicationService } from './job-application.service';
+import { CareerLadderService } from './career-ladder.service';
 
 @Injectable()
 export class StoresCronService {
@@ -16,6 +17,7 @@ export class StoresCronService {
     private readonly lockService: DistributedLockService,
     private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
     private readonly jobApplicationService: JobApplicationService,
+    private readonly careerLadderService: CareerLadderService,
     private readonly configService: ConfigService,
   ) {}
 
@@ -36,6 +38,32 @@ export class StoresCronService {
 
     await this.lockService.withLock('cron:redact-stale-job-applications', 300, () =>
       this.jobApplicationService.redactStaleContactDetails(),
+    );
+  }
+
+  /**
+   * Chạy 00:45 mỗi ngày: xét ai đã đủ điều kiện lên bậc trên mọi lộ trình.
+   *
+   * Trước đây `probation_ends_at` được ghi lúc tuyển rồi không ai đọc lại, nên
+   * chưa từng có ai được chuyển từ thử việc sang chính thức. Đây là chỗ nối
+   * dây cho nó.
+   */
+  @Cron('45 0 * * *', {
+    name: 'evaluate-career-eligibility',
+    timeZone: 'Asia/Ho_Chi_Minh',
+  })
+  async handleEvaluateCareerEligibility() {
+    if (this.isReadOnlyMode()) return;
+
+    await this.lockService.withLock(
+      'cron:evaluate-career-eligibility',
+      600,
+      async () => {
+        const result = await this.careerLadderService.sweepEligibleEmployees();
+        this.logger.log(
+          `Xét lộ trình: kiểm ${result.checked} hồ sơ, tự thăng ${result.autoAdvanced}, báo chủ ${result.notified}`,
+        );
+      },
     );
   }
 

@@ -32,6 +32,7 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { StoresService } from './stores.service';
+import { CareerLadderService } from './career-ladder.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { StoreAccessGuard } from './guards/store-access.guard';
 import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
@@ -190,6 +191,7 @@ export class StoresController {
     @InjectQueue('attendance-background')
     private readonly attendanceQueue: Queue,
     private readonly shiftEndWorkflowService: ShiftEndWorkflowService,
+    private readonly careerLadderService: CareerLadderService,
   ) {}
 
   @Post()
@@ -1536,7 +1538,15 @@ export class StoresController {
     type: EmployeePerformanceReportResponseDto,
   })
   async getEmployeePerformance(@Param('profileId') profileId: string) {
-    return this.storesService.getEmployeePerformance(profileId);
+    // `progression` được ghép ở đây thay vì trong StoresService: nó cần lộ
+    // trình, còn StoresService thì không nên nhận thêm phụ thuộc nào nữa.
+    const report = await this.storesService.getEmployeePerformance(profileId);
+    const progression =
+      await this.careerLadderService.getProgressionSummaryByProfileId(profileId);
+    return {
+      ...report,
+      progression: { ...progression, rankInPosition: report.rankInPosition },
+    };
   }
 
   @Get('employees/:profileId/progression')
@@ -1551,7 +1561,184 @@ export class StoresController {
     type: [ProgressionStageDto],
   })
   async getEmployeeProgression(@Param('profileId') profileId: string) {
-    return this.storesService.getEmployeeProgression(profileId);
+    // Vẫn là một mảng trần đúng như app chủ đang đọc bằng `setStages(res)`;
+    // chỉ nguồn tính đổi sang máy đánh giá của lộ trình.
+    return this.careerLadderService.getProgressionStages(profileId);
+  }
+
+  // --- Lộ trình thăng tiến ---
+  //
+  // StoreAccessGuard và StoreResourceAccessGuard chỉ kiểm "tài khoản có thuộc
+  // cửa hàng này không" — chúng cho qua cả nhân viên đang làm, không nhìn vai
+  // trò. Mọi route dưới đây đều là việc của chủ, nên route nào cũng tự gọi
+  // assertOwnerStoreAccess như các route nhạy cảm khác trong controller này.
+  // Service còn kiểm lại `storeId` của lộ trình và bậc thêm một lần nữa.
+
+  /**
+   * Route theo hồ sơ không mang id cửa hàng, nên phải tra cửa hàng của hồ sơ
+   * trước rồi mới kiểm được người gọi có phải chủ không.
+   */
+  private async assertOwnerOfProfile(profileId: string, accountId: string) {
+    const storeId = await this.careerLadderService.storeIdOfProfile(profileId);
+    await this.storesService.assertOwnerStoreAccess(storeId, accountId);
+  }
+
+  @Get(':id/ladders')
+  @ApiOperation({ summary: 'Danh sách lộ trình của cửa hàng' })
+  async getLadders(@Param('id') storeId: string, @GetUser() user: any) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.getLadders(storeId);
+  }
+
+  @Post(':id/ladders')
+  @ApiOperation({ summary: 'Tạo lộ trình cho một tác nhân' })
+  async createLadder(
+    @Param('id') storeId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.createLadder(storeId, body);
+  }
+
+  @Post(':id/ladders/:ladderId/rungs')
+  @ApiOperation({ summary: 'Thêm một bậc vào lộ trình' })
+  async createRung(
+    @Param('id') storeId: string,
+    @Param('ladderId') ladderId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.createRung(storeId, ladderId, body);
+  }
+
+  @Patch(':id/rungs/:rungId')
+  @ApiOperation({ summary: 'Sửa một bậc' })
+  async updateRung(
+    @Param('id') storeId: string,
+    @Param('rungId') rungId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.updateRung(storeId, rungId, body);
+  }
+
+  @Delete(':id/rungs/:rungId')
+  @ApiOperation({ summary: 'Gỡ một bậc khỏi lộ trình' })
+  async deleteRung(
+    @Param('id') storeId: string,
+    @Param('rungId') rungId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.deleteRung(storeId, rungId);
+  }
+
+  @Put(':id/rungs/:rungId/criteria')
+  @ApiOperation({ summary: 'Đặt lại toàn bộ điều kiện để vào một bậc' })
+  async setRungCriteria(
+    @Param('id') storeId: string,
+    @Param('rungId') rungId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.setRungCriteria(
+      storeId,
+      rungId,
+      body?.items ?? [],
+    );
+  }
+
+  @Put(':id/rungs/:rungId/next')
+  @ApiOperation({
+    summary: 'Đặt lại các bậc đi tiếp được từ một bậc',
+    description:
+      'Đây là cách khai phân nhánh: mỗi bậc chọn nhiều bậc có thể lên tiếp.',
+  })
+  async setRungNextRungs(
+    @Param('id') storeId: string,
+    @Param('rungId') rungId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.setRungNextRungs(
+      storeId,
+      rungId,
+      body?.nextRungIds ?? [],
+    );
+  }
+
+  @Get('employees/:profileId/career-history')
+  @ApiOperation({ summary: 'Lịch sử nghề nghiệp của nhân viên' })
+  async getCareerHistory(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.assertOwnerOfProfile(profileId, user.userId);
+    return this.careerLadderService.getCareerHistory(profileId);
+  }
+
+  @Get('employees/:profileId/next-rungs/:ladderId')
+  @ApiOperation({ summary: 'Các bậc kế tiếp và tiến độ trên một lộ trình' })
+  async getNextRungs(
+    @Param('profileId') profileId: string,
+    @Param('ladderId') ladderId: string,
+    @GetUser() user: any,
+  ) {
+    await this.assertOwnerOfProfile(profileId, user.userId);
+    return this.careerLadderService.nextRungs(profileId, ladderId);
+  }
+
+  @Post('employees/:profileId/advance')
+  @ApiOperation({
+    summary: 'Nâng nhân viên lên một bậc',
+    description:
+      'Đường duy nhất được phép đổi loại nhân viên, vị trí hay kỹ năng của hồ sơ.',
+  })
+  async advanceEmployee(
+    @Param('profileId') profileId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    // Không có kiểm tra này thì một nhân viên gửi `force: true` lên chính hồ
+    // sơ của mình là tự thăng chức, bỏ qua mọi điều kiện: cả hai guard chỉ
+    // kiểm "có thuộc cửa hàng không", không kiểm vai trò.
+    await this.assertOwnerOfProfile(profileId, user.userId);
+    return this.careerLadderService.advance(profileId, body?.rungId, user.userId, {
+      note: body?.note ?? null,
+      checklistResults: body?.checklistResults,
+      force: body?.force === true,
+    });
+  }
+
+  @Get('employees/:profileId/capability-points')
+  @ApiOperation({ summary: 'Lịch sử chấm điểm năng lực' })
+  async getCapabilityEntries(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.assertOwnerOfProfile(profileId, user.userId);
+    return this.careerLadderService.getCapabilityEntries(profileId);
+  }
+
+  @Post('employees/:profileId/capability-points')
+  @ApiOperation({ summary: 'Chủ cộng hoặc trừ điểm năng lực kèm lý do' })
+  async awardCapabilityPoints(
+    @Param('profileId') profileId: string,
+    @Body() body: any,
+    @GetUser() user: any,
+  ) {
+    await this.assertOwnerOfProfile(profileId, user.userId);
+    return this.careerLadderService.awardCapabilityPoints(
+      profileId,
+      Number(body?.points),
+      body?.reason ?? null,
+      user.userId,
+    );
   }
 
   @Post('employees/contracts/:contractId/renew')
@@ -1797,28 +1984,6 @@ export class StoresController {
     @Query('month') month?: string,
   ) {
     return this.storesService.getEmployeeMonthlySummaries(storeId, month);
-  }
-
-  @Post('profiles/:profileId/roles/:roleId')
-  @ApiOperation({
-    summary: 'Gán chức vụ cho nhân viên',
-    description: 'Gán một Role cụ thể cho hồ sơ nhân viên',
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Gán chức vụ thành công',
-    type: EmployeeProfileResponseDto,
-  })
-  async assignRole(
-    @Param('profileId') profileId: string,
-    @Param('roleId') roleId: string,
-    @GetUser() user: any,
-  ) {
-    return this.storesService.assignRoleToEmployee(
-      profileId,
-      roleId,
-      user.userId,
-    );
   }
 
   // Contracts

@@ -2,6 +2,14 @@ import { Entity, Column, ManyToOne, JoinColumn, OneToOne } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 
+/**
+ * Chính sách thử việc của một cửa hàng.
+ *
+ * Phần *điều kiện* — số ngày, số ca, và hai checklist — đã chuyển sang lộ
+ * trình `employment_type` dưới dạng store_rung_criteria, nơi mọi điều kiện lên
+ * bậc được mô tả theo cùng một cách. Ở lại đây chỉ còn chính sách: nhắc ai,
+ * báo cho ai, thưởng bao nhiêu.
+ */
 @Entity('store_probation_settings')
 export class StoreProbationSetting extends BaseEntity {
   @Column({ name: 'store_id' })
@@ -11,13 +19,6 @@ export class StoreProbationSetting extends BaseEntity {
   @JoinColumn({ name: 'store_id' })
   store: Store;
 
-  // -- Chu kỳ thử việc --
-  @Column({ name: 'probation_days', type: 'int', default: 0 })
-  probationDays: number; // Số ngày thử việc
-
-  @Column({ name: 'probation_shifts', type: 'int', default: 0 })
-  probationShifts: number; // Số ca thử việc
-
   @Column({ name: 'notify_evaluation', default: false })
   notifyEvaluation: boolean; // Kích hoạt thông báo nhắc đánh giá
 
@@ -26,15 +27,6 @@ export class StoreProbationSetting extends BaseEntity {
 
   @Column({ name: 'auto_close_checklist', default: false })
   autoCloseChecklist: boolean; // In/đóng file checklist khi kết thúc
-
-  // -- Checklist đánh giá (JSON) --  
-  // Tiêu chí về chuyên cần
-  @Column({ type: 'jsonb', nullable: true, name: 'attendance_checklist' })
-  attendanceChecklist: any[];
-
-  // Tiêu chí về thái độ và kỹ năng
-  @Column({ type: 'jsonb', nullable: true, name: 'attitude_checklist' })
-  attitudeChecklist: any[];
 
   // -- Thiết lập thưởng hoàn thành thử việc --
   @Column({ name: 'enable_completion_bonus', default: false })

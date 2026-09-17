@@ -41,6 +41,14 @@ import {
 } from './entities/bonus-work-request.entity';
 import { Store, StoreStatus } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
+import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
+import { StoreLadderRung } from './entities/store-ladder-rung.entity';
+import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
+import {
+  StoreRungCriteria,
+  CriteriaKind,
+  CriteriaCode,
+} from './entities/store-rung-criteria.entity';
 import { StoreRole } from './entities/store-role.entity';
 import {
   EMPLOYED_STATUSES,
@@ -49,7 +57,6 @@ import {
   isEmployedStatus,
   WorkingStatus,
 } from './entities/employee-profile.entity';
-import { EmployeeProfileRole } from './entities/employee-profile-role.entity';
 import {
   EmployeeContract,
   PaymentType,
@@ -237,6 +244,10 @@ import {
 import { AccountFinance } from '../accounts/entities/account-finance.entity';
 import { AccountsService } from '../accounts/accounts.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import {
+  buildShiftNotification,
+  ShiftNotificationKind,
+} from './shift-assignment-notification';
 import {
   NotificationPriority,
   NotificationType,
@@ -565,8 +576,6 @@ export class StoresService {
     private readonly roleRepository: Repository<StoreRole>,
     @InjectRepository(EmployeeProfile)
     private readonly profileRepository: Repository<EmployeeProfile>,
-    @InjectRepository(EmployeeProfileRole)
-    private readonly profileRoleRepository: Repository<EmployeeProfileRole>,
     @InjectRepository(EmployeeContract)
     private readonly contractRepository: Repository<EmployeeContract>,
     @InjectRepository(ContractTemplate)
@@ -829,46 +838,14 @@ export class StoresService {
   }
 
   async createDefaultProbationSetting(storeId: string) {
-    const DEFAULT_ATTENDANCE_CHECKLIST = [
-      {
-        label: 'Đi làm đúng giờ [Bắt buộc]',
-        targetValue: 28,
-        unit: 'ngày / tháng',
-        checked: true,
-        hidden: false,
-      },
-      {
-        label: 'Đủ số ca làm việc [Bắt buộc]',
-        targetValue: 28,
-        unit: 'ca / tháng',
-        checked: false,
-        hidden: false,
-      },
-      { label: 'Không nghỉ không phép', checked: false, hidden: false },
-      { label: 'Sẵn sàng làm thêm giờ', checked: false, hidden: false },
-    ];
-
-    const DEFAULT_ATTITUDE_CHECKLIST = [
-      {
-        label: 'Thái độ phục vụ khách hàng [Bắt buộc]',
-        checked: false,
-        hidden: false,
-      },
-      { label: 'Tinh thần đồng đội', checked: false, hidden: false },
-      { label: 'Kỹ năng bán hàng', checked: false, hidden: false },
-      { label: 'Kỹ năng xử lý tình huống', checked: false, hidden: false },
-      { label: 'Đề xuất ý tưởng', checked: false, hidden: false },
-    ];
-
+    // Số ngày, số ca và hai checklist từng nằm ở đây; chúng là *điều kiện* lên
+    // bậc nên đã chuyển sang lộ trình employment_type dưới dạng
+    // store_rung_criteria. Dòng này nay chỉ mang chính sách.
     const defaultSetting = this.probationSettingRepository.create({
       storeId,
-      probationDays: 0,
-      probationShifts: 0,
       notifyEvaluation: false,
       notifyResultToEmployee: false,
       autoCloseChecklist: false,
-      attendanceChecklist: DEFAULT_ATTENDANCE_CHECKLIST,
-      attitudeChecklist: DEFAULT_ATTITUDE_CHECKLIST,
       completionBonus: 0,
       isActive: true,
     });
@@ -1494,11 +1471,11 @@ export class StoresService {
   }
 
   async getEmployeeTypes(storeId: string) {
+    // Đây lại là danh mục thuần. Thứ tự bậc nay nằm ở store_ladder_rungs.level
+    // và được đọc qua CareerLadderService, không còn trên bảng này.
     return this.employeeTypeRepository.find({
       where: { storeId, isActive: true },
-      // `level` is the rung on the promotion ladder, so the list is only
-      // meaningful in that order — the progression screen reads it this way.
-      order: { level: 'ASC' },
+      order: { name: 'ASC' },
     });
   }
 
@@ -1592,56 +1569,24 @@ export class StoresService {
   }
 
   async getProbationSetting(storeId: string) {
-    let setting = await this.probationSettingRepository.findOne({
-      where: { storeId },
-    });
-
-    const DEFAULT_ATTENDANCE_CHECKLIST = [
-      {
-        label: 'Đi làm đúng giờ [Bắt buộc]',
-        targetValue: 28,
-        unit: 'ngày / tháng',
-        checked: true,
-        hidden: false,
-      },
-      {
-        label: 'Đủ số ca làm việc [Bắt buộc]',
-        targetValue: 28,
-        unit: 'ca / tháng',
-        checked: false,
-        hidden: false,
-      },
-      { label: 'Không nghỉ không phép', checked: false, hidden: false },
-      { label: 'Sẵn sàng làm thêm giờ', checked: false, hidden: false },
-    ];
-
-    const DEFAULT_ATTITUDE_CHECKLIST = [
-      {
-        label: 'Thái độ phục vụ khách hàng [Bắt buộc]',
-        checked: false,
-        hidden: false,
-      },
-      { label: 'Tinh thần đồng đội', checked: false, hidden: false },
-      { label: 'Kỹ năng bán hàng', checked: false, hidden: false },
-      { label: 'Kỹ năng xử lý tình huống', checked: false, hidden: false },
-      { label: 'Đề xuất ý tưởng', checked: false, hidden: false },
-    ];
-
-    if (!setting) {
-      // Create and save defaults if missing
-      setting = await this.createDefaultProbationSetting(storeId);
-    } else if (
-      (!setting.attendanceChecklist ||
-        setting.attendanceChecklist.length === 0) &&
-      (!setting.attitudeChecklist || setting.attitudeChecklist.length === 0)
-    ) {
-      // Lazy migration: Populate empty checklists with defaults
-      setting.attendanceChecklist = DEFAULT_ATTENDANCE_CHECKLIST;
-      setting.attitudeChecklist = DEFAULT_ATTITUDE_CHECKLIST;
-      setting = await this.probationSettingRepository.save(setting);
-    }
-
-    return setting;
+    const setting =
+      (await this.probationSettingRepository.findOne({
+        where: { storeId },
+      })) ?? (await this.createDefaultProbationSetting(storeId));
+    // Không còn phần gieo checklist mặc định: nội dung đánh giá thử việc nay là
+    // điều kiện của bậc trên lộ trình, do CareerLadderService quản lý.
+    //
+    // TẠM THỜI: bản app chủ trước khi có lộ trình render thẳng
+    // `settings.attendanceChecklist.map(...)` và `probationDays.toString()`,
+    // nên thiếu các trường này là màn Đánh giá thử việc sập. Trả chúng ở dạng
+    // rỗng cho tới khi mọi máy đã nhận bản OTA mới, rồi bỏ khối này.
+    return {
+      ...setting,
+      probationDays: 0,
+      probationShifts: 0,
+      attendanceChecklist: [],
+      attitudeChecklist: [],
+    };
   }
 
   // --- Approval Settings ---
@@ -2294,6 +2239,100 @@ export class StoresService {
     }
   }
 
+  /**
+   * Loại nhân viên và trạng thái cho một người vừa được tuyển.
+   *
+   * Trước đây việc này do `store_probation_settings.probation_days` quyết
+   * định: khác 0 thì mọi người mới đều vào thử việc, bằng 0 thì không ai vào
+   * cả — và trên thực tế mọi cửa hàng đều để 0 nên chưa từng có ai ở trạng
+   * thái thử việc. Nay nó là bậc điểm-vào của lộ trình loại nhân viên, và hạn
+   * thử việc lấy từ điều kiện `days_in_rung` của chính bậc đó.
+   *
+   * Truy vấn thẳng qua `manager` chứ không gọi CareerLadderService, để
+   * StoresService không phải nhận thêm phụ thuộc vào constructor vốn đã rất lớn.
+   */
+  private async resolveHireEmploymentType(
+    manager: EntityManager,
+    storeId: string,
+    requestedTypeId?: string | null,
+  ): Promise<{
+    employeeTypeId: string | null;
+    employmentStatus: EmploymentStatus;
+    probationEndsAt: Date | undefined;
+  }> {
+    let typeId = requestedTypeId ?? null;
+    let rungId: string | null = null;
+
+    const ladder = await manager.findOne(StoreLadder, {
+      where: {
+        storeId,
+        dimension: LadderDimension.EMPLOYMENT_TYPE,
+        isActive: true,
+      },
+    });
+
+    if (ladder) {
+      if (typeId) {
+        const rung = await manager.findOne(StoreLadderRung, {
+          where: { ladderId: ladder.id, targetId: typeId },
+        });
+        rungId = rung?.id ?? null;
+      } else {
+        // Không chọn gì thì vào điểm-vào của lộ trình.
+        const entryEdge = await manager.findOne(StoreLadderEdge, {
+          where: { ladderId: ladder.id, fromRungId: null as any },
+        });
+        if (entryEdge) {
+          const rung = await manager.findOne(StoreLadderRung, {
+            where: { id: entryEdge.toRungId },
+          });
+          if (rung) {
+            rungId = rung.id;
+            typeId = rung.targetId;
+          }
+        }
+      }
+    }
+
+    if (!typeId) {
+      return {
+        employeeTypeId: null,
+        employmentStatus: EmploymentStatus.ACTIVE,
+        probationEndsAt: undefined,
+      };
+    }
+
+    const type = await manager.findOne(StoreEmployeeType, {
+      where: { id: typeId },
+    });
+    if (!type?.isProbation) {
+      return {
+        employeeTypeId: typeId,
+        employmentStatus: EmploymentStatus.ACTIVE,
+        probationEndsAt: undefined,
+      };
+    }
+
+    let probationEndsAt: Date | undefined;
+    if (rungId) {
+      const tenure = await manager.findOne(StoreRungCriteria, {
+        where: {
+          rungId,
+          kind: CriteriaKind.TENURE,
+          code: CriteriaCode.DAYS_IN_RUNG,
+        },
+      });
+      const days = Number(tenure?.value ?? 0);
+      if (days > 0) probationEndsAt = new Date(Date.now() + days * 86_400_000);
+    }
+
+    return {
+      employeeTypeId: typeId,
+      employmentStatus: EmploymentStatus.PROBATION,
+      probationEndsAt,
+    };
+  }
+
   private async initializeEmployeeProfile(
     manager: EntityManager,
     storeId: string,
@@ -2307,14 +2346,11 @@ export class StoresService {
     promoteProfileId?: string,
   ): Promise<EmployeeProfile> {
     await this.assertEmployeeReferences(manager, storeId, data);
-    const probationSetting = await manager.findOne(StoreProbationSetting, {
-      where: { storeId },
-    });
-    const probationDays = probationSetting?.probationDays || 0;
-    const probationEndsAt =
-      probationDays > 0
-        ? new Date(Date.now() + probationDays * 86_400_000)
-        : undefined;
+    // Thử việc nay là một bậc trên lộ trình chứ không còn là một con số ngày
+    // của cửa hàng: loại nhân viên được chọn tự nói nó có phải thử việc không,
+    // và hạn lấy từ điều kiện days_in_rung của chính bậc đó.
+    const { employeeTypeId, employmentStatus, probationEndsAt } =
+      await this.resolveHireEmploymentType(manager, storeId, data.employeeTypeId);
     const profile = await manager.save(
       EmployeeProfile,
       manager.create(EmployeeProfile, {
@@ -2322,13 +2358,13 @@ export class StoresService {
         storeId,
         accountId,
         storeRoleId: data.storeRoleId,
-        employeeTypeId: data.employeeTypeId,
+        // Cột nullable trong DB nhưng khai `string` trên entity, nên NULL phải
+        // đi vào dưới dạng undefined để TypeORM bỏ qua trường.
+        employeeTypeId: employeeTypeId ?? undefined,
         workShiftId: data.workShiftId,
         skillId: data.skillId,
         joinedAt: new Date(),
-        employmentStatus: probationEndsAt
-          ? EmploymentStatus.PROBATION
-          : EmploymentStatus.ACTIVE,
+        employmentStatus,
         probationEndsAt,
         // Reviving a former employee's row has to undo what ended it. Saving
         // the fields above alone left `deleted_at` in place, so the rehired
@@ -2721,18 +2757,6 @@ export class StoresService {
       relations: ['performances', 'performances.reviewerAccount'],
     });
 
-    // 2. Lấy loại nhân viên tiếp theo (Level + 1)
-    let nextType: StoreEmployeeType | null = null;
-    if (profile.employeeType) {
-      nextType = await this.employeeTypeRepository.findOne({
-        where: {
-          storeId: profile.storeId,
-          level: profile.employeeType.level + 1,
-          isActive: true,
-        },
-      });
-    }
-
     // 3. Tính toán thâm niên
     const tenureMonths = summary?.tenureMonths || 0;
     const years = Math.floor(tenureMonths / 12);
@@ -2754,47 +2778,6 @@ export class StoresService {
           (p.type === PerformanceType.SELF ? 'Tự đánh giá' : 'Hệ thống'),
         date: p.performanceDate,
       }));
-
-    // 5. Xử lý lộ trình thăng tiến
-    const requirements: any[] = [];
-    let suggestion = 'Bạn đang hoàn thành tốt công việc!';
-
-    if (nextType) {
-      // Đúng giờ
-      const currentOnTime = summary?.totalShifts
-        ? (summary.onTimeArrivalsCount / summary.totalShifts) * 100
-        : 0;
-      requirements.push({
-        label: `${nextType.reqOnTimePercent}% ca đúng giờ / 30 ngày`,
-        currentValue: `${currentOnTime.toFixed(0)}%`,
-        requiredValue: `${nextType.reqOnTimePercent}%`,
-        isMet: currentOnTime >= nextType.reqOnTimePercent,
-      });
-
-      // Nghỉ không phép
-      const unauthorized = summary?.unauthorizedLeavesCount || 0;
-      requirements.push({
-        label: `Nghỉ không phép < ${nextType.reqMaxUnauthorizedLeave} ngày`,
-        currentValue: unauthorized,
-        requiredValue: nextType.reqMaxUnauthorizedLeave,
-        isMet: unauthorized < nextType.reqMaxUnauthorizedLeave,
-      });
-
-      // Năng lực
-      requirements.push({
-        label: `Năng lực > ${nextType.reqMinCapabilityPoints} điểm`,
-        currentValue: profile.capabilityPoints,
-        requiredValue: nextType.reqMinCapabilityPoints,
-        isMet: profile.capabilityPoints >= nextType.reqMinCapabilityPoints,
-      });
-
-      // Gợi ý
-      const pointDiff =
-        nextType.reqMinCapabilityPoints - profile.capabilityPoints;
-      if (pointDiff > 0) {
-        suggestion = `Còn thiếu ${pointDiff} điểm năng lực. Cần làm thêm các ca đúng giờ trong tháng này`;
-      }
-    }
 
     // 6. Xếp hạng cùng vị trí (Lazy rank calculation)
     const totalInPosition = await this.profileRepository.count({
@@ -2824,133 +2807,16 @@ export class StoresService {
       totalWorkHours: summary?.totalWorkHours || 0,
       totalCompletedShifts: summary?.totalCompletedShifts || 0,
       assessments,
-      progression: {
-        currentPosition: profile.employeeType?.name || 'N/A',
-        skills: profile.employeeType?.skillName || 'N/A',
-        nextTarget: nextType?.name || 'Cấp tối đa',
-        rankInPosition: `${higherProfiles}/${totalInPosition}`,
-        requirements,
-        suggestion,
-      },
+      // `progression` được controller ghép vào từ CareerLadderService. Giữ nó
+      // ngoài StoresService để service này không phải nhận thêm phụ thuộc —
+      // constructor của nó đã có hơn bảy mươi tham số mà mọi spec đang mock.
+      rankInPosition: `${higherProfiles}/${totalInPosition}`,
     };
   }
 
-  async getEmployeeProgression(profileId: string) {
-    const profile = await this.profileRepository.findOne({
-      where: { id: profileId },
-      relations: ['employeeType'],
-    });
-
-    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
-
-    // Lấy tất cả các loại nhân viên của store, sắp xếp theo level
-    const types = await this.employeeTypeRepository.find({
-      where: { storeId: profile.storeId, isActive: true },
-      order: { level: 'ASC' },
-    });
-
-    // Lấy thống kê hiện tại để tính toán tiến độ
-    const currentMonth = new Date(
-      new Date().getFullYear(),
-      new Date().getMonth(),
-      1,
-    );
-    const summary = await this.monthlySummaryRepository.findOne({
-      where: { employeeProfileId: profileId, month: currentMonth },
-    });
-
-    const currentLevel = profile.employeeType?.level || 0;
-    const stages: any[] = [];
-
-    for (const type of types) {
-      const stage: any = {
-        title: type.name,
-        progress: 0,
-      };
-
-      if (type.level <= currentLevel) {
-        // Đã hoàn thành hoặc đang giữ vị trí này -> 100%
-        stage.progress = 100;
-      } else if (type.level === currentLevel + 1) {
-        // Đây là mục tiêu tiếp theo -> Tính toán tiến độ dựa trên yêu cầu
-        const currentReqs: any[] = [];
-        let completedReqs = 0;
-        let totalReqs = 0;
-
-        // 1. Đúng giờ
-        if (type.reqOnTimePercent > 0) {
-          totalReqs++;
-          const currentOnTime = summary?.totalShifts
-            ? (summary.onTimeArrivalsCount / summary.totalShifts) * 100
-            : 0;
-          const met = currentOnTime >= type.reqOnTimePercent;
-          if (met) completedReqs++;
-          currentReqs.push({
-            text: `${type.reqOnTimePercent}% ca đúng giờ / 30 ngày`,
-            completed: met,
-          });
-        }
-
-        // 2. Nghỉ không phép
-        // Luôn kiểm tra yêu cầu này
-        totalReqs++;
-        const unauthorized = summary?.unauthorizedLeavesCount || 0;
-        const metUnauthorized = unauthorized < type.reqMaxUnauthorizedLeave;
-        if (metUnauthorized) completedReqs++;
-        currentReqs.push({
-          text: `Nghỉ không phép < ${type.reqMaxUnauthorizedLeave} ngày`,
-          completed: metUnauthorized,
-        });
-
-        // 3. Không bị phản ánh
-        if (type.reqNoComplaints) {
-          totalReqs++;
-          // Tạm thời giả định là true vì chưa có logic phản ánh
-          const met = true;
-          if (met) completedReqs++;
-          currentReqs.push({
-            text: 'Không bị phản ánh',
-            completed: met,
-          });
-        }
-
-        // 4. Năng lực
-        if (type.reqMinCapabilityPoints > 0) {
-          totalReqs++;
-          const met = profile.capabilityPoints >= type.reqMinCapabilityPoints;
-          if (met) completedReqs++;
-          currentReqs.push({
-            text: `Năng lực > ${type.reqMinCapabilityPoints} điểm`,
-            completed: met,
-          });
-        }
-
-        stage.requirements = currentReqs;
-        stage.progress =
-          totalReqs > 0 ? Math.round((completedReqs / totalReqs) * 100) : 0;
-
-        // Gợi ý
-        const pointDiff =
-          type.reqMinCapabilityPoints - profile.capabilityPoints;
-        if (pointDiff > 0) {
-          stage.suggestion = {
-            text: `Còn thiếu ${pointDiff} điểm năng lực. Cần làm thêm các ca đúng giờ trong tháng này`,
-          };
-        } else if (stage.progress < 100) {
-          stage.suggestion = {
-            text: `Bạn đã đạt đủ điểm năng lực, hãy duy trì các chỉ số khác nhé!`,
-          };
-        }
-      } else {
-        // Các mức cao hơn nữa -> 0%
-        stage.progress = 0;
-      }
-
-      stages.push(stage);
-    }
-
-    return stages;
-  }
+  // getEmployeeProgression đã chuyển sang CareerLadderService.getProgressionStages.
+  // Nó từng dựng thang bằng cách sắp store_employee_types theo `level` rồi nối
+  // chuỗi điều kiện từ bốn cột req_*, nên mỗi màn tự mô tả điều kiện một kiểu.
 
   async getEmployeeScheduleDetails(
     profileId: string,
@@ -3224,6 +3090,7 @@ export class StoresService {
         this.scheduleReminderForAssignment(savedAssignment.id).catch(() => {
           this.logger.error('Failed to schedule assignment reminder');
         });
+        void this.notifyEmployeesOfNewShifts([savedAssignment.id], 'approved');
       }
 
       return savedAssignment;
@@ -3687,19 +3554,6 @@ export class StoresService {
       await manager.save(EmployeeProfile, profile);
       return manager.restore(EmployeeProfile, profileId);
     });
-  }
-
-  async assignRoleToEmployee(
-    profileId: string,
-    roleId: string,
-    assignedBy: string,
-  ) {
-    const profileRole = this.profileRoleRepository.create({
-      employeeProfileId: profileId,
-      storeRoleId: roleId,
-      assignedByAccountId: assignedBy,
-    });
-    return this.profileRoleRepository.save(profileRole);
   }
 
   // Contract management
@@ -4541,6 +4395,7 @@ export class StoresService {
             'Failed to schedule reminders for newly created shift schedule',
           );
         });
+      void this.notifyEmployeesOfNewShifts(assignmentIds, 'assigned');
     }
 
     return publicResult;
@@ -5950,9 +5805,90 @@ export class StoresService {
     // must not be rolled back because a notification failed.
     if (!isOwnerAssign) {
       await this.notifyOwnerOfShiftRegistration(storeId, employeeId, slotId);
+    } else if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
+      // Ngược lại, chủ xếp ca thì chính nhân viên mới là người chưa biết.
+      void this.notifyEmployeesOfNewShifts([savedAssignment.id], 'assigned');
     }
 
     return savedAssignment;
+  }
+
+  /**
+   * Báo cho nhân viên khi chủ xếp ca cho họ hoặc duyệt ca họ đăng ký.
+   *
+   * Gom theo nhân viên: tạo một lịch lặp nhiều tuần sinh ra hàng chục
+   * assignment, và một người không nên nhận hàng chục thông báo cho cùng một
+   * lần bấm. Gửi sau khi dữ liệu đã commit và chỉ là best effort — thông báo
+   * hỏng không được làm hỏng việc xếp ca. Nơi gọi không chờ hàm này: gửi push
+   * lần lượt cho từng người không được giữ phản hồi của chủ. Hàm tự bắt mọi
+   * lỗi nên không có promise bị từ chối mà không ai xử lý.
+   */
+  private async notifyEmployeesOfNewShifts(
+    assignmentIds: string[],
+    kind: ShiftNotificationKind,
+  ): Promise<void> {
+    if (!assignmentIds.length) return;
+    let assignments: ShiftAssignment[];
+    try {
+      assignments = await this.shiftAssignmentRepository.find({
+        where: { id: In(assignmentIds) },
+        relations: ['employee', 'shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[notifyEmployeesOfNewShifts] could not load assignments: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return;
+    }
+
+    const byAccount = new Map<string, ShiftAssignment[]>();
+    for (const assignment of assignments) {
+      const accountId = assignment.employee?.accountId;
+      if (!accountId || !assignment.shiftSlot?.workDate) continue;
+      byAccount.set(accountId, [...(byAccount.get(accountId) ?? []), assignment]);
+    }
+
+    for (const [accountId, list] of byAccount) {
+      try {
+        const { title, content } = buildShiftNotification(
+          kind,
+          list.map((a) => ({
+            workDate: a.shiftSlot.workDate,
+            startTime: a.shiftSlot.startTime || a.shiftSlot.workShift?.startTime,
+            endTime: a.shiftSlot.endTime || a.shiftSlot.workShift?.endTime,
+            shiftName: a.shiftSlot.workShift?.shiftName,
+          })),
+        );
+        const storeId = list[0].shiftSlot?.cycle?.storeId;
+        await this.notificationsService.create({
+          accountId,
+          storeId,
+          title,
+          content,
+          type:
+            kind === 'approved'
+              ? NotificationType.SHIFT_APPROVAL
+              : NotificationType.SCHEDULE_CONFIRMATION,
+          priority: NotificationPriority.NORMAL,
+          // Chạm vào thông báo trong danh sách mở thẳng lịch làm việc.
+          actionUrl: '/(home)/workshift',
+          metadata: {
+            type: kind === 'approved' ? 'SHIFT_APPROVED' : 'SHIFT_ASSIGNED',
+            storeId,
+            assignmentIds: list.map((a) => a.id),
+          },
+        });
+      } catch (error) {
+        // Lỗi với một người không được chặn thông báo của người khác.
+        this.logger.warn(
+          `[notifyEmployeesOfNewShifts] could not notify account ${accountId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   }
 
   /**
@@ -6122,6 +6058,16 @@ export class StoresService {
       current.status = nextStatus;
       if (note !== undefined) current.note = note;
       return manager.save(ShiftAssignment, current);
+    }).then(async (saved) => {
+      // Transaction đã kiểm lại chuyển trạng thái dưới khoá, nên trạng thái
+      // đọc trước đó là PENDING nghĩa là đây đúng là lần duyệt ca đăng ký.
+      if (
+        assignment.status === ShiftAssignmentStatus.PENDING &&
+        nextStatus === ShiftAssignmentStatus.APPROVED
+      ) {
+        void this.notifyEmployeesOfNewShifts([assignmentId], 'approved');
+      }
+      return saved;
     });
   }
 

@@ -14,7 +14,10 @@ import {
   EmployeeProfile,
   EmploymentStatus,
 } from './entities/employee-profile.entity';
-import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
+import {
+  EmployeeLeaveRequest,
+  LeaveRequestStatus,
+} from './entities/employee-leave-request.entity';
 import { PaymentType } from './entities/employee-contract.entity';
 import {
   StorePayrollRule,
@@ -158,6 +161,12 @@ export interface EmployeeScheduleDay {
   dateNumber: number;
   dayName: string;
   isToday: boolean;
+  /**
+   * Có đơn nghỉ phép đã duyệt phủ ngày này. App dùng để phân biệt "Nghỉ phép"
+   * với một ngày đơn giản là không có ca — trước đây app không có cách nào
+   * biết, nên ghi "Nghỉ phép" cho mọi ngày trống.
+   */
+  isOnLeave: boolean;
   shifts: {
     id: string;
     type: string;
@@ -817,6 +826,14 @@ export class ShiftAggregationService {
       .orderBy('slot.workDate', 'ASC')
       .getMany();
 
+    const approvedLeaves = await this.leaveRequestRepo
+      .createQueryBuilder('leave')
+      .where('leave.employeeProfileId = :employeeId', { employeeId })
+      .andWhere('leave.status = :status', { status: LeaveRequestStatus.APPROVED })
+      .andWhere('leave.startDate <= :to', { to })
+      .andWhere('leave.endDate >= :from', { from })
+      .getMany();
+
     const dateRange = this.getDateRange(from, to);
     const today = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Ho_Chi_Minh',
@@ -836,6 +853,12 @@ export class ShiftAggregationService {
         dateNumber: date.getDate(),
         dayName: DAY_SHORT_VI[dayOfWeek] || dayOfWeek,
         isToday: dateStr === today,
+        // Ngày dạng YYYY-MM-DD nên so sánh chuỗi là so sánh ngày.
+        isOnLeave: approvedLeaves.some(
+          (leave) =>
+            String(leave.startDate).slice(0, 10) <= dateStr &&
+            String(leave.endDate).slice(0, 10) >= dateStr,
+        ),
         shifts: dayAssignments.map((a) => ({
           id: a.shiftSlotId,
           type: this.inferShiftType(

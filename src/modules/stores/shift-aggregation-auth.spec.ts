@@ -349,6 +349,7 @@ describe('calendar mutation owner authorization', () => {
 
   it('only allows forward assignment transitions and rejects terminal replay', async () => {
     const service = Object.create(StoresService.prototype) as any;
+    service.notifyEmployeesOfNewShifts = jest.fn().mockResolvedValue(undefined);
     const assignment = {
       id: 'assignment-1',
       status: ShiftAssignmentStatus.PENDING,
@@ -395,6 +396,11 @@ describe('calendar mutation owner authorization', () => {
     expect(save).toHaveBeenCalledWith(
       ShiftAssignment,
       expect.objectContaining({ status: ShiftAssignmentStatus.APPROVED }),
+    );
+    // Duyệt ca đăng ký (PENDING → APPROVED) phải báo cho nhân viên.
+    expect(service.notifyEmployeesOfNewShifts).toHaveBeenCalledWith(
+      ['assignment-1'],
+      'approved',
     );
 
     service.shiftAssignmentRepository.findOne.mockResolvedValueOnce({
@@ -624,6 +630,15 @@ describe('calendar mutation owner authorization', () => {
         return qb;
       }),
     };
+    service.leaveRequestRepo = {
+      createQueryBuilder: jest.fn(() => {
+        const qb: any = {};
+        for (const method of ['where', 'andWhere'])
+          qb[method] = jest.fn().mockReturnValue(qb);
+        qb.getMany = jest.fn().mockResolvedValue([]);
+        return qb;
+      }),
+    };
 
     const result = await service.getEmployeeScheduleGrid({
       storeId: 'store-1',
@@ -635,6 +650,63 @@ describe('calendar mutation owner authorization', () => {
 
     expect(result?.schedule[0].isToday).toBe(true);
     jest.useRealTimers();
+  });
+
+  // App nhân viên ghi "Nghỉ phép" cho mọi ngày trống vì API không nói ngày nào
+  // thật sự nghỉ phép. Cờ này phải đúng từng ngày, kể cả đơn nghỉ nhiều ngày.
+  it('marks only days covered by an approved leave as on leave', async () => {
+    const service = Object.create(ShiftAggregationService.prototype) as any;
+    service.assertEmployeeCalendarAccess = jest
+      .fn()
+      .mockResolvedValue(undefined);
+    service.requireDateRange = jest.fn();
+    const builder = (result: 'one' | 'many', value: unknown) =>
+      jest.fn(() => {
+        const qb: any = {};
+        for (const method of [
+          'leftJoinAndSelect',
+          'leftJoin',
+          'where',
+          'andWhere',
+          'orderBy',
+        ])
+          qb[method] = jest.fn().mockReturnValue(qb);
+        qb[result === 'one' ? 'getOne' : 'getMany'] = jest
+          .fn()
+          .mockResolvedValue(value);
+        return qb;
+      });
+    service.employeeProfileRepo = {
+      createQueryBuilder: builder('one', {
+        id: 'emp-1',
+        account: { fullName: 'A' },
+      }),
+    };
+    service.shiftAssignmentRepo = { createQueryBuilder: builder('many', []) };
+    const leaveBuilder = builder('many', [
+      { startDate: '2026-08-25', endDate: '2026-08-26', status: 'APPROVED' },
+    ]);
+    service.leaveRequestRepo = { createQueryBuilder: leaveBuilder };
+
+    const result = await service.getEmployeeScheduleGrid({
+      storeId: 'store-1',
+      employeeId: 'emp-1',
+      from: '2026-08-24',
+      to: '2026-08-27',
+      ownerAccountId: 'owner-1',
+    });
+
+    expect(result?.schedule.map((d: any) => [d.date, d.isOnLeave])).toEqual([
+      ['2026-08-24', false],
+      ['2026-08-25', true],
+      ['2026-08-26', true],
+      ['2026-08-27', false],
+    ]);
+    // Chỉ đơn đã duyệt mới tính là nghỉ phép.
+    const qb = leaveBuilder.mock.results[0].value as any;
+    expect(qb.andWhere).toHaveBeenCalledWith('leave.status = :status', {
+      status: 'APPROVED',
+    });
   });
 
   it('keeps an overnight slot ongoing after local midnight', () => {
