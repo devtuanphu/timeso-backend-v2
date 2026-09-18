@@ -1351,10 +1351,12 @@ export class StoresController {
     }
     return {
       success: true,
-      reminderSettings: profile.reminderSettings || {
+      reminderSettings: {
         type: 'off',
         remindIfNotCheckIn: true,
         vibrate: false,
+        notifyNewShifts: true,
+        ...(profile.reminderSettings || {}),
       },
     };
   }

@@ -117,7 +117,9 @@ describe('StoresService shift predicate writers', () => {
     expect(manager.softDelete).not.toHaveBeenCalled();
   });
 
-  it('rejects duplicate final active names across timekeeping updates and reactivations', async () => {
+  // Chủ cửa hàng cho phép trùng tên ca miễn khác ngày; ca mẫu trong cài đặt
+  // chấm công không gắn ngày nên không còn bị chặn vì trùng tên. Tên rỗng vẫn bị chặn.
+  it('allows reactivating a timekeeping shift that shares an active name, but not an empty name', async () => {
     const service = createService();
     const manager = {
       query: jest.fn(async () => []),
@@ -168,7 +170,7 @@ describe('StoresService shift predicate writers', () => {
           shifts: [
             {
               id: 'shift-2',
-              shiftName: '  ca   sáng ',
+              shiftName: '   ',
               isActive: true,
             },
           ],
@@ -178,6 +180,22 @@ describe('StoresService shift predicate writers', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(manager.update).not.toHaveBeenCalled();
     expect(manager.save).not.toHaveBeenCalled();
+
+    await expect(
+      service.upsertTimekeepingSetting(
+        'store-1',
+        {
+          shifts: [
+            {
+              id: 'shift-2',
+              shiftName: '  ca   sáng ',
+              isActive: true,
+            },
+          ],
+        } as any,
+        'owner-1',
+      ),
+    ).resolves.not.toThrow();
   });
 
   it('rejects a timekeeping shift id outside the authoritative store set', async () => {

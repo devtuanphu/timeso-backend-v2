@@ -20,8 +20,8 @@ describe('buildShiftNotification', () => {
 
   it('một ca được duyệt', () => {
     expect(buildShiftNotification('approved', [shift('2026-09-16')])).toEqual({
-      title: 'Ca đăng ký đã được duyệt',
-      content: 'Ca sáng ngày 16/09 (08:00–12:00) bạn đăng ký đã được duyệt.',
+      title: 'Đăng ký ca thành công · ngày 16/09',
+      content: 'Ca 08:00-12:00 đã được đăng ký thành công',
     });
   });
 
@@ -46,7 +46,16 @@ describe('buildShiftNotification', () => {
         shiftName: 'Ca chiều',
       }),
     ]);
-    expect(result.content).toBe('2 ca bạn đăng ký ngày 16/09 đã được duyệt.');
+    expect(result.content).toBe('2 ca ngày 16/09 đã được đăng ký thành công');
+  });
+
+  // Câu chủ cửa hàng yêu cầu: "Ca 19:00-24:00 đã được đăng ký thành công".
+  it('ca kết thúc lúc nửa đêm ghi 24:00', () => {
+    expect(
+      buildShiftNotification('approved', [
+        shift('2026-09-19', { startTime: '19:00:00', endTime: '00:00:00' }),
+      ]).content,
+    ).toBe('Ca 19:00-24:00 đã được đăng ký thành công');
   });
 
   it('thiếu tên ca và giờ vẫn ra câu đọc được', () => {
@@ -61,9 +70,10 @@ describe('StoresService.notifyEmployeesOfNewShifts', () => {
     id: string,
     accountId: string | null,
     workDate: string,
+    reminderSettings: unknown = null,
   ) => ({
     id,
-    employee: accountId ? { accountId } : null,
+    employee: accountId ? { accountId, reminderSettings } : null,
     shiftSlot: {
       workDate,
       startTime: '08:00',
@@ -106,6 +116,30 @@ describe('StoresService.notifyEmployeesOfNewShifts', () => {
         }),
       }),
     );
+  });
+
+  // Công tắc "Nhận thông báo khi có ca mới" ở màn Nhắc tôi.
+  it('nhân viên tắt thông báo ca mới thì không nhận ca chủ xếp', async () => {
+    const service = build([
+      assignment('a1', 'acc-off', '2026-09-14', {
+        type: 'off',
+        notifyNewShifts: false,
+      }),
+      assignment('a2', 'acc-legacy', '2026-09-14', { type: 'off' }),
+    ]);
+    await service.notifyEmployeesOfNewShifts(['a1', 'a2'], 'assigned');
+    expect(service.notificationsService.create).toHaveBeenCalledTimes(1);
+    expect(service.notificationsService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: 'acc-legacy' }),
+    );
+  });
+
+  it('tắt thông báo ca mới vẫn nhận xác nhận đăng ký thành công', async () => {
+    const service = build([
+      assignment('a1', 'acc-off', '2026-09-14', { notifyNewShifts: false }),
+    ]);
+    await service.notifyEmployeesOfNewShifts(['a1'], 'approved');
+    expect(service.notificationsService.create).toHaveBeenCalledTimes(1);
   });
 
   it('duyệt ca dùng loại "Duyệt ca"', async () => {

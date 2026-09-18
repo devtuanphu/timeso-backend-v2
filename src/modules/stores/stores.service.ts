@@ -509,8 +509,66 @@ const groupBlockingLeaveIntervals = (
   return intervalsByEmployee;
 };
 
+/** Mặc định bật; chỉ tắt khi nhân viên chủ động tắt. */
+export const shouldNotifyNewShifts = (reminderSettings: unknown): boolean =>
+  (reminderSettings as { notifyNewShifts?: unknown } | null)?.notifyNewShifts !==
+  false;
+
 const normalizeActiveShiftName = (name: string) =>
   name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('vi-VN');
+
+const assertShiftNamesPresent = (
+  shifts: Array<{ shiftName: string; isActive?: boolean }>,
+) => {
+  if (
+    shifts
+      .filter((shift) => shift.isActive !== false)
+      .some((shift) => !normalizeActiveShiftName(shift.shiftName))
+  ) {
+    throw new BadRequestException('Tên ca là bắt buộc');
+  }
+};
+
+/**
+ * Tên ca được phép trùng, miễn các ca cùng tên không làm cùng ngày. Trả về
+ * ngày đầu tiên có ca khác (đang hoạt động, chu kỳ chưa dừng) trùng tên với
+ * một trong `names` — null nếu không trùng.
+ */
+export const findSameNameShiftOnDates = async (
+  manager: EntityManager,
+  storeId: string,
+  names: string[],
+  workDates: string[],
+  excludeShiftIds: string[] = [],
+): Promise<{ shiftName: string; workDate: string } | null> => {
+  const wanted = new Set(names.map(normalizeActiveShiftName));
+  if (wanted.size === 0 || workDates.length === 0) return null;
+  const rows: Array<{ shift_name: string; work_date: string }> =
+    await manager.query(
+      `SELECT ws.shift_name, to_char(ss.work_date, 'YYYY-MM-DD') AS work_date
+         FROM shift_slots ss
+         JOIN work_shifts ws ON ws.id = ss.work_shift_id
+         JOIN work_cycles wc ON wc.id = ss.cycle_id
+        WHERE ws.store_id = $1
+          AND ws.is_active = true
+          AND wc.status IN ('ACTIVE', 'EXPIRED')
+          AND ss.work_date = ANY($2::date[])
+          AND NOT (ws.id = ANY($3::uuid[]))
+        ORDER BY ss.work_date ASC`,
+      [storeId, workDates, excludeShiftIds],
+    );
+  const hit = (Array.isArray(rows) ? rows : []).find(
+    (row) =>
+      typeof row?.shift_name === 'string' &&
+      wanted.has(normalizeActiveShiftName(row.shift_name)),
+  );
+  return hit ? { shiftName: hit.shift_name, workDate: hit.work_date } : null;
+};
+
+export const sameNameShiftMessage = (hit: { shiftName: string; workDate: string }) => {
+  const [year, month, day] = hit.workDate.split('-');
+  return `Đã có ca "${hit.shiftName}" vào ngày ${day}/${month}/${year}. Tên ca chỉ được trùng khi khác ngày.`;
+};
 
 const assertUniqueActiveShiftNames = (
   shifts: Array<{ shiftName: string; isActive?: boolean }>,
@@ -1008,7 +1066,7 @@ export class StoresService {
     const existingShifts = await manager.find(WorkShift, {
       where: { storeId },
     });
-    assertUniqueActiveShiftNames(existingShifts);
+    assertShiftNamesPresent(existingShifts);
     if (setting) return { setting, shifts: existingShifts };
 
     const finalActiveShifts = existingShifts.filter((shift) => shift.isActive);
@@ -1038,7 +1096,7 @@ export class StoresService {
       finalActiveShifts.push(newShift);
       createdShifts.push(newShift);
     }
-    assertUniqueActiveShiftNames(finalActiveShifts);
+    assertShiftNamesPresent(finalActiveShifts);
 
     setting = manager.create(
       StoreTimekeepingSetting,
@@ -1755,7 +1813,7 @@ export class StoresService {
           isActive: update?.isActive ?? shift.isActive,
         };
       });
-      assertUniqueActiveShiftNames(finalShifts);
+      assertShiftNamesPresent(finalShifts);
       const reminderShiftIds = shiftUpdates
         .filter((shiftData) => {
           const existing = existingById.get(shiftData.id!);
@@ -2401,18 +2459,13 @@ export class StoresService {
       currentMonth,
       manager,
     );
-    await this.createEmployeeSalary(
-      {
-        employeeProfileId: profile.id,
-        month: currentMonth,
-        monthlyPayrollId: monthlyPayroll.id,
-        baseSalary: salaryAmount,
-        paymentType: data.contract?.paymentType,
-        workingHours: 0,
-        earnedBaseSalary: 0,
-      },
-      manager,
-    );
+    await this.upsertInitialEmployeeSalary(manager, {
+      employeeProfileId: profile.id,
+      month: currentMonth,
+      monthlyPayrollId: monthlyPayroll.id,
+      baseSalary: salaryAmount,
+      paymentType: data.contract?.paymentType,
+    });
     await this.assignInitialAssets(manager, storeId, profile.id, data.assetIds);
     return profile;
   }
@@ -3749,18 +3802,8 @@ export class StoresService {
           'Bạn không có quyền tạo ca cho cửa hàng này',
         );
       }
-      const activeShifts = await manager.find(WorkShift, {
-        where: { storeId, isActive: true },
-        select: ['id', 'shiftName'],
-      });
-      const normalizedName = normalizeActiveShiftName(shiftName);
-      if (
-        activeShifts.some(
-          (shift) =>
-            normalizeActiveShiftName(shift.shiftName) === normalizedName,
-        )
-      ) {
-        throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+      if (!normalizeActiveShiftName(shiftName)) {
+        throw new BadRequestException('Tên ca là bắt buộc');
       }
       const shift = manager.create(WorkShift, {
         storeId,
@@ -4285,11 +4328,15 @@ export class StoresService {
           );
         }
 
-        const activeShifts = await manager.find(WorkShift, {
-          where: { storeId, isActive: true },
-          select: ['id', 'shiftName'],
-        });
-        assertUniqueActiveShiftNames([...activeShifts, ...drafts]);
+        const sameNameHit = await findSameNameShiftOnDates(
+          manager,
+          storeId,
+          drafts.map((draft) => draft.shiftName),
+          workDates,
+        );
+        if (sameNameHit) {
+          throw new BadRequestException(sameNameShiftMessage(sameNameHit));
+        }
 
         if (drafts.some((draft) => draft.employeeIds.length > 0)) {
           await this.assertShiftScheduleAvailabilityAtCommit(
@@ -4443,18 +4490,25 @@ export class StoresService {
         const normalizedName = normalizeActiveShiftName(data.shiftName);
         if (!normalizedName)
           throw new BadRequestException('Tên ca là bắt buộc');
-        const activeShifts = await manager.find(WorkShift, {
-          where: { storeId, isActive: true },
-          select: ['id', 'shiftName'],
-        });
-        if (
-          activeShifts.some(
-            (candidate) =>
-              candidate.id !== shiftId &&
-              normalizeActiveShiftName(candidate.shiftName) === normalizedName,
-          )
-        ) {
-          throw new BadRequestException('Ca làm việc với tên này đã tồn tại');
+        const ownDates: Array<{ work_date: string }> = await manager.query(
+          `SELECT DISTINCT to_char(ss.work_date, 'YYYY-MM-DD') AS work_date
+             FROM shift_slots ss
+             JOIN work_cycles wc ON wc.id = ss.cycle_id
+            WHERE ss.work_shift_id = $1
+              AND wc.status IN ('ACTIVE', 'EXPIRED')`,
+          [shiftId],
+        );
+        const sameNameHit = await findSameNameShiftOnDates(
+          manager,
+          storeId,
+          [data.shiftName],
+          (Array.isArray(ownDates) ? ownDates : [])
+            .map((row) => row?.work_date)
+            .filter((date): date is string => typeof date === 'string'),
+          [shiftId],
+        );
+        if (sameNameHit) {
+          throw new BadRequestException(sameNameShiftMessage(sameNameHit));
         }
       }
       const allowed: Partial<WorkShift> = {};
@@ -5847,6 +5901,15 @@ export class StoresService {
     for (const assignment of assignments) {
       const accountId = assignment.employee?.accountId;
       if (!accountId || !assignment.shiftSlot?.workDate) continue;
+      // Nhân viên tắt "Nhận thông báo khi có ca mới" ở màn Nhắc tôi thì không
+      // báo ca chủ xếp. Xác nhận đăng ký thành công vẫn gửi: đó là phản hồi cho
+      // việc chính họ vừa làm.
+      if (
+        kind === 'assigned' &&
+        !shouldNotifyNewShifts(assignment.employee?.reminderSettings)
+      ) {
+        continue;
+      }
       byAccount.set(accountId, [...(byAccount.get(accountId) ?? []), assignment]);
     }
 
@@ -5930,6 +5993,8 @@ export class StoresService {
         content: `${who} vừa đăng ký ${shiftName}${when}.`,
         type: NotificationType.SYSTEM,
         priority: NotificationPriority.NORMAL,
+        // App chủ: mở thẳng màn duyệt ca.
+        actionUrl: '/(work-shift-v2)/approval',
         metadata: {
           type: 'SHIFT_REGISTRATION',
           storeId,
@@ -8361,6 +8426,71 @@ export class StoresService {
   }
 
   // Employee Salary management
+  /**
+   * Phiếu lương tháng hiện tại khi nhận một nhân viên vào cửa hàng.
+   *
+   * Mỗi nhân viên chỉ được một phiếu cho mỗi tháng (unique employee_profile_id
+   * + month). Xoá nhân viên khỏi cửa hàng chỉ xoá mềm hồ sơ và giữ nguyên
+   * phiếu lương, nên nhận lại người đó trong cùng tháng sẽ đụng ràng buộc:
+   * INSERT hỏng và cả giao dịch thêm nhân viên bị huỷ. Vì vậy dùng lại phiếu
+   * đã có thay vì tạo phiếu thứ hai.
+   *
+   * Phiếu đã duyệt hoặc đã thanh toán là số tiền chủ đã chốt: không ghi đè.
+   */
+  private async upsertInitialEmployeeSalary(
+    manager: EntityManager,
+    data: {
+      employeeProfileId: string;
+      month: Date;
+      monthlyPayrollId: string;
+      baseSalary: number;
+      paymentType?: PaymentType;
+    },
+  ): Promise<void> {
+    const repository = manager.getRepository(EmployeeSalary);
+    const existing = await repository.findOne({
+      where: {
+        employeeProfileId: data.employeeProfileId,
+        month: data.month,
+      },
+      // Phiếu của hồ sơ đã xoá mềm vẫn chiếm chỗ trong ràng buộc duy nhất.
+      withDeleted: true,
+    });
+
+    if (!existing) {
+      await repository.save(
+        repository.create({
+          ...data,
+          workingHours: 0,
+          earnedBaseSalary: 0,
+        }),
+      );
+      return;
+    }
+
+    if (
+      existing.paymentStatus === PaymentStatus.APPROVED ||
+      existing.paymentStatus === PaymentStatus.PAID
+    ) {
+      // Vẫn gắn vào bảng lương tháng đang mở nếu phiếu chưa thuộc bảng nào,
+      // để nó không biến mất khỏi bảng lương của chủ.
+      if (!existing.monthlyPayrollId) {
+        await repository.update(existing.id, {
+          monthlyPayrollId: data.monthlyPayrollId,
+        });
+      }
+      if (existing.deletedAt) await repository.restore(existing.id);
+      return;
+    }
+
+    await repository.update(existing.id, {
+      monthlyPayrollId: data.monthlyPayrollId,
+      baseSalary: data.baseSalary,
+      ...(data.paymentType ? { paymentType: data.paymentType } : {}),
+    });
+    if (existing.deletedAt) await repository.restore(existing.id);
+  }
+
   async createEmployeeSalary(
     data: Partial<EmployeeSalary>,
     manager?: EntityManager,

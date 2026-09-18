@@ -1307,6 +1307,8 @@ export class CareerLadderService {
         type: NotificationType.SYSTEM,
         title: 'Bạn đã lên bậc mới',
         content: `${ladder.name}: ${names.get(rung.targetId) ?? 'bậc mới'}`,
+        // App nhân viên: trang chủ có mục Lộ trình.
+        actionUrl: '/',
         metadata: {
           ladderId: ladder.id,
           rungId: rung.id,
@@ -1560,6 +1562,8 @@ export class CareerLadderService {
         type: NotificationType.SYSTEM,
         title: 'Có nhân viên đủ điều kiện lên bậc',
         content: `${ladder.name}: một nhân viên đã đủ điều kiện lên ${candidate.targetName ?? 'bậc kế'}.`,
+        // App chủ: mở thẳng màn xét lên bậc của nhân viên này.
+        actionUrl: `/(employee)/${profile.id}/promotion-detail`,
         metadata: { storeId: profile.storeId, profileId: profile.id },
       } as any);
       return true;

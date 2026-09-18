@@ -187,6 +187,8 @@ export class ShiftReminderProcessor extends WorkerHost {
         content: `Ca làm của bạn sẽ bắt đầu lúc ${timeStr}. Đừng quên check-in đúng giờ nhé!`,
         type: NotificationType.SHIFT_REMINDER,
         priority: NotificationPriority.HIGH,
+        // Chạm vào thông báo mở thẳng lịch làm việc của nhân viên.
+        actionUrl: '/(home)/workshift',
         metadata: {
           shiftId: current.shiftId,
           shiftSlotId: current.shiftSlotId,

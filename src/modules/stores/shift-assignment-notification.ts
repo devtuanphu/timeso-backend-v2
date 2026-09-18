@@ -21,6 +21,12 @@ const dayMonth = (workDate: string) => {
 
 const clock = (time?: string | null) => (time ? time.slice(0, 5) : '');
 
+/** Giờ kết thúc 00:00 là hết ngày — viết "24:00" như cách chủ và nhân viên gọi. */
+const endClock = (time?: string | null) => {
+  const value = clock(time);
+  return value === '00:00' ? '24:00' : value;
+};
+
 export function buildShiftNotification(
   kind: ShiftNotificationKind,
   shifts: ShiftForNotification[],
@@ -44,8 +50,12 @@ export function buildShiftNotification(
           content: `Chủ cửa hàng đã xếp cho bạn ${what}.`,
         }
       : {
-          title: 'Ca đăng ký đã được duyệt',
-          content: `${what} bạn đăng ký đã được duyệt.`,
+          // Nội dung theo đúng câu chủ cửa hàng yêu cầu; ngày để ở tiêu đề.
+          title: `Đăng ký ca thành công · ngày ${dayMonth(shift.workDate)}`,
+          content:
+            shift.startTime && shift.endTime
+              ? `Ca ${clock(shift.startTime)}-${endClock(shift.endTime)} đã được đăng ký thành công`
+              : `${shift.shiftName || 'Ca làm'} đã được đăng ký thành công`,
         };
   }
 
@@ -58,7 +68,7 @@ export function buildShiftNotification(
         content: `Chủ cửa hàng đã xếp cho bạn ${sorted.length} ca, ${span}.`,
       }
     : {
-        title: 'Ca đăng ký đã được duyệt',
-        content: `${sorted.length} ca bạn đăng ký ${span} đã được duyệt.`,
+        title: 'Đăng ký ca thành công',
+        content: `${sorted.length} ca ${span} đã được đăng ký thành công`,
       };
 }

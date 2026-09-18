@@ -296,6 +296,7 @@ export class ShiftEndWorkflowService {
         content: 'Hệ thống ghi nhận bạn quên chấm công ra.',
         type: NotificationType.SHIFT_AUTO_CHECKOUT,
         priority: NotificationPriority.HIGH,
+        actionUrl: '/(home)/workshift',
         metadata: { type: 'SHIFT_AUTO_CHECKOUT', assignmentId },
       });
     }
