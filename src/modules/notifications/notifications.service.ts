@@ -5,6 +5,40 @@ import { Notification } from './entities/notification.entity';
 import { Account } from '../accounts/entities/account.entity';
 import { DevicesService } from '../devices/devices.service';
 import { ExpoPushService } from '../push/expo-push.service';
+import { resolveDeviceChannelId } from '../push/push-capabilities';
+import {
+  isWorkDateRangeOnly,
+  notificationWorkDates,
+  rerenderRelativeDays,
+} from '../../common/utils/relative-day';
+
+/**
+ * A notification as returned to the app: "hôm nay / ngày mai / ngày kia" in
+ * the stored title and content is recomputed for the moment it is read, from
+ * the work dates in its metadata. The stored row is never changed; rows
+ * without work dates are returned as they are.
+ */
+export function presentNotificationForRead<
+  T extends { title?: string | null; content?: string | null; metadata?: unknown },
+>(notification: T, now: Date = new Date()): T {
+  const dates = notificationWorkDates(notification?.metadata);
+  if (!dates.length) return notification;
+  // Chỉ có workDateRange {from,to}: "(có hôm nay)" khi from <= hôm nay <= to.
+  const options = {
+    continuousRange: isWorkDateRangeOnly(notification?.metadata),
+  };
+  return {
+    ...notification,
+    title:
+      typeof notification.title === 'string'
+        ? rerenderRelativeDays(notification.title, dates, now, options)
+        : notification.title,
+    content:
+      typeof notification.content === 'string'
+        ? rerenderRelativeDays(notification.content, dates, now, options)
+        : notification.content,
+  };
+}
 
 @Injectable()
 export class NotificationsService {
@@ -62,8 +96,24 @@ export class NotificationsService {
     const devices = await this.devicesService.getActiveDevicesByUser(userId);
     const tokens = devices.map(d => d.expoPushToken);
 
-    if (tokens.length > 0) {
-      await this.expoPushService.sendToMultiple(tokens, notification);
+    // Builds that never created the requested Android channel get 'default',
+    // so the push still vibrates instead of landing in the OS fallback.
+    const byChannel = new Map<string | undefined, string[]>();
+    for (const device of devices) {
+      const channelId = resolveDeviceChannelId(
+        notification.channelId,
+        device.pushCapabilities,
+      );
+      byChannel.set(channelId, [
+        ...(byChannel.get(channelId) ?? []),
+        device.expoPushToken,
+      ]);
+    }
+    for (const [channelId, channelTokens] of byChannel) {
+      await this.expoPushService.sendToMultiple(channelTokens, {
+        ...notification,
+        channelId,
+      });
     }
 
     return {
@@ -129,7 +179,9 @@ export class NotificationsService {
     // Order by newest first
     qb.orderBy('n.createdAt', 'DESC');
 
-    const [data, total] = await qb.getManyAndCount();
+    const [rows, total] = await qb.getManyAndCount();
+    const now = new Date();
+    const data = rows.map((row) => presentNotificationForRead(row, now));
 
     return {
       data,
@@ -149,10 +201,12 @@ export class NotificationsService {
       where.isRead = false;
     }
 
-    return this.notificationRepository.find({
+    const rows = await this.notificationRepository.find({
       where,
       order: { createdAt: 'DESC' },
     });
+    const now = new Date();
+    return rows.map((row) => presentNotificationForRead(row, now));
   }
 
   // Mark notification as read

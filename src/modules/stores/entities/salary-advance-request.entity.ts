@@ -23,7 +23,11 @@ export class SalaryAdvanceRequest extends BaseEntity {
   @Column({ name: 'employee_salary_id' })
   employeeSalaryId: string;
 
-  @ManyToOne(() => EmployeeSalary, { onDelete: 'CASCADE' })
+  // NO ACTION, not CASCADE: deleting a payslip must never silently delete the
+  // advances paid against it. NO ACTION is checked at the end of the
+  // statement, so deleting an employee profile (which cascades to both
+  // tables) still succeeds. See scripts/migration_salary_advance_fk_no_cascade.sql.
+  @ManyToOne(() => EmployeeSalary, { onDelete: 'NO ACTION' })
   @JoinColumn({ name: 'employee_salary_id' })
   employeeSalary: EmployeeSalary;
 

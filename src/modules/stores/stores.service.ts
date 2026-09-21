@@ -18,8 +18,24 @@ import {
   DataSource,
   EntityManager,
   Raw,
+  Brackets,
+  SelectQueryBuilder,
 } from 'typeorm';
 import { isUUID } from 'class-validator';
+import {
+  CreateEmployeeSalaryDto,
+  UpdateEmployeeSalaryDto,
+} from './dto/employee-salary-write.dto';
+import {
+  CreateEmployeePaymentHistoryDto,
+  UpdateEmployeePaymentHistoryDto,
+} from './dto/employee-payment-history.dto';
+import { UpdateServiceItemRecipeDto } from './dto/service-item-recipe.dto';
+import { StopWorkCycleDto } from './dto/stop-work-cycle.dto';
+import {
+  computeProbationEndsAt,
+  recordEntryCareerEvents,
+} from './career-ladder.lifecycle';
 import * as QRCode from 'qrcode';
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -192,6 +208,11 @@ import {
   parseDateOnly,
 } from './shift-schedule.utils';
 import { parseVietnamShiftStart } from './shift-reminder.utils';
+import {
+  AUTHORIZED_ABSENCE_LEAVE_TYPES,
+  isShiftCoveredByApprovedLeave,
+  leaveCoversShift,
+} from './leave-coverage.utils';
 
 import { StorePayrollPaymentHistory } from './entities/store-payroll-payment-history.entity';
 import { SalaryFundHistory } from './entities/salary-fund-history.entity';
@@ -243,9 +264,12 @@ import {
 } from '../accounts/entities/account-identity-document.entity';
 import { AccountFinance } from '../accounts/entities/account-finance.entity';
 import { AccountsService } from '../accounts/accounts.service';
+import { describeWorkDate } from '../../common/utils/relative-day';
 import { NotificationsService } from '../notifications/notifications.service';
 import {
   buildShiftNotification,
+  shiftNotificationDateMetadata,
+  ShiftForNotification,
   ShiftNotificationKind,
 } from './shift-assignment-notification';
 import {
@@ -256,10 +280,36 @@ import {
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
 import { calculateShiftEarnings } from './shift-earnings.utils';
-import { countWorkingDaysForMonthDate } from './working-days.utils';
+import { countWorkingDaysInMonth } from './working-days.utils';
+import { validateStoreReportDate } from './store-report-date.utils';
+import {
+  computeNetFromIncome,
+  computePayslip,
+  computeRuleAdjustmentBreakdown,
+  PayslipAdjustmentLine,
+  computePayslipTotals,
+  MonthlyAttendanceFacts,
+  PayrollAssignmentFact,
+  PayslipComputation,
+  pickDayOwnerAssignmentIds,
+  summarizeMonthlyAttendance,
+} from './payroll-calculation.utils';
+import {
+  parseVnMonthInput,
+  shiftVnMonth,
+  toDateMarker,
+  toMonthMarker,
+  vnClockHHmm,
+  vnDateString,
+  vnMiddayInstant,
+  VnMonth,
+  vnMonthOf,
+  vnMonthOfDateString,
+} from '../../common/utils/vn-calendar';
 import {
   calculateEarlyMinutes,
   calculateLateMinutes,
+  computeAttendanceDeltas,
   resolveShiftBoundaries,
 } from './attendance-time.utils';
 import {
@@ -376,6 +426,320 @@ const intervalSetsOverlap = (
   }
   return false;
 };
+
+/** Payslip fields `POST/PUT employee-salaries` may write (see the DTO). */
+const EMPLOYEE_SALARY_CLIENT_FIELDS = [
+  'monthlyPayrollId',
+  'baseSalary',
+  'paymentType',
+  'earnedBaseSalary',
+  'allowances',
+  'bonus',
+  'penalty',
+  'workingDays',
+  'workingHours',
+  'unauthorizedLeaveDays',
+  'advancePayment',
+  'otherDeductions',
+  'totalIncome',
+  'totalDeductions',
+  'netSalary',
+  'notes',
+] as const;
+
+/** Copies only `fields` that are present on `source`. */
+const pickDefined = <K extends string>(
+  source: unknown,
+  fields: readonly K[],
+): Partial<Record<K, unknown>> => {
+  const picked: Partial<Record<K, unknown>> = {};
+  const record = (source ?? {}) as Record<string, unknown>;
+  for (const field of fields) {
+    if (record[field] !== undefined) picked[field] = record[field];
+  }
+  return picked;
+};
+
+/** Employee KPI fields a client may set on create. */
+const EMPLOYEE_KPI_CLIENT_FIELDS = [
+  'name',
+  'employeeProfileId',
+  'month',
+  'status',
+  'notes',
+  'reminders',
+  'compliments',
+] as const;
+
+/** Asset columns `POST :id/assets` (bulk) may set: scalars only. */
+const ASSET_CLIENT_FIELDS = [
+  'name',
+  'code',
+  'avatarUrl',
+  'assetUnitId',
+  'assetCategoryId',
+  'value',
+  'note',
+  'assetStatusId',
+  'purchaseDate',
+  'supplierName',
+  'supplierPhone',
+  'invoiceFileUrl',
+  'currentStock',
+  'minStock',
+  'maxStock',
+  'responsibleEmployeeId',
+  'isActive',
+] as const;
+
+/** Product columns `POST :id/products` (bulk) may set: scalars only. */
+const PRODUCT_CLIENT_FIELDS = [
+  'name',
+  'sku',
+  'avatarUrl',
+  'productUnitId',
+  'productCategoryId',
+  'productStatusId',
+  'costPrice',
+  'sellingPrice',
+  'minThreshold',
+  'maxThreshold',
+  'note',
+  'currentStock',
+  'isActive',
+] as const;
+
+/** Columns a client may set when creating a KPI type / unit / period. */
+const KPI_TYPE_CLIENT_FIELDS = ['name', 'description', 'isActive'] as const;
+const KPI_UNIT_CLIENT_FIELDS = ['name', 'isActive'] as const;
+const KPI_PERIOD_CLIENT_FIELDS = ['name', 'isActive'] as const;
+
+/** Largest number of items one bulk stock-out request may carry. */
+export const BULK_EXPORT_MAX_ITEMS = 500;
+
+/** 403 codes of the KPI write rules (see `assertKpiWriteAccess`). */
+export const KPI_SELF_OR_OWNER_REQUIRED = 'KPI_SELF_OR_OWNER_REQUIRED';
+export const KPI_NOT_DRAFT = 'KPI_NOT_DRAFT';
+export const KPI_CLOSED = 'KPI_CLOSED';
+
+/** KPI task fields a client may set (never `id`, `employeeKpiId`, rates). */
+const KPI_TASK_CLIENT_FIELDS = [
+  'taskName',
+  'kpiUnitId',
+  'kpiPeriodId',
+  'kpiTypeId',
+  'target',
+  'actualValue',
+  'startDate',
+  'endDate',
+  'description',
+  'isHidden',
+] as const;
+
+/** Largest value `kpi_tasks.completion_rate` (decimal(5,2)) can hold. */
+export const KPI_COMPLETION_RATE_MAX = 999.99;
+
+/** Completion % of a KPI task, clamped to the column's range. */
+export const kpiCompletionRate = (
+  actualValue: unknown,
+  target: unknown,
+): number => {
+  const actual = Number(actualValue);
+  const goal = Number(target);
+  if (!(goal > 0) || actualValue === undefined || !Number.isFinite(actual)) {
+    return 0;
+  }
+  const rate = Math.round((actual / goal) * 10000) / 100;
+  return Math.min(KPI_COMPLETION_RATE_MAX, Math.max(-KPI_COMPLETION_RATE_MAX, rate));
+};
+
+/** Advisory-lock key serializing payslip writers for a store and month. */
+export const monthlyPayrollLockKey = (storeId: string, month: VnMonth) =>
+  `monthly-payroll:${storeId}:${month.year}-${month.monthIndex + 1}`;
+
+/**
+ * Unique indexes that enforce one ACTIVE old-style cycle per store: the
+ * original (every cycle) and its replacement (cycles without a recurrence
+ * rule). Both are matched while the SQL rollout is in progress.
+ */
+export const ONE_ACTIVE_CYCLE_CONSTRAINTS = new Set([
+  'uq_work_cycles_one_active_per_store',
+  'uq_work_cycles_one_active_legacy_per_store',
+]);
+
+const isOneActiveCycleViolation = (error: any): boolean =>
+  (error?.code === '23505' || error?.driverError?.code === '23505') &&
+  ONE_ACTIVE_CYCLE_CONSTRAINTS.has(
+    error?.constraint ?? error?.driverError?.constraint,
+  );
+
+export type WorkCycleStopPlan =
+  | { immediate: true }
+  | { immediate: false; stopAt: Date };
+
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Reads a cycle stop request into "stop now" or "stop at `stopAt`".
+ *
+ * - `{stopImmediately: false, scheduledStopAt: 'X'}`: X is the first day with
+ *   no shifts; the cycle stops at 00:00 Vietnam time on X. A full ISO instant
+ *   is taken as is.
+ * - Released owner builds send `{stopType: 'scheduled', stopDate: S}` where S
+ *   is the last working day (their date maths lands one day early), so the
+ *   stop is at 00:00 Vietnam time on S + 1 — the same day the owner picked.
+ * - `{stopType: 'immediate'}`, `{stopImmediately: true}` or nothing: now.
+ *
+ * A date before today (Vietnam) is 400; a stop instant already reached is
+ * treated as immediate.
+ */
+export function normalizeWorkCycleStopRequest(
+  body: {
+    stopImmediately?: boolean;
+    scheduledStopAt?: string;
+    stopType?: string;
+    stopDate?: string;
+  } | null | undefined,
+  todayVn: string = getTodayDateString(),
+  now: Date = new Date(),
+): WorkCycleStopPlan {
+  const request = body ?? {};
+  const invalid = () => new BadRequestException('Ngày dừng không hợp lệ');
+  const inPast = () =>
+    new BadRequestException('Ngày dừng không được ở trong quá khứ');
+  const plan = (stopAt: Date): WorkCycleStopPlan =>
+    stopAt.getTime() <= now.getTime()
+      ? { immediate: true }
+      : { immediate: false, stopAt };
+  const firstDayWithoutShifts = (date: string): WorkCycleStopPlan => {
+    if (!DATE_ONLY_PATTERN.test(date)) throw invalid();
+    try {
+      parseDateOnly(date);
+    } catch {
+      throw invalid();
+    }
+    if (date < todayVn) throw inPast();
+    return plan(parseVietnamShiftStart(date, '00:00'));
+  };
+
+  if (request.stopImmediately === true) return { immediate: true };
+  if (request.stopImmediately === false) {
+    const raw =
+      typeof request.scheduledStopAt === 'string'
+        ? request.scheduledStopAt.trim()
+        : '';
+    if (!raw) throw invalid();
+    if (DATE_ONLY_PATTERN.test(raw)) return firstDayWithoutShifts(raw);
+    const instant = new Date(raw);
+    if (Number.isNaN(instant.getTime())) throw invalid();
+    if (vnDateString(instant) < todayVn) throw inPast();
+    return plan(instant);
+  }
+  if (request.stopType === 'scheduled') {
+    const lastWorkingDay =
+      typeof request.stopDate === 'string' ? request.stopDate.trim() : '';
+    if (!DATE_ONLY_PATTERN.test(lastWorkingDay)) throw invalid();
+    try {
+      parseDateOnly(lastWorkingDay);
+    } catch {
+      throw invalid();
+    }
+    return firstDayWithoutShifts(addDays(lastWorkingDay, 1));
+  }
+  return { immediate: true };
+}
+
+/** Longest range a fixed-shift registration without an end date covers. */
+export const FIXED_SHIFT_MAX_RANGE_DAYS = 366;
+
+/**
+ * A leave request's type. `'LEAVE'` (sent by released staff builds, not an
+ * enum value) is read as PERSONAL; missing stays missing; anything else that
+ * is not a `LeaveType` is 400.
+ */
+export function normalizeLeaveType(raw: unknown): LeaveType | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  if (raw === 'LEAVE') return LeaveType.PERSONAL;
+  if (
+    typeof raw === 'string' &&
+    (Object.values(LeaveType) as string[]).includes(raw)
+  ) {
+    return raw as LeaveType;
+  }
+  throw new BadRequestException('Loại đơn không hợp lệ');
+}
+
+/**
+ * `?type=` on an employee's leave history: a comma-separated list of
+ * `LeaveType` values, where `LEAVE` means every absence type. Missing or
+ * blank is no filter; an unknown value is 400.
+ */
+export function parseLeaveTypeFilter(
+  raw: string | undefined,
+): LeaveType[] | null {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const types = new Set<LeaveType>();
+  for (const part of raw.split(',')) {
+    const value = part.trim().toUpperCase();
+    if (!value) continue;
+    if (value === 'LEAVE') {
+      BLOCKING_LEAVE_TYPE_VALUES.forEach((leaveType) => types.add(leaveType));
+    } else if ((Object.values(LeaveType) as string[]).includes(value)) {
+      types.add(value as LeaveType);
+    } else {
+      throw new BadRequestException('Loại đơn không hợp lệ');
+    }
+  }
+  return types.size ? [...types] : null;
+}
+
+/**
+ * A leave request date as YYYY-MM-DD. A full ISO timestamp keeps its date
+ * part, which is what the `date` column did with it before; anything else
+ * is 400.
+ */
+const normalizeLeaveDate = (raw: unknown): string => {
+  const value =
+    typeof raw === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(raw)
+      ? raw.slice(0, 10)
+      : raw;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new BadRequestException('Ngày của đơn không hợp lệ');
+  }
+  try {
+    parseDateOnly(value);
+  } catch {
+    throw new BadRequestException('Ngày của đơn không hợp lệ');
+  }
+  return value;
+};
+
+/** Fields `PUT service-items/:itemId` may change; never `storeId` or `id`. */
+const SERVICE_ITEM_EDITABLE_FIELDS = [
+  'categoryId',
+  'name',
+  'price',
+  'size',
+  'avatarUrl',
+  'description',
+  'duration',
+  'metadata',
+  'isActive',
+] as const;
+
+/**
+ * Employment statuses that can be rostered: registration, owner assignment,
+ * schedule creation and swaps. Probation is a working state; ON_LEAVE is not.
+ */
+export const SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES = [
+  EmploymentStatus.ACTIVE,
+  EmploymentStatus.PROBATION,
+] as const;
+
+const isShiftEligibleEmploymentStatus = (
+  status: EmploymentStatus | null | undefined,
+): boolean =>
+  (SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES as readonly unknown[]).includes(status);
 
 const BLOCKING_LEAVE_TYPES = new Set<LeaveType>([
   LeaveType.SICK,
@@ -509,7 +873,11 @@ const groupBlockingLeaveIntervals = (
   return intervalsByEmployee;
 };
 
-/** Mặc định bật; chỉ tắt khi nhân viên chủ động tắt. */
+/**
+ * Công tắc "Nhận thông báo khi có ca mới được tạo" ở màn Nhắc tôi — báo khi
+ * chủ mở ca mới để đăng ký. Mặc định bật; chỉ tắt khi nhân viên chủ động tắt.
+ * Không ảnh hưởng thông báo ca chủ xếp hay duyệt cho chính nhân viên.
+ */
 export const shouldNotifyNewShifts = (reminderSettings: unknown): boolean =>
   (reminderSettings as { notifyNewShifts?: unknown } | null)?.notifyNewShifts !==
   false;
@@ -1373,9 +1741,10 @@ export class StoresService {
     });
     if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
     if (store.ownerAccountId === accountId) return profile;
+    // Any employed member (probation and on-leave included) reads their own.
     if (
       profile.accountId !== accountId ||
-      profile.employmentStatus !== EmploymentStatus.ACTIVE
+      !isEmployedStatus(profile.employmentStatus)
     ) {
       throw new ForbiddenException('Bạn chỉ có thể xem lịch của chính mình');
     }
@@ -1440,6 +1809,65 @@ export class StoresService {
     return profile;
   }
 
+  /**
+   * Who is reading store data: the owner, or an employed member (with their
+   * profile at this store). 404 for a missing store, 403 for anyone else —
+   * the same rule as `StoreAccessResolver`.
+   */
+  async resolveStoreViewer(
+    storeId: string,
+    accountId: string | undefined,
+  ): Promise<
+    { isOwner: true; profileId: null } | { isOwner: false; profileId: string }
+  > {
+    if (!accountId) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+    if (!storeId || !isUUID(storeId)) {
+      throw new BadRequestException('storeId không hợp lệ');
+    }
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) {
+      throw new NotFoundException('Cửa hàng không tồn tại');
+    }
+    if (store.ownerAccountId === accountId) {
+      return { isOwner: true, profileId: null };
+    }
+    const profile = await this.profileRepository.findOne({
+      where: {
+        storeId,
+        accountId,
+        employmentStatus: In([...EMPLOYED_STATUSES]),
+      },
+      select: ['id'],
+    });
+    if (!profile) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+    return { isOwner: false, profileId: profile.id };
+  }
+
+  /**
+   * For owner tooling that names no store (contract-template file upload and
+   * placeholder extraction): the caller must own at least one store.
+   */
+  async assertOwnsAnyStore(accountId: string | undefined): Promise<void> {
+    const ownsStore = accountId
+      ? await this.storeRepository.exists({
+          where: { ownerAccountId: accountId },
+        })
+      : false;
+    if (!ownsStore) {
+      throw new ForbiddenException({
+        code: 'STORE_OWNER_REQUIRED',
+        message: 'Chỉ chủ cửa hàng mới được thực hiện thao tác này',
+      });
+    }
+  }
+
   async assertStoreRevenueReportAccess(storeId: string, accountId: string) {
     const store = await this.storeRepository.findOne({
       where: { id: storeId },
@@ -1489,13 +1917,11 @@ export class StoresService {
     // Parse month or use current month
     let targetMonth: Date;
     if (monthStr) {
-      targetMonth = new Date(monthStr);
+      const parsed = parseVnMonthInput(monthStr);
+      if (!parsed) throw new BadRequestException('Tháng không hợp lệ');
+      targetMonth = toMonthMarker(parsed);
     } else {
-      targetMonth = new Date(
-        new Date().getFullYear(),
-        new Date().getMonth(),
-        1,
-      );
+      targetMonth = toMonthMarker(vnMonthOf());
     }
 
     // Get all employees in the store
@@ -1524,7 +1950,10 @@ export class StoresService {
 
   // Employee Type management
   async createEmployeeType(storeId: string, data: Partial<StoreEmployeeType>) {
-    const type = this.employeeTypeRepository.create({ ...data, storeId });
+    const type = this.employeeTypeRepository.create({
+      ...this.creatableRow(this.employeeTypeRepository, data),
+      storeId,
+    });
     return this.employeeTypeRepository.save(type);
   }
 
@@ -2371,17 +2800,13 @@ export class StoresService {
       };
     }
 
+    // "Days in rung" usually sits on the rung after probation (Chính thức),
+    // not on the probation rung itself; see computeProbationEndsAt.
     let probationEndsAt: Date | undefined;
     if (rungId) {
-      const tenure = await manager.findOne(StoreRungCriteria, {
-        where: {
-          rungId,
-          kind: CriteriaKind.TENURE,
-          code: CriteriaCode.DAYS_IN_RUNG,
-        },
-      });
-      const days = Number(tenure?.value ?? 0);
-      if (days > 0) probationEndsAt = new Date(Date.now() + days * 86_400_000);
+      probationEndsAt =
+        (await computeProbationEndsAt(manager, rungId, new Date())) ??
+        undefined;
     }
 
     return {
@@ -2438,15 +2863,21 @@ export class StoresService {
       }),
     );
 
+    // Where the hire enters each active ladder; tenure counts from here. A
+    // revived (rehired) row gets a fresh event, so the previous stint no
+    // longer counts.
+    await recordEntryCareerEvents(manager, profile, {
+      decidedByAccountId: null,
+      note: 'Vào làm',
+      effectiveAt: profile.joinedAt ?? new Date(),
+    });
+
     if (data.contract) {
       await this.createContract(profile.id, data.contract, manager);
     }
-    const currentDate = new Date();
-    const currentMonth = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth(),
-      1,
-    );
+    // Current Vietnam month, not the server clock's month.
+    const vnMonth = vnMonthOf();
+    const currentMonth = toMonthMarker(vnMonth);
     const salaryAmount = Number(data.contract?.salaryAmount || 0);
     await this.createOrUpdateMonthlySummary(
       profile.id,
@@ -2456,7 +2887,7 @@ export class StoresService {
     );
     const monthlyPayroll = await this.findOrCreateMonthlyPayroll(
       storeId,
-      currentMonth,
+      vnMonth,
       manager,
     );
     await this.upsertInitialEmployeeSalary(manager, {
@@ -2520,7 +2951,25 @@ export class StoresService {
       throw new NotFoundException('Không tìm thấy nhân viên');
     }
 
-    profile.reminderSettings = settings;
+    // Gộp với cài đặt đang có: nút chuông ngoài lịch chỉ gửi { type }, và
+    // trước đây ghi đè làm mất rung, nhắc chưa check-in, công tắc ca mới…
+    profile.reminderSettings = {
+      ...(profile.reminderSettings || {}),
+      ...(settings || {}),
+    };
+    // Released staff builds choose "Nhắc cố định" by sending `fixedTime` with
+    // `custom: undefined`, which JSON drops, so a stale relative `custom`
+    // survived the merge and kept winning. A fixed time sent without a
+    // `custom` key clears it.
+    if (
+      settings &&
+      typeof settings === 'object' &&
+      settings.fixedTime &&
+      !('custom' in settings)
+    ) {
+      profile.reminderSettings.custom = null;
+    }
+    settings = profile.reminderSettings;
     await this.profileRepository.save(profile);
 
     // Fetch upcoming shifts to reschedule reminders
@@ -2561,6 +3010,80 @@ export class StoresService {
     return this.shiftReminderService.scheduleAssignmentReminder(assignmentId);
   }
 
+  /**
+   * Keeps an assignment's reminder in step with its status after the change
+   * commits: approving schedules it, cancelling an approved one removes it.
+   * Queue failures are logged, never surfaced; the status change stands.
+   */
+  /**
+   * Nghỉ có phép (đơn nghỉ cả ngày đã duyệt): huỷ nhắc vào ca cho các ca sắp
+   * tới trong khoảng nghỉ. Bộ xử lý nhắc ca cũng tự bỏ qua ngày nghỉ, nên đây
+   * chỉ là dọn hàng đợi sớm. Chỉ xét ca từ hôm nay (giờ VN), tối đa 500 ca.
+   */
+  private async cancelRemindersCoveredByLeave(
+    leave: Pick<
+      EmployeeLeaveRequest,
+      | 'employeeProfileId'
+      | 'type'
+      | 'startDate'
+      | 'endDate'
+      | 'startTime'
+      | 'endTime'
+      | 'shiftAssignmentId'
+    >,
+  ): Promise<void> {
+    if (!AUTHORIZED_ABSENCE_LEAVE_TYPES.includes(leave.type)) return;
+    const today = vnDateString();
+    const from = String(leave.startDate).slice(0, 10);
+    const to = String(leave.endDate).slice(0, 10);
+    const qb = this.shiftAssignmentRepository
+      .createQueryBuilder('sa')
+      .innerJoin('sa.shiftSlot', 'slot')
+      .select('sa.id', 'id')
+      .where('sa.employeeId = :employeeId', {
+        employeeId: leave.employeeProfileId,
+      })
+      .andWhere('sa.status = :status', {
+        status: ShiftAssignmentStatus.APPROVED,
+      })
+      .andWhere('slot.workDate >= :from', { from: from > today ? from : today })
+      .andWhere('slot.workDate <= :to', { to })
+      .limit(500);
+    // Đơn nghỉ theo giờ chỉ phủ đúng ca nó gắn.
+    if (leave.startTime && leave.endTime) {
+      if (!leave.shiftAssignmentId) return;
+      qb.andWhere('sa.id = :assignmentId', {
+        assignmentId: leave.shiftAssignmentId,
+      });
+    }
+    const rows = await qb.getRawMany<{ id: string }>();
+    if (!rows.length) return;
+    await this.shiftReminderService.cancelAssignmentReminders(
+      rows.map((row) => row.id),
+    );
+  }
+
+  private async syncReminderAfterAssignmentStatusChange(
+    assignmentId: string,
+    previous: ShiftAssignmentStatus,
+    next: ShiftAssignmentStatus,
+  ): Promise<void> {
+    try {
+      if (next === ShiftAssignmentStatus.APPROVED) {
+        await this.scheduleReminderForAssignment(assignmentId);
+      } else if (
+        previous === ShiftAssignmentStatus.APPROVED &&
+        next === ShiftAssignmentStatus.CANCELLED
+      ) {
+        await this.shiftReminderService.cancelAssignmentReminders([
+          assignmentId,
+        ]);
+      }
+    } catch {
+      this.logger.error('Failed to sync assignment reminder after status change');
+    }
+  }
+
   async getEmployeeById(profileId: string) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -2578,12 +3101,8 @@ export class StoresService {
 
     if (!profile) return null;
 
-    // 1. Lấy thống kê tháng hiện tại
-    const currentMonth = new Date(
-      new Date().getFullYear(),
-      new Date().getMonth(),
-      1,
-    );
+    // 1. Lấy thống kê tháng hiện tại (tháng Việt Nam)
+    const currentMonth = toMonthMarker(vnMonthOf());
     const summary = await this.monthlySummaryRepository.findOne({
       where: {
         employeeProfileId: profileId,
@@ -2799,12 +3318,8 @@ export class StoresService {
 
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
 
-    // 1. Lấy thống kê tháng hiện tại
-    const currentMonth = new Date(
-      new Date().getFullYear(),
-      new Date().getMonth(),
-      1,
-    );
+    // 1. Lấy thống kê tháng hiện tại (tháng Việt Nam)
+    const currentMonth = toMonthMarker(vnMonthOf());
     const summary = await this.monthlySummaryRepository.findOne({
       where: { employeeProfileId: profileId, month: currentMonth },
       relations: ['performances', 'performances.reviewerAccount'],
@@ -3140,9 +3655,11 @@ export class StoresService {
 
       // Hook: Schedule reminder if approved
       if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
-        this.scheduleReminderForAssignment(savedAssignment.id).catch(() => {
-          this.logger.error('Failed to schedule assignment reminder');
-        });
+        void this.syncReminderAfterAssignmentStatusChange(
+          savedAssignment.id,
+          ShiftAssignmentStatus.PENDING,
+          ShiftAssignmentStatus.APPROVED,
+        );
         void this.notifyEmployeesOfNewShifts([savedAssignment.id], 'approved');
       }
 
@@ -3172,7 +3689,7 @@ export class StoresService {
           where: {
             id: swap.toEmployeeId,
             storeId: sourceStoreId,
-            employmentStatus: EmploymentStatus.ACTIVE,
+            employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
           },
           select: ['id'],
         });
@@ -3239,7 +3756,7 @@ export class StoresService {
         status === 'APPROVED'
           ? LeaveRequestStatus.APPROVED
           : LeaveRequestStatus.REJECTED;
-      return this.dataSource.transaction(async (manager) => {
+      const processed = await this.dataSource.transaction(async (manager) => {
         await lockStoreShiftAvailability(manager, leave.storeId);
         const store = await manager.findOne(Store, {
           where: { id: leave.storeId },
@@ -3269,6 +3786,12 @@ export class StoresService {
           ...(status === 'REJECTED' ? { rejectionReason: reason || '' } : {}),
         };
       });
+      if (nextStatus === LeaveRequestStatus.APPROVED) {
+        void this.cancelRemindersCoveredByLeave(leave).catch(() => {
+          this.logger?.error('Failed to cancel reminders for an approved leave');
+        });
+      }
+      return processed;
     }
 
     throw new BadRequestException('Loại yêu cầu không hợp lệ');
@@ -3308,6 +3831,11 @@ export class StoresService {
         },
         typeCounts: [{ name: 'All', count: 0 }],
       };
+    }
+    // With a storeId, the caller must own it; without one the query below is
+    // already scoped to the caller's own stores.
+    if (storeId) {
+      await this.assertOwnerStoreAccess(storeId, ownerId);
     }
     const contextWhere: any = {
       // A PENDING profile belongs to a job application the owner has not
@@ -3410,12 +3938,8 @@ export class StoresService {
       });
     }
 
-    // 4. Lấy tháng hiện tại & Summaries cho danh sách đã lọc
-    const currentMonth = new Date(
-      new Date().getFullYear(),
-      new Date().getMonth(),
-      1,
-    );
+    // 4. Lấy tháng hiện tại (tháng Việt Nam) & Summaries cho danh sách đã lọc
+    const currentMonth = toMonthMarker(vnMonthOf());
 
     let monthlySummaries: EmployeeMonthlySummary[] = [];
     if (employeeIds.length > 0) {
@@ -3536,14 +4060,27 @@ export class StoresService {
     });
   }
 
-  async permanentDeleteEmployee(profileId: string) {
+  /**
+   * Hard-deletes an employee profile (soft-deleted or not). Owner only: the
+   * route guard enforces it, and this re-checks so no other caller can reach
+   * the delete without it.
+   */
+  async permanentDeleteEmployee(profileId: string, ownerAccountId: string) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
       withDeleted: true,
     });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+    await this.assertOwnerStoreAccess(profile.storeId, ownerAccountId);
 
-    return this.profileRepository.delete(profileId);
+    // Scoped to the verified store so the row cannot have moved in between.
+    return this.profileRepository.delete({
+      id: profileId,
+      storeId: profile.storeId,
+    });
   }
 
   async restoreEmployee(profileId: string, ownerAccountId: string) {
@@ -3945,7 +4482,7 @@ export class StoresService {
     const workDateSet = new Set(workDates);
 
     const employees = await this.profileRepository.find({
-      where: { storeId, employmentStatus: EmploymentStatus.ACTIVE },
+      where: { storeId, employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]) },
       relations: ['account', 'storeRole', 'employeeType'],
     });
     if (employees.length === 0) {
@@ -4103,7 +4640,7 @@ export class StoresService {
       where: {
         id: In(employeeIds),
         storeId,
-        employmentStatus: EmploymentStatus.ACTIVE,
+        employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
       select: ['id', 'storeId', 'employmentStatus'],
     });
@@ -4427,7 +4964,9 @@ export class StoresService {
         };
       });
     } catch (error: any) {
-      if (error?.code === '23505' || error?.driverError?.code === '23505') {
+      // Only the one-active-cycle index means "already has an active cycle";
+      // any other unique violation is a real error and is rethrown.
+      if (isOneActiveCycleViolation(error)) {
         throw new BadRequestException('Cửa hàng đã có chu kỳ đang hoạt động');
       }
       throw error;
@@ -4444,8 +4983,83 @@ export class StoresService {
         });
       void this.notifyEmployeesOfNewShifts(assignmentIds, 'assigned');
     }
+    void this.notifyEmployeesOfCreatedShifts(
+      storeId,
+      drafts
+        .filter((draft) => draft.employeeIds.length < draft.maxStaff)
+        .flatMap((draft) =>
+          workDates.map((workDate) => ({
+            workDate,
+            startTime: draft.startTime,
+            endTime: draft.endTime,
+            shiftName: draft.shiftName,
+          })),
+        ),
+    );
 
     return publicResult;
+  }
+
+  /**
+   * Báo cho nhân viên của cửa hàng khi chủ vừa mở ca mới còn chỗ, để họ vào
+   * đăng ký. Chỉ gửi cho người đang làm và bật công tắc ở màn Nhắc tôi. Gửi
+   * sau commit, best effort: lỗi không được làm hỏng việc tạo lịch.
+   */
+  private async notifyEmployeesOfCreatedShifts(
+    storeId: string,
+    openShifts: ShiftForNotification[],
+  ): Promise<void> {
+    if (!openShifts.length) return;
+    try {
+      const employees = await this.profileRepository.find({
+        where: { storeId, employmentStatus: In([...EMPLOYED_STATUSES]) },
+        select: ['id', 'accountId', 'reminderSettings'],
+      });
+      const recipients = [
+        ...new Set(
+          employees
+            .filter(
+              (employee) =>
+                !!employee.accountId &&
+                shouldNotifyNewShifts(employee.reminderSettings),
+            )
+            .map((employee) => employee.accountId as string),
+        ),
+      ];
+      if (!recipients.length) return;
+      const { title, content } = buildShiftNotification('created', openShifts);
+      for (const accountId of recipients) {
+        try {
+          await this.notificationsService.create({
+            accountId,
+            storeId,
+            title,
+            content,
+            type: NotificationType.SYSTEM,
+            priority: NotificationPriority.NORMAL,
+            // Mở thẳng lịch làm việc, nơi nhân viên đăng ký ca.
+            actionUrl: '/(home)/workshift',
+            metadata: {
+              type: 'SHIFT_CREATED',
+              storeId,
+              ...shiftNotificationDateMetadata(openShifts),
+            },
+          });
+        } catch (error) {
+          this.logger.warn(
+            `[notifyEmployeesOfCreatedShifts] could not notify an employee of store ${storeId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[notifyEmployeesOfCreatedShifts] could not load employees of store ${storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async updateWorkShift(
@@ -4560,6 +5174,7 @@ export class StoresService {
   async getActiveCycle(storeId: string, ownerAccountId?: string) {
     if (ownerAccountId)
       await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    // A store may have several active schedules; return the newest.
     return this.workCycleRepository.findOne({
       where: {
         storeId,
@@ -4571,6 +5186,7 @@ export class StoresService {
         'templates',
         'templates.workShift',
       ],
+      order: { createdAt: 'DESC' },
     });
   }
 
@@ -4655,8 +5271,16 @@ export class StoresService {
       ];
       await this.assertWorkShiftsBelongToStore(storeId, shiftIds);
     }
-    // Kiểm tra xem có chu kỳ active không
-    const activeCycle = await this.getActiveCycle(storeId);
+    // Kiểm tra xem có chu kỳ active không. Only old-style cycles (no
+    // recurrence rule) block another old-style cycle.
+    const activeCycle = await this.workCycleRepository.findOne({
+      where: {
+        storeId,
+        status: WorkCycleStatus.ACTIVE,
+        recurrenceRule: IsNull(),
+      },
+      select: ['id'],
+    });
     if (activeCycle) {
       throw new BadRequestException(
         'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước khi tạo mới.',
@@ -4682,10 +5306,7 @@ export class StoresService {
     } catch (error: any) {
       // Concurrent requests are rejected by the partial unique index rather
       // than leaking a database error or creating a second ACTIVE cycle.
-      if (
-        error?.code === '23505' &&
-        error?.constraint === 'uq_work_cycles_one_active_per_store'
-      ) {
+      if (isOneActiveCycleViolation(error)) {
         throw new BadRequestException(
           'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước khi tạo mới.',
         );
@@ -4906,14 +5527,13 @@ export class StoresService {
   // Dừng chu kỳ (không xóa, chỉ chuyển status)
   async stopWorkCycle(
     cycleId: string,
-    options: { stopImmediately?: boolean; scheduledStopAt?: string } = {
-      stopImmediately: true,
-    },
+    options: StopWorkCycleDto = { stopImmediately: true },
     ownerAccountId?: string,
   ) {
     if (!ownerAccountId) {
       throw new ForbiddenException('Không xác định được tài khoản');
     }
+    const stopPlan = normalizeWorkCycleStopRequest(options);
     const cycle = await this.workCycleRepository.findOne({
       where: { id: cycleId },
     });
@@ -4946,7 +5566,7 @@ export class StoresService {
             throw new ForbiddenException('Bạn không có quyền dừng chu kỳ này');
           }
         }
-        if (options.stopImmediately !== false) {
+        if (stopPlan.immediate) {
           await manager.update(WorkCycle, cycleId, {
             status: WorkCycleStatus.STOPPED,
             stoppedAt: new Date(),
@@ -4958,9 +5578,9 @@ export class StoresService {
             select: ['id'],
           });
           return assignments.map((assignment) => assignment.id);
-        } else if (options.scheduledStopAt) {
+        } else {
           await manager.update(WorkCycle, cycleId, {
-            scheduledStopAt: new Date(options.scheduledStopAt),
+            scheduledStopAt: stopPlan.stopAt,
           });
         }
         return [] as string[];
@@ -5005,9 +5625,17 @@ export class StoresService {
             'Bạn không có quyền kích hoạt chu kỳ này',
           );
         }
-        const activeCycle = await manager.findOne(WorkCycle, {
-          where: { storeId: cycle.storeId, status: WorkCycleStatus.ACTIVE },
-        });
+        // Only an old-style cycle is limited to one active per store.
+        const activeCycle = cycle.recurrenceRule
+          ? null
+          : await manager.findOne(WorkCycle, {
+              where: {
+                storeId: cycle.storeId,
+                status: WorkCycleStatus.ACTIVE,
+                recurrenceRule: IsNull(),
+                id: Not(cycleId),
+              },
+            });
         if (activeCycle && activeCycle.id !== cycleId) {
           throw new BadRequestException(
             'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước.',
@@ -5018,10 +5646,7 @@ export class StoresService {
         });
       });
     } catch (error: any) {
-      if (
-        error?.code === '23505' &&
-        error?.constraint === 'uq_work_cycles_one_active_per_store'
-      ) {
+      if (isOneActiveCycleViolation(error)) {
         throw new BadRequestException(
           'Cửa hàng đã có chu kỳ đang hoạt động. Vui lòng dừng chu kỳ hiện tại trước.',
         );
@@ -5499,13 +6124,15 @@ export class StoresService {
     if (accountId) {
       if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
       const isOwner = store.ownerAccountId === accountId;
+      // Read access: any employed member (probation and on-leave included),
+      // the same rule as the store guards.
       const activeEmployee = isOwner
         ? null
         : await this.profileRepository.findOne({
             where: {
               storeId,
               accountId,
-              employmentStatus: EmploymentStatus.ACTIVE,
+              employmentStatus: In([...EMPLOYED_STATUSES]),
             },
             select: ['id'],
           });
@@ -5519,7 +6146,7 @@ export class StoresService {
           where: {
             id: employeeProfileId,
             storeId,
-            employmentStatus: EmploymentStatus.ACTIVE,
+            employmentStatus: In([...EMPLOYED_STATUSES]),
           },
           select: ['id', 'accountId'],
         });
@@ -5574,6 +6201,29 @@ export class StoresService {
       });
     }
 
+    // MONTH contracts show the same day rate the checkout stores: the monthly
+    // salary over the store's standard working days of the slot's month.
+    // Days off are loaded once; the count is memoized per month.
+    const daysOff = activeContract?.salaryAmount
+      ? (
+          await this.shiftConfigRepository.findOne({
+            where: { storeId },
+            select: ['id', 'daysOff'],
+          })
+        )?.daysOff
+      : undefined;
+    const workingDaysByMonth = new Map<string, number>();
+    const workingDaysFor = (workDate: string): number | undefined => {
+      const month = vnMonthOfDateString(workDate);
+      if (!month) return undefined;
+      let days = workingDaysByMonth.get(month.key);
+      if (days === undefined) {
+        days = countWorkingDaysInMonth(month.year, month.monthIndex, daysOff);
+        workingDaysByMonth.set(month.key, days);
+      }
+      return days;
+    };
+
     // Estimated salary for a single slot from contract rate + slot duration.
     const slotSalary = (slot: ShiftSlot): number => {
       if (!activeContract || !activeContract.salaryAmount) return 0;
@@ -5594,7 +6244,8 @@ export class StoresService {
           paymentType: activeContract.paymentType,
           baseSalary: base,
           hours: durationHours,
-          referenceDate: new Date(slot.workDate),
+          referenceDate: vnMiddayInstant(String(slot.workDate)),
+          workingDaysInMonth: workingDaysFor(String(slot.workDate)),
         }) ?? 0
       );
     };
@@ -5717,10 +6368,7 @@ export class StoresService {
           // Probation is a working state — someone on probation is rostered
           // like anyone else. Requiring ACTIVE alone locked every new hire out
           // of signing up for their own shifts.
-          employmentStatus: In([
-            EmploymentStatus.ACTIVE,
-            EmploymentStatus.PROBATION,
-          ]),
+          employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
         },
         select: ['id'],
       });
@@ -5802,7 +6450,7 @@ export class StoresService {
       if (!employee) {
         throw new NotFoundException('Không tìm thấy nhân viên');
       }
-      if (employee.employmentStatus !== EmploymentStatus.ACTIVE) {
+      if (!isShiftEligibleEmploymentStatus(employee.employmentStatus)) {
         throw new BadRequestException(
           'Nhân viên không còn hoạt động, không thể đăng ký ca',
         );
@@ -5901,29 +6549,18 @@ export class StoresService {
     for (const assignment of assignments) {
       const accountId = assignment.employee?.accountId;
       if (!accountId || !assignment.shiftSlot?.workDate) continue;
-      // Nhân viên tắt "Nhận thông báo khi có ca mới" ở màn Nhắc tôi thì không
-      // báo ca chủ xếp. Xác nhận đăng ký thành công vẫn gửi: đó là phản hồi cho
-      // việc chính họ vừa làm.
-      if (
-        kind === 'assigned' &&
-        !shouldNotifyNewShifts(assignment.employee?.reminderSettings)
-      ) {
-        continue;
-      }
       byAccount.set(accountId, [...(byAccount.get(accountId) ?? []), assignment]);
     }
 
     for (const [accountId, list] of byAccount) {
       try {
-        const { title, content } = buildShiftNotification(
-          kind,
-          list.map((a) => ({
-            workDate: a.shiftSlot.workDate,
-            startTime: a.shiftSlot.startTime || a.shiftSlot.workShift?.startTime,
-            endTime: a.shiftSlot.endTime || a.shiftSlot.workShift?.endTime,
-            shiftName: a.shiftSlot.workShift?.shiftName,
-          })),
-        );
+        const shifts = list.map((a) => ({
+          workDate: a.shiftSlot.workDate,
+          startTime: a.shiftSlot.startTime || a.shiftSlot.workShift?.startTime,
+          endTime: a.shiftSlot.endTime || a.shiftSlot.workShift?.endTime,
+          shiftName: a.shiftSlot.workShift?.shiftName,
+        }));
+        const { title, content } = buildShiftNotification(kind, shifts);
         const storeId = list[0].shiftSlot?.cycle?.storeId;
         await this.notificationsService.create({
           accountId,
@@ -5941,6 +6578,7 @@ export class StoresService {
             type: kind === 'approved' ? 'SHIFT_APPROVED' : 'SHIFT_ASSIGNED',
             storeId,
             assignmentIds: list.map((a) => a.id),
+            ...shiftNotificationDateMetadata(shifts),
           },
         });
       } catch (error) {
@@ -5984,7 +6622,10 @@ export class StoresService {
 
       const who = profile?.account?.fullName?.trim() || 'Một nhân viên';
       const shiftName = slot?.workShift?.shiftName || 'ca làm việc';
-      const when = slot?.workDate ? ` ngày ${slot.workDate}` : '';
+      // "hôm nay (18/09)" / "ngày mai (19/09)" / "ngày 25/09" thay cho ngày thô YYYY-MM-DD.
+      const when = slot?.workDate
+        ? ` ${describeWorkDate(String(slot.workDate))}`
+        : '';
 
       await this.notificationsService.create({
         accountId: store.ownerAccountId,
@@ -6120,10 +6761,12 @@ export class StoresService {
           'Không thể chuyển trạng thái assignment hiện tại',
         );
       }
+      const previousStatus = current.status;
       current.status = nextStatus;
       if (note !== undefined) current.note = note;
-      return manager.save(ShiftAssignment, current);
-    }).then(async (saved) => {
+      const saved = await manager.save(ShiftAssignment, current);
+      return { saved, previousStatus };
+    }).then(async ({ saved, previousStatus }) => {
       // Transaction đã kiểm lại chuyển trạng thái dưới khoá, nên trạng thái
       // đọc trước đó là PENDING nghĩa là đây đúng là lần duyệt ca đăng ký.
       if (
@@ -6132,6 +6775,13 @@ export class StoresService {
       ) {
         void this.notifyEmployeesOfNewShifts([assignmentId], 'approved');
       }
+      // After commit, from the status read under the lock. The owner app
+      // approves through this route, which scheduled no reminder before.
+      await this.syncReminderAfterAssignmentStatusChange(
+        assignmentId,
+        previousStatus,
+        nextStatus,
+      );
       return saved;
     });
   }
@@ -6189,7 +6839,7 @@ export class StoresService {
         id: data.requestedByEmployeeId,
         accountId,
         storeId,
-        employmentStatus: EmploymentStatus.ACTIVE,
+        employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
       select: ['id'],
     });
@@ -6202,7 +6852,7 @@ export class StoresService {
       where: {
         id: data.toEmployeeId,
         storeId,
-        employmentStatus: EmploymentStatus.ACTIVE,
+        employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
       select: ['id'],
     });
@@ -6261,7 +6911,7 @@ export class StoresService {
         where: {
           accountId,
           storeId,
-          employmentStatus: EmploymentStatus.ACTIVE,
+          employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
         },
         select: ['id'],
       });
@@ -6278,7 +6928,7 @@ export class StoresService {
       where: {
         id: swap.toEmployeeId,
         storeId,
-        employmentStatus: EmploymentStatus.ACTIVE,
+        employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
       select: ['id'],
     });
@@ -6298,7 +6948,7 @@ export class StoresService {
           where: {
             accountId,
             storeId,
-            employmentStatus: EmploymentStatus.ACTIVE,
+            employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
           },
           select: ['id'],
         });
@@ -6317,7 +6967,7 @@ export class StoresService {
         where: {
           id: swap.toEmployeeId,
           storeId,
-          employmentStatus: EmploymentStatus.ACTIVE,
+          employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
         },
         select: ['id'],
       });
@@ -6353,6 +7003,61 @@ export class StoresService {
     });
   }
 
+  /** Rows an asset may reference; each must belong to the asset's store. */
+  private assetReferences(data: any) {
+    return [
+      { repository: this.assetUnitRepository, id: data?.assetUnitId, label: 'Đơn vị tính' },
+      { repository: this.assetCategoryRepository, id: data?.assetCategoryId, label: 'Danh mục tài sản' },
+      { repository: this.assetStatusRepository, id: data?.assetStatusId, label: 'Trạng thái tài sản' },
+      { repository: this.profileRepository, id: data?.responsibleEmployeeId, label: 'Nhân viên phụ trách' },
+    ];
+  }
+
+  /** Rows a product may reference; each must belong to the product's store. */
+  private productReferences(data: any) {
+    return [
+      { repository: this.productUnitRepository, id: data?.productUnitId, label: 'Đơn vị tính' },
+      { repository: this.productCategoryRepository, id: data?.productCategoryId, label: 'Danh mục hàng hóa' },
+      { repository: this.productStatusRepository, id: data?.productStatusId, label: 'Trạng thái hàng hóa' },
+    ];
+  }
+
+  /**
+   * Drops the fields a client must never set on a catalogue row: its identity
+   * (an `id` turns `save` into an update of that row, in any store) and its
+   * store (always the addressed one).
+   */
+  /**
+   * `withoutRowIdentity` plus the entity's relation properties, for simple
+   * store-scoped creates: a relation object (`store: { id }`, ...) would
+   * otherwise set its foreign key past the addressed store.
+   */
+  private creatableRow(
+    repository: Repository<any>,
+    data: unknown,
+  ): Record<string, any> {
+    const row: Record<string, any> = this.withoutRowIdentity(
+      (data ?? {}) as Record<string, any>,
+    );
+    for (const relation of repository.metadata?.relations ?? []) {
+      delete row[relation.propertyName];
+    }
+    return row;
+  }
+
+  private withoutRowIdentity<T extends Record<string, any>>(data: T) {
+    const {
+      id: _id,
+      storeId: _storeId,
+      store: _store,
+      createdAt: _createdAt,
+      updatedAt: _updatedAt,
+      deletedAt: _deletedAt,
+      ...rest
+    } = (data ?? {}) as Record<string, any>;
+    return rest as Omit<T, 'id' | 'storeId'>;
+  }
+
   async createAssetsBulk(
     storeId: string,
     assetsData: any[],
@@ -6360,9 +7065,18 @@ export class StoresService {
   ) {
     console.log('Chạy hàm createAssetsBulk');
     const savedAssets: Asset[] = [];
+    // Validate every row before writing any of them.
+    // Scalar columns only: no identity, store or relation objects (a
+    // `responsibleEmployee: { id }` would otherwise bypass the FK checks).
+    const rows = assetsData.map(
+      (data) => pickDefined(data, ASSET_CLIENT_FIELDS) as any,
+    );
+    for (const data of rows) {
+      await this.assertRowsInStore(storeId, this.assetReferences(data));
+    }
 
-    for (let i = 0; i < assetsData.length; i++) {
-      const data = assetsData[i];
+    for (let i = 0; i < rows.length; i++) {
+      const data = rows[i];
 
       // 1. Ánh xạ file từ Form Data (Convention: avatar_0, invoice_0...)
       const avatarFile = files.find((f) => f.fieldname === `avatar_${i}`);
@@ -6739,7 +7453,16 @@ export class StoresService {
   }
 
   async updateAsset(id: string, data: Partial<Asset>) {
-    await this.assetRepository.update(id, data);
+    const asset = await this.assetRepository.findOne({
+      where: { id },
+      select: ['id', 'storeId'],
+    });
+    if (!asset) throw new NotFoundException('Không tìm thấy tài sản');
+    // The store never changes here, and every referenced row must be in it
+    // (the guard cannot see this multipart body).
+    const changes = this.withoutRowIdentity(data as any);
+    await this.assertRowsInStore(asset.storeId, this.assetReferences(changes));
+    await this.assetRepository.update(id, changes);
     return this.assetRepository.findOne({
       where: { id },
       relations: [
@@ -6797,9 +7520,17 @@ export class StoresService {
     files: Express.Multer.File[],
   ) {
     const savedProducts: Product[] = [];
+    // Validate every row before writing any of them.
+    // Scalar columns only: no identity, store or relation objects.
+    const rows = productsData.map(
+      (data) => pickDefined(data, PRODUCT_CLIENT_FIELDS) as any,
+    );
+    for (const data of rows) {
+      await this.assertRowsInStore(storeId, this.productReferences(data));
+    }
 
-    for (let i = 0; i < productsData.length; i++) {
-      const data = productsData[i];
+    for (let i = 0; i < rows.length; i++) {
+      const data = rows[i];
 
       // 1. Ánh xạ file (avatar_0, avatar_1...)
       const avatarFile = files.find((f) => f.fieldname === `avatar_${i}`);
@@ -6848,7 +7579,19 @@ export class StoresService {
   }
 
   async updateProduct(id: string, data: Partial<Product>) {
-    await this.productRepository.update(id, data);
+    const product = await this.productRepository.findOne({
+      where: { id },
+      select: ['id', 'storeId'],
+    });
+    if (!product) throw new NotFoundException('Không tìm thấy hàng hóa');
+    // The store never changes here, and every referenced row must be in it
+    // (the guard cannot see this multipart body).
+    const changes = this.withoutRowIdentity(data as any);
+    await this.assertRowsInStore(
+      product.storeId,
+      this.productReferences(changes),
+    );
+    await this.productRepository.update(id, changes);
     return this.productRepository.findOne({
       where: { id },
       relations: ['productUnit', 'productCategory', 'productStatus'],
@@ -6911,7 +7654,10 @@ export class StoresService {
 
   // Unit management
   async createAssetUnit(storeId: string, data: Partial<AssetUnit>) {
-    const unit = this.assetUnitRepository.create({ ...data, storeId });
+    const unit = this.assetUnitRepository.create({
+      ...this.creatableRow(this.assetUnitRepository, data),
+      storeId,
+    });
     return this.assetUnitRepository.save(unit);
   }
 
@@ -6922,7 +7668,10 @@ export class StoresService {
   }
 
   async createProductUnit(storeId: string, data: Partial<ProductUnit>) {
-    const unit = this.productUnitRepository.create({ ...data, storeId });
+    const unit = this.productUnitRepository.create({
+      ...this.creatableRow(this.productUnitRepository, data),
+      storeId,
+    });
     return this.productUnitRepository.save(unit);
   }
 
@@ -7016,8 +7765,8 @@ export class StoresService {
     month?: Date,
     manager?: EntityManager,
   ) {
-    const targetMonth =
-      month || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    // Default is the current Vietnam month, not the server clock's month.
+    const targetMonth = month || toMonthMarker(vnMonthOf());
 
     const repository = manager
       ? manager.getRepository(EmployeeMonthlySummary)
@@ -7042,7 +7791,10 @@ export class StoresService {
 
   // Monthly Payroll management
   async createPayroll(storeId: string, data: Partial<MonthlyPayroll>) {
-    const payroll = this.payrollRepository.create({ ...data, storeId });
+    const payroll = this.payrollRepository.create({
+      ...this.creatableRow(this.payrollRepository, data),
+      storeId,
+    });
     return this.payrollRepository.save(payroll);
   }
 
@@ -7057,12 +7809,9 @@ export class StoresService {
     return this.payrollRepository.findOne({ where: { id } });
   }
 
-  async getPayrollByMonth(storeId: string, date: Date) {
-    // Set to first day of month
-    const month = new Date(date.getFullYear(), date.getMonth(), 1);
-
+  async getPayrollByMonth(storeId: string, date: Date | string) {
     return this.payrollRepository.findOne({
-      where: { storeId, month },
+      where: { storeId, month: this.parsePayrollMonthMarker(date) },
     });
   }
 
@@ -7072,21 +7821,40 @@ export class StoresService {
   }
 
   async deletePayroll(id: string) {
+    // Deleting a payroll cascades to its payslips. Advances recorded against
+    // those payslips are money records and must never be removed with them
+    // (the FK is ON DELETE NO ACTION, so the database would refuse anyway).
+    // Soft-deleted payslips and advance requests still hold the foreign key,
+    // so they count: missing them turned the 409 into a 23503 500.
+    const advances = await this.salaryAdvanceRequestRepository
+      .createQueryBuilder('request')
+      .withDeleted()
+      .innerJoin('request.employeeSalary', 'salary')
+      .where('salary.monthlyPayrollId = :payrollId', { payrollId: id })
+      .getCount();
+    if (advances > 0) {
+      throw new ConflictException(
+        'Không thể xoá phiếu lương đã có yêu cầu ứng lương',
+      );
+    }
     await this.payrollRepository.delete(id);
     return { message: 'Payroll deleted successfully' };
   }
 
   /**
    * Find or create the MonthlyPayroll scaffold row for a store+month.
-   * Shared by createMonthlyPayrollForStore, recalculatePayroll and the
+   * Shared by payroll generation/recalculation, onboarding and the
    * real-time salary update on check-out, so every write path is guaranteed
    * a MonthlyPayroll to attach EmployeeSalary rows to (fixes orphaned
    * EmployeeSalary.monthlyPayrollId when check-out happens before the
    * monthly cron/generate endpoint has ever run for that month).
+   *
+   * Takes a per-(store, month) advisory lock that is held until the caller's
+   * transaction ends, which serializes every payslip writer for that month.
    */
   private async findOrCreateMonthlyPayroll(
     storeId: string,
-    month: Date,
+    month: VnMonth,
     manager?: EntityManager,
   ): Promise<MonthlyPayroll> {
     if (!manager) {
@@ -7094,18 +7862,21 @@ export class StoresService {
         this.findOrCreateMonthlyPayroll(storeId, month, transactionManager),
       );
     }
-    const lockMonth = `${month.getFullYear()}-${month.getMonth() + 1}`;
+    // Key format must stay `<year>-<unpadded month>` (e.g. 2026-9), as before
+    // the Vietnam-month refactor: during a rolling deploy old and new
+    // instances must contend on the same lock.
     await manager.query(
       'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-      [`monthly-payroll:${storeId}:${lockMonth}`],
+      [monthlyPayrollLockKey(storeId, month)],
     );
+    const monthMarker = toMonthMarker(month);
     const repo = manager.getRepository(MonthlyPayroll);
-    let payroll = await repo.findOne({ where: { storeId, month } });
+    let payroll = await repo.findOne({ where: { storeId, month: monthMarker } });
     if (payroll) return payroll;
 
     payroll = repo.create({
       storeId,
-      month,
+      month: monthMarker,
       estimatedPayment: 0,
       salaryFund: 0,
       totalBonus: 0,
@@ -7118,671 +7889,457 @@ export class StoresService {
     return repo.save(payroll);
   }
 
-  async createMonthlyPayrollForStore(storeId: string, date?: Date) {
-    const currentDate = date || new Date();
-    const month = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth(),
-      1,
-    );
-    const nextMonth = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth() + 1,
-      1,
-    );
-
-    console.log(
-      `📊 [Payroll] Creating payroll for store=${storeId}, month=${month.toISOString().slice(0, 7)}`,
-    );
-
-    // 1. Create or find MonthlyPayroll
-    const payroll = await this.findOrCreateMonthlyPayroll(storeId, month);
-
-    // 2. Load payroll rules for this store
-    const payrollRules = await this.payrollRuleRepository.find({
-      where: { storeId, isActive: true },
-    });
-
-    // 3. Load payroll settings
-    const payrollSetting = await this.payrollSettingRepository.findOne({
-      where: { storeId, isActive: true },
-    });
-    // Loaded once per store, not per employee.
-    const workingDaysInMonth = await this.getWorkingDaysInMonth(storeId, month);
-
-    // 4. Get all active employees
-    const employees = await this.profileRepository.find({
-      where: { storeId, employmentStatus: EmploymentStatus.ACTIVE },
-      relations: ['contracts'],
-    });
-
-    console.log(`📊 [Payroll] Found ${employees.length} active employees`);
-
-    let totalEstimatedPayment = 0;
-    let totalBonus = 0;
-    let totalPenalty = 0;
-
-    const PROTECTED_STATUSES = [PaymentStatus.APPROVED, PaymentStatus.PAID];
-
-    for (const employee of employees) {
-      const existingSalary = await this.employeeSalaryRepository.findOne({
-        where: { employeeProfileId: employee.id, month },
-      });
-
-      // Never overwrite a salary that's already been approved or paid —
-      // just make sure it's linked to this MonthlyPayroll (backfills any
-      // record that was created as an "orphan" by the real-time check-out
-      // update before this MonthlyPayroll existed) and fold its totals in.
-      if (
-        existingSalary &&
-        PROTECTED_STATUSES.includes(existingSalary.paymentStatus)
-      ) {
-        if (!existingSalary.monthlyPayrollId) {
-          await this.employeeSalaryRepository.update(existingSalary.id, {
-            monthlyPayrollId: payroll.id,
-          });
-        }
-        totalEstimatedPayment += Number(existingSalary.netSalary) || 0;
-        totalBonus += Number(existingSalary.bonus) || 0;
-        totalPenalty += Number(existingSalary.penalty) || 0;
-        continue;
-      }
-
-      // Resolve active contract
-      const activeContract = employee.contracts?.find((c) => c.isActive);
-      if (!activeContract) {
-        // Bug 4.3 fix: Create salary record with 0 salary instead of skipping
-        console.log(
-          `⚠️ [Payroll] No contract for ${employee.id}, ${existingSalary ? 'updating' : 'creating'} zero-salary record`,
-        );
-        const zeroSalaryPayload: Partial<EmployeeSalary> = {
-          employeeProfileId: employee.id,
-          month,
-          monthlyPayrollId: payroll.id,
-          baseSalary: 0,
-          paymentType: PaymentType.MONTH,
-          workingDays: 0,
-          workingHours: 0,
-          unauthorizedLeaveDays: 0,
-          bonus: 0,
-          penalty: 0,
-          totalIncome: 0,
-          totalDeductions: 0,
-          netSalary: 0,
-          advancePayment: 0,
-          otherDeductions: 0,
-          earnedBaseSalary: 0,
-        };
-        if (existingSalary) {
-          await this.employeeSalaryRepository.update(
-            existingSalary.id,
-            zeroSalaryPayload,
-          );
-        } else {
-          await this.createEmployeeSalary(zeroSalaryPayload);
-        }
-        continue;
-      }
-
-      // Check salary adjustments
-      const adjustment = await this.salaryAdjustmentRepository.findOne({
-        where: { employeeProfileId: employee.id, effectiveMonth: month },
-        order: { createdAt: 'DESC' },
-      });
-
-      let currentBaseSalary = Number(activeContract.salaryAmount);
-      if (adjustment) {
-        currentBaseSalary = Number(adjustment.newSalary);
-        await this.contractRepository.update(activeContract.id, {
-          salaryAmount: currentBaseSalary,
-        });
-      }
-
-      // ========== AGGREGATE ATTENDANCE DATA ==========
-      const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
-        employee.id,
-        storeId,
-        month,
-        nextMonth,
-      );
-
-      console.log(
-        `📊 [Payroll] Employee ${employee.id}: ${attendanceSummary.completedShifts} shifts, ${attendanceSummary.workingHours.toFixed(1)}h, late=${attendanceSummary.lateCount}, early=${attendanceSummary.earlyCount}`,
-      );
-
-      // ========== CALCULATE SALARY ==========
-      // Prefer real-time per-shift earnings if available
-      const paymentType = activeContract.paymentType || PaymentType.MONTH;
-
-      const calculatedSalary = this.calculateBaseSalary(
-        currentBaseSalary,
-        paymentType,
-        attendanceSummary,
-        payrollSetting,
-        month,
-        workingDaysInMonth,
-      );
-
-      // ========== APPLY PAYROLL RULES (Bonus/Penalty) ==========
-      let bonus = 0;
-      let penalty = 0;
-
-      for (const rule of payrollRules) {
-        if (rule.category === PayrollRuleCategory.FINE) {
-          // Late penalty rules
-          if (rule.ruleType === 'LATE' && attendanceSummary.lateCount > 0) {
-            if (rule.calcType === PayrollCalcType.AMOUNT) {
-              penalty += Number(rule.value) * attendanceSummary.lateCount;
-            } else if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-              penalty +=
-                ((calculatedSalary * Number(rule.value)) / 100) *
-                attendanceSummary.lateCount;
-            }
-          }
-          // Early leave penalty
-          if (rule.ruleType === 'EARLY' && attendanceSummary.earlyCount > 0) {
-            if (rule.calcType === PayrollCalcType.AMOUNT) {
-              penalty += Number(rule.value) * attendanceSummary.earlyCount;
-            } else if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-              penalty +=
-                ((calculatedSalary * Number(rule.value)) / 100) *
-                attendanceSummary.earlyCount;
-            }
-          }
-          // Absent penalty
-          if (rule.ruleType === 'ABSENT' && attendanceSummary.absentCount > 0) {
-            if (rule.calcType === PayrollCalcType.AMOUNT) {
-              penalty += Number(rule.value) * attendanceSummary.absentCount;
-            }
-          }
-        } else if (rule.category === PayrollRuleCategory.BONUS) {
-          // Attendance bonus (e.g., full attendance bonus)
-          if (
-            rule.ruleType === 'ATTENDANCE' &&
-            attendanceSummary.lateCount === 0 &&
-            attendanceSummary.absentCount === 0
-          ) {
-            bonus += Number(rule.value);
-          }
-          // Other bonuses
-          if (!rule.ruleType || rule.ruleType === 'GENERAL') {
-            bonus += Number(rule.value);
-          }
-        }
-      }
-
-      // ========== CALCULATE TOTALS ==========
-      const allowancesTotal = activeContract.allowances
-        ? Object.values(activeContract.allowances).reduce(
-            (sum, v) => sum + Number(v || 0),
-            0,
-          )
-        : 0;
-      const totalIncome = calculatedSalary + allowancesTotal + bonus;
-      // Advances already approved against this payslip must survive a
-      // regeneration. This used to be hardcoded to 0, so re-running payroll
-      // after an advance was approved restored the full net salary and the
-      // employee was paid both the advance and the whole month.
-      // A payslip that does not exist yet cannot have advances against it.
-      const advancePayment = await this.sumApprovedAdvances(existingSalary?.id);
-      const otherDeductions = 0;
-      const totalDeductions = penalty + advancePayment + otherDeductions;
-      const netSalary = Math.max(0, totalIncome - totalDeductions);
-
-      // ========== SAVE EmployeeSalary (update in place if it already
-      // exists as PENDING/REJECTED — never insert a duplicate row for the
-      // same employee+month) ==========
-      const salaryPayload: Partial<EmployeeSalary> = {
-        employeeProfileId: employee.id,
-        month,
-        monthlyPayrollId: payroll.id,
-        baseSalary: currentBaseSalary,
-        paymentType,
-        workingDays: attendanceSummary.completedShifts,
-        workingHours: attendanceSummary.workingHours,
-        unauthorizedLeaveDays: attendanceSummary.absentCount,
-        bonus,
-        penalty,
-        totalIncome,
-        totalDeductions,
-        netSalary,
-        advancePayment,
-        otherDeductions,
-        earnedBaseSalary: calculatedSalary,
-      };
-      if (existingSalary) {
-        await this.employeeSalaryRepository.update(
-          existingSalary.id,
-          salaryPayload,
-        );
-      } else {
-        await this.createEmployeeSalary(salaryPayload);
-      }
-      // Per-employee net salary is not log material.
-
-      totalEstimatedPayment += netSalary;
-      totalBonus += bonus;
-      totalPenalty += penalty;
-    }
-
-    // 5. Update MonthlyPayroll totals
-    payroll.estimatedPayment = totalEstimatedPayment;
-    payroll.totalBonus = totalBonus;
-    payroll.totalPenalty = totalPenalty;
-    payroll.totalPendingApproval = totalEstimatedPayment;
-    await this.payrollRepository.save(payroll);
-
-    console.log(
-      `📊 [Payroll] DONE — total=${totalEstimatedPayment.toFixed(0)}, bonus=${totalBonus.toFixed(0)}, penalty=${totalPenalty.toFixed(0)}`,
-    );
-
-    return payroll;
+  /**
+   * Month argument of the generate/recalculate entry points: a raw API string
+   * ('YYYY-MM-DD', 'YYYY-MM', 'MM/YYYY', ISO datetime) or an instant. Omitted
+   * means the current Vietnam month.
+   */
+  private resolveMonthArg(date?: Date | string | null): VnMonth {
+    if (date === undefined || date === null || date === '') return vnMonthOf();
+    return this.parsePayrollMonth(date);
   }
 
   /**
-   * Recalculate payroll for a store — deletes old salary records and recalculates from attendance.
-   * Uses a transaction to prevent data loss if recalculation fails mid-way.
+   * Month parameter of the payroll read/write endpoints ('MM/YYYY', 'YYYY-MM',
+   * 'YYYY-MM-DD', ISO datetime or Date), as a Vietnam month.
    */
-  async recalculatePayroll(storeId: string, date?: Date) {
-    const currentDate = date || new Date();
-    const month = new Date(
-      currentDate.getFullYear(),
-      currentDate.getMonth(),
-      1,
-    );
-    const dataSource = this.payrollRepository.manager;
-    const PROTECTED_STATUSES = [PaymentStatus.APPROVED, PaymentStatus.PAID];
+  private parsePayrollMonth(input: string | Date | null | undefined): VnMonth {
+    const month = parseVnMonthInput(input);
+    if (!month) throw new BadRequestException('Tháng không hợp lệ');
+    return month;
+  }
 
-    console.log(
-      `🔄 [Payroll] Recalculating payroll for store=${storeId}, month=${month.toISOString().slice(0, 7)}`,
-    );
+  private parsePayrollMonthMarker(
+    input: string | Date | null | undefined,
+  ): Date {
+    return toMonthMarker(this.parsePayrollMonth(input));
+  }
 
-    return dataSource.transaction(async (manager) => {
-      // 1. Delete existing salary records for this month, EXCEPT ones that
-      // are already approved/paid — those must never be recomputed/removed.
-      const deleteResult = await manager
-        .createQueryBuilder()
-        .delete()
-        .from('employee_salaries')
-        .where(
-          'monthly_payroll_id IN (SELECT id FROM monthly_payrolls WHERE store_id = :storeId AND month = :month)',
-          { storeId, month: month.toISOString().slice(0, 10) },
-        )
-        .andWhere('payment_status NOT IN (:...protectedStatuses)', {
-          protectedStatuses: PROTECTED_STATUSES,
-        })
-        .execute();
+  /**
+   * Generates (or regenerates) the payroll for a store and month. Idempotent:
+   * payslips are updated in place and never deleted, so salary advances
+   * recorded against them survive. APPROVED and PAID payslips are only linked
+   * to the payroll, never recomputed.
+   */
+  async createMonthlyPayrollForStore(storeId: string, date?: Date | string) {
+    return this.rebuildStorePayrollForMonth(storeId, this.resolveMonthArg(date));
+  }
 
-      console.log(
-        `🗑️ [Payroll] Deleted ${deleteResult.affected || 0} old salary records`,
-      );
+  /**
+   * Recalculates the payroll for a store and month from attendance, updating
+   * PENDING/REJECTED payslips in place. Same routine as generation: it never
+   * deletes payslips, so approved advances are preserved and re-applied.
+   */
+  async recalculatePayroll(storeId: string, date?: Date | string) {
+    return this.rebuildStorePayrollForMonth(storeId, this.resolveMonthArg(date));
+  }
 
-      // 2. Find or create the MonthlyPayroll row — never delete it, since
-      // doing so would cascade-delete any protected EmployeeSalary rows
-      // that survived the filtered delete above.
+  private async rebuildStorePayrollForMonth(
+    storeId: string,
+    month: VnMonth,
+  ): Promise<MonthlyPayroll> {
+    return this.dataSource.transaction(async (manager) => {
+      // Takes the per-(store, month) advisory lock for the whole rebuild.
       const payroll = await this.findOrCreateMonthlyPayroll(
         storeId,
         month,
         manager,
       );
-
-      // 3. Load payroll rules and settings via manager
-      const [payrollRules, payrollSetting] = await Promise.all([
-        manager.findBy(StorePayrollRule, { storeId, isActive: true }),
-        manager.findOne(StorePayrollSetting, {
-          where: { storeId, isActive: true },
-        }),
-      ]);
-      // Loaded once per store, not per employee.
-      const workingDaysInMonth = await this.getWorkingDaysInMonth(
+      const rules = await manager
+        .getRepository(StorePayrollRule)
+        .find({ where: { storeId, isActive: true } });
+      const standardWorkingDays = await this.getStandardWorkingDays(
         storeId,
         month,
+        manager,
       );
-
-      // 4. Get active employees via manager
-      const employees = await manager.find(EmployeeProfile, {
-        where: { storeId, employmentStatus: EmploymentStatus.ACTIVE },
+      // Everyone who can work shifts is paid: active and probation staff.
+      // ON_LEAVE staff are still skipped, as before: they are not rostered,
+      // and a payslip they already have is left as it is (not rebuilt).
+      const employees = await manager.getRepository(EmployeeProfile).find({
+        where: {
+          storeId,
+          employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
+        },
         relations: ['contracts'],
       });
 
-      let totalEstimatedPayment = 0;
-      let totalBonus = 0;
-      let totalPenalty = 0;
-
+      const counts = { protected: 0, updated: 0, inserted: 0 };
+      const now = new Date();
       for (const employee of employees) {
-        // Any surviving record here is either protected (APPROVED/PAID,
-        // skipped) or was deleted above (PENDING/REJECTED) and will be
-        // recreated fresh below.
-        const existingSalary = await manager.findOne(EmployeeSalary, {
-          where: { employeeProfileId: employee.id, month },
-        });
-        if (
-          existingSalary &&
-          PROTECTED_STATUSES.includes(existingSalary.paymentStatus)
-        ) {
-          if (!existingSalary.monthlyPayrollId) {
-            await manager.update(EmployeeSalary, existingSalary.id, {
+        const existing = await this.lockEmployeePayslip(
+          manager,
+          employee.id,
+          month,
+        );
+        if (existing && this.isProtectedPayslip(existing)) {
+          counts[
+            await this.upsertEmployeePayslip(manager, {
+              employeeProfileId: employee.id,
+              month,
               monthlyPayrollId: payroll.id,
-            });
-          }
-          totalEstimatedPayment += Number(existingSalary.netSalary) || 0;
-          totalBonus += Number(existingSalary.bonus) || 0;
-          totalPenalty += Number(existingSalary.penalty) || 0;
+              payslip: null,
+              allowances: null,
+              existing,
+            })
+          ] += 1;
           continue;
         }
 
-        const activeContract = employee.contracts?.find((c) => c.isActive);
-
-        // Bug 4.3 fix: Handle employees without contract
-        if (!activeContract) {
-          console.log(
-            `⚠️ [Payroll] No contract for ${employee.id}, creating zero-salary record`,
+        const contract = employee.contracts?.find((c) => c.isActive) ?? null;
+        let payslip: PayslipComputation | null = null;
+        if (contract) {
+          const { rate, adjustment } = await this.resolveRateForMonth(
+            employee.id,
+            contract,
+            month,
+            manager,
           );
-          const zeroSalary = manager.create(EmployeeSalary, {
+          if (adjustment) {
+            // Existing behaviour: an adjustment for the month is written back
+            // to the active contract when payroll is generated.
+            await manager
+              .getRepository(EmployeeContract)
+              .update(contract.id, { salaryAmount: rate });
+          }
+          ({ payslip } = await this.computeEmployeePayslip({
+            manager,
+            employeeProfileId: employee.id,
+            storeId,
+            month,
+            contract,
+            rate,
+            rules,
+            standardWorkingDays,
+            existingSalaryId: existing?.id ?? null,
+            otherDeductions: existing?.otherDeductions,
+            now,
+          }));
+        }
+
+        counts[
+          await this.upsertEmployeePayslip(manager, {
             employeeProfileId: employee.id,
             month,
             monthlyPayrollId: payroll.id,
-            baseSalary: 0,
-            paymentType: PaymentType.MONTH,
-            workingDays: 0,
-            workingHours: 0,
-            unauthorizedLeaveDays: 0,
-            bonus: 0,
-            penalty: 0,
-            totalIncome: 0,
-            totalDeductions: 0,
-            netSalary: 0,
-            advancePayment: 0,
-            otherDeductions: 0,
-            earnedBaseSalary: 0,
-          });
-          await manager.save(EmployeeSalary, zeroSalary);
-          continue;
-        }
-
-        const adjustment = await manager.findOne(SalaryAdjustment, {
-          where: { employeeProfileId: employee.id, effectiveMonth: month },
-          order: { createdAt: 'DESC' },
-        });
-
-        let currentBaseSalary = Number(activeContract.salaryAmount);
-        if (adjustment) {
-          currentBaseSalary = Number(adjustment.newSalary);
-          await manager.update(EmployeeContract, activeContract.id, {
-            salaryAmount: currentBaseSalary,
-          });
-        }
-
-        const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
-          employee.id,
-          storeId,
-          month,
-          new Date(currentDate.getFullYear(), currentDate.getMonth() + 1, 1),
-        );
-
-        const paymentType = activeContract.paymentType || PaymentType.MONTH;
-        // Reuse the single source of truth for base-salary calculation
-        // instead of re-implementing the same branching inline (previously
-        // this duplicated — and had silently drifted from — calculateBaseSalary).
-        const calculatedSalary = this.calculateBaseSalary(
-          currentBaseSalary,
-          paymentType,
-          attendanceSummary,
-          payrollSetting,
-          month,
-          workingDaysInMonth,
-        );
-
-        let bonus = 0;
-        let penalty = 0;
-
-        for (const rule of payrollRules) {
-          if (rule.category === PayrollRuleCategory.FINE) {
-            if (rule.ruleType === 'LATE' && attendanceSummary.lateCount > 0) {
-              penalty +=
-                rule.calcType === PayrollCalcType.AMOUNT
-                  ? Number(rule.value) * attendanceSummary.lateCount
-                  : ((calculatedSalary * Number(rule.value)) / 100) *
-                    attendanceSummary.lateCount;
-            }
-            if (rule.ruleType === 'EARLY' && attendanceSummary.earlyCount > 0) {
-              penalty +=
-                rule.calcType === PayrollCalcType.AMOUNT
-                  ? Number(rule.value) * attendanceSummary.earlyCount
-                  : ((calculatedSalary * Number(rule.value)) / 100) *
-                    attendanceSummary.earlyCount;
-            }
-            if (
-              rule.ruleType === 'ABSENT' &&
-              attendanceSummary.absentCount > 0 &&
-              rule.calcType === PayrollCalcType.AMOUNT
-            ) {
-              penalty += Number(rule.value) * attendanceSummary.absentCount;
-            }
-          } else if (rule.category === PayrollRuleCategory.BONUS) {
-            if (
-              rule.ruleType === 'ATTENDANCE' &&
-              attendanceSummary.lateCount === 0 &&
-              attendanceSummary.absentCount === 0
-            ) {
-              bonus += Number(rule.value);
-            }
-            if (!rule.ruleType || rule.ruleType === 'GENERAL') {
-              bonus += Number(rule.value);
-            }
-          }
-        }
-
-        const allowancesTotal = activeContract.allowances
-          ? Object.values(activeContract.allowances).reduce(
-              (sum, v) => sum + Number(v || 0),
-              0,
-            )
-          : 0;
-        const totalIncome = calculatedSalary + allowancesTotal + bonus;
-        // `advancePayment` was missing from this path entirely, so a
-        // recalculation silently cleared any approved advance from the
-        // payslip and restored the full net salary.
-        const advancePayment = await this.sumApprovedAdvances(
-          existingSalary?.id,
-        );
-        const totalDeductions = penalty + advancePayment;
-        const netSalary = Math.max(0, totalIncome - totalDeductions);
-
-        const salaryPayload = {
-          employeeProfileId: employee.id,
-          month,
-          monthlyPayrollId: payroll.id,
-          baseSalary: currentBaseSalary,
-          paymentType,
-          workingDays: attendanceSummary.completedShifts,
-          workingHours: attendanceSummary.workingHours,
-          unauthorizedLeaveDays: attendanceSummary.absentCount,
-          bonus,
-          penalty,
-          totalIncome,
-          totalDeductions,
-          netSalary,
-          advancePayment,
-          earnedBaseSalary: calculatedSalary,
-        };
-        if (existingSalary) {
-          await manager.update(
-            EmployeeSalary,
-            existingSalary.id,
-            salaryPayload,
-          );
-        } else {
-          const salaryRecord = manager.create(EmployeeSalary, salaryPayload);
-          await manager.save(EmployeeSalary, salaryRecord);
-        }
-        totalEstimatedPayment += netSalary;
-        totalBonus += bonus;
-        totalPenalty += penalty;
+            payslip,
+            allowances: contract?.allowances ?? null,
+            existing,
+          })
+        ] += 1;
       }
 
-      payroll.estimatedPayment = totalEstimatedPayment;
-      payroll.totalBonus = totalBonus;
-      payroll.totalPenalty = totalPenalty;
-      payroll.totalPendingApproval = totalEstimatedPayment;
-      await manager.save(payroll);
-
-      console.log(
-        `📊 [Payroll] Recalculate DONE — total=${totalEstimatedPayment.toFixed(0)}`,
+      const totals = await this.refreshMonthlyPayrollTotals(
+        manager,
+        payroll.id,
       );
-      return payroll;
+      // Counts only: per-employee amounts are not log material.
+      this.logger.log(
+        `[Payroll] store=${storeId} month=${month.label} employees=${employees.length} protected=${counts.protected} updated=${counts.updated} inserted=${counts.inserted}`,
+      );
+      return Object.assign(payroll, totals);
+    });
+  }
+
+  private isProtectedPayslip(salary: Pick<EmployeeSalary, 'paymentStatus'>) {
+    return (
+      salary.paymentStatus === PaymentStatus.APPROVED ||
+      salary.paymentStatus === PaymentStatus.PAID
+    );
+  }
+
+  /**
+   * Locks the employee's payslip row for the month, including a soft-deleted
+   * one (it still occupies the unique (employee, month) key).
+   */
+  private async lockEmployeePayslip(
+    manager: EntityManager,
+    employeeProfileId: string,
+    month: VnMonth,
+  ): Promise<EmployeeSalary | null> {
+    return manager.getRepository(EmployeeSalary).findOne({
+      where: { employeeProfileId, month: toMonthMarker(month) },
+      withDeleted: true,
+      lock: { mode: 'pessimistic_write' },
     });
   }
 
   /**
-   * Aggregate attendance data for an employee in a given month.
-   * Queries ShiftAssignments linked to ShiftSlots with workDate in [month, nextMonth).
+   * The single payslip writer for generation, recalculation and check-out.
+   *
+   * Invariants: never deletes a payslip; never changes paymentStatus,
+   * approvedAt or paidAt; APPROVED/PAID payslips are only linked to the
+   * payroll. `advancePayment` is always re-derived from the APPROVED salary
+   * advance requests, under the row lock, so it cannot be lost or doubled.
+   *
+   * `payslip: null` writes a zero payslip (employee without an active
+   * contract) that still deducts approved advances.
    */
-  private async calculateEmployeeAttendanceSummary(
+  private async upsertEmployeePayslip(
+    manager: EntityManager,
+    input: {
+      employeeProfileId: string;
+      month: VnMonth;
+      monthlyPayrollId: string;
+      payslip: PayslipComputation | null;
+      allowances: Record<string, number> | null;
+      /** Row already loaded under lock by the caller; omitted = load it here. */
+      existing?: EmployeeSalary | null;
+    },
+  ): Promise<'protected' | 'updated' | 'inserted'> {
+    const repository = manager.getRepository(EmployeeSalary);
+    const existing =
+      input.existing !== undefined
+        ? input.existing
+        : await this.lockEmployeePayslip(
+            manager,
+            input.employeeProfileId,
+            input.month,
+          );
+
+    if (existing && this.isProtectedPayslip(existing)) {
+      if (!existing.monthlyPayrollId) {
+        await repository.update(existing.id, {
+          monthlyPayrollId: input.monthlyPayrollId,
+        });
+      }
+      return 'protected';
+    }
+
+    const advancePayment = await this.sumApprovedAdvances(
+      existing?.id,
+      manager,
+    );
+    const otherDeductions = Math.round(Number(existing?.otherDeductions) || 0);
+    const payslip = input.payslip;
+    const totals = computePayslipTotals({
+      earnedBase: payslip?.earnedBaseSalary ?? 0,
+      allowancesTotal: payslip?.allowancesTotal ?? 0,
+      bonus: payslip?.bonus ?? 0,
+      penalty: payslip?.penalty ?? 0,
+      advancePayment,
+      otherDeductions,
+    });
+
+    const payload: Partial<EmployeeSalary> = {
+      monthlyPayrollId: input.monthlyPayrollId,
+      baseSalary: payslip?.baseSalary ?? 0,
+      paymentType: payslip?.paymentType ?? PaymentType.MONTH,
+      earnedBaseSalary: payslip?.earnedBaseSalary ?? 0,
+      allowances: input.allowances ?? {},
+      bonus: payslip?.bonus ?? 0,
+      penalty: payslip?.penalty ?? 0,
+      workingDays: payslip?.workingDays ?? 0,
+      workingHours: payslip?.workingHours ?? 0,
+      unauthorizedLeaveDays: payslip?.unauthorizedLeaveDays ?? 0,
+      advancePayment: Math.round(advancePayment),
+      otherDeductions,
+      ...totals,
+    };
+
+    if (existing) {
+      await repository.update(existing.id, payload);
+      if (existing.deletedAt) await repository.restore(existing.id);
+      return 'updated';
+    }
+
+    await repository.save(
+      repository.create({
+        ...payload,
+        employeeProfileId: input.employeeProfileId,
+        month: toMonthMarker(input.month),
+      }),
+    );
+    return 'inserted';
+  }
+
+  /**
+   * Payroll totals from the payslips actually linked to it (including rows of
+   * employees who have since left), recomputed with SQL SUM.
+   */
+  private async refreshMonthlyPayrollTotals(
+    manager: EntityManager,
+    payrollId: string,
+  ): Promise<{
+    estimatedPayment: number;
+    totalBonus: number;
+    totalPenalty: number;
+    totalPendingApproval: number;
+  }> {
+    const raw = await manager
+      .getRepository(EmployeeSalary)
+      .createQueryBuilder('salary')
+      .select('COALESCE(SUM(salary.netSalary), 0)', 'estimatedPayment')
+      .addSelect('COALESCE(SUM(salary.bonus), 0)', 'totalBonus')
+      .addSelect('COALESCE(SUM(salary.penalty), 0)', 'totalPenalty')
+      .where('salary.monthlyPayrollId = :payrollId', { payrollId })
+      .getRawOne<{
+        estimatedPayment: string;
+        totalBonus: string;
+        totalPenalty: string;
+      }>();
+    const totals = {
+      estimatedPayment: Number(raw?.estimatedPayment || 0),
+      totalBonus: Number(raw?.totalBonus || 0),
+      totalPenalty: Number(raw?.totalPenalty || 0),
+      totalPendingApproval: Number(raw?.estimatedPayment || 0),
+    };
+    await manager.getRepository(MonthlyPayroll).update(payrollId, totals);
+    return totals;
+  }
+
+  /**
+   * An employee's shift assignments whose slot work date is in the Vietnam
+   * month, bound as 'YYYY-MM-DD' strings so the window never depends on the
+   * server timezone.
+   */
+  private async loadMonthlyAssignments(
     employeeProfileId: string,
     storeId: string,
-    monthStart: Date,
-    monthEnd: Date,
-  ) {
-    // Get all shift assignments for this employee in this month
-    const assignments = await this.shiftAssignmentRepository
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<PayrollAssignmentFact[]> {
+    const repository = manager
+      ? manager.getRepository(ShiftAssignment)
+      : this.shiftAssignmentRepository;
+    const assignments = await repository
       .createQueryBuilder('sa')
       .leftJoinAndSelect('sa.shiftSlot', 'slot')
       .innerJoin('slot.cycle', 'cycle')
       .where('sa.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('cycle.storeId = :storeId', { storeId })
-      .andWhere('slot.workDate >= :monthStart', {
-        monthStart: monthStart.toISOString().slice(0, 10),
-      })
+      .andWhere('slot.workDate >= :monthStart', { monthStart: month.key })
       .andWhere('slot.workDate < :monthEnd', {
-        monthEnd: monthEnd.toISOString().slice(0, 10),
+        monthEnd: month.endExclusiveDate,
       })
       .getMany();
 
-    const totalAssignedShifts = assignments.length;
-    const completedShifts = assignments.filter(
-      (a) => a.status === ShiftAssignmentStatus.COMPLETED,
-    ).length;
-    const confirmedShifts = assignments.filter(
-      (a) => a.status === ShiftAssignmentStatus.CONFIRMED,
-    ).length;
+    // Approved leave for the month, read on the same manager as the
+    // attendance so both come from one snapshot under the payroll lock. A
+    // shift covered by it (full-day leave types, or a timed leave attached to
+    // that exact shift) is authorized leave and never counts as an absence.
+    const leaveRepository = manager
+      ? manager.getRepository(EmployeeLeaveRequest)
+      : this.leaveRequestRepository;
+    const approvedLeaves = assignments.length
+      ? ((await leaveRepository.find({
+          where: {
+            employeeProfileId,
+            status: LeaveRequestStatus.APPROVED,
+            startDate: LessThanOrEqual(month.lastDate),
+            endDate: MoreThanOrEqual(month.key),
+          },
+          take: 500,
+        })) ?? [])
+      : [];
 
-    const totalWorkedMinutes = assignments
-      .filter((a) => a.workedMinutes > 0)
-      .reduce((sum, a) => sum + a.workedMinutes, 0);
-
-    const lateCount = assignments.filter((a) => a.lateMinutes > 0).length;
-    const totalLateMinutes = assignments.reduce(
-      (sum, a) => sum + (a.lateMinutes || 0),
-      0,
-    );
-
-    const earlyCount = assignments.filter((a) => a.earlyMinutes > 0).length;
-    const totalEarlyMinutes = assignments.reduce(
-      (sum, a) => sum + (a.earlyMinutes || 0),
-      0,
-    );
-
-    // Absent = approved but never checked in (past shifts only)
-    const today = new Date().toISOString().slice(0, 10);
-    const absentCount = assignments.filter(
-      (a) =>
-        a.status === ShiftAssignmentStatus.APPROVED &&
-        !a.checkInTime &&
-        a.shiftSlot?.workDate < today,
-    ).length;
-
-    // SUM of real-time shift earnings (from checkout)
-    const totalShiftEarnings = assignments
-      .filter((a) => a.shiftEarnings != null)
-      .reduce((sum, a) => sum + Number(a.shiftEarnings), 0);
-    const hasShiftEarnings = assignments.some((a) => a.shiftEarnings != null);
-
-    return {
-      totalAssignedShifts,
-      completedShifts: completedShifts, // Only completed shifts count
-      workingHours: Math.round((totalWorkedMinutes / 60) * 100) / 100,
-      lateCount,
-      totalLateMinutes,
-      earlyCount,
-      totalEarlyMinutes,
-      absentCount,
-      totalShiftEarnings,
-      hasShiftEarnings,
-    };
+    return assignments.map((a) => {
+      const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+      return {
+        id: a.id,
+        workDate,
+        status: a.status,
+        attendanceStatus: a.attendanceStatus ?? null,
+        checkInTime: a.checkInTime ?? null,
+        workedMinutes: a.workedMinutes ?? null,
+        lateMinutes: a.lateMinutes ?? null,
+        earlyMinutes: a.earlyMinutes ?? null,
+        shiftEarnings: a.shiftEarnings ?? null,
+        leaveCovered:
+          workDate !== '' &&
+          approvedLeaves.some((leave) => leaveCoversShift(leave, workDate, a.id)),
+      };
+    });
   }
 
   /**
-   * Helper method to calculate base salary accurately based on PaymentType
+   * Standard working days for a store in a Vietnam month, from its configured
+   * weekly days off. Falls back to calendar days when the store has no shift
+   * config (never returns 0).
    */
-  /**
-   * Standard working days for a store in the month marked by `monthDate`
-   * (a local-time `new Date(y, m, 1)`), from its configured weekly days off.
-   * Falls back to calendar days when the store has no shift config.
-   */
-  private async getWorkingDaysInMonth(
+  private async getStandardWorkingDays(
     storeId: string,
-    monthDate: Date,
+    month: VnMonth,
+    manager?: EntityManager,
   ): Promise<number> {
-    const config = await this.shiftConfigRepository.findOne({
+    const repository = manager
+      ? manager.getRepository(StoreShiftConfig)
+      : this.shiftConfigRepository;
+    const config = await repository.findOne({
       where: { storeId },
       select: ['id', 'daysOff'],
     });
-    return countWorkingDaysForMonthDate(monthDate, config?.daysOff);
+    return countWorkingDaysInMonth(month.year, month.monthIndex, config?.daysOff);
   }
 
-  private calculateBaseSalary(
-    currentBaseSalary: number,
-    paymentType: PaymentType,
-    attendanceSummary: any,
-    payrollSetting: any,
-    now: Date,
-    /**
-     * Standard working days in the month, from the store's configured days
-     * off. Omitted falls back to calendar days, preserving prior behaviour
-     * for stores with no weekly schedule.
-     */
-    workingDaysInMonth?: number,
-  ): number {
-    if (attendanceSummary.hasShiftEarnings) {
-      return attendanceSummary.totalShiftEarnings;
-    }
+  /**
+   * The contract rate for a month: the latest SalaryAdjustment effective that
+   * month, else the contract's salary amount.
+   */
+  private async resolveRateForMonth(
+    employeeProfileId: string,
+    contract: EmployeeContract,
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<{ rate: number; adjustment: SalaryAdjustment | null }> {
+    const repository = manager
+      ? manager.getRepository(SalaryAdjustment)
+      : this.salaryAdjustmentRepository;
+    const adjustment = await repository.findOne({
+      where: { employeeProfileId, effectiveMonth: toMonthMarker(month) },
+      order: { createdAt: 'DESC' },
+    });
+    const rate = Number(adjustment ? adjustment.newSalary : contract.salaryAmount);
+    return { rate: Number.isFinite(rate) ? rate : 0, adjustment: adjustment ?? null };
+  }
 
-    if (
-      paymentType === PaymentType.HOUR ||
-      payrollSetting?.calculationMethod === PayrollCalculationMethod.HOUR
-    ) {
-      const standardHours = payrollSetting?.priorityCalcValue || 176;
-      return (
-        currentBaseSalary * (attendanceSummary.workingHours / standardHours)
-      );
-    }
-
-    if (
-      paymentType === PaymentType.SHIFT ||
-      payrollSetting?.calculationMethod === PayrollCalculationMethod.SHIFT ||
-      paymentType === PaymentType.DAY ||
-      payrollSetting?.calculationMethod === PayrollCalculationMethod.DAY
-    ) {
-      return currentBaseSalary * attendanceSummary.completedShifts;
-    }
-
-    // Default to PaymentType.MONTH logic.
-    // Prorated across the store's WORKING days. Using calendar days meant an
-    // employee who worked every scheduled shift still received only 71-84% of
-    // their contracted monthly salary.
-    const daysInMonth =
-      workingDaysInMonth && workingDaysInMonth > 0
-        ? workingDaysInMonth
-        : new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-
-    if (daysInMonth > 0 && attendanceSummary.completedShifts > 0) {
-      return (
-        currentBaseSalary * (attendanceSummary.completedShifts / daysInMonth)
-      );
-    }
-
-    return 0; // If they haven't completed any shifts, base salary earned is 0
+  /**
+   * The single payslip composer used by generation, recalculation, check-out
+   * and the live estimate. Read-only: it performs no writes.
+   */
+  private async computeEmployeePayslip(p: {
+    manager?: EntityManager;
+    employeeProfileId: string;
+    storeId: string;
+    month: VnMonth;
+    contract: EmployeeContract | null;
+    rate: number;
+    rules: StorePayrollRule[];
+    standardWorkingDays: number;
+    existingSalaryId?: string | null;
+    otherDeductions?: number | null;
+    now?: Date;
+  }): Promise<{
+    facts: MonthlyAttendanceFacts;
+    assignments: PayrollAssignmentFact[];
+    payslip: PayslipComputation;
+  }> {
+    const assignments = await this.loadMonthlyAssignments(
+      p.employeeProfileId,
+      p.storeId,
+      p.month,
+      p.manager,
+    );
+    const facts = summarizeMonthlyAttendance(
+      assignments,
+      vnDateString(p.now ?? new Date()),
+    );
+    const advancePayment = await this.sumApprovedAdvances(
+      p.existingSalaryId,
+      p.manager,
+    );
+    const payslip = computePayslip({
+      paymentType: p.contract?.paymentType ?? null,
+      rate: p.contract ? p.rate : 0,
+      allowances: p.contract?.allowances ?? null,
+      rules: p.contract ? p.rules : [],
+      facts,
+      standardWorkingDays: p.standardWorkingDays,
+      calendarDays: p.month.calendarDays,
+      advancePayment,
+      otherDeductions: Number(p.otherDeductions) || 0,
+    });
+    return { facts, assignments, payslip };
   }
 
   // --- Store Payroll Payment History ---
@@ -7794,11 +8351,7 @@ export class StoresService {
     const payment = this.paymentHistoryRepository.create({
       ...data,
       storeId,
-      month: new Date(
-        new Date(data.month).getFullYear(),
-        new Date(data.month).getMonth(),
-        1,
-      ), // Normalize to first of month
+      month: this.parsePayrollMonthMarker(data.month), // First of the VN month
       paymentDate: data.paymentDate ? new Date(data.paymentDate) : new Date(),
     });
     return this.paymentHistoryRepository.save(payment);
@@ -7841,16 +8394,9 @@ export class StoresService {
       storeId,
       ownerAccountId,
     );
-    let date: Date;
-    if (dateStr.includes('/')) {
-      const [month, year] = dateStr.split('/').map(Number);
-      date = new Date(year, month - 1, 1);
-    } else {
-      date = new Date(dateStr);
-    }
-
-    const currentMonth = new Date(date.getFullYear(), date.getMonth(), 1);
-    const prevMonth = new Date(date.getFullYear(), date.getMonth() - 1, 1);
+    const vnMonth = this.parsePayrollMonth(dateStr);
+    const currentMonth = toMonthMarker(vnMonth);
+    const prevMonth = toMonthMarker(shiftVnMonth(vnMonth, -1));
 
     // 1. Fetch current and previous payroll records
     const [currentPayroll, previousPayroll] = await Promise.all([
@@ -7947,14 +8493,7 @@ export class StoresService {
   }
 
   async getPayrollDetailsList(storeId: string, monthStr: string) {
-    let targetMonth: Date;
-    if (monthStr.includes('/')) {
-      const [m, y] = monthStr.split('/').map(Number);
-      targetMonth = new Date(y, m - 1, 1);
-    } else {
-      const parsed = new Date(monthStr);
-      targetMonth = new Date(parsed.getFullYear(), parsed.getMonth(), 1);
-    }
+    const targetMonth = this.parsePayrollMonthMarker(monthStr);
 
     const payroll = await this.payrollRepository.findOne({
       where: { storeId, month: targetMonth },
@@ -8055,14 +8594,7 @@ export class StoresService {
   async downloadPayrollReport(storeId: string, monthStr: string) {
     const workbook = new ExcelJS.Workbook();
 
-    let targetMonth: Date;
-    if (monthStr.includes('/')) {
-      const [m, y] = monthStr.split('/').map(Number);
-      targetMonth = new Date(y, m - 1, 1);
-    } else {
-      const parsed = new Date(monthStr);
-      targetMonth = new Date(parsed.getFullYear(), parsed.getMonth(), 1);
-    }
+    const targetMonth = this.parsePayrollMonthMarker(monthStr);
 
     const payroll = await this.payrollRepository.findOne({
       where: { storeId, month: targetMonth },
@@ -8140,14 +8672,7 @@ export class StoresService {
     if (!dateStr)
       throw new BadRequestException('Vui lòng cung cấp ngày tháng (date)');
 
-    let date: Date;
-    if (dateStr.includes('/')) {
-      const [month, year] = dateStr.split('/').map(Number);
-      date = new Date(year, month - 1, 1);
-    } else {
-      date = new Date(dateStr);
-    }
-    const month = new Date(date.getFullYear(), date.getMonth(), 1);
+    const month = this.parsePayrollMonthMarker(dateStr);
 
     let payroll = await this.payrollRepository.findOne({
       where: { storeId, month },
@@ -8192,14 +8717,7 @@ export class StoresService {
       `[getMonthlySalaryFund] owner=${ownerAccountId}, dateStr=${dateStr}`,
     );
 
-    let date: Date;
-    if (dateStr.includes('/')) {
-      const [month, year] = dateStr.split('/').map(Number);
-      date = new Date(year, month - 1, 1);
-    } else {
-      date = new Date(dateStr);
-    }
-    const month = new Date(date.getFullYear(), date.getMonth(), 1);
+    const month = this.parsePayrollMonthMarker(dateStr);
 
     // Lấy tất cả stores của owner
     const stores = await this.storeRepository.find({
@@ -8277,14 +8795,7 @@ export class StoresService {
       .orderBy('history.createdAt', 'DESC');
 
     if (dateStr) {
-      let date: Date;
-      if (dateStr.includes('/')) {
-        const [month, year] = dateStr.split('/').map(Number);
-        date = new Date(year, month - 1, 1);
-      } else {
-        date = new Date(dateStr);
-      }
-      const monthDate = new Date(date.getFullYear(), date.getMonth(), 1);
+      const monthDate = this.parsePayrollMonthMarker(dateStr);
       query.andWhere('history.month = :month', { month: monthDate });
     }
 
@@ -8296,20 +8807,25 @@ export class StoresService {
       where: { status: StoreStatus.ACTIVE },
     });
 
-    const now = date || new Date();
+    // Vietnam months: the cron fires at 00:10 VN on the 1st, which is still
+    // the previous day on a UTC host.
+    const currentMonth = vnMonthOf(date ?? new Date());
     // The previous month has just ended — run one reconciliation pass so any
     // shifts checked out late (or attendance corrected after month-end) are
-    // folded in. Safe: createMonthlyPayrollForStore now skips anyone already
-    // APPROVED/PAID, so this can never clobber a payment already made.
-    const prevMonthAnchor = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    // folded in. Safe: the rebuild never touches APPROVED/PAID payslips and
+    // never deletes, so this can never clobber a payment or an advance.
+    const previousMonth = shiftVnMonth(currentMonth, -1);
 
     const results: MonthlyPayroll[] = [];
     for (const store of stores) {
       try {
-        await this.createMonthlyPayrollForStore(store.id, prevMonthAnchor);
+        await this.rebuildStorePayrollForMonth(store.id, previousMonth);
         // Scaffold the new month so real-time check-out updates have a
         // MonthlyPayroll to attach to right away.
-        const payroll = await this.createMonthlyPayrollForStore(store.id, now);
+        const payroll = await this.rebuildStorePayrollForMonth(
+          store.id,
+          currentMonth,
+        );
         results.push(payroll);
       } catch (error) {
         console.error(
@@ -8323,8 +8839,8 @@ export class StoresService {
   }
 
   async createMonthlySummariesForAllEmployees(date?: Date) {
-    const targetMonth =
-      date || new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    // Vietnam month of the given instant (default now), as a month marker.
+    const targetMonth = toMonthMarker(vnMonthOf(date ?? new Date()));
 
     // Get all active employees across all stores
     const employees = await this.profileRepository.find({
@@ -8502,13 +9018,59 @@ export class StoresService {
     return repository.save(salary);
   }
 
+  /** Store of an employee profile, soft-deleted included (404 if none). */
+  private async profileStoreId(employeeProfileId: string): Promise<string> {
+    const profile =
+      typeof employeeProfileId === 'string' && isUUID(employeeProfileId)
+        ? await this.profileRepository.findOne({
+            where: { id: employeeProfileId },
+            select: ['id', 'storeId'],
+            withDeleted: true,
+          })
+        : null;
+    if (!profile?.storeId) {
+      throw new NotFoundException('Không tìm thấy hồ sơ nhân viên');
+    }
+    return profile.storeId;
+  }
+
+  /**
+   * `POST employee-salaries`: a manual payslip. Only whitelisted fields are
+   * written, and the payroll it joins must be in the employee's store (the
+   * guard proves the caller owns the employee's store).
+   */
+  async createEmployeeSalaryForStore(dto: CreateEmployeeSalaryDto) {
+    const storeId = await this.profileStoreId(dto.employeeProfileId);
+    const month = parseVnMonthInput(dto.month);
+    if (!month) throw new BadRequestException('Tháng lương không hợp lệ');
+    await this.assertRowsInStore(storeId, [
+      { repository: this.payrollRepository, id: dto.monthlyPayrollId, label: 'Bảng lương' },
+    ]);
+    try {
+      return await this.createEmployeeSalary({
+        ...(pickDefined(dto, EMPLOYEE_SALARY_CLIENT_FIELDS) as Partial<EmployeeSalary>),
+        employeeProfileId: dto.employeeProfileId,
+        month: toMonthMarker(month),
+      });
+    } catch (error: any) {
+      if (error?.code === '23505' || error?.driverError?.code === '23505') {
+        throw new ConflictException('Nhân viên đã có phiếu lương tháng này');
+      }
+      throw error;
+    }
+  }
+
   async getEmployeeSalaries(employeeProfileId: string, month?: string) {
     const where: any = { employeeProfileId };
+    let vnMonth: VnMonth | null = null;
     if (month) {
-      const [y, m] = month.split('-').map(Number);
-      where.month = new Date(y, m - 1, 1);
+      // Accepts 'YYYY-MM' and the staff app's 'MM/YYYY'. The old split('-')
+      // turned 'MM/YYYY' into an Invalid Date and a database error.
+      vnMonth = parseVnMonthInput(month);
+      if (!vnMonth) throw new BadRequestException('Tháng không hợp lệ');
+      where.month = toMonthMarker(vnMonth);
     }
-    return this.employeeSalaryRepository.find({
+    const rows = await this.employeeSalaryRepository.find({
       where,
       order: { month: 'DESC' },
       // The staff payslip screen renders the employee's name, position and
@@ -8522,6 +9084,128 @@ export class StoresService {
         'monthlyPayroll',
       ],
     });
+    if (!vnMonth) return rows;
+    // One month = at most one payslip: show it live, like the Home estimate.
+    const selectedMonth = vnMonth;
+    return Promise.all(
+      rows.map((row) => this.presentPayslipForMonth(row, selectedMonth)),
+    );
+  }
+
+  /**
+   * A payslip as the salary screen shows it for one month.
+   *
+   * - Not finalized (PENDING/REJECTED): the figures are recomputed live with
+   *   the same composer as the Home estimate and recalculation, so both
+   *   screens agree (for example an absence fine applied before the payslip
+   *   is next rewritten). Read-only: nothing is written; `isEstimate: true`.
+   * - APPROVED/PAID: the stored figures, `isEstimate: false`.
+   *
+   * `adjustmentBreakdown` lists the automatic bonus/fine lines; it is null
+   * when it cannot be shown to add up to the payslip's bonus and penalty.
+   */
+  private async presentPayslipForMonth(
+    row: EmployeeSalary,
+    month: VnMonth,
+  ): Promise<
+    EmployeeSalary & {
+      isEstimate: boolean;
+      adjustmentBreakdown: PayslipAdjustmentLine[] | null;
+    }
+  > {
+    const storeId = row.employeeProfile?.storeId;
+    if (!storeId) {
+      return { ...row, isEstimate: false, adjustmentBreakdown: null } as any;
+    }
+    const live = await this.composeLivePayslip(
+      row.employeeProfileId,
+      storeId,
+      month,
+      row,
+    );
+    if (this.isProtectedPayslip(row)) {
+      const lines = computeRuleAdjustmentBreakdown(
+        live.rules,
+        live.facts,
+        Number(row.earnedBaseSalary) || 0,
+      );
+      const sum = (kind: 'BONUS' | 'FINE') =>
+        lines
+          .filter((line) => line.kind === kind)
+          .reduce((total, line) => total + line.amount, 0);
+      const consistent =
+        sum('BONUS') === Math.round(Number(row.bonus) || 0) &&
+        sum('FINE') === Math.round(Number(row.penalty) || 0);
+      return Object.assign(row, {
+        isEstimate: false,
+        adjustmentBreakdown: consistent ? lines : null,
+      });
+    }
+    const payslip = live.payslip;
+    return Object.assign(row, {
+      baseSalary: payslip.baseSalary,
+      paymentType: payslip.paymentType,
+      earnedBaseSalary: payslip.earnedBaseSalary,
+      bonus: payslip.bonus,
+      penalty: payslip.penalty,
+      workingDays: payslip.workingDays,
+      workingHours: payslip.workingHours,
+      unauthorizedLeaveDays: payslip.unauthorizedLeaveDays,
+      advancePayment: payslip.advancePayment,
+      otherDeductions: payslip.otherDeductions,
+      totalIncome: payslip.totalIncome,
+      totalDeductions: payslip.totalDeductions,
+      netSalary: payslip.netSalary,
+      isEstimate: true,
+      adjustmentBreakdown: computeRuleAdjustmentBreakdown(
+        live.rules,
+        live.facts,
+        payslip.earnedBaseSalary,
+      ),
+    });
+  }
+
+  /**
+   * The live payslip for a month from the active contract and attendance —
+   * the one composer behind the Home estimate and the salary screen. Reads
+   * only.
+   */
+  private async composeLivePayslip(
+    employeeProfileId: string,
+    storeId: string,
+    month: VnMonth,
+    existing: Pick<EmployeeSalary, 'id' | 'otherDeductions'> | null,
+    standardWorkingDaysInput?: number,
+  ) {
+    const standardWorkingDays =
+      standardWorkingDaysInput ??
+      (await this.getStandardWorkingDays(storeId, month));
+    const profile = await this.profileRepository.findOne({
+      where: { id: employeeProfileId },
+      relations: ['contracts'],
+    });
+    const activeContract = profile?.contracts?.find((c) => c.isActive) ?? null;
+    const rate = activeContract
+      ? (await this.resolveRateForMonth(employeeProfileId, activeContract, month))
+          .rate
+      : 0;
+    const rules = activeContract
+      ? await this.payrollRuleRepository.find({
+          where: { storeId, isActive: true },
+        })
+      : [];
+    const { facts, payslip } = await this.computeEmployeePayslip({
+      employeeProfileId,
+      storeId,
+      month,
+      contract: activeContract,
+      rate,
+      rules,
+      standardWorkingDays,
+      existingSalaryId: existing?.id ?? null,
+      otherDeductions: existing?.otherDeductions,
+    });
+    return { facts, payslip, rules, standardWorkingDays };
   }
 
   async getEmployeeSalaryById(id: string) {
@@ -8550,75 +9234,60 @@ export class StoresService {
     earnedBaseSalary: number;
     completedShifts: number;
     workingHours: number;
+    daysWorked: number;
+    standardWorkingDays: number;
     isFinalized: boolean;
     month: string;
   }> {
-    const now = new Date();
-    let m: number, y: number;
-    if (monthStr && monthStr.includes('-')) {
-      [y, m] = monthStr.split('-').map(Number);
-    } else if (monthStr && monthStr.includes('/')) {
-      [m, y] = monthStr.split('/').map(Number);
-    } else {
-      m = now.getMonth() + 1;
-      y = now.getFullYear();
-    }
-    const monthStart = new Date(y, m - 1, 1);
-    const monthEnd = new Date(y, m, 1);
-    const monthLabel = `${y}-${String(m).padStart(2, '0')}`;
-
-    // Attendance for the month (worked shifts/hours/earnings).
-    const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
-      employeeProfileId,
+    const month = parseVnMonthInput(monthStr) ?? vnMonthOf();
+    const standardWorkingDays = await this.getStandardWorkingDays(
       storeId,
-      monthStart,
-      monthEnd,
+      month,
     );
 
-    // If payroll already finalized this month, prefer the stored value.
+    // Chỉ lấy số lưu khi phiếu lương đã chốt (duyệt / đã trả). Phiếu chờ duyệt
+    // được tạo ngay lúc nhận nhân viên với thực lãnh 0, nên trước đây Home hiện
+    // 0 hoặc số của lần check-out gần nhất thay vì số tạm tính hiện tại.
     const existing = await this.employeeSalaryRepository.findOne({
-      where: { employeeProfileId, month: monthStart },
+      where: { employeeProfileId, month: toMonthMarker(month) },
     });
-    if (existing) {
+    if (existing && this.isProtectedPayslip(existing)) {
+      const facts = summarizeMonthlyAttendance(
+        await this.loadMonthlyAssignments(employeeProfileId, storeId, month),
+        vnDateString(),
+      );
       return {
         estimatedSalary: Number(existing.netSalary) || 0,
         earnedBaseSalary: Number(existing.earnedBaseSalary) || 0,
-        completedShifts: attendanceSummary.completedShifts,
-        workingHours: attendanceSummary.workingHours,
+        completedShifts: facts.completedShifts,
+        workingHours: facts.workingHours,
+        daysWorked: facts.daysWorked,
+        standardWorkingDays,
         isFinalized: true,
-        month: monthLabel,
+        month: month.label,
       };
     }
 
-    // Otherwise compute a live estimate from the active contract.
-    const profile = await this.profileRepository.findOne({
-      where: { id: employeeProfileId },
-      relations: ['contracts'],
-    });
-    const activeContract = profile?.contracts?.find((c) => c.isActive);
-
-    let earnedBaseSalary = 0;
-    if (activeContract) {
-      const payrollSetting = await this.payrollSettingRepository.findOne({
-        where: { storeId },
-      });
-      earnedBaseSalary = this.calculateBaseSalary(
-        Number(activeContract.salaryAmount) || 0,
-        activeContract.paymentType || PaymentType.MONTH,
-        attendanceSummary,
-        payrollSetting,
-        monthStart,
-        await this.getWorkingDaysInMonth(storeId, monthStart),
-      );
-    }
+    // Otherwise the live estimate, from the same composer as the payslip so
+    // the Home card shows exactly what generating the payslip would store
+    // (and what the salary screen shows for a month not yet finalized).
+    const { facts, payslip } = await this.composeLivePayslip(
+      employeeProfileId,
+      storeId,
+      month,
+      existing ?? null,
+      standardWorkingDays,
+    );
 
     return {
-      estimatedSalary: Math.round(earnedBaseSalary),
-      earnedBaseSalary: Math.round(earnedBaseSalary),
-      completedShifts: attendanceSummary.completedShifts,
-      workingHours: attendanceSummary.workingHours,
+      estimatedSalary: payslip.netSalary,
+      earnedBaseSalary: payslip.earnedBaseSalary,
+      completedShifts: facts.completedShifts,
+      workingHours: facts.workingHours,
+      daysWorked: facts.daysWorked,
+      standardWorkingDays,
       isFinalized: false,
-      month: monthLabel,
+      month: month.label,
     };
   }
 
@@ -8627,14 +9296,7 @@ export class StoresService {
     monthStr: string,
     filterType?: string,
   ) {
-    let month: Date;
-    if (monthStr.includes('/')) {
-      const [m, y] = monthStr.split('/').map(Number);
-      month = new Date(y, m - 1, 1);
-    } else {
-      month = new Date(monthStr);
-    }
-    const targetMonth = new Date(month.getFullYear(), month.getMonth(), 1);
+    const targetMonth = this.parsePayrollMonthMarker(monthStr);
 
     // 1. Find the MonthlyPayroll for this store and month
     const payroll = await this.payrollRepository.findOne({
@@ -8698,8 +9360,24 @@ export class StoresService {
     };
   }
 
-  async updateEmployeeSalary(id: string, data: Partial<EmployeeSalary>) {
-    await this.employeeSalaryRepository.update(id, data);
+  async updateEmployeeSalary(id: string, data: UpdateEmployeeSalaryDto) {
+    const salary = await this.employeeSalaryRepository.findOne({
+      where: { id },
+      select: ['id', 'employeeProfileId'],
+    });
+    if (!salary) throw new NotFoundException('Không tìm thấy phiếu lương');
+    // A payslip may only join a payroll of its own employee's store.
+    const storeId = await this.profileStoreId(salary.employeeProfileId);
+    await this.assertRowsInStore(storeId, [
+      { repository: this.payrollRepository, id: data?.monthlyPayrollId, label: 'Bảng lương' },
+    ]);
+    const changes = pickDefined(
+      data,
+      EMPLOYEE_SALARY_CLIENT_FIELDS,
+    ) as Partial<EmployeeSalary>;
+    if (Object.keys(changes).length > 0) {
+      await this.employeeSalaryRepository.update(id, changes);
+    }
     return this.employeeSalaryRepository.findOne({
       where: { id },
       relations: ['employeeProfile', 'monthlyPayroll'],
@@ -8707,13 +9385,28 @@ export class StoresService {
   }
 
   async deleteEmployeeSalary(id: string) {
+    // Advances recorded against a payslip are money records; refuse rather
+    // than delete them with it (the FK is ON DELETE NO ACTION).
+    // Soft-deleted advance requests still hold the foreign key.
+    const advances = await this.salaryAdvanceRequestRepository.count({
+      where: { employeeSalaryId: id },
+      withDeleted: true,
+    });
+    if (advances > 0) {
+      throw new ConflictException(
+        'Không thể xoá phiếu lương đã có yêu cầu ứng lương',
+      );
+    }
     await this.employeeSalaryRepository.delete(id);
     return { message: 'Employee salary deleted successfully' };
   }
 
   // KPI Type management
   async createKpiType(storeId: string, data: Partial<KpiType>) {
-    const type = this.kpiTypeRepository.create({ ...data, storeId });
+    const type = this.kpiTypeRepository.create({
+      ...(pickDefined(data, KPI_TYPE_CLIENT_FIELDS) as Partial<KpiType>),
+      storeId,
+    });
     return this.kpiTypeRepository.save(type);
   }
 
@@ -8723,7 +9416,10 @@ export class StoresService {
 
   // KPI Unit management
   async createKpiUnit(storeId: string, data: Partial<KpiUnit>) {
-    const unit = this.kpiUnitRepository.create({ ...data, storeId });
+    const unit = this.kpiUnitRepository.create({
+      ...(pickDefined(data, KPI_UNIT_CLIENT_FIELDS) as Partial<KpiUnit>),
+      storeId,
+    });
     return this.kpiUnitRepository.save(unit);
   }
 
@@ -8733,7 +9429,10 @@ export class StoresService {
 
   // KPI Period management
   async createKpiPeriod(storeId: string, data: Partial<KpiPeriod>) {
-    const period = this.kpiPeriodRepository.create({ ...data, storeId });
+    const period = this.kpiPeriodRepository.create({
+      ...(pickDefined(data, KPI_PERIOD_CLIENT_FIELDS) as Partial<KpiPeriod>),
+      storeId,
+    });
     return this.kpiPeriodRepository.save(period);
   }
 
@@ -8743,9 +9442,47 @@ export class StoresService {
     });
   }
 
+  /**
+   * Task fields a client may set, from an explicit list. The task's store is
+   * `storeId`, else the first of the released owner app's `storeIds`, and
+   * must be one of the KPI's stores (else the KPI's first store).
+   */
+  private buildKpiTaskFields(
+    taskData: any,
+    kpiStoreIds: string[],
+  ): Partial<KpiTask> {
+    const fields: Partial<KpiTask> = {};
+    for (const field of KPI_TASK_CLIENT_FIELDS) {
+      if (taskData?.[field] !== undefined) {
+        (fields as Record<string, unknown>)[field] = taskData[field];
+      }
+    }
+    const requested =
+      (typeof taskData?.storeId === 'string' && taskData.storeId) ||
+      (Array.isArray(taskData?.storeIds) ? taskData.storeIds[0] : undefined) ||
+      kpiStoreIds[0] ||
+      null;
+    fields.storeId = (
+      requested && kpiStoreIds.includes(requested)
+        ? requested
+        : (kpiStoreIds[0] ?? null)
+    ) as string;
+    fields.completionRate = kpiCompletionRate(fields.actualValue, fields.target);
+    return fields;
+  }
+
+  /** KPI units, periods and types must come from one of the KPI's stores. */
+  private kpiTaskReferences(task: Partial<KpiTask>) {
+    return [
+      { repository: this.kpiUnitRepository, id: task.kpiUnitId, label: 'Đơn vị đo lường' },
+      { repository: this.kpiPeriodRepository, id: task.kpiPeriodId, label: 'Kỳ đo lường' },
+      { repository: this.kpiTypeRepository, id: task.kpiTypeId, label: 'Loại KPI' },
+    ];
+  }
+
   // Employee KPI Management
-  async createEmployeeKpi(data: any) {
-    const { tasks, ...kpiData } = data;
+  async createEmployeeKpi(data: any, accountId?: string) {
+    const { tasks, ...kpiData } = data ?? {};
     // Alias kpiName → name (support both field names from frontend/test)
     if (!kpiData.name && kpiData.kpiName) {
       kpiData.name = kpiData.kpiName;
@@ -8756,24 +9493,57 @@ export class StoresService {
       kpiData.storeIds = [kpiData.storeId];
     }
 
-    const kpi = this.employeeKpiRepository.create(
-      kpiData as Partial<EmployeeKpi>,
+    // The owner of the rated employee's store, or the employee rating
+    // themself; every store the KPI applies to must be one the caller
+    // belongs to.
+    const actor = await this.resolveKpiActor(
+      kpiData.employeeProfileId,
+      accountId,
+      'Không tìm thấy hồ sơ nhân viên',
     );
+    const profileStoreId = actor.storeId;
+    if (!actor.isOwner) {
+      // A self-authored KPI always starts as a draft for the owner to
+      // approve; the client's status is ignored.
+      kpiData.status = KpiStatus.DRAFT;
+    }
+    if (!Array.isArray(kpiData.storeIds) || kpiData.storeIds.length === 0) {
+      kpiData.storeIds = [profileStoreId];
+    }
+    const accessible = new Set(
+      await this.getAccessibleStoreIds(accountId as string),
+    );
+    for (const storeId of kpiData.storeIds) {
+      if (typeof storeId !== 'string' || !accessible.has(storeId)) {
+        throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+      }
+    }
+    const kpiStoreIds: string[] = [...new Set<string>(kpiData.storeIds)];
+    const referenceStores = [...new Set([...kpiStoreIds, profileStoreId])];
+
+    const taskRows = Array.isArray(tasks)
+      ? tasks.map((taskData) => this.buildKpiTaskFields(taskData, kpiStoreIds))
+      : [];
+    for (const task of taskRows) {
+      await this.assertRowsInStore(referenceStores, this.kpiTaskReferences(task));
+    }
+
+    // Explicit fields only: no `id`, no relation objects.
+    const kpiFields: Partial<EmployeeKpi> = { storeIds: kpiStoreIds };
+    for (const field of EMPLOYEE_KPI_CLIENT_FIELDS) {
+      if (kpiData[field] !== undefined) {
+        (kpiFields as Record<string, unknown>)[field] = kpiData[field];
+      }
+    }
+    const kpi = this.employeeKpiRepository.create(kpiFields);
     const savedKpi = await this.employeeKpiRepository.save(kpi);
 
-    if (tasks && Array.isArray(tasks)) {
-      for (const taskData of tasks) {
-        let completionRate = 0;
-        if (taskData.target > 0 && taskData.actualValue !== undefined) {
-          completionRate = (taskData.actualValue / taskData.target) * 100;
-        }
-        const task = this.kpiTaskRepository.create({
-          ...taskData,
-          employeeKpiId: savedKpi.id,
-          completionRate,
-        });
-        await this.kpiTaskRepository.save(task);
-      }
+    for (const taskFields of taskRows) {
+      const task = this.kpiTaskRepository.create({
+        ...taskFields,
+        employeeKpiId: savedKpi.id,
+      });
+      await this.kpiTaskRepository.save(task);
     }
 
     const kpiWithRelations = await this.employeeKpiRepository.findOne({
@@ -8969,22 +9739,62 @@ export class StoresService {
   }
 
   // KPI Task Management
-  async createKpiTask(data: Partial<KpiTask>) {
-    // Tự động tính tỷ lệ hoàn thành
-    if (data.target && data.actualValue !== undefined) {
-      data.completionRate = (data.actualValue / data.target) * 100;
-    }
-    const task = this.kpiTaskRepository.create(data);
+  async createKpiTask(data: any, accountId?: string) {
+    const kpi =
+      typeof data?.employeeKpiId === 'string' && isUUID(data.employeeKpiId)
+        ? await this.employeeKpiRepository.findOne({
+            where: { id: data.employeeKpiId },
+            select: ['id', 'employeeProfileId', 'storeIds', 'status'],
+          })
+        : null;
+    if (!kpi) throw new NotFoundException('Không tìm thấy bảng KPI');
+    // The owner, or the KPI's own employee while it is still a draft.
+    const { storeId } = await this.assertKpiWriteAccess(kpi, accountId, {
+      draftOnly: true,
+    });
+
+    const kpiStoreIds = kpi.storeIds?.length ? kpi.storeIds : [storeId];
+    const fields = this.buildKpiTaskFields(data, kpiStoreIds);
+    await this.assertRowsInStore(
+      [...new Set([...kpiStoreIds, storeId])],
+      this.kpiTaskReferences(fields),
+    );
+    // Tự động tính tỷ lệ hoàn thành (buildKpiTaskFields, clamped)
+    const task = this.kpiTaskRepository.create({
+      ...fields,
+      employeeKpiId: kpi.id,
+    });
     return this.kpiTaskRepository.save(task);
   }
 
-  async updateKpiTaskProgress(id: string, actualValue: number) {
+  async updateKpiTaskProgress(
+    id: string,
+    actualValue: number,
+    accountId?: string,
+  ) {
     const task = await this.kpiTaskRepository.findOne({ where: { id } });
     if (!task) throw new NotFoundException('Không tìm thấy nhiệm vụ KPI');
+    // The owner, or the KPI's own employee self-reporting progress — but not
+    // on a KPI the owner has already closed (completed or cancelled): only
+    // completed KPIs count toward the career ladder.
+    const kpi = await this.findKpiForTask(task);
+    const actor = await this.assertKpiWriteAccess(kpi, accountId, {
+      draftOnly: false,
+    });
+    if (
+      !actor.isOwner &&
+      (kpi.status === KpiStatus.COMPLETED || kpi.status === KpiStatus.CANCELLED)
+    ) {
+      throw new ForbiddenException({
+        code: KPI_CLOSED,
+        message: 'Bảng KPI đã đóng, không thể cập nhật tiến độ',
+      });
+    }
 
     task.actualValue = actualValue;
     if (task.target > 0) {
-      task.completionRate = (actualValue / task.target) * 100;
+      // Clamped: completion_rate is decimal(5,2) and overflowed above 999.99.
+      task.completionRate = kpiCompletionRate(actualValue, task.target);
     }
     return this.kpiTaskRepository.save(task);
   }
@@ -9008,27 +9818,35 @@ export class StoresService {
     });
   }
 
-  async deleteKpiTask(id: string) {
+  async deleteKpiTask(id: string, accountId?: string) {
     const task = await this.kpiTaskRepository.findOne({ where: { id } });
     if (!task) throw new NotFoundException('Không tìm thấy nhiệm vụ');
+    await this.assertKpiWriteAccess(await this.findKpiForTask(task), accountId, {
+      draftOnly: true,
+    });
     await this.kpiTaskRepository.delete(id);
     return { message: 'Xóa nhiệm vụ thành công' };
   }
 
-  async hideKpiTask(id: string) {
+  async hideKpiTask(id: string, accountId?: string) {
     const task = await this.kpiTaskRepository.findOne({ where: { id } });
     if (!task) throw new NotFoundException('Không tìm thấy nhiệm vụ');
+    await this.assertKpiWriteAccess(await this.findKpiForTask(task), accountId, {
+      draftOnly: true,
+    });
     task.isHidden = true;
     return this.kpiTaskRepository.save(task);
   }
 
-  async duplicateEmployeeKpi(id: string) {
+  async duplicateEmployeeKpi(id: string, accountId?: string) {
     const sourceKpi = await this.employeeKpiRepository.findOne({
       where: { id },
       relations: ['tasks'],
     });
 
     if (!sourceKpi) throw new NotFoundException('Không tìm thấy bảng KPI gốc');
+    // The owner, or the KPI's own employee while the source is a draft.
+    await this.assertKpiWriteAccess(sourceKpi, accountId, { draftOnly: true });
 
     // 1. Tạo bản sao bảng KPI
     const duplicatedKpi = this.employeeKpiRepository.create({
@@ -9061,29 +9879,207 @@ export class StoresService {
 
   // --- KPI Approval Request Management ---
 
-  async createKpiApprovalRequest(data: {
-    employeeProfileId: string;
-    employeeKpiId: string;
-    note?: string;
-  }) {
-    // Kiểm tra xem yêu cầu đã tồn tại chưa
-    const existing = await this.kpiApprovalRequestRepository.findOne({
-      where: {
-        employeeKpiId: data.employeeKpiId,
-        status: KpiRequestStatus.PENDING,
-      },
-    });
-    if (existing) throw new BadRequestException('Yêu cầu này đang chờ duyệt');
-
-    const request = this.kpiApprovalRequestRepository.create({
-      ...data,
-      status: KpiRequestStatus.PENDING,
-    });
-
-    return this.kpiApprovalRequestRepository.save(request);
+  /**
+   * The store a KPI belongs to: that of the employee it rates. Soft-deleted
+   * profiles still resolve, as in `StoreResourceLocator`.
+   */
+  private async kpiStoreId(employeeProfileId: string): Promise<string> {
+    const profile = employeeProfileId
+      ? await this.profileRepository.findOne({
+          where: { id: employeeProfileId },
+          select: ['id', 'storeId'],
+          withDeleted: true,
+        })
+      : null;
+    if (!profile?.storeId) {
+      throw new NotFoundException('Không tìm thấy bảng KPI');
+    }
+    return profile.storeId;
   }
 
-  async getKpiApprovalRequests(storeId?: string, month?: string) {
+  /**
+   * Who is changing an employee's KPI: the owner of the employee's store, or
+   * the employee themself (their own profile, still employed). Anyone else —
+   * including other members of the store — is refused (403).
+   */
+  private async resolveKpiActor(
+    employeeProfileId: string,
+    accountId: string | undefined,
+    notFoundMessage = 'Không tìm thấy bảng KPI',
+  ): Promise<{ storeId: string; isOwner: boolean }> {
+    if (!accountId) {
+      throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+    }
+    const profile =
+      typeof employeeProfileId === 'string' && isUUID(employeeProfileId)
+        ? await this.profileRepository.findOne({
+            where: { id: employeeProfileId },
+            select: ['id', 'storeId', 'accountId', 'employmentStatus', 'deletedAt'],
+            withDeleted: true,
+          })
+        : null;
+    if (!profile?.storeId) throw new NotFoundException(notFoundMessage);
+    const store = await this.storeRepository.findOne({
+      where: { id: profile.storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+    if (store.ownerAccountId === accountId) {
+      return { storeId: store.id, isOwner: true };
+    }
+    if (
+      profile.accountId === accountId &&
+      !profile.deletedAt &&
+      isEmployedStatus(profile.employmentStatus)
+    ) {
+      return { storeId: store.id, isOwner: false };
+    }
+    throw new ForbiddenException({
+      code: KPI_SELF_OR_OWNER_REQUIRED,
+      message: 'Bạn chỉ có thể thao tác trên KPI của chính mình',
+    });
+  }
+
+  /**
+   * Write access to an existing KPI (or its tasks): the store owner always;
+   * the KPI's own employee, and with `draftOnly` only while it is 'Nháp'.
+   */
+  private async assertKpiWriteAccess(
+    kpi: Pick<EmployeeKpi, 'employeeProfileId' | 'status'>,
+    accountId: string | undefined,
+    { draftOnly }: { draftOnly: boolean },
+  ): Promise<{ storeId: string; isOwner: boolean }> {
+    const actor = await this.resolveKpiActor(kpi.employeeProfileId, accountId);
+    if (!actor.isOwner && draftOnly && kpi.status !== KpiStatus.DRAFT) {
+      throw new ForbiddenException({
+        code: KPI_NOT_DRAFT,
+        message: 'Chỉ có thể chỉnh sửa bảng KPI khi còn ở trạng thái Nháp',
+      });
+    }
+    return actor;
+  }
+
+  /** The KPI a task belongs to (404 when it is gone). */
+  private async findKpiForTask(
+    task: Pick<KpiTask, 'employeeKpiId'>,
+  ): Promise<Pick<EmployeeKpi, 'id' | 'employeeProfileId' | 'status'>> {
+    const kpi = task.employeeKpiId
+      ? await this.employeeKpiRepository.findOne({
+          where: { id: task.employeeKpiId },
+          select: ['id', 'employeeProfileId', 'status'],
+        })
+      : null;
+    if (!kpi) throw new NotFoundException('Không tìm thấy bảng KPI');
+    return kpi;
+  }
+
+  async createKpiApprovalRequest(
+    data: {
+      employeeProfileId?: string;
+      employeeKpiId: string;
+      note?: string;
+    },
+    accountId?: string,
+  ) {
+    const kpi = data?.employeeKpiId
+      ? await this.employeeKpiRepository.findOne({
+          where: { id: data.employeeKpiId },
+          select: ['id', 'employeeProfileId'],
+        })
+      : null;
+    if (!kpi) throw new NotFoundException('Không tìm thấy bảng KPI');
+    // Members of the KPI's store only; the rated employee comes from the KPI
+    // itself (released staff builds omit it, which failed the NOT NULL).
+    await this.resolveStoreViewer(
+      await this.kpiStoreId(kpi.employeeProfileId),
+      accountId,
+    );
+
+    // Idempotent: a KPI has at most one pending request. The KPI row lock
+    // serializes concurrent submissions, so the second one sees the first
+    // and gets it back instead of inserting a duplicate.
+    return this.dataSource.transaction(async (manager) => {
+      const locked = await manager.getRepository(EmployeeKpi).findOne({
+        where: { id: kpi.id },
+        select: ['id'],
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!locked) throw new NotFoundException('Không tìm thấy bảng KPI');
+
+      const requests = manager.getRepository(KpiApprovalRequest);
+      const existing = await requests.findOne({
+        where: {
+          employeeKpiId: kpi.id,
+          status: KpiRequestStatus.PENDING,
+        },
+      });
+      if (existing) return existing;
+
+      const request = requests.create({
+        employeeProfileId: kpi.employeeProfileId,
+        employeeKpiId: kpi.id,
+        note: data.note ?? null,
+        status: KpiRequestStatus.PENDING,
+      });
+      return requests.save(request);
+    });
+  }
+
+  async getKpiApprovalRequests(
+    storeId: string | undefined,
+    month: string | undefined,
+    accountId: string | undefined,
+  ) {
+    let scope: (query: SelectQueryBuilder<KpiApprovalRequest>) => void;
+    if (storeId) {
+      const viewer = await this.resolveStoreViewer(storeId, accountId);
+      // A KPI belongs to the store of the employee it rates (the same hop the
+      // route guards use), not to whatever `store_ids` its author listed.
+      scope = (query) => {
+        query.andWhere('profile.store_id = :storeId', { storeId });
+        if (!viewer.isOwner) {
+          query.andWhere('kpi.employee_profile_id = :viewerProfileId', {
+            viewerProfileId: viewer.profileId,
+          });
+        }
+      };
+    } else {
+      // No store named (released apps): the stores the caller owns, plus the
+      // caller's own KPIs where they are employed — never every tenant.
+      if (!accountId) {
+        throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+      }
+      const [owned, ownProfiles] = await Promise.all([
+        this.storeRepository.find({
+          where: { ownerAccountId: accountId },
+          select: ['id'],
+        }),
+        this.profileRepository.find({
+          where: { accountId, employmentStatus: In([...EMPLOYED_STATUSES]) },
+          select: ['id'],
+        }),
+      ]);
+      const ownedStoreIds = owned.map((store) => store.id);
+      const ownProfileIds = ownProfiles.map((profile) => profile.id);
+      if (ownedStoreIds.length === 0 && ownProfileIds.length === 0) return [];
+      scope = (query) => {
+        query.andWhere(
+          new Brackets((where) => {
+            if (ownedStoreIds.length > 0) {
+              where.orWhere('profile.store_id IN (:...ownedStoreIds)', {
+                ownedStoreIds,
+              });
+            }
+            if (ownProfileIds.length > 0) {
+              where.orWhere('kpi.employee_profile_id IN (:...ownProfileIds)', {
+                ownProfileIds,
+              });
+            }
+          }),
+        );
+      };
+    }
+
     const query = this.kpiApprovalRequestRepository
       .createQueryBuilder('request')
       .leftJoinAndSelect('request.employeeProfile', 'req_profile')
@@ -9100,9 +10096,7 @@ export class StoresService {
       .leftJoinAndSelect('tasks.store', 'taskStore')
       .orderBy('request.created_at', 'DESC');
 
-    if (storeId) {
-      query.andWhere(':storeId = ANY(kpi.store_ids)', { storeId });
-    }
+    scope(query);
 
     if (month) {
       query.andWhere("to_char(kpi.month, 'YYYY-MM') = :month", { month });
@@ -9132,40 +10126,74 @@ export class StoresService {
 
   async handleKpiApprovalRequest(
     id: string,
-    reviewerId: string,
+    reviewerAccountId: string,
     data: { status: KpiRequestStatus; note?: string },
   ) {
+    const status = data?.status;
+    if (
+      status !== KpiRequestStatus.APPROVED &&
+      status !== KpiRequestStatus.REJECTED
+    ) {
+      throw new BadRequestException('Trạng thái duyệt không hợp lệ');
+    }
+
     const request = await this.kpiApprovalRequestRepository.findOne({
       where: { id },
       relations: ['employeeKpi'],
     });
-
-    if (!request)
+    if (!request || !request.employeeKpi) {
       throw new NotFoundException('Không tìm thấy yêu cầu duyệt KPI');
+    }
+
+    // Only the owner of the KPI's store decides; a member approving their
+    // own KPI was possible before.
+    const storeId = await this.kpiStoreId(request.employeeKpi.employeeProfileId);
+    await this.assertOwnerStoreAccess(storeId, reviewerAccountId);
     if (request.status !== KpiRequestStatus.PENDING) {
       throw new BadRequestException('Yêu cầu này đã được xử lý');
     }
 
-    request.status = data.status;
-    request.reviewerId = reviewerId;
-    request.note = data.note ?? null;
+    // `reviewer_id` references employee_profiles: the owner's own profile in
+    // that store, or none. An account id here broke the foreign key.
+    const reviewerProfile = await this.profileRepository.findOne({
+      where: { accountId: reviewerAccountId, storeId },
+      select: ['id'],
+    });
+    const reviewerId = reviewerProfile?.id ?? null;
+    const note = data.note ?? null;
 
-    if (data.status === KpiRequestStatus.APPROVED) {
-      // Nếu chấp thuận, kích hoạt bảng KPI
-      await this.employeeKpiRepository.update(request.employeeKpiId, {
-        status: KpiStatus.ACTIVE,
+    return this.dataSource.transaction(async (manager) => {
+      // Conditional on PENDING so two concurrent decisions cannot both apply.
+      const result = await manager
+        .getRepository(KpiApprovalRequest)
+        .update(
+          { id, status: KpiRequestStatus.PENDING },
+          { status, reviewerId: reviewerId as string, note },
+        );
+      if (!result.affected) {
+        throw new BadRequestException('Yêu cầu này đã được xử lý');
+      }
+      await manager.getRepository(EmployeeKpi).update(request.employeeKpiId, {
+        // Chấp thuận -> kích hoạt bảng KPI; Từ chối -> đưa về Nháp.
+        status:
+          status === KpiRequestStatus.APPROVED
+            ? KpiStatus.ACTIVE
+            : KpiStatus.DRAFT,
       });
-    } else if (data.status === KpiRequestStatus.REJECTED) {
-      // Nếu từ chối, đưa về Nháp
-      await this.employeeKpiRepository.update(request.employeeKpiId, {
-        status: KpiStatus.DRAFT,
-      });
-    }
-
-    return this.kpiApprovalRequestRepository.save(request);
+      return manager
+        .getRepository(KpiApprovalRequest)
+        .findOne({ where: { id } });
+    });
   }
 
-  async deleteEmployeeKpi(id: string) {
+  async deleteEmployeeKpi(id: string, accountId?: string) {
+    const kpi = await this.employeeKpiRepository.findOne({
+      where: { id },
+      select: ['id', 'employeeProfileId', 'status'],
+    });
+    if (!kpi) throw new NotFoundException('Không tìm thấy bảng KPI');
+    // The owner, or the KPI's own employee while it is still a draft.
+    await this.assertKpiWriteAccess(kpi, accountId, { draftOnly: true });
     return this.employeeKpiRepository.softDelete(id);
   }
 
@@ -9191,9 +10219,17 @@ export class StoresService {
     return this.dailyReportRepository.save(report);
   }
 
-  async createDailyReportForStore(storeId: string, date?: Date) {
-    const reportDate = date || new Date();
-    reportDate.setHours(0, 0, 0, 0); // Reset time to midnight
+  /**
+   * @param reportDateStr Vietnam calendar date 'YYYY-MM-DD'; defaults to
+   * today in Vietnam. The old `setHours(0,0,0,0)` used the server clock (on a
+   * UTC host the 00:05 VN cron created yesterday's report) and mutated the
+   * caller's Date.
+   */
+  async createDailyReportForStore(storeId: string, reportDateStr?: string) {
+    const reportDate = toDateMarker(reportDateStr ?? vnDateString());
+    if (Number.isNaN(reportDate.getTime())) {
+      throw new BadRequestException('Ngày báo cáo không hợp lệ');
+    }
 
     // Check if report already exists for this date
     const existing = await this.dailyReportRepository.findOne({
@@ -9309,18 +10345,23 @@ export class StoresService {
   }
 
   /**
-   * Cron cuối ngày: phát hiện quên check-out + nghỉ không phép.
-   * Scan tất cả shift assignments hôm nay cho tất cả stores active.
+   * Cron cuối ngày: ghi báo cáo ngày từ trạng thái chấm công đã chốt.
+   * Không tự phân loại lại: quên chấm công ra = FORGOT_CHECKOUT (tự kết thúc
+   * ca lúc hết ca + 15 phút), nghỉ không phép = ABSENT (ghi ngay khi hết ca,
+   * cron mỗi phút), nghỉ có phép = ca chưa check-in có đơn nghỉ cả ngày đã
+   * duyệt. Chỉ ghi vào báo cáo, không đổi trạng thái ca.
    */
   async detectEndOfDayAttendanceIssues(): Promise<{
     forgotCount: number;
     unauthorizedCount: number;
+    authorizedCount?: number;
   }> {
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0]; // 'YYYY-MM-DD'
+    const now = new Date();
+    const todayStr = vnDateString(now); // Vietnam 'YYYY-MM-DD'
 
     let forgotCount = 0;
     let unauthorizedCount = 0;
+    let authorizedCount = 0;
 
     const stores = await this.storeRepository.find({
       where: { status: StoreStatus.ACTIVE },
@@ -9354,41 +10395,64 @@ export class StoresService {
 
       for (const assignment of assignments) {
         const slot = slots.find((s) => s.id === assignment.shiftSlotId);
-        if (!slot?.workShift?.endTime) continue;
+        if (!slot) continue;
 
-        // Check xem ca đã kết thúc chưa
-        const [endH, endM] = slot.workShift.endTime.split(':').map(Number);
-        const shiftEnd = new Date();
-        shiftEnd.setHours(endH, endM, 0, 0);
+        // Check xem ca đã kết thúc chưa — mốc kết thúc tuyệt đối theo giờ
+        // Việt Nam trên work_date của ca (ca qua đêm kết thúc ngày hôm sau).
+        // `setHours` trên đồng hồ máy chủ bỏ sót mọi ca kết thúc sau 16:30 VN
+        // khi máy chủ chạy UTC.
+        const { end: shiftEnd } = resolveShiftBoundaries(
+          slot.workDate,
+          slot.startTime ?? slot.workShift?.startTime,
+          slot.endTime ?? slot.workShift?.endTime,
+        );
+        if (!shiftEnd || now < shiftEnd) continue; // Ca chưa kết thúc, bỏ qua
 
-        if (new Date() < shiftEnd) continue; // Ca chưa kết thúc, bỏ qua
-
-        // Case 1: Quên check-out — đã check-in nhưng chưa check-out sau khi ca kết thúc
-        if (assignment.checkInTime && !assignment.checkOutTime) {
+        // Quên chấm công ra: ca đã được hệ thống tự kết thúc.
+        if (assignment.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT) {
           await this.appendToDailyReport(
             store.id,
             'forgotClockOut',
             assignment.employeeId,
           );
           forgotCount++;
+          continue;
         }
 
-        // Case 2: Nghỉ không phép — được approved nhưng không check-in sau khi ca kết thúc
-        if (
-          assignment.status === ShiftAssignmentStatus.APPROVED &&
-          !assignment.checkInTime
-        ) {
+        // Nghỉ không phép: đã ghi ABSENT lúc hết ca.
+        if (assignment.attendanceStatus === AttendanceStatus.ABSENT) {
           await this.appendToDailyReport(
             store.id,
             'unauthorizedLeaves',
             assignment.employeeId,
           );
           unauthorizedCount++;
+          continue;
+        }
+
+        // Nghỉ có phép: chưa check-in, có đơn nghỉ cả ngày đã duyệt.
+        if (
+          assignment.status === ShiftAssignmentStatus.APPROVED &&
+          !assignment.checkInTime &&
+          !assignment.attendanceStatus &&
+          (await isShiftCoveredByApprovedLeave(
+            this.dataSource,
+            assignment.employeeId,
+            String(slot.workDate).slice(0, 10),
+            assignment.id,
+          ))
+        ) {
+          await this.appendToDailyReport(
+            store.id,
+            'authorizedLeaves',
+            assignment.employeeId,
+          );
+          authorizedCount++;
         }
       }
     }
 
-    return { forgotCount, unauthorizedCount };
+    return { forgotCount, unauthorizedCount, authorizedCount };
   }
 
   async getDailyReports(storeId: string) {
@@ -9411,9 +10475,7 @@ export class StoresService {
   async getDailyReportByDate(storeId: string, date: string | Date) {
     // Chuyển về format YYYY-MM-DD để query chính xác trong Postgres DATE column
     const dateString =
-      typeof date === 'string'
-        ? date.split('T')[0]
-        : date.toISOString().split('T')[0];
+      typeof date === 'string' ? date.split('T')[0] : vnDateString(date);
 
     const report = await this.dailyReportRepository
       .createQueryBuilder('report')
@@ -9470,9 +10532,16 @@ export class StoresService {
   }
 
   private async getFinancialDataForReport(report: DailyEmployeeReport) {
-    // Đảm bảo reportDate là đối tượng Date
-    const rDate = new Date(report.reportDate);
-    const month = new Date(rDate.getFullYear(), rDate.getMonth(), 1);
+    // report_date là cột `date`: TypeORM trả về chuỗi 'YYYY-MM-DD'; một Date
+    // (nếu có) là mốc nửa đêm giờ máy chủ, nên đọc theo giờ địa phương.
+    const rawDate: unknown = report.reportDate;
+    const reportDateStr =
+      rawDate instanceof Date
+        ? `${rawDate.getFullYear()}-${String(rawDate.getMonth() + 1).padStart(2, '0')}-${String(rawDate.getDate()).padStart(2, '0')}`
+        : String(rawDate ?? '');
+    const reportMonth = vnMonthOfDateString(reportDateStr);
+    if (!reportMonth) return report;
+    const month = toMonthMarker(reportMonth);
 
     const store = await this.storeRepository.findOne({
       where: { id: report.storeId },
@@ -9524,7 +10593,8 @@ export class StoresService {
     return this.dailyReportRepository.findOne({ where: { id } });
   }
 
-  async createDailyReportsForAllStores(date?: Date) {
+  /** @param date Vietnam calendar date 'YYYY-MM-DD'; defaults to today in Vietnam. */
+  async createDailyReportsForAllStores(date?: string) {
     const stores = await this.storeRepository.find({
       where: { status: StoreStatus.ACTIVE },
     });
@@ -9552,7 +10622,10 @@ export class StoresService {
 
   // Store Event management
   async createEvent(storeId: string, data: Partial<StoreEvent>) {
-    const event = this.eventRepository.create({ ...data, storeId });
+    const event = this.eventRepository.create({
+      ...this.creatableRow(this.eventRepository, data),
+      storeId,
+    });
     return this.eventRepository.save(event);
   }
 
@@ -9614,7 +10687,10 @@ export class StoresService {
 
   // Asset Category management
   async createAssetCategory(storeId: string, data: Partial<AssetCategory>) {
-    const category = this.assetCategoryRepository.create({ ...data, storeId });
+    const category = this.assetCategoryRepository.create({
+      ...this.creatableRow(this.assetCategoryRepository, data),
+      storeId,
+    });
     return this.assetCategoryRepository.save(category);
   }
 
@@ -9626,7 +10702,10 @@ export class StoresService {
 
   // Asset Status management
   async createAssetStatus(storeId: string, data: Partial<AssetStatus>) {
-    const status = this.assetStatusRepository.create({ ...data, storeId });
+    const status = this.assetStatusRepository.create({
+      ...this.creatableRow(this.assetStatusRepository, data),
+      storeId,
+    });
     return this.assetStatusRepository.save(status);
   }
 
@@ -9639,7 +10718,7 @@ export class StoresService {
   // Product Category management
   async createProductCategory(storeId: string, data: Partial<ProductCategory>) {
     const category = this.productCategoryRepository.create({
-      ...data,
+      ...this.creatableRow(this.productCategoryRepository, data),
       storeId,
     });
     return this.productCategoryRepository.save(category);
@@ -9653,7 +10732,10 @@ export class StoresService {
 
   // Product Status management
   async createProductStatus(storeId: string, data: Partial<ProductStatus>) {
-    const status = this.productStatusRepository.create({ ...data, storeId });
+    const status = this.productStatusRepository.create({
+      ...this.creatableRow(this.productStatusRepository, data),
+      storeId,
+    });
     return this.productStatusRepository.save(status);
   }
 
@@ -9839,7 +10921,7 @@ export class StoresService {
   // Service Category Management
   async createServiceCategory(storeId: string, data: any) {
     const category = this.serviceCategoryRepository.create({
-      ...data,
+      ...this.creatableRow(this.serviceCategoryRepository, data),
       storeId,
     });
     return this.serviceCategoryRepository.save(category);
@@ -9870,7 +10952,21 @@ export class StoresService {
 
   // Service Item Management
   async createServiceItem(storeId: string, data: any) {
-    const item = this.serviceItemRepository.create({ ...data, storeId });
+    // Multipart body, unseen by the guard and the DTO pipe: the same fields
+    // an update may set (never `id`/`storeId`/relations), with the category
+    // inside the addressed store.
+    const fields = pickDefined(data, SERVICE_ITEM_EDITABLE_FIELDS);
+    await this.assertRowsInStore(storeId, [
+      {
+        repository: this.serviceCategoryRepository,
+        id: fields.categoryId,
+        label: 'Danh mục',
+      },
+    ]);
+    const item = this.serviceItemRepository.create({
+      ...(fields as Partial<ServiceItem>),
+      storeId,
+    });
     return this.serviceItemRepository.save(item);
   }
 
@@ -10298,7 +11394,27 @@ export class StoresService {
   }
 
   async updateServiceItem(id: string, data: any) {
-    await this.serviceItemRepository.update(id, data);
+    const item = await this.serviceItemRepository.findOne({
+      where: { id },
+      select: ['id', 'storeId'],
+    });
+    if (!item) throw new NotFoundException('Không tìm thấy mặt hàng');
+    // Multipart body, unseen by the guard: take only editable fields (never
+    // `storeId`/`id`), and keep the category inside the item's store.
+    const changes: Record<string, unknown> = {};
+    for (const field of SERVICE_ITEM_EDITABLE_FIELDS) {
+      if (data?.[field] !== undefined) changes[field] = data[field];
+    }
+    await this.assertRowsInStore(item.storeId, [
+      {
+        repository: this.serviceCategoryRepository,
+        id: changes.categoryId,
+        label: 'Danh mục',
+      },
+    ]);
+    if (Object.keys(changes).length > 0) {
+      await this.serviceItemRepository.update(id, changes);
+    }
     return this.getServiceItemById(id);
   }
 
@@ -10308,12 +11424,40 @@ export class StoresService {
   }
 
   // Service Item Recipe Management
+  /** The store of a service item (404 when it does not exist). */
+  private async serviceItemStoreId(serviceItemId: string): Promise<string> {
+    const item =
+      typeof serviceItemId === 'string' && isUUID(serviceItemId)
+        ? await this.serviceItemRepository.findOne({
+            where: { id: serviceItemId },
+            select: ['id', 'storeId'],
+          })
+        : null;
+    if (!item) throw new NotFoundException('Không tìm thấy mặt hàng');
+    return item.storeId;
+  }
+
   async createServiceItemRecipe(serviceItemId: string, data: any) {
+    const storeId = await this.serviceItemStoreId(serviceItemId);
+    const fields = this.pickRecipeFields(data);
+    await this.assertRowsInStore(storeId, [
+      { repository: this.productRepository, id: fields.productId, label: 'Nguyên liệu' },
+    ]);
     const recipe = this.serviceItemRecipeRepository.create({
-      ...data,
+      ...fields,
       serviceItemId,
     });
     return this.serviceItemRecipeRepository.save(recipe);
+  }
+
+  /** The client-settable fields of a recipe line. */
+  private pickRecipeFields(data: any): Partial<ServiceItemRecipe> {
+    const fields: Partial<ServiceItemRecipe> = {};
+    if (data?.productId !== undefined) fields.productId = data.productId;
+    if (data?.quantity !== undefined) fields.quantity = data.quantity;
+    if (data?.unit !== undefined) fields.unit = data.unit;
+    if (data?.note !== undefined) fields.note = data.note;
+    return fields;
   }
 
   async getServiceItemRecipes(serviceItemId: string) {
@@ -10323,8 +11467,27 @@ export class StoresService {
     });
   }
 
-  async updateServiceItemRecipe(id: string, data: any) {
-    await this.serviceItemRecipeRepository.update(id, data);
+  async updateServiceItemRecipe(id: string, data: UpdateServiceItemRecipeDto) {
+    const recipe = await this.serviceItemRecipeRepository.findOne({
+      where: { id },
+      select: ['id', 'serviceItemId'],
+    });
+    if (!recipe) throw new NotFoundException('Không tìm thấy định lượng');
+    // Both ends of the recipe must stay in the recipe's current store.
+    const storeId = await this.serviceItemStoreId(recipe.serviceItemId);
+    const changes: Partial<ServiceItemRecipe> = this.pickRecipeFields(data);
+    if (data?.serviceItemId !== undefined) {
+      if ((await this.serviceItemStoreId(data.serviceItemId)) !== storeId) {
+        throw new BadRequestException('Mặt hàng không thuộc cửa hàng này');
+      }
+      changes.serviceItemId = data.serviceItemId;
+    }
+    await this.assertRowsInStore(storeId, [
+      { repository: this.productRepository, id: changes.productId, label: 'Nguyên liệu' },
+    ]);
+    if (Object.keys(changes).length > 0) {
+      await this.serviceItemRecipeRepository.update(id, changes);
+    }
     return this.serviceItemRecipeRepository.findOne({
       where: { id },
       relations: ['product', 'product.productUnit'],
@@ -10338,7 +11501,17 @@ export class StoresService {
 
   // Bulk create recipes for a service item
   async bulkCreateRecipes(serviceItemId: string, recipes: any[]) {
-    const recipeEntities = recipes.map((recipe) =>
+    if (!Array.isArray(recipes)) {
+      throw new BadRequestException('recipes phải là một mảng');
+    }
+    const storeId = await this.serviceItemStoreId(serviceItemId);
+    const rows = recipes.map((recipe) => this.pickRecipeFields(recipe));
+    for (const row of rows) {
+      await this.assertRowsInStore(storeId, [
+        { repository: this.productRepository, id: row.productId, label: 'Nguyên liệu' },
+      ]);
+    }
+    const recipeEntities = rows.map((recipe) =>
       this.serviceItemRecipeRepository.create({ ...recipe, serviceItemId }),
     );
     return this.serviceItemRecipeRepository.save(recipeEntities as any);
@@ -11846,83 +13019,119 @@ export class StoresService {
       throw new BadRequestException('Yêu cầu này đã được xử lý');
     }
 
-    // Nếu duyệt (APPROVED), cập nhật EmployeeSalary
+    let approvedAmount = 0;
     if (data.status === AdvanceRequestStatus.APPROVED) {
       // `||` treated a deliberate 0 as "not supplied" and granted the full
       // request. `??` distinguishes "omitted" from "approved for nothing".
-      const approvedAmount = Number(
-        data.approvedAmount ?? request.requestedAmount,
-      );
+      approvedAmount = Number(data.approvedAmount ?? request.requestedAmount);
       if (!Number.isFinite(approvedAmount) || approvedAmount < 0) {
         throw new BadRequestException({
           code: 'VALIDATION_ERROR',
           message: 'Số tiền duyệt không hợp lệ.',
         });
       }
-
-      // Kiểm tra lại điều kiện
-      const totalAdvanced = await this.calculateTotalAdvanced(
-        request.employeeSalaryId,
-        requestId,
-      );
-      const totalAfterApproval = totalAdvanced + Number(approvedAmount);
-
-      if (totalAfterApproval > Number(request.employeeSalary.netSalary)) {
-        throw new BadRequestException(
-          `Tổng tiền ứng sau khi duyệt (${totalAfterApproval.toLocaleString()}đ) vượt quá lương thực nhận`,
-        );
-      }
-
-      // Cập nhật EmployeeSalary
-      const currentAdvancePayment = Number(
-        request.employeeSalary.advancePayment || 0,
-      );
-      const newAdvancePayment = currentAdvancePayment + Number(approvedAmount);
-
-      // Tính lại totalDeductions và netSalary
-      const currentOtherDeductions = Number(
-        request.employeeSalary.otherDeductions || 0,
-      );
-      const currentPenalty = Number(request.employeeSalary.penalty || 0);
-      const newTotalDeductions =
-        currentPenalty + newAdvancePayment + currentOtherDeductions;
-      // Floored like every other net-salary computation in this file; without
-      // it a negative deduction would push net pay above total income.
-      const newNetSalary = Math.max(
-        0,
-        Number(request.employeeSalary.totalIncome) - newTotalDeductions,
-      );
-
-      await this.employeeSalaryRepository.update(request.employeeSalaryId, {
-        advancePayment: newAdvancePayment,
-        totalDeductions: newTotalDeductions,
-        netSalary: newNetSalary,
-      });
-
-      // Cập nhật request
-      request.approvedAmount = approvedAmount;
     }
 
-    // Cập nhật trạng thái request
-    request.status = data.status;
-    request.reviewedAt = new Date();
-    request.reviewedByAccountId = reviewerId;
-    if (data.reviewNote) request.reviewNote = data.reviewNote;
-    if (data.paymentMethod) request.paymentMethod = data.paymentMethod;
-    if (data.paymentReference) request.paymentReference = data.paymentReference;
+    // One transaction with the payslip row locked, so a concurrent payroll
+    // recalculation or a second review cannot interleave. `advancePayment` is
+    // re-derived from the APPROVED requests (the source of truth) instead of
+    // being incremented, so it can be neither lost nor doubled.
+    return this.dataSource.transaction(async (manager) => {
+      const requestRepository = manager.getRepository(SalaryAdvanceRequest);
+      const salaryRepository = manager.getRepository(EmployeeSalary);
 
-    return this.salaryAdvanceRequestRepository.save(request);
+      const lockedSalary = request.employeeSalaryId
+        ? await salaryRepository.findOne({
+            where: { id: request.employeeSalaryId },
+            lock: { mode: 'pessimistic_write' },
+          })
+        : null;
+      const current = await requestRepository.findOne({
+        where: { id: requestId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!current) {
+        throw new NotFoundException('Không tìm thấy yêu cầu ứng lương');
+      }
+      if (current.status !== AdvanceRequestStatus.PENDING) {
+        throw new BadRequestException('Yêu cầu này đã được xử lý');
+      }
+
+      const payslip = lockedSalary ?? request.employeeSalary;
+      if (data.status === AdvanceRequestStatus.APPROVED) {
+        if (!payslip) {
+          throw new NotFoundException('Không tìm thấy phiếu lương');
+        }
+        // Kiểm tra lại điều kiện
+        const totalAdvanced = await this.calculateTotalAdvanced(
+          request.employeeSalaryId,
+          requestId,
+        );
+        const totalAfterApproval = totalAdvanced + approvedAmount;
+
+        if (totalAfterApproval > Number(payslip.netSalary)) {
+          throw new BadRequestException(
+            `Tổng tiền ứng sau khi duyệt (${totalAfterApproval.toLocaleString()}đ) vượt quá lương thực nhận`,
+          );
+        }
+        request.approvedAmount = approvedAmount;
+      }
+
+      // Cập nhật trạng thái request
+      request.status = data.status;
+      request.reviewedAt = new Date();
+      request.reviewedByAccountId = reviewerId;
+      if (data.reviewNote) request.reviewNote = data.reviewNote;
+      if (data.paymentMethod) request.paymentMethod = data.paymentMethod;
+      if (data.paymentReference) {
+        request.paymentReference = data.paymentReference;
+      }
+      const saved = await requestRepository.save(request);
+
+      if (data.status === AdvanceRequestStatus.APPROVED && payslip) {
+        const advancePayment = await this.sumApprovedAdvances(
+          request.employeeSalaryId,
+          manager,
+        );
+        // Stored income, penalty and other deductions are kept; net is
+        // floored at 0 like every other net-salary computation.
+        const totals = computeNetFromIncome({
+          totalIncome: Number(payslip.totalIncome) || 0,
+          penalty: Number(payslip.penalty) || 0,
+          advancePayment,
+          otherDeductions: Number(payslip.otherDeductions) || 0,
+        });
+        await salaryRepository.update(request.employeeSalaryId, {
+          advancePayment: Math.round(advancePayment),
+          totalDeductions: totals.totalDeductions,
+          netSalary: totals.netSalary,
+        });
+      }
+
+      return saved;
+    });
   }
 
-  async cancelSalaryAdvanceRequest(
-    requestId: string,
-    employeeProfileId: string,
-  ) {
+  /** Only the employee who filed the advance request may cancel it. */
+  async cancelSalaryAdvanceRequest(requestId: string, accountId: string) {
+    if (!accountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     const request = await this.salaryAdvanceRequestRepository.findOne({
-      where: { id: requestId, employeeProfileId },
+      where: { id: requestId },
     });
 
     if (!request) {
+      throw new NotFoundException('Không tìm thấy yêu cầu ứng lương');
+    }
+
+    const requester = await this.profileRepository.findOne({
+      where: { id: request.employeeProfileId },
+      select: ['id', 'accountId'],
+      withDeleted: true,
+    });
+    if (!requester || requester.accountId !== accountId) {
+      // Same answer as a missing request: do not confirm foreign ids exist.
       throw new NotFoundException('Không tìm thấy yêu cầu ứng lương');
     }
 
@@ -11930,8 +13139,22 @@ export class StoresService {
       throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
     }
 
+    // Conditional on PENDING (and on the verified requester): saving the
+    // whole entity read above could overwrite a concurrent approval with
+    // CANCELLED and silently drop the payslip deduction.
+    const result = await this.salaryAdvanceRequestRepository.update(
+      {
+        id: request.id,
+        status: AdvanceRequestStatus.PENDING,
+        employeeProfileId: requester.id,
+      },
+      { status: AdvanceRequestStatus.CANCELLED },
+    );
+    if (!result.affected) {
+      throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
+    }
     request.status = AdvanceRequestStatus.CANCELLED;
-    return this.salaryAdvanceRequestRepository.save(request);
+    return request;
   }
 
   /**
@@ -11943,9 +13166,13 @@ export class StoresService {
    */
   private async sumApprovedAdvances(
     employeeSalaryId: string | undefined | null,
+    manager?: EntityManager,
   ): Promise<number> {
     if (!employeeSalaryId) return 0;
-    const approved = await this.salaryAdvanceRequestRepository.find({
+    const repository = manager
+      ? manager.getRepository(SalaryAdvanceRequest)
+      : this.salaryAdvanceRequestRepository;
+    const approved = await repository.find({
       where: {
         employeeSalaryId,
         status: AdvanceRequestStatus.APPROVED,
@@ -11999,6 +13226,9 @@ export class StoresService {
     if (!profile) {
       throw new NotFoundException('Không tìm thấy hồ sơ nhân viên');
     }
+    // Changing pay is store administration: only the owner of the employee's
+    // store may do it (the route addresses no store, so no guard can).
+    await this.assertOwnerStoreAccess(profile.storeId, createdByAccountId);
 
     // Lấy hợp đồng đang hiệu lực (active)
     const activeContract = profile.contracts?.find((c) => c.isActive);
@@ -12008,12 +13238,18 @@ export class StoresService {
       );
     }
 
-    // Kiểm tra tháng hiệu lực (Không cho phép tháng quá khứ)
-    const now = new Date();
-    const currentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const effectiveMonth = new Date(data.effectiveMonth);
+    // Kiểm tra tháng hiệu lực (Không cho phép tháng quá khứ). So sánh theo
+    // tháng Việt Nam: `new Date('YYYY-MM-01')` (nửa đêm UTC) không bao giờ
+    // bằng mốc tháng giờ địa phương trên máy chủ +07.
+    const effective = parseVnMonthInput(data.effectiveMonth);
+    if (!effective) {
+      throw new BadRequestException('Tháng hiệu lực không hợp lệ');
+    }
+    const current = vnMonthOf();
+    const currentMonth = toMonthMarker(current);
+    const effectiveMonth = toMonthMarker(effective);
 
-    if (effectiveMonth < currentMonth) {
+    if (effective.key < current.key) {
       throw new BadRequestException(
         'Không thể điều chỉnh lương cho các tháng trong quá khứ',
       );
@@ -12040,9 +13276,14 @@ export class StoresService {
     let reasonText = data.reasonText || '';
     if (data.reasonId) {
       const reason = await this.salaryAdjustmentReasonRepository.findOne({
-        where: { id: data.reasonId },
+        where: { id: data.reasonId, storeId: profile.storeId },
       });
-      if (reason) reasonText = reason.name;
+      if (!reason) {
+        throw new BadRequestException(
+          'Lý do điều chỉnh không thuộc cửa hàng này',
+        );
+      }
+      reasonText = reason.name;
     }
 
     // 1. Tạo bản ghi lịch sử điều chỉnh
@@ -12061,7 +13302,7 @@ export class StoresService {
       await this.salaryAdjustmentRepository.save(adjustment);
 
     // 2. Nếu hiệu lực ngay tháng hiện tại -> Cập nhật Hợp đồng và Phiếu lương
-    if (effectiveMonth.getTime() === currentMonth.getTime()) {
+    if (effective.key === current.key) {
       // Cập nhật Hợp đồng
       const updateData: any = { salaryAmount: newSalary };
       await this.contractRepository.update(activeContract.id, updateData);
@@ -12112,18 +13353,56 @@ export class StoresService {
   }
 
   // Employee Payment History (Individual)
-  async createEmployeePaymentHistory(data: Partial<EmployeePaymentHistory>) {
-    // Nếu có ID tài khoản thanh toán, tự động lấy thông tin để lưu snapshot
-    if (data.paymentAccountId && !data.paymentAccountInfo) {
-      const account = await this.storePaymentAccountRepository.findOne({
-        where: { id: data.paymentAccountId },
-      });
-      if (account) {
-        data.paymentAccountInfo = `${account.bankName} - ****${account.accountNumber.slice(-4)}`;
-      }
-    }
+  /** Bank snapshot for a payment row, from an account of `storeId`. */
+  private async paymentAccountSnapshot(
+    storeId: string,
+    paymentAccountId: string | undefined,
+  ): Promise<string | undefined> {
+    if (!paymentAccountId) return undefined;
+    await this.assertRowsInStore(storeId, [
+      {
+        repository: this.storePaymentAccountRepository,
+        id: paymentAccountId,
+        label: 'Tài khoản thanh toán',
+      },
+    ]);
+    const account = await this.storePaymentAccountRepository.findOne({
+      where: { id: paymentAccountId, storeId },
+    });
+    return account
+      ? `${account.bankName} - ****${String(account.accountNumber ?? '').slice(-4)}`
+      : undefined;
+  }
 
-    const payment = this.employeePaymentHistoryRepository.create(data);
+  // Employee Payment History (Individual)
+  async createEmployeePaymentHistory(dto: CreateEmployeePaymentHistoryDto) {
+    // The store is the employee's; a different body storeId is refused.
+    const storeId = await this.profileStoreId(dto.employeeProfileId);
+    if (dto.storeId && dto.storeId !== storeId) {
+      throw new BadRequestException('Nhân viên không thuộc cửa hàng này');
+    }
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'name'],
+    });
+    const payment = this.employeePaymentHistoryRepository.create({
+      ...pickDefined(dto, [
+        'amount',
+        'paymentMethod',
+        'referenceNumber',
+        'paymentAccountId',
+        'notes',
+      ] as const),
+      employeeProfileId: dto.employeeProfileId,
+      paymentDate: dto.paymentDate ? new Date(dto.paymentDate) : undefined,
+      salaryMonth: new Date(dto.salaryMonth),
+      storeId,
+      storeName: store?.name,
+      paymentAccountInfo: await this.paymentAccountSnapshot(
+        storeId,
+        dto.paymentAccountId,
+      ),
+    } as Partial<EmployeePaymentHistory>);
     return this.employeePaymentHistoryRepository.save(payment);
   }
 
@@ -12149,7 +13428,7 @@ export class StoresService {
 
   async updateEmployeePaymentHistory(
     id: string,
-    data: Partial<EmployeePaymentHistory>,
+    data: UpdateEmployeePaymentHistoryDto,
   ) {
     const payment = await this.employeePaymentHistoryRepository.findOne({
       where: { id },
@@ -12157,7 +13436,27 @@ export class StoresService {
     if (!payment)
       throw new NotFoundException('Không tìm thấy lịch sử thanh toán');
 
-    Object.assign(payment, data);
+    // Whitelisted fields only; `id`, the employee and the store never move.
+    const { paymentDate, salaryMonth, paymentAccountId } = data ?? {};
+    for (const field of [
+      'amount',
+      'paymentMethod',
+      'referenceNumber',
+      'notes',
+    ] as const) {
+      if (data?.[field] !== undefined) {
+        (payment as unknown as Record<string, unknown>)[field] = data[field];
+      }
+    }
+    if (paymentDate !== undefined) payment.paymentDate = new Date(paymentDate);
+    if (salaryMonth !== undefined) payment.salaryMonth = new Date(salaryMonth);
+    if (paymentAccountId !== undefined) {
+      payment.paymentAccountInfo = (await this.paymentAccountSnapshot(
+        payment.storeId,
+        paymentAccountId,
+      )) as string;
+      payment.paymentAccountId = paymentAccountId;
+    }
     return this.employeePaymentHistoryRepository.save(payment);
   }
 
@@ -12307,8 +13606,9 @@ export class StoresService {
     employeeProfileId: string,
     monthStr: string,
   ) {
-    const month = new Date(monthStr);
-    const monthStart = new Date(month.getFullYear(), month.getMonth(), 1);
+    const parsedMonth = parseVnMonthInput(monthStr);
+    if (!parsedMonth) throw new BadRequestException('Tháng không hợp lệ');
+    const monthStart = toMonthMarker(parsedMonth);
 
     const profile = await this.profileRepository.findOne({
       where: { id: employeeProfileId },
@@ -12397,9 +13697,9 @@ export class StoresService {
       throw new NotFoundException('Không tìm thấy hồ sơ nhân viên');
     }
 
-    // Xác định ngày bắt đầu của tháng hiện tại
+    // Xác định ngày bắt đầu của tháng hiện tại (tháng Việt Nam)
     const now = new Date();
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonthStart = toMonthMarker(vnMonthOf(now));
 
     // 1. Tìm hợp đồng đang hiệu lực
     const activeContract = profile.contracts?.find((c) => c.isActive);
@@ -12498,8 +13798,7 @@ export class StoresService {
     await this.contractRepository.update(activeContract.id, updateData);
 
     // Nếu cập nhật trong tháng này, cần kiểm tra và cập nhật phiếu lương tháng này nếu đã tạo
-    const now = new Date();
-    const currentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonth = toMonthMarker(vnMonthOf());
 
     const currentSalary = await this.employeeSalaryRepository.findOne({
       where: { employeeProfileId, month: currentMonth },
@@ -12528,9 +13827,8 @@ export class StoresService {
       order: { joinedAt: 'DESC' },
     });
 
-    // Xác định ngày bắt đầu của tháng hiện tại
-    const now = new Date();
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    // Xác định ngày bắt đầu của tháng hiện tại (tháng Việt Nam)
+    const currentMonthStart = toMonthMarker(vnMonthOf());
 
     return Promise.all(
       profiles.map(async (profile) => {
@@ -12583,7 +13881,10 @@ export class StoresService {
 
   // Asset Export Management
   async createAssetExportType(storeId: string, data: any) {
-    const type = this.assetExportTypeRepository.create({ ...data, storeId });
+    const type = this.assetExportTypeRepository.create({
+      ...this.creatableRow(this.assetExportTypeRepository, data),
+      storeId,
+    });
     return this.assetExportTypeRepository.save(type);
   }
 
@@ -12593,15 +13894,171 @@ export class StoresService {
     });
   }
 
+  /**
+   * Bulk stock-out addresses no store in its path, so each item names its
+   * own store: every item's store must be one the caller owns or is employed
+   * at (the released owner app sends items of several stores in one request).
+   * Quantities must be positive. Runs before any write.
+   */
+  private async assertBulkExportItems(
+    items: unknown,
+    accountId: string | undefined,
+  ): Promise<any[]> {
+    if (!Array.isArray(items) || items.length === 0) {
+      throw new BadRequestException('Danh sách xuất kho không được để trống');
+    }
+    if (items.length > BULK_EXPORT_MAX_ITEMS) {
+      throw new BadRequestException(
+        `Mỗi lần xuất kho tối đa ${BULK_EXPORT_MAX_ITEMS} món`,
+      );
+    }
+    for (const item of items) {
+      if (typeof item?.storeId !== 'string' || !isUUID(item.storeId)) {
+        throw new BadRequestException('Mỗi món xuất kho phải có cửa hàng hợp lệ');
+      }
+      const quantity = Number(item.quantity);
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        throw new BadRequestException('Số lượng xuất phải lớn hơn 0');
+      }
+    }
+    const accessible = new Set(
+      await this.getAccessibleStoreIds(accountId as string),
+    );
+    for (const item of items) {
+      if (!accessible.has(item.storeId)) {
+        throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
+      }
+    }
+    return items;
+  }
+
+  /**
+   * The stock row (product or asset) an export item takes from: its id must
+   * be a uuid naming a row of the item's own store (400 otherwise). Rows are
+   * shared by id so repeated items draw down the same stock.
+   */
+  private async loadStockRowInStore<T extends { id: string; storeId: string }>(
+    repository: Repository<T>,
+    id: unknown,
+    storeId: string,
+    label: string,
+    loaded: Map<string, T>,
+  ): Promise<T> {
+    if (typeof id !== 'string' || !isUUID(id)) {
+      throw new BadRequestException(`${label} không hợp lệ`);
+    }
+    const cached = loaded.get(id);
+    if (cached) {
+      if (cached.storeId !== storeId) {
+        throw new BadRequestException(`${label} không thuộc cửa hàng này`);
+      }
+      return cached;
+    }
+    const row = await repository.findOne({
+      where: { id, storeId } as never,
+    });
+    if (!row || row.storeId !== storeId) {
+      throw new BadRequestException(`${label} không thuộc cửa hàng này`);
+    }
+    loaded.set(id, row);
+    return row;
+  }
+
+  /** 400 when the items take more of a row than it has in stock. */
+  private assertStockCovers(
+    plan: Array<{ row: { id: string; name?: string; currentStock?: number }; quantity: number }>,
+    label: string,
+  ): void {
+    const requested = new Map<string, number>();
+    for (const { row, quantity } of plan) {
+      const total = (requested.get(row.id) ?? 0) + quantity;
+      requested.set(row.id, total);
+      const stock = Number(row.currentStock) || 0;
+      if (total > stock) {
+        throw new BadRequestException(
+          `Số lượng xuất (${total}) vượt quá tồn kho hiện tại (${stock}) của ${label} "${row.name}"`,
+        );
+      }
+    }
+  }
+
+  /**
+   * 400 unless every given id names a row of `storeId` (or of one of the
+   * given stores). Blank ids are
+   * skipped (optional fields); a malformed id is "not in this store".
+   */
+  private async assertRowsInStore(
+    storeId: string | string[],
+    refs: Array<{ repository: Repository<any>; id: unknown; label: string }>,
+  ): Promise<void> {
+    const storeScope = Array.isArray(storeId) ? In(storeId) : storeId;
+    for (const { repository, id, label } of refs) {
+      if (id === undefined || id === null || id === '') continue;
+      let found = false;
+      if (typeof id === 'string' && isUUID(id)) {
+        found = await repository.exists({ where: { id, storeId: storeScope } });
+      }
+      if (!found) {
+        throw new BadRequestException(`${label} không thuộc cửa hàng này`);
+      }
+    }
+  }
+
   async exportAssetsBulk(
     data: AssetExportDto,
     files: Express.Multer.File[] = [],
+    accountId?: string,
   ) {
-    const { items } = data;
-    const transactionCodes: string[] = [];
+    const items = await this.assertBulkExportItems(data?.items, accountId);
 
+    // Validate every item — store, stock row, export type, quantity — before
+    // any write. An item takes from its asset, else (legacy) its product.
+    const assets = new Map<string, Asset>();
+    const products = new Map<string, Product>();
+    const plan: Array<
+      | { kind: 'asset'; row: Asset; quantity: number }
+      | { kind: 'product'; row: Product; quantity: number }
+    > = [];
+    for (const item of items) {
+      const quantity = Number(item.quantity);
+      if (item.assetId !== undefined && item.assetId !== null && item.assetId !== '') {
+        plan.push({
+          kind: 'asset',
+          row: await this.loadStockRowInStore(
+            this.assetRepository, item.assetId, item.storeId, 'Tài sản', assets,
+          ),
+          quantity,
+        });
+      } else {
+        plan.push({
+          kind: 'product',
+          row: await this.loadStockRowInStore(
+            this.productRepository, item.productId, item.storeId, 'Hàng hóa', products,
+          ),
+          quantity,
+        });
+      }
+      await this.assertRowsInStore(item.storeId, [
+        {
+          repository: this.assetExportTypeRepository,
+          id: item.assetExportTypeId,
+          label: 'Loại xuất kho',
+        },
+      ]);
+    }
+    this.assertStockCovers(
+      plan.filter((step) => step.kind === 'asset'),
+      'tài sản',
+    );
+    this.assertStockCovers(
+      plan.filter((step) => step.kind === 'product'),
+      'hàng hóa',
+    );
+
+    const transactionCodes: string[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+      const step = plan[i];
 
       // 1. Create Stock Transaction for each item (since they have individual dates/types)
       const transaction = this.stockTransactionRepository.create({
@@ -12625,64 +14082,37 @@ export class StoresService {
       transactionCodes.push(savedTransaction.code);
 
       // 2. Create Detail and Update Stock
-      if (item.assetId) {
-        const asset = await this.assetRepository.findOne({
-          where: { id: item.assetId },
+      if (step.kind === 'asset') {
+        const asset = step.row;
+        const detail = this.stockTransactionDetailRepository.create({
+          transactionId: savedTransaction.id,
+          assetId: asset.id,
+          quantity: step.quantity,
+          unitPrice: Number(asset.value) || 0,
+          totalPrice: (Number(asset.value) || 0) * step.quantity,
+          note: item.note,
+          fileUrl: transaction.fileUrl,
         });
-        if (asset) {
-          // Validate stock
-          if (Number(item.quantity) > (asset.currentStock || 0)) {
-            throw new BadRequestException(
-              `Số lượng xuất (${item.quantity}) vượt quá tồn kho hiện tại (${asset.currentStock}) của tài sản "${asset.name}"`,
-            );
-          }
+        await this.stockTransactionDetailRepository.save(detail);
 
-          const detail = this.stockTransactionDetailRepository.create({
-            transactionId: savedTransaction.id,
-            assetId: asset.id,
-            quantity: Number(item.quantity),
-            unitPrice: Number(asset.value) || 0,
-            totalPrice: (Number(asset.value) || 0) * Number(item.quantity),
-            note: item.note,
-            fileUrl: transaction.fileUrl,
-          });
-          await this.stockTransactionDetailRepository.save(detail);
-
-          // Update Stock
-          asset.currentStock =
-            (asset.currentStock || 0) - Number(item.quantity);
-          await this.assetRepository.save(asset);
-        }
-      } else if ((item as any).productId) {
-        const product = await this.productRepository.findOne({
-          where: { id: (item as any).productId },
+        asset.currentStock = (Number(asset.currentStock) || 0) - step.quantity;
+        await this.assetRepository.save(asset);
+      } else {
+        const product = step.row;
+        const detail = this.stockTransactionDetailRepository.create({
+          transactionId: savedTransaction.id,
+          productId: product.id,
+          quantity: step.quantity,
+          unitPrice: Number(product.costPrice) || 0,
+          totalPrice: (Number(product.costPrice) || 0) * step.quantity,
+          note: item.note,
+          fileUrl: transaction.fileUrl,
         });
-        if (product) {
-          // Validate stock
-          if (Number(item.quantity) > ((product as any).currentStock || 0)) {
-            throw new BadRequestException(
-              `Số lượng xuất (${item.quantity}) vượt quá tồn kho hiện tại (${(product as any).currentStock}) của hàng hóa "${product.name}"`,
-            );
-          }
+        await this.stockTransactionDetailRepository.save(detail);
 
-          const detail = this.stockTransactionDetailRepository.create({
-            transactionId: savedTransaction.id,
-            productId: product.id,
-            quantity: Number(item.quantity),
-            unitPrice: Number(product.costPrice) || 0,
-            totalPrice:
-              (Number(product.costPrice) || 0) * Number(item.quantity),
-            note: item.note,
-            fileUrl: transaction.fileUrl,
-          });
-          await this.stockTransactionDetailRepository.save(detail);
-
-          // Update Stock
-          if ((product as any).currentStock !== undefined) {
-            (product as any).currentStock -= Number(item.quantity);
-            await this.productRepository.save(product);
-          }
-        }
+        product.currentStock =
+          (Number(product.currentStock) || 0) - step.quantity;
+        await this.productRepository.save(product);
       }
     }
 
@@ -12697,7 +14127,10 @@ export class StoresService {
     storeId: string,
     data: Partial<ProductExportType>,
   ) {
-    const type = this.productExportTypeRepository.create({ ...data, storeId });
+    const type = this.productExportTypeRepository.create({
+      ...this.creatableRow(this.productExportTypeRepository, data),
+      storeId,
+    });
     return this.productExportTypeRepository.save(type);
   }
 
@@ -12710,12 +14143,35 @@ export class StoresService {
   async exportProductsBulk(
     data: ProductExportDto,
     files: Express.Multer.File[] = [],
+    accountId?: string,
   ) {
-    const items = data.items || [];
-    const transactionCodes: string[] = [];
+    const items = await this.assertBulkExportItems(data?.items, accountId);
 
+    // Validate every item — store, product, export type, quantity — before
+    // any write.
+    const products = new Map<string, Product>();
+    const plan: Array<{ row: Product; quantity: number }> = [];
+    for (const item of items) {
+      plan.push({
+        row: await this.loadStockRowInStore(
+          this.productRepository, item.productId, item.storeId, 'Hàng hóa', products,
+        ),
+        quantity: Number(item.quantity),
+      });
+      await this.assertRowsInStore(item.storeId, [
+        {
+          repository: this.productExportTypeRepository,
+          id: item.productExportTypeId,
+          label: 'Loại xuất kho',
+        },
+      ]);
+    }
+    this.assertStockCovers(plan, 'hàng hóa');
+
+    const transactionCodes: string[] = [];
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
+      const { row: product, quantity } = plan[i];
 
       const transaction = this.stockTransactionRepository.create({
         storeId: item.storeId,
@@ -12736,31 +14192,19 @@ export class StoresService {
         await this.stockTransactionRepository.save(transaction);
       transactionCodes.push(savedTransaction.code);
 
-      const product = await this.productRepository.findOne({
-        where: { id: item.productId },
+      const detail = this.stockTransactionDetailRepository.create({
+        transactionId: savedTransaction.id,
+        productId: product.id,
+        quantity,
+        unitPrice: Number(product.costPrice) || 0,
+        totalPrice: (Number(product.costPrice) || 0) * quantity,
+        note: item.note,
+        fileUrl: transaction.fileUrl,
       });
-      if (product) {
-        if (Number(item.quantity) > (product.currentStock || 0)) {
-          throw new BadRequestException(
-            `Số lượng xuất (${item.quantity}) vượt quá tồn kho hiện tại (${product.currentStock}) của hàng hóa "${product.name}"`,
-          );
-        }
+      await this.stockTransactionDetailRepository.save(detail);
 
-        const detail = this.stockTransactionDetailRepository.create({
-          transactionId: savedTransaction.id,
-          productId: product.id,
-          quantity: Number(item.quantity),
-          unitPrice: Number(product.costPrice) || 0,
-          totalPrice: (Number(product.costPrice) || 0) * Number(item.quantity),
-          note: item.note,
-          fileUrl: transaction.fileUrl,
-        });
-        await this.stockTransactionDetailRepository.save(detail);
-
-        product.currentStock =
-          (product.currentStock || 0) - Number(item.quantity);
-        await this.productRepository.save(product);
-      }
+      product.currentStock = (Number(product.currentStock) || 0) - quantity;
+      await this.productRepository.save(product);
     }
 
     return {
@@ -13940,8 +15384,20 @@ export class StoresService {
     employeeProfileId: string,
     dateStr?: string,
   ) {
-    const targetDate = dateStr ? new Date(dateStr) : new Date();
-    const dateString = targetDate.toISOString().split('T')[0];
+    // Vietnam calendar day. A full ISO datetime is read as an instant in
+    // Vietnam time; otherwise the value must be 'YYYY-MM-DD'.
+    let dateString: string;
+    if (!dateStr) {
+      dateString = vnDateString();
+    } else if (/^\d{4}-\d{2}-\d{2}T/.test(dateStr)) {
+      const instant = new Date(dateStr);
+      if (Number.isNaN(instant.getTime())) {
+        throw new BadRequestException('date phải có định dạng YYYY-MM-DD hợp lệ');
+      }
+      dateString = vnDateString(instant);
+    } else {
+      dateString = validateStoreReportDate(dateStr);
+    }
 
     // Get shift assignments for this employee on this date
     const assignments = await this.shiftAssignmentRepository
@@ -13965,13 +15421,11 @@ export class StoresService {
     if (assignments.length > 0) {
       assignments.forEach((a: any) => {
         if (a.checkInTime) {
-          const cin = new Date(a.checkInTime);
-          checkIn = `${String(cin.getHours()).padStart(2, '0')}:${String(cin.getMinutes()).padStart(2, '0')}`;
+          checkIn = vnClockHHmm(new Date(a.checkInTime));
           lateMinutes = Number(a.lateMinutes) || 0;
         }
         if (a.checkOutTime) {
-          const cout = new Date(a.checkOutTime);
-          checkOut = `${String(cout.getHours()).padStart(2, '0')}:${String(cout.getMinutes()).padStart(2, '0')}`;
+          checkOut = vnClockHHmm(new Date(a.checkOutTime));
           earlyMinutes = Number(a.earlyMinutes) || 0;
         }
         totalMinutes += Number(a.workedMinutes || 0);
@@ -13998,19 +15452,14 @@ export class StoresService {
       dailyIncome = Math.round(dailyShiftEarnings);
     } else {
       // Fallback: estimate from batch EmployeeSalary
-      const salaryMonthDate = new Date(
-        targetDate.getFullYear(),
-        targetDate.getMonth(),
-        1,
-      );
+      const reportMonth = vnMonthOfDateString(dateString)!;
       const salaries = await this.employeeSalaryRepository.find({
-        where: { employeeProfileId, month: salaryMonthDate } as any,
+        where: {
+          employeeProfileId,
+          month: toMonthMarker(reportMonth),
+        } as any,
       });
-      const daysInMonth = new Date(
-        targetDate.getFullYear(),
-        targetDate.getMonth() + 1,
-        0,
-      ).getDate();
+      const daysInMonth = reportMonth.calendarDays;
       dailyIncome =
         salaries.length > 0
           ? Math.round(Number(salaries[0].netSalary || 0) / daysInMonth)
@@ -14037,22 +15486,9 @@ export class StoresService {
     employeeProfileId: string,
     monthStr?: string,
   ) {
-    const now = new Date();
-    const month =
-      monthStr ||
-      `${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
-
-    // Parse month string (MM/YYYY or YYYY-MM-DD) into m/y
-    let mNum: number, yNum: number;
-    if (month.includes('/')) {
-      [mNum, yNum] = month.split('/').map(Number);
-    } else {
-      const d = new Date(month);
-      mNum = d.getMonth() + 1;
-      yNum = d.getFullYear();
-    }
-    // Use Date object for salary month query
-    const salaryMonthDate = new Date(yNum, mNum - 1, 1);
+    // Vietnam month: 'MM/YYYY', 'YYYY-MM', 'YYYY-MM-DD'; default current.
+    const reportMonth = parseVnMonthInput(monthStr) ?? vnMonthOf();
+    const salaryMonthDate = toMonthMarker(reportMonth);
 
     // Get salary info
     const salaries = await this.employeeSalaryRepository.find({
@@ -14062,9 +15498,10 @@ export class StoresService {
 
     const salary = salaries.length > 0 ? salaries[0] : null;
 
-    // Get shift assignments for the month
-    const startDate = new Date(yNum, mNum - 1, 1).toISOString().split('T')[0];
-    const endDate = new Date(yNum, mNum, 0).toISOString().split('T')[0];
+    // Get shift assignments for the month (both bounds inclusive). The old
+    // toISOString() bounds were a day early on a +07 host.
+    const startDate = reportMonth.key;
+    const endDate = reportMonth.lastDate;
 
     const assignments = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
@@ -14144,7 +15581,8 @@ export class StoresService {
         accountId,
         storeId,
       );
-    const now = new Date();
+    // Default is the current Vietnam month, not the server clock's month.
+    const currentVnMonth = vnMonthOf();
     let m: number, y: number;
     if (monthStr) {
       if (monthStr.includes('/')) {
@@ -14152,26 +15590,70 @@ export class StoresService {
       } else if (monthStr.includes('-')) {
         [y, m] = monthStr.split('-').map(Number);
       } else {
-        m = now.getMonth() + 1;
-        y = now.getFullYear();
+        m = currentVnMonth.month;
+        y = currentVnMonth.year;
       }
     } else {
-      m = now.getMonth() + 1;
-      y = now.getFullYear();
+      m = currentVnMonth.month;
+      y = currentVnMonth.year;
     }
-    const startDate = new Date(y, m - 1, 1).toISOString().split('T')[0];
-    const endDate = new Date(y, m, 0).toISOString().split('T')[0];
+    // Ngày dạng chuỗi, không qua toISOString của giờ máy chủ (lệch một ngày ở UTC+7).
+    const pad = (value: number) => String(value).padStart(2, '0');
+    const startDate = `${y}-${pad(m)}-01`;
+    const endDate = `${y}-${pad(m)}-${pad(new Date(Date.UTC(y, m, 0)).getUTCDate())}`;
 
     const query = this.shiftAssignmentRepository
       .createQueryBuilder('a')
       .leftJoinAndSelect('a.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoin('slot.cycle', 'cycle')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      // Ca chờ duyệt / đã huỷ không phải ca đã làm.
+      .andWhere('a.status NOT IN (:...skipped)', {
+        skipped: [ShiftAssignmentStatus.PENDING, ShiftAssignmentStatus.CANCELLED],
+      })
       .andWhere('CAST(slot.workDate AS DATE) >= :startDate', { startDate })
       .andWhere('CAST(slot.workDate AS DATE) <= :endDate', { endDate })
       .orderBy('slot.workDate', 'DESC');
 
-    const assignments = await query.getMany();
+    // Chỉ liệt kê ca đã diễn ra: đã chấm công, đã bị ghi nghỉ không phép,
+    // hoặc đã hết giờ khi đang nghỉ có phép (đơn nghỉ cả ngày đã duyệt).
+    // Ca sắp tới chưa có gì để báo cáo.
+    const loaded = await query.getMany();
+    const approvedLeaves = await this.leaveRequestRepository.find({
+      where: {
+        employeeProfileId,
+        storeId,
+        status: LeaveRequestStatus.APPROVED,
+        startDate: LessThanOrEqual(endDate),
+        endDate: MoreThanOrEqual(startDate),
+      },
+      take: 500,
+    });
+    const nowInstant = new Date();
+    const boundariesOf = (a: any) =>
+      resolveShiftBoundaries(
+        String(a.shiftSlot?.workDate || '').slice(0, 10),
+        a.shiftSlot?.startTime ?? a.shiftSlot?.workShift?.startTime,
+        a.shiftSlot?.endTime ?? a.shiftSlot?.workShift?.endTime,
+      );
+    const onLeaveIds = new Set<string>();
+    for (const a of loaded as any[]) {
+      if (a.checkInTime || a.attendanceStatus) continue;
+      const { end } = boundariesOf(a);
+      if (!end || end.getTime() > nowInstant.getTime()) continue;
+      const workDate = String(a.shiftSlot?.workDate || '').slice(0, 10);
+      if (approvedLeaves.some((leave) => leaveCoversShift(leave, workDate, a.id))) {
+        onLeaveIds.add(a.id);
+      }
+    }
+    const assignments = loaded.filter(
+      (a: any) =>
+        a.checkInTime ||
+        a.attendanceStatus === AttendanceStatus.ABSENT ||
+        onLeaveIds.has(a.id),
+    );
 
     // Aggregate counts by status
     const tabCounts: Record<string, number> = {
@@ -14185,53 +15667,82 @@ export class StoresService {
       absent: 0,
     };
 
+    const dayNames = ['Chủ nhật', 'Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7'];
     let totalMinutes = 0;
+    let completedShifts = 0;
     const shifts = assignments.map((a: any) => {
       const slot = a.shiftSlot;
-      const dateObj = slot?.workDate ? new Date(slot.workDate) : new Date();
-      const dayNames = [
-        'Chủ nhật',
-        'Thứ 2',
-        'Thứ 3',
-        'Thứ 4',
-        'Thứ 5',
-        'Thứ 6',
-        'Thứ 7',
-      ];
-      const dayLabel = `${dayNames[dateObj.getDay()]}, ${String(dateObj.getDate()).padStart(2, '0')}/${String(dateObj.getMonth() + 1).padStart(2, '0')}/${String(dateObj.getFullYear()).slice(2)}`;
+      const workDate = String(slot?.workDate || '').slice(0, 10);
+      const [yy, mm, dd] = workDate.split('-').map(Number);
+      const weekday = new Date(Date.UTC(yy, (mm || 1) - 1, dd || 1)).getUTCDay();
+      const dayLabel = `${dayNames[weekday]}, ${pad(dd || 1)}/${pad(mm || 1)}/${String(yy || '').slice(2)}`;
       const shiftName = slot?.workShift?.shiftName || slot?.name || 'Ca làm';
 
+      // Phân loại theo trạng thái chấm công (attendanceStatus). Trước đây so
+      // trạng thái đăng ký ca (a.status) với 'LATE'/'ABSENT'… nên ca nào cũng
+      // thành "Đúng giờ".
+      const { start, end } = boundariesOf(a);
+      const autoCheckedOut = !!(a.isAutoCheckout || a.autoCheckoutReason);
+      const deltas = computeAttendanceDeltas({
+        start,
+        end,
+        checkIn: a.checkInTime ? new Date(a.checkInTime) : null,
+        checkOut: a.checkOutTime ? new Date(a.checkOutTime) : null,
+        autoCheckedOut,
+      });
+      // Tab keys this row belongs to (filter uses them, not the label).
+      const statusKeys: string[] = [];
       let status = 'Đúng giờ';
       let statusColor = '#12B569';
-      const assignStatus = (a.status || '').toUpperCase();
-
-      if (assignStatus === 'LATE' || assignStatus === 'CHECKED_IN_LATE') {
-        status = 'Đi trễ';
-        statusColor = '#F78F08';
-        tabCounts.late++;
-      } else if (assignStatus === 'EARLY' || assignStatus === 'LEFT_EARLY') {
-        status = 'Về sớm';
-        statusColor = '#F78F08';
-        tabCounts.early++;
-      } else if (assignStatus === 'ABSENT') {
-        status = 'Nghỉ không phép';
-        statusColor = '#F95555';
-        tabCounts.absent++;
-      } else if (assignStatus === 'LEAVE') {
-        status = 'Nghỉ phép';
-        statusColor = '#3B82F6';
-        tabCounts.leave++;
-      } else if (assignStatus === 'OVERTIME') {
-        status = 'Tăng ca';
-        statusColor = '#8B5CF6';
-        tabCounts.overtime++;
-      } else if (assignStatus === 'FORGOT') {
-        status = 'Quên chấm công';
-        statusColor = '#F95555';
-        tabCounts.forgot++;
-      } else {
-        tabCounts.on_time++;
+      switch (a.attendanceStatus) {
+        case AttendanceStatus.LATE:
+          status = 'Đi trễ';
+          statusColor = '#F78F08';
+          tabCounts.late++;
+          statusKeys.push('late');
+          break;
+        case AttendanceStatus.LATE_AND_EARLY:
+          status = 'Đi trễ · Về sớm';
+          statusColor = '#F78F08';
+          tabCounts.late++;
+          tabCounts.early++;
+          statusKeys.push('late', 'early');
+          break;
+        case AttendanceStatus.EARLY:
+          status = 'Về sớm';
+          statusColor = '#F78F08';
+          tabCounts.early++;
+          statusKeys.push('early');
+          break;
+        case AttendanceStatus.ABSENT:
+          status = 'Nghỉ không phép';
+          statusColor = '#F95555';
+          tabCounts.absent++;
+          statusKeys.push('absent');
+          break;
+        case AttendanceStatus.FORGOT_CHECKOUT:
+          status = 'Quên chấm công';
+          statusColor = '#F95555';
+          tabCounts.forgot++;
+          statusKeys.push('forgot');
+          break;
+        default:
+          if (onLeaveIds.has(a.id)) {
+            status = 'Nghỉ phép';
+            statusColor = '#667085';
+            tabCounts.leave++;
+            statusKeys.push('leave');
+          } else {
+            tabCounts.on_time++;
+            statusKeys.push('on_time');
+          }
       }
+      // "Tăng ca": ra muộn sau giờ kết thúc ca (không tính tự kết thúc ca).
+      if (deltas.overtimeMinutes > 0) {
+        tabCounts.overtime++;
+        statusKeys.push('overtime');
+      }
+      if (a.checkInTime) completedShifts++;
 
       const workedMins = Number(a.workedMinutes || 0);
       totalMinutes += workedMins;
@@ -14245,26 +15756,36 @@ export class StoresService {
         status,
         statusColor,
         hours: `${h}:${String(mins).padStart(2, '0')}`,
+        workedMinutes: workedMins,
+        // Giờ vào/ra và số phút trễ/sớm — app hiện giống màn kết quả chấm công.
+        checkInTime: a.checkInTime ? new Date(a.checkInTime).toISOString() : null,
+        checkOutTime: a.checkOutTime ? new Date(a.checkOutTime).toISOString() : null,
+        lateMinutes: Number(a.lateMinutes || 0),
+        earlyMinutes: Number(a.earlyMinutes || 0),
+        // Cùng cách tính với màn kết quả chấm công (computeAttendanceDeltas).
+        earlyArrivalMinutes: deltas.earlyArrivalMinutes,
+        overtimeMinutes: deltas.overtimeMinutes,
+        autoCheckedOut,
+        autoCheckoutReason: a.autoCheckoutReason ?? null,
+        // Tự kết thúc ca: giờ làm tính đến mốc này (giờ kết thúc ca).
+        scheduledCheckoutTime: a.scheduledCheckoutTime
+          ? new Date(a.scheduledCheckoutTime).toISOString()
+          : null,
+        attendanceStatus: a.attendanceStatus ?? null,
+        onLeave: onLeaveIds.has(a.id),
+        statusKeys,
       };
     });
 
-    // Filter if needed
+    // Filter by tab key; a row can belong to several tabs (e.g. late + early,
+    // or on time + overtime).
     let filteredShifts = shifts;
     if (filter && filter !== 'all') {
-      const statusMap: Record<string, string> = {
-        on_time: 'Đúng giờ',
-        overtime: 'Tăng ca',
-        forgot: 'Quên chấm công',
-        late: 'Đi trễ',
-        early: 'Về sớm',
-        leave: 'Nghỉ phép',
-        absent: 'Nghỉ không phép',
-      };
-      filteredShifts = shifts.filter((s) => s.status === statusMap[filter]);
+      filteredShifts = shifts.filter((s) => s.statusKeys.includes(filter));
     }
 
     return {
-      completedShifts: tabCounts.on_time + tabCounts.overtime,
+      completedShifts,
       totalHours: Math.floor(totalMinutes / 60),
       totalMinutes: totalMinutes % 60,
       shiftsTrend: 0,
@@ -14291,6 +15812,14 @@ export class StoresService {
       'Bạn chỉ có thể gửi đơn cho chính mình',
     );
 
+    const startDate = normalizeLeaveDate(data?.startDate);
+    const endDate = normalizeLeaveDate(data?.endDate);
+    if (endDate < startDate) {
+      throw new BadRequestException('Ngày kết thúc phải sau ngày bắt đầu');
+    }
+    // Released staff builds send 'LEAVE' (not an enum value: a 500 before).
+    const type = normalizeLeaveType(data?.type) ?? LeaveType.PERSONAL;
+
     const attachments: string[] = [];
     if (files && files.length > 0) {
       files.forEach((file) => {
@@ -14298,34 +15827,112 @@ export class StoresService {
       });
     }
 
-    // Explicit allowlist. The previous `create({ ...data })` spread let a
-    // client set `id` (turning the save into an update of an arbitrary row),
-    // `approvedById`, `approvedAt` and every other column.
-    const leaveRequest = this.leaveRequestRepository.create({
-      storeId,
-      employeeProfileId: data.employeeProfileId,
-      type: data.type,
-      startDate: data.startDate,
-      endDate: data.endDate,
-      startTime: data.startTime,
-      endTime: data.endTime,
-      reason: data.reason,
-      leaveDays: data.leaveDays,
-      shiftAssignmentId: data.shiftAssignmentId || undefined,
-      attachments,
-      status: LeaveRequestStatus.PENDING,
-    } as Partial<EmployeeLeaveRequest>);
-    return this.leaveRequestRepository.save(leaveRequest);
+    return this.dataSource.transaction(async (manager) => {
+      // Serialise this employee's submissions (as createShiftChangeRequest
+      // does) so a double submit cannot slip past the duplicate check.
+      await manager.findOne(EmployeeProfile, {
+        where: { id: data.employeeProfileId },
+        select: ['id'],
+        lock: { mode: 'pessimistic_write' },
+      });
+      const shiftAssignmentId = await this.resolveLeaveShiftAssignmentId(
+        manager,
+        storeId,
+        data.employeeProfileId,
+        data?.shiftAssignmentId,
+      );
+
+      // Late/Early/Absent screens in released builds submit twice (modal and
+      // parent). An identical pending request is returned, not duplicated.
+      const duplicate = await manager.findOne(EmployeeLeaveRequest, {
+        where: {
+          employeeProfileId: data.employeeProfileId,
+          type,
+          startDate,
+          endDate,
+          status: LeaveRequestStatus.PENDING,
+          shiftAssignmentId: shiftAssignmentId ?? IsNull(),
+        },
+        order: { createdAt: 'DESC' },
+      });
+      if (duplicate) return duplicate;
+
+      // Explicit allowlist. The previous `create({ ...data })` spread let a
+      // client set `id` (turning the save into an update of an arbitrary row),
+      // `approvedById`, `approvedAt` and every other column.
+      const leaveRequest = manager.create(EmployeeLeaveRequest, {
+        storeId,
+        employeeProfileId: data.employeeProfileId,
+        type,
+        startDate,
+        endDate,
+        startTime: data.startTime,
+        endTime: data.endTime,
+        reason: data.reason,
+        leaveDays: data.leaveDays,
+        shiftAssignmentId: shiftAssignmentId ?? undefined,
+        attachments,
+        status: LeaveRequestStatus.PENDING,
+      } as Partial<EmployeeLeaveRequest>);
+      return manager.save(EmployeeLeaveRequest, leaveRequest);
+    });
+  }
+
+  /**
+   * The shift a leave request is about. Released staff builds send the slot
+   * id (the schedule grid's `id`) as `shiftAssignmentId`, which broke the
+   * foreign key; it is resolved to the employee's own assignment on that
+   * slot. Anything else outside the caller's own assignments in this store
+   * is refused.
+   */
+  private async resolveLeaveShiftAssignmentId(
+    manager: EntityManager,
+    storeId: string,
+    employeeProfileId: string,
+    ref: unknown,
+  ): Promise<string | null> {
+    if (ref === undefined || ref === null || ref === '') return null;
+    const invalid = () =>
+      new BadRequestException('Ca làm không hợp lệ cho đơn này');
+    if (typeof ref !== 'string' || !isUUID(ref)) throw invalid();
+
+    const own = await manager.findOne(ShiftAssignment, {
+      where: {
+        id: ref,
+        employeeId: employeeProfileId,
+        shiftSlot: { cycle: { storeId } },
+      },
+      select: ['id'],
+    });
+    if (own) return own.id;
+
+    const onSlot = await manager.findOne(ShiftAssignment, {
+      where: {
+        shiftSlotId: ref,
+        employeeId: employeeProfileId,
+        status: Not(ShiftAssignmentStatus.CANCELLED),
+        shiftSlot: { cycle: { storeId } },
+      },
+      select: ['id'],
+      order: { createdAt: 'DESC' },
+    });
+    if (onSlot) return onSlot.id;
+    throw invalid();
   }
 
   async getLeaveRequestsByEmployee(
     employeeProfileId: string,
     accountId?: string,
+    type?: string,
   ) {
+    const types = parseLeaveTypeFilter(type);
     if (accountId)
       await this.assertEmployeeCalendarAccess(employeeProfileId, accountId);
     return this.leaveRequestRepository.find({
-      where: { employeeProfileId },
+      where: {
+        employeeProfileId,
+        ...(types ? { type: In(types) } : {}),
+      },
       order: { createdAt: 'DESC' },
       relations: ['approvedBy', 'approvedBy.account', 'shiftAssignment'],
     });
@@ -14485,7 +16092,9 @@ export class StoresService {
         id: data.employeeProfileId,
         storeId: data.storeId,
         accountId,
-        employmentStatus: EmploymentStatus.ACTIVE,
+        // Anyone who can be rostered may ask to change a shift (probation
+        // included); on-leave staff have no shifts to change.
+        employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
       select: ['id', 'storeId', 'accountId'],
     });
@@ -14898,33 +16507,51 @@ export class StoresService {
     });
   }
 
-  async approveBonusWorkRequest(id: string, approverId: string | undefined) {
-    if (!approverId)
-      throw new BadRequestException('Không xác định được người duyệt');
+  /**
+   * Loads a bonus-work request for review by the store owner.
+   *
+   * `approvedById` is an `EmployeeProfile` FK, and an owner normally has no
+   * profile at their own store, so it records the owner's profile there when
+   * one exists and null otherwise. The authority is the owner check, not the
+   * profile.
+   */
+  private async loadBonusWorkRequestForOwner(
+    id: string,
+    ownerAccountId: string | undefined,
+  ) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
     const request = await this.bonusWorkRequestRepository.findOne({
       where: { id },
     });
     if (!request)
       throw new NotFoundException('Không tìm thấy yêu cầu bổ sung công');
+    await this.assertOwnerStoreAccess(request.storeId, ownerAccountId);
+    const approverProfile = await this.profileRepository.findOne({
+      where: { accountId: ownerAccountId, storeId: request.storeId },
+      select: ['id'],
+    });
+    return { request, approverProfileId: approverProfile?.id ?? null };
+  }
+
+  async approveBonusWorkRequest(id: string, ownerAccountId: string | undefined) {
+    const { request, approverProfileId } =
+      await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
     request.status = BonusWorkRequestStatus.APPROVED;
-    request.approvedById = approverId ?? null;
+    request.approvedById = approverProfileId;
     return this.bonusWorkRequestRepository.save(request);
   }
 
   async rejectBonusWorkRequest(
     id: string,
-    approverId: string | undefined,
+    ownerAccountId: string | undefined,
     reason?: string,
   ) {
-    if (!approverId)
-      throw new BadRequestException('Không xác định được người duyệt');
-    const request = await this.bonusWorkRequestRepository.findOne({
-      where: { id },
-    });
-    if (!request)
-      throw new NotFoundException('Không tìm thấy yêu cầu bổ sung công');
+    const { request, approverProfileId } =
+      await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
     request.status = BonusWorkRequestStatus.REJECTED;
-    request.approvedById = approverId ?? null;
+    request.approvedById = approverProfileId;
     request.rejectionReason = reason ?? null;
     return this.bonusWorkRequestRepository.save(request);
   }
@@ -14975,19 +16602,22 @@ export class StoresService {
     return { total, pending, approved, urgent };
   }
 
-  async cancelBonusWorkRequest(
-    id: string,
-    employeeProfileId: string | undefined,
-  ) {
-    if (!employeeProfileId)
+  /** Only the employee who filed the request may cancel it. */
+  async cancelBonusWorkRequest(id: string, accountId: string | undefined) {
+    if (!accountId)
       throw new BadRequestException('Không xác định được nhân viên');
     const request = await this.bonusWorkRequestRepository.findOne({
       where: { id },
     });
     if (!request)
       throw new NotFoundException('Không tìm thấy yêu cầu bổ sung công');
-    if (request.employeeProfileId !== employeeProfileId) {
-      throw new BadRequestException('Bạn không có quyền hủy yêu cầu này');
+    const requester = await this.profileRepository.findOne({
+      where: { id: request.employeeProfileId },
+      select: ['id', 'accountId'],
+      withDeleted: true,
+    });
+    if (!requester || requester.accountId !== accountId) {
+      throw new ForbiddenException('Bạn không có quyền hủy yêu cầu này');
     }
     if (request.status !== BonusWorkRequestStatus.PENDING) {
       throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
@@ -15042,6 +16672,30 @@ export class StoresService {
     return this.feedbackRepository.find({
       where,
       order: { createdAt: 'DESC' },
+    });
+  }
+
+  /**
+   * Feedback list for one store. The owner sees all of it; an employee sees
+   * only the feedback they submitted. `storeId` is required.
+   */
+  async getFeedbacksForViewer(
+    accountId: string | undefined,
+    filters: {
+      storeId?: string;
+      employeeProfileId?: string;
+      status?: FeedbackStatus;
+    },
+  ) {
+    if (!filters.storeId) {
+      throw new BadRequestException('storeId is required');
+    }
+    const viewer = await this.resolveStoreViewer(filters.storeId, accountId);
+    return this.getFeedbacks({
+      storeId: filters.storeId,
+      employeeProfileId: filters.employeeProfileId,
+      status: filters.status,
+      ...(viewer.isOwner ? {} : { accountId }),
     });
   }
 
@@ -15268,6 +16922,24 @@ export class StoresService {
         'Ca làm việc chưa được chấp thuận. Vui lòng chờ chủ cửa hàng duyệt.',
       );
     }
+    // Qua giờ kết thúc mà chưa vào ca thì ca đã bị ghi nghỉ không phép; không
+    // cho check-in muộn hơn giờ kết thúc nữa.
+    {
+      const slot = assignment.shiftSlot;
+      const { end } = resolveShiftBoundaries(
+        slot?.workDate ? String(slot.workDate).slice(0, 10) : null,
+        slot?.startTime || slot?.workShift?.startTime,
+        slot?.endTime || slot?.workShift?.endTime,
+      );
+      if (
+        assignment.attendanceStatus === AttendanceStatus.ABSENT ||
+        (end && Date.now() >= end.getTime())
+      ) {
+        throw new BadRequestException(
+          'Ca làm đã kết thúc nên không thể check-in. Ca được ghi nhận là nghỉ không phép.',
+        );
+      }
+    }
 
     const storeId = assignment.shiftSlot?.cycle?.storeId;
 
@@ -15410,6 +17082,13 @@ export class StoresService {
       matched: true,
       distance: matchResult.distance,
       lateMinutes,
+      // Đến sớm bao nhiêu phút so với giờ vào ca (0 nếu đúng giờ hoặc trễ), để
+      // màn kết quả nói "Sớm 12 phút" thay vì luôn "Đúng giờ".
+      earlyArrivalMinutes: computeAttendanceDeltas({
+        start: shiftStart,
+        end: null,
+        checkIn: now,
+      }).earlyArrivalMinutes,
       attendanceStatus,
       checkInTime: now.toISOString(),
       gpsDistance: checkinDistance != null ? Math.round(checkinDistance) : null,
@@ -15614,6 +17293,12 @@ export class StoresService {
       matched: true,
       distance: matchResult.distance,
       earlyMinutes,
+      // Ra muộn bao nhiêu phút sau giờ kết thúc ca (0 nếu về đúng giờ hoặc sớm).
+      overtimeMinutes: computeAttendanceDeltas({
+        start: null,
+        end: shiftEnd,
+        checkOut: now,
+      }).overtimeMinutes,
       workedMinutes,
       attendanceStatus,
       checkOutTime: now.toISOString(),
@@ -15622,6 +17307,83 @@ export class StoresService {
       netSalary: null,
       payrollProcessing: true,
     };
+  }
+
+  /**
+   * Recomputes one employee's payslip for the Vietnam month of `workDate`
+   * after an attendance change without a check-out (a shift marked ABSENT at
+   * its end). Same lock, composer and single writer as recalculation and
+   * check-out: never deletes a payslip, APPROVED/PAID payslips stay as they
+   * are, advances are re-derived under the row lock. Idempotent.
+   */
+  async recomputeEmployeePayslipForWorkDate(input: {
+    employeeProfileId: string;
+    storeId: string;
+    workDate: string;
+  }): Promise<'protected' | 'updated' | 'inserted' | 'skipped'> {
+    const month = vnMonthOfDateString(input.workDate);
+    if (!month) return 'skipped';
+    const employee = await this.profileRepository.findOne({
+      where: { id: input.employeeProfileId, storeId: input.storeId },
+      relations: ['contracts'],
+    });
+    // Same population as a store recalculation: rostered staff only.
+    if (!employee || !isShiftEligibleEmploymentStatus(employee.employmentStatus)) {
+      return 'skipped';
+    }
+    return this.dataSource.transaction(async (manager) => {
+      const payroll = await this.findOrCreateMonthlyPayroll(
+        input.storeId,
+        month,
+        manager,
+      );
+      const existing = await this.lockEmployeePayslip(
+        manager,
+        employee.id,
+        month,
+      );
+      const contract = employee.contracts?.find((c) => c.isActive) ?? null;
+      let payslip: PayslipComputation | null = null;
+      if (contract && !(existing && this.isProtectedPayslip(existing))) {
+        const { rate } = await this.resolveRateForMonth(
+          employee.id,
+          contract,
+          month,
+          manager,
+        );
+        const rules = await manager
+          .getRepository(StorePayrollRule)
+          .find({ where: { storeId: input.storeId, isActive: true } });
+        const standardWorkingDays = await this.getStandardWorkingDays(
+          input.storeId,
+          month,
+          manager,
+        );
+        ({ payslip } = await this.computeEmployeePayslip({
+          manager,
+          employeeProfileId: employee.id,
+          storeId: input.storeId,
+          month,
+          contract,
+          rate,
+          rules,
+          standardWorkingDays,
+          existingSalaryId: existing?.id ?? null,
+          otherDeductions: existing?.otherDeductions,
+          now: new Date(),
+        }));
+      }
+      const outcome = await this.upsertEmployeePayslip(manager, {
+        employeeProfileId: employee.id,
+        month,
+        monthlyPayrollId: payroll.id,
+        payslip,
+        allowances: contract?.allowances ?? null,
+        existing,
+      });
+      await this.refreshMonthlyPayrollTotals(manager, payroll.id);
+      return outcome;
+    });
   }
 
   async processCheckoutPayroll(assignmentId: string): Promise<void> {
@@ -15655,47 +17417,136 @@ export class StoresService {
     }
 
     const checkoutTime = new Date(assignment.checkOutTime);
-    const activeContract = assignment.employee?.contracts?.find(
-      (contract) => contract.isActive,
-    );
+    const workDate =
+      typeof assignment.shiftSlot?.workDate === 'string'
+        ? assignment.shiftSlot.workDate.slice(0, 10)
+        : null;
+    // The payslip month is the Vietnam month of the shift's work date, the
+    // same window the attendance query uses. An overnight shift on the 31st
+    // that checks out on the 1st belongs to the month it started in.
+    const month = vnMonthOfDateString(workDate) ?? vnMonthOf(checkoutTime);
+    const activeContract =
+      assignment.employee?.contracts?.find((contract) => contract.isActive) ??
+      null;
 
-    if (activeContract) {
-      const baseSalary = Number(activeContract.salaryAmount) || 0;
-      const workedHours = Number(assignment.workedMinutes || 0) / 60;
-      let shiftEarnings: number | null = null;
-
-      // Shared with the shift-estimate path. A null result means no rule
-      // covers this payment type; the stored figure is then left untouched,
-      // exactly as the previous default-less switch did.
-      shiftEarnings = calculateShiftEarnings({
-        paymentType: activeContract.paymentType,
-        baseSalary,
-        hours: workedHours,
-        referenceDate: checkoutTime,
+    // The payslip and its inputs (rate, rules, working days, attendance) are
+    // read by `composeCheckoutPayslip`. With a contract that runs inside the
+    // payslip transaction, after the per-(store, month) advisory lock taken by
+    // findOrCreateMonthlyPayroll, so a stale checkout job cannot overwrite a
+    // payslip written by a newer one or by a recalculation.
+    const composeCheckoutPayslip = async (manager?: EntityManager) => {
+      const standardWorkingDays = await this.getStandardWorkingDays(
+        storeId,
+        month,
+        manager,
+      );
+      const rate = activeContract
+        ? (
+            await this.resolveRateForMonth(
+              assignment.employeeId,
+              activeContract,
+              month,
+              manager,
+            )
+          ).rate
+        : 0;
+      const payrollRules = activeContract
+        ? await (manager
+            ? manager.getRepository(StorePayrollRule)
+            : this.payrollRuleRepository
+          ).find({
+            where: { storeId, isActive: true },
+          })
+        : [];
+      // Read-only: facts and the month's payslip from the shared composer.
+      const composed = await this.computeEmployeePayslip({
+        manager,
+        employeeProfileId: assignment.employeeId,
+        storeId,
+        month,
+        contract: activeContract,
+        rate,
+        rules: payrollRules,
+        standardWorkingDays,
+        now: new Date(),
       });
+      return { ...composed, rate, standardWorkingDays };
+    };
 
-      if (shiftEarnings != null && assignment.shiftEarnings !== shiftEarnings) {
-        assignment.shiftEarnings = shiftEarnings;
-        await this.shiftAssignmentRepository.save(assignment);
-      }
+    let facts: MonthlyAttendanceFacts;
+    let payslip: PayslipComputation;
+    if (!activeContract) {
+      ({ facts, payslip } = await composeCheckoutPayslip());
+    } else {
+      // Same writer and lock as generation/recalculation, so a checkout job
+      // and a recalculation for the same store and month serialize.
+      ({ facts, payslip } = await this.dataSource.transaction(
+        async (manager) => {
+          const payroll = await this.findOrCreateMonthlyPayroll(
+            storeId,
+            month,
+            manager,
+          );
+          const composed = await composeCheckoutPayslip(manager);
+          const { assignments, rate, standardWorkingDays } = composed;
+
+          // Per-shift display figures for every completed shift on this work
+          // date. A monthly salary is paid per distinct day, so only the day's
+          // owner shift carries the day rate. Recomputing the whole day makes
+          // the result independent of the order checkout jobs run in, and
+          // idempotent.
+          const owners = pickDayOwnerAssignmentIds(assignments);
+          const loadedIds = new Set(assignments.map((a) => a.id));
+          const targets: PayrollAssignmentFact[] = assignments.filter(
+            (a) =>
+              a.status === ShiftAssignmentStatus.COMPLETED &&
+              workDate !== null &&
+              a.workDate === workDate,
+          );
+          if (!loadedIds.has(assignment.id)) {
+            targets.push({
+              id: assignment.id,
+              workDate: workDate ?? '',
+              status: assignment.status,
+              workedMinutes: assignment.workedMinutes,
+              shiftEarnings: assignment.shiftEarnings,
+            });
+          }
+
+          for (const target of targets) {
+            // Shared with the shift-estimate path. A null result means no rule
+            // covers this payment type; the stored figure is then left
+            // untouched.
+            const shiftEarnings = calculateShiftEarnings({
+              paymentType: activeContract.paymentType,
+              baseSalary: rate,
+              hours: Number(target.workedMinutes || 0) / 60,
+              referenceDate: workDate ? vnMiddayInstant(workDate) : checkoutTime,
+              workingDaysInMonth: standardWorkingDays,
+              countsAsWorkedDay:
+                owners.has(target.id) || !loadedIds.has(target.id),
+            });
+            const previous =
+              target.shiftEarnings == null ? null : Number(target.shiftEarnings);
+            if (shiftEarnings != null && previous !== shiftEarnings) {
+              await manager.getRepository(ShiftAssignment).update(target.id, {
+                shiftEarnings,
+              });
+            }
+          }
+
+          await this.upsertEmployeePayslip(manager, {
+            employeeProfileId: assignment.employeeId,
+            month,
+            monthlyPayrollId: payroll.id,
+            payslip: composed.payslip,
+            allowances: activeContract.allowances ?? null,
+          });
+          await this.refreshMonthlyPayrollTotals(manager, payroll.id);
+          return composed;
+        },
+      ));
     }
-
-    const monthDate = new Date(
-      checkoutTime.getFullYear(),
-      checkoutTime.getMonth(),
-      1,
-    );
-    const nextMonthDate = new Date(
-      checkoutTime.getFullYear(),
-      checkoutTime.getMonth() + 1,
-      1,
-    );
-    const attendanceSummary = await this.calculateEmployeeAttendanceSummary(
-      assignment.employeeId,
-      storeId,
-      monthDate,
-      nextMonthDate,
-    );
 
     const cumulative = await this.shiftAssignmentRepository
       .createQueryBuilder('assignment')
@@ -15711,25 +17562,23 @@ export class StoresService {
 
     const onTimeArrivalsCount = Math.max(
       0,
-      attendanceSummary.completedShifts - attendanceSummary.lateCount,
+      facts.completedShifts - facts.lateCount,
     );
-    const performanceScore = attendanceSummary.completedShifts
-      ? Math.round(
-          (onTimeArrivalsCount / attendanceSummary.completedShifts) * 100,
-        )
+    const performanceScore = facts.completedShifts
+      ? Math.round((onTimeArrivalsCount / facts.completedShifts) * 100)
       : 0;
     await this.monthlySummaryRepository.upsert(
       {
         employeeProfileId: assignment.employeeId,
-        month: monthDate,
-        totalShifts: attendanceSummary.totalAssignedShifts,
-        completedShifts: attendanceSummary.completedShifts,
-        monthlyWorkHours: attendanceSummary.workingHours,
-        lateArrivalsCount: attendanceSummary.lateCount,
+        month: toMonthMarker(month),
+        totalShifts: facts.totalAssignedShifts,
+        completedShifts: facts.completedShifts,
+        monthlyWorkHours: facts.workingHours,
+        lateArrivalsCount: facts.lateCount,
         onTimeArrivalsCount,
-        earlyDeparturesCount: attendanceSummary.earlyCount,
-        unauthorizedLeavesCount: attendanceSummary.absentCount,
-        estimatedSalary: attendanceSummary.totalShiftEarnings,
+        earlyDeparturesCount: facts.earlyCount,
+        unauthorizedLeavesCount: facts.absentCount,
+        estimatedSalary: payslip.earnedBaseSalary,
         baseSalary: Number(activeContract?.salaryAmount) || 0,
         performanceScore,
         totalCompletedShifts: Number(cumulative?.completedShifts || 0),
@@ -15737,116 +17586,6 @@ export class StoresService {
       },
       ['employeeProfileId', 'month'],
     );
-
-    if (!activeContract) return;
-
-    const payrollSetting = await this.payrollSettingRepository.findOne({
-      where: { storeId, isActive: true },
-    });
-    const calculatedSalary = this.calculateBaseSalary(
-      Number(activeContract.salaryAmount) || 0,
-      activeContract.paymentType || PaymentType.MONTH,
-      attendanceSummary,
-      payrollSetting,
-      checkoutTime,
-      await this.getWorkingDaysInMonth(storeId, checkoutTime),
-    );
-    const payrollRules = await this.payrollRuleRepository.find({
-      where: { storeId, isActive: true },
-    });
-    let bonus = 0;
-    let penalty = 0;
-    for (const rule of payrollRules) {
-      if (rule.category === PayrollRuleCategory.FINE) {
-        if (rule.ruleType === 'LATE' && attendanceSummary.lateCount > 0) {
-          penalty +=
-            rule.calcType === PayrollCalcType.AMOUNT
-              ? Number(rule.value) * attendanceSummary.lateCount
-              : ((calculatedSalary * Number(rule.value)) / 100) *
-                attendanceSummary.lateCount;
-        }
-        if (rule.ruleType === 'EARLY' && attendanceSummary.earlyCount > 0) {
-          penalty +=
-            rule.calcType === PayrollCalcType.AMOUNT
-              ? Number(rule.value) * attendanceSummary.earlyCount
-              : ((calculatedSalary * Number(rule.value)) / 100) *
-                attendanceSummary.earlyCount;
-        }
-        if (rule.ruleType === 'ABSENT' && attendanceSummary.absentCount > 0) {
-          penalty += Number(rule.value) * attendanceSummary.absentCount;
-        }
-      } else if (rule.category === PayrollRuleCategory.BONUS) {
-        if (
-          rule.ruleType === 'ATTENDANCE' &&
-          attendanceSummary.lateCount === 0 &&
-          attendanceSummary.absentCount === 0
-        ) {
-          bonus += Number(rule.value);
-        }
-        if (!rule.ruleType || rule.ruleType === 'GENERAL') {
-          bonus += Number(rule.value);
-        }
-      }
-    }
-
-    const allowances = activeContract.allowances || {};
-    const allowancesTotal = Object.values(allowances).reduce(
-      (sum, value) => sum + Number(value || 0),
-      0,
-    );
-    const totalIncome = Math.round(calculatedSalary + allowancesTotal + bonus);
-    const totalDeductions = Math.round(penalty);
-    const netSalary = Math.max(0, totalIncome - totalDeductions);
-    const payroll = await this.findOrCreateMonthlyPayroll(storeId, monthDate);
-    const existingSalary = await this.employeeSalaryRepository.findOne({
-      where: { employeeProfileId: assignment.employeeId, month: monthDate },
-    });
-
-    if (
-      !existingSalary ||
-      ![PaymentStatus.APPROVED, PaymentStatus.PAID].includes(
-        existingSalary.paymentStatus,
-      )
-    ) {
-      await this.employeeSalaryRepository.upsert(
-        {
-          employeeProfileId: assignment.employeeId,
-          month: monthDate,
-          monthlyPayrollId: payroll.id,
-          baseSalary: Number(activeContract.salaryAmount) || 0,
-          paymentType: activeContract.paymentType,
-          allowances,
-          workingDays: attendanceSummary.completedShifts,
-          workingHours: attendanceSummary.workingHours,
-          unauthorizedLeaveDays: attendanceSummary.absentCount,
-          bonus,
-          penalty,
-          totalIncome,
-          totalDeductions,
-          netSalary,
-          earnedBaseSalary: calculatedSalary,
-        },
-        ['employeeProfileId', 'month'],
-      );
-    }
-
-    const totals = await this.employeeSalaryRepository
-      .createQueryBuilder('salary')
-      .select('COALESCE(SUM(salary.netSalary), 0)', 'estimatedPayment')
-      .addSelect('COALESCE(SUM(salary.bonus), 0)', 'totalBonus')
-      .addSelect('COALESCE(SUM(salary.penalty), 0)', 'totalPenalty')
-      .where('salary.monthlyPayrollId = :payrollId', { payrollId: payroll.id })
-      .getRawOne<{
-        estimatedPayment: string;
-        totalBonus: string;
-        totalPenalty: string;
-      }>();
-    await this.payrollRepository.update(payroll.id, {
-      estimatedPayment: Number(totals?.estimatedPayment || 0),
-      totalBonus: Number(totals?.totalBonus || 0),
-      totalPenalty: Number(totals?.totalPenalty || 0),
-      totalPendingApproval: Number(totals?.estimatedPayment || 0),
-    });
   }
 
   /**
@@ -16103,7 +17842,15 @@ export class StoresService {
     });
   }
 
-  async getBonusHistory(storeId: string, month?: string) {
+  /**
+   * `employeeProfileId`, when given, limits the history to that employee —
+   * used for non-owner callers, who may only see their own rows.
+   */
+  async getBonusHistory(
+    storeId: string,
+    month?: string,
+    employeeProfileId?: string,
+  ) {
     const query = this.salaryAdjustmentRepository
       .createQueryBuilder('sa')
       .innerJoinAndSelect('sa.employeeProfile', 'ep')
@@ -16113,6 +17860,10 @@ export class StoresService {
       .where('ep.storeId = :storeId', { storeId })
       .andWhere('sa.adjustmentType = :type', { type: AdjustmentType.INCREASE })
       .orderBy('sa.createdAt', 'DESC');
+
+    if (employeeProfileId) {
+      query.andWhere('ep.id = :employeeProfileId', { employeeProfileId });
+    }
 
     if (month) {
       query.andWhere("TO_CHAR(sa.effective_month, 'MM/YYYY') = :month", {
@@ -16143,7 +17894,15 @@ export class StoresService {
     }));
   }
 
-  async getPenaltyHistory(storeId: string, month?: string) {
+  /**
+   * `employeeProfileId`, when given, limits the history to that employee —
+   * used for non-owner callers, who may only see their own rows.
+   */
+  async getPenaltyHistory(
+    storeId: string,
+    month?: string,
+    employeeProfileId?: string,
+  ) {
     const query = this.salaryAdjustmentRepository
       .createQueryBuilder('sa')
       .innerJoinAndSelect('sa.employeeProfile', 'ep')
@@ -16153,6 +17912,10 @@ export class StoresService {
       .where('ep.storeId = :storeId', { storeId })
       .andWhere('sa.adjustmentType = :type', { type: AdjustmentType.DECREASE })
       .orderBy('sa.createdAt', 'DESC');
+
+    if (employeeProfileId) {
+      query.andWhere('ep.id = :employeeProfileId', { employeeProfileId });
+    }
 
     if (month) {
       query.andWhere("TO_CHAR(sa.effective_month, 'MM/YYYY') = :month", {
@@ -16184,12 +17947,9 @@ export class StoresService {
   }
 
   async getNextShiftAssignment(employeeProfileId: string, storeId: string) {
-    const today = new Date();
-    // Use local date to match PostgreSQL date column (avoids UTC+7 midnight mismatch)
-    const year = today.getFullYear();
-    const month = String(today.getMonth() + 1).padStart(2, '0');
-    const day = String(today.getDate()).padStart(2, '0');
-    const todayStr = `${year}-${month}-${day}`;
+    // Vietnam calendar day, whatever the server timezone (a UTC host saw
+    // "yesterday" between 00:00 and 07:00 VN).
+    const todayStr = vnDateString(new Date());
 
     this.logger.log(
       `[getNextShiftAssignment] employeeProfileId=${employeeProfileId}, storeId=${storeId}, todayStr=${todayStr}`,
@@ -16227,6 +17987,30 @@ export class StoresService {
       return end !== null && end.getTime() <= now.getTime();
     };
 
+    // Additive attendance facts for the Home / "Hôm nay" cards.
+    const attendanceFields = (assignment: ShiftAssignment) => ({
+      attendanceStatus: assignment.attendanceStatus ?? null,
+      checkOutTime: assignment.checkOutTime?.toISOString() || null,
+      workedMinutes: assignment.workedMinutes ?? 0,
+      earlyMinutes: assignment.earlyMinutes ?? 0,
+      autoCheckoutReason: assignment.autoCheckoutReason ?? null,
+      autoCheckedOut: !!(
+        assignment.isAutoCheckout || assignment.autoCheckoutReason
+      ),
+      // Auto check-out: the shift end the employee is paid up to.
+      scheduledCheckoutTime:
+        assignment.scheduledCheckoutTime?.toISOString?.() || null,
+    });
+    const onLeaveFor = (assignment: ShiftAssignment) =>
+      assignment.checkInTime
+        ? Promise.resolve(false)
+        : isShiftCoveredByApprovedLeave(
+            this.dataSource,
+            employeeProfileId,
+            String(assignment.shiftSlot?.workDate ?? todayStr).slice(0, 10),
+            assignment.id,
+          );
+
     // 1) Check if there's an active assignment (checked in but not checked out) in this store
     const activeAssignment = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
@@ -16263,6 +18047,8 @@ export class StoresService {
         // check out rather than letting it run silently past closing.
         shiftEnded: hasEnded(activeAssignment),
         missed: false,
+        onLeave: false,
+        ...attendanceFields(activeAssignment),
         totalShiftsToday,
       };
     }
@@ -16312,9 +18098,18 @@ export class StoresService {
         note: approvedAssignment.shiftSlot?.note || '',
         shiftEnded: false,
         missed: false,
+        onLeave: await onLeaveFor(approvedAssignment),
+        ...attendanceFields(approvedAssignment),
         totalShiftsToday,
       };
     }
+
+    // Terminal states below also carry today's worked total and the next
+    // scheduled shift (any day) for the "Ca tiếp theo" line.
+    const [workedMinutesToday, nextShift] = await Promise.all([
+      this.sumWorkedMinutesOn(employeeProfileId, storeId, todayStr),
+      this.findNextUpcomingShift(employeeProfileId, storeId, todayStr, now),
+    ]);
 
     // 2b) Nothing left to act on, but a shift today was missed outright. Report
     //     it instead of silently falling through, so the app can say so rather
@@ -16338,6 +18133,13 @@ export class StoresService {
         note: missedAssignment.shiftSlot?.note || '',
         shiftEnded: true,
         missed: true,
+        // attendanceStatus is 'ABSENT' once the per-minute reconcile marked
+        // it; null for that first minute, or when onLeave (approved full-day
+        // leave → "Nghỉ phép", never ABSENT).
+        onLeave: await onLeaveFor(missedAssignment),
+        ...attendanceFields(missedAssignment),
+        workedMinutesToday,
+        nextShift,
         totalShiftsToday,
       };
     }
@@ -16385,6 +18187,10 @@ export class StoresService {
         shiftEnded: hasEnded(doneAssignment),
         // Status is COMPLETED but nothing was ever recorded against it.
         missed: !doneAssignment.checkInTime,
+        onLeave: await onLeaveFor(doneAssignment),
+        ...attendanceFields(doneAssignment),
+        workedMinutesToday,
+        nextShift,
         location: doneAssignment.shiftSlot?.location || ws?.location || '',
         note: doneAssignment.shiftSlot?.note || '',
         totalShiftsToday,
@@ -16394,18 +18200,111 @@ export class StoresService {
     this.logger.log(
       `[getNextShiftAssignment] No shifts found for today (${todayStr})`,
     );
+    // Same fields as every other mode, with empty defaults, so the app can
+    // read the contract without per-mode guards.
     return {
       mode: 'none',
       assignmentId: null,
       shiftName: null,
       startTime: null,
       endTime: null,
+      workDate: null,
+      shiftSlotId: null,
       checkInTime: null,
       lateMinutes: 0,
       location: '',
       note: '',
+      shiftEnded: false,
+      missed: false,
+      onLeave: false,
+      attendanceStatus: null,
+      checkOutTime: null,
+      workedMinutes: 0,
+      earlyMinutes: 0,
+      autoCheckoutReason: null,
+      autoCheckedOut: false,
+      scheduledCheckoutTime: null,
+      workedMinutesToday,
+      nextShift,
       totalShiftsToday,
     };
+  }
+
+  /** Worked minutes of the employee's completed shifts on a VN work date. */
+  private async sumWorkedMinutesOn(
+    employeeProfileId: string,
+    storeId: string,
+    workDate: string,
+  ): Promise<number> {
+    const raw = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoin('a.shiftSlot', 'slot')
+      .leftJoin('slot.cycle', 'cycle')
+      .select('COALESCE(SUM(a.workedMinutes), 0)', 'total')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('slot.workDate = :workDate', { workDate })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('a.status = :status', {
+        status: ShiftAssignmentStatus.COMPLETED,
+      })
+      .getRawOne<{ total: string | number }>();
+    return Number(raw?.total || 0);
+  }
+
+  /**
+   * The next APPROVED, not-yet-started shift in this store from today (VN)
+   * on, or null. Bounded look-ahead of 20 rows.
+   */
+  private async findNextUpcomingShift(
+    employeeProfileId: string,
+    storeId: string,
+    todayStr: string,
+    now: Date,
+  ): Promise<{
+    assignmentId: string;
+    workDate: string;
+    startTime: string;
+    endTime: string;
+    shiftName: string;
+    startsAt: string;
+  } | null> {
+    const candidates = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoin('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('a.status = :status', {
+        status: ShiftAssignmentStatus.APPROVED,
+      })
+      .andWhere('a.checkInTime IS NULL')
+      .andWhere('slot.workDate >= :todayStr', { todayStr })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .orderBy('slot.workDate', 'ASC')
+      // Effective start: a slot's own start time overrides its work shift's,
+      // so order by the same time the loop below resolves.
+      .addOrderBy('COALESCE(slot.start_time, ws.start_time)', 'ASC')
+      .addOrderBy('a.id', 'ASC')
+      // Many-to-one joins only, so a plain LIMIT is exact.
+      .limit(20)
+      .getMany();
+    for (const candidate of candidates) {
+      const slot = candidate.shiftSlot;
+      const startTime = slot?.startTime ?? slot?.workShift?.startTime;
+      const endTime = slot?.endTime ?? slot?.workShift?.endTime;
+      const workDate = String(slot?.workDate ?? '').slice(0, 10);
+      const { start } = resolveShiftBoundaries(workDate, startTime, endTime);
+      if (!start || start.getTime() <= now.getTime()) continue;
+      return {
+        assignmentId: candidate.id,
+        workDate,
+        startTime: startTime || '',
+        endTime: endTime || '',
+        shiftName: slot?.workShift?.shiftName || '',
+        startsAt: start.toISOString(),
+      };
+    }
+    return null;
   }
 
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -16474,6 +18373,56 @@ export class StoresService {
     return { cancelled: doomed.length };
   }
 
+  /**
+   * Last day a fixed-shift registration covers. With an end date, that date
+   * (never before the start). Without one (the staff app's "vô thời hạn"),
+   * every slot of the shift already open in the store's ACTIVE cycles from
+   * the start date, capped at 366 days. Slots the nightly job adds later are
+   * not registered automatically.
+   */
+  private async resolveFixedShiftRangeEnd(
+    storeId: string,
+    workShiftId: string,
+    startDate: string,
+    endDate: string | undefined,
+  ): Promise<string> {
+    if (endDate) {
+      if (endDate < startDate) {
+        throw new BadRequestException('Ngày kết thúc phải sau ngày bắt đầu');
+      }
+      return endDate;
+    }
+    const start = String(startDate).slice(0, 10);
+    let cap: string;
+    try {
+      cap = addDays(start, FIXED_SHIFT_MAX_RANGE_DAYS);
+    } catch {
+      throw new BadRequestException('Ngày bắt đầu không hợp lệ');
+    }
+    const row = await this.shiftSlotRepository
+      .createQueryBuilder('slot')
+      .innerJoin('slot.cycle', 'cycle')
+      .select('MAX(slot.workDate)', 'latest')
+      .where('slot.workShiftId = :workShiftId', { workShiftId })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('slot.workDate >= :startDate', { startDate })
+      .andWhere('cycle.status = :activeStatus', {
+        activeStatus: WorkCycleStatus.ACTIVE,
+      })
+      .getRawOne();
+    const latestRaw = row?.latest;
+    if (!latestRaw) return startDate;
+    const latest =
+      latestRaw instanceof Date
+        ? [
+            latestRaw.getFullYear(),
+            String(latestRaw.getMonth() + 1).padStart(2, '0'),
+            String(latestRaw.getDate()).padStart(2, '0'),
+          ].join('-')
+        : String(latestRaw).slice(0, 10);
+    return latest < cap ? latest : cap;
+  }
+
   async createShiftRegistration(
     accountId: string,
     data: {
@@ -16499,7 +18448,7 @@ export class StoresService {
     if (callerProfile.storeId !== data.storeId) {
       throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
     }
-    if (callerProfile.employmentStatus !== EmploymentStatus.ACTIVE) {
+    if (!isShiftEligibleEmploymentStatus(callerProfile.employmentStatus)) {
       throw new BadRequestException(
         'Nhân viên không còn hoạt động, không thể đăng ký ca',
       );
@@ -16522,6 +18471,12 @@ export class StoresService {
       data.daysOfWeek &&
       data.daysOfWeek.length > 0
     ) {
+      const rangeEnd = await this.resolveFixedShiftRangeEnd(
+        data.storeId,
+        data.workShiftId,
+        data.startDate,
+        data.endDate,
+      );
       const slots = await this.shiftSlotRepository
         .createQueryBuilder('slot')
         .leftJoinAndSelect('slot.cycle', 'cycle')
@@ -16531,7 +18486,7 @@ export class StoresService {
         .andWhere('cycle.storeId = :storeId', { storeId: data.storeId })
         .andWhere('slot.workDate >= :startDate', { startDate: data.startDate })
         .andWhere('slot.workDate <= :endDate', {
-          endDate: data.endDate || data.startDate,
+          endDate: rangeEnd,
         })
         .andWhere('cycle.status = :activeStatus', {
           activeStatus: WorkCycleStatus.ACTIVE,
@@ -16571,7 +18526,7 @@ export class StoresService {
         if (!employee) {
           throw new NotFoundException('Không tìm thấy nhân viên');
         }
-        if (employee.employmentStatus !== EmploymentStatus.ACTIVE) {
+        if (!isShiftEligibleEmploymentStatus(employee.employmentStatus)) {
           throw new BadRequestException(
             'Nhân viên không còn hoạt động, không thể đăng ký ca',
           );
@@ -16886,7 +18841,8 @@ export class StoresService {
     // Fetch recent KPIs and performance data for the employee
     const kpis = await this.employeeKpiRepository.find({
       where: { employeeProfileId: data.employeeProfileId },
-      relations: ['kpiTasks'],
+      // The relation is `tasks`; 'kpiTasks' made every request throw.
+      relations: ['tasks'],
       order: { createdAt: 'DESC' },
       take: 5,
     });

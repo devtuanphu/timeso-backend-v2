@@ -22,6 +22,7 @@ import {
   multerConfig,
   identityMulterConfig,
   IDENTITY_UPLOAD_DIR,
+  identityImageUrl,
 } from '../../common/utils/multer-config';
 import { AccountsService } from './accounts.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
@@ -82,6 +83,24 @@ export class AccountsController {
     return { avatar: avatarUrl };
   }
 
+  private async isOwnerOfEmployingStore(
+    ownerAccountId: string,
+    employeeAccountId: string,
+  ): Promise<boolean> {
+    const rows = await this.identityRepository.manager.query(
+      `SELECT 1
+         FROM employee_profiles ep
+         JOIN stores s ON s.id = ep.store_id
+        WHERE ep.account_id = $1
+          AND s.owner_account_id = $2
+          AND ep.deleted_at IS NULL
+          AND s.deleted_at IS NULL
+        LIMIT 1`,
+      [employeeAccountId, ownerAccountId],
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  }
+
   @Get('identity/image/:filename')
   @ApiOperation({
     summary: 'Tải ảnh giấy tờ định danh',
@@ -99,16 +118,18 @@ export class AccountsController {
       throw new NotFoundException('Không tìm thấy ảnh giấy tờ');
     }
 
+    // Resolve the document that references exactly this private file.
+    const imageUrl = identityImageUrl(filename);
     const document = await this.identityRepository.findOne({
-      where: { accountId: user.userId },
+      where: [{ frontImageUrl: imageUrl }, { backImageUrl: imageUrl }],
     });
     if (!document) throw new NotFoundException('Không tìm thấy ảnh giấy tờ');
 
-    // Ownership: the requested file must be one of this account's own images.
-    const owned = [document.frontImageUrl, document.backImageUrl].some((url) =>
-      typeof url === 'string' ? url.endsWith(`/${filename}`) : false,
-    );
-    if (!owned) {
+    // Readers: the account holder, or the owner of a store that employs them.
+    if (
+      document.accountId !== user.userId &&
+      !(await this.isOwnerOfEmployingStore(user.userId, document.accountId))
+    ) {
       throw new ForbiddenException('Bạn không có quyền xem ảnh giấy tờ này');
     }
 

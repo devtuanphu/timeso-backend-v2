@@ -1,5 +1,7 @@
 import { Controller, Get, Param, Query, UseGuards } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
+import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import {
   ShiftAggregationService,
@@ -7,7 +9,7 @@ import {
 } from './shift-aggregation.service';
 
 @Controller('stores')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, StoreOwnerOnlyGuard)
 export class ShiftAggregationController {
   constructor(private readonly aggService: ShiftAggregationService) {}
 
@@ -15,6 +17,7 @@ export class ShiftAggregationController {
    * GET /stores/:storeId/shifts/slots
    * List shift slots với filter + aggregations
    */
+  @StoreOwnerOnly()
   @Get(':storeId/shifts/slots')
   async getShiftSlots(
     @Param('storeId') storeId: string,
@@ -42,6 +45,7 @@ export class ShiftAggregationController {
    * GET /stores/:storeId/shifts/summary
    * Stats summary (3 cards)
    */
+  @StoreOwnerOnly()
   @Get(':storeId/shifts/summary')
   async getShiftSummary(
     @Param('storeId') storeId: string,
@@ -56,6 +60,7 @@ export class ShiftAggregationController {
    * GET /stores/:storeId/shifts/month-summary
    * Month summary (ca đủ/thiếu/thiếu nghiêm trọng)
    */
+  @StoreOwnerOnly()
   @Get(':storeId/shifts/month-summary')
   async getMonthSummary(
     @Param('storeId') storeId: string,
@@ -75,6 +80,7 @@ export class ShiftAggregationController {
    * GET /stores/:storeId/shifts/suggestions
    * Gợi ý nhân viên cho ca thiếu
    */
+  @StoreOwnerOnly()
   @Get(':storeId/shifts/suggestions')
   async getShiftSuggestions(
     @Param('storeId') storeId: string,
@@ -96,6 +102,7 @@ export class ShiftAggregationController {
    * GET /stores/:storeId/shifts/:shiftSlotId
    * Chi tiết 1 ca
    */
+  @StoreOwnerOnly()
   @Get(':storeId/shifts/:shiftSlotId')
   async getShiftDetail(
     @Param('storeId') storeId: string,

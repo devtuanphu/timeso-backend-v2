@@ -15,9 +15,12 @@ const builderReturning = (terminal: Record<string, unknown>) => {
   for (const method of [
     'leftJoin',
     'leftJoinAndSelect',
+    'select',
     'where',
     'andWhere',
     'orderBy',
+    'addOrderBy',
+    'limit',
   ]) {
     builder[method] = jest.fn(() => builder);
   }
@@ -45,31 +48,47 @@ const assignment = (over: Record<string, unknown> = {}) => ({
 });
 
 /**
- * Wires the four query-builder calls the method makes, in order: the day's
- * shift count, the active assignment, the approved candidates, and the
- * already-processed fallback.
+ * Wires the query-builder calls the method makes, in order: the day's shift
+ * count, the active assignment, the approved candidates, then (terminal
+ * states only) today's worked total and the upcoming-shift look-ahead, and
+ * the already-processed fallback.
  */
 function build({
   active = null,
   approved = [],
   done = null,
+  workedToday = 0,
+  upcoming = [],
+  onLeave = false,
 }: {
   active?: unknown;
   approved?: unknown[];
   done?: unknown;
+  workedToday?: number;
+  upcoming?: unknown[];
+  onLeave?: boolean;
 } = {}) {
   const service = Object.create(StoresService.prototype) as any;
   service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
 
-  const queue = [
+  const builders = [
     builderReturning({ getCount: jest.fn().mockResolvedValue(approved.length) }),
     builderReturning({ getOne: jest.fn().mockResolvedValue(active) }),
     builderReturning({ getMany: jest.fn().mockResolvedValue(approved) }),
+    builderReturning({
+      getRawOne: jest.fn().mockResolvedValue({ total: String(workedToday) }),
+    }),
+    builderReturning({ getMany: jest.fn().mockResolvedValue(upcoming) }),
     builderReturning({ getOne: jest.fn().mockResolvedValue(done) }),
   ];
+  const queue = [...builders];
   service.shiftAssignmentRepository = {
     createQueryBuilder: jest.fn(() => queue.shift()),
   };
+  service.dataSource = {
+    query: jest.fn().mockResolvedValue([{ covered: onLeave }]),
+  };
+  service.builders = builders;
   return service;
 }
 
@@ -189,5 +208,151 @@ describe('getNextShiftAssignment — sau khi tự động check-out', () => {
       mode: 'check-out',
       shiftEnded: true,
     });
+  });
+});
+
+describe('getNextShiftAssignment — additive attendance fields', () => {
+  afterEach(() => jest.useRealTimers());
+
+  it('uses the Vietnam date at 06:30 VN on a UTC server', async () => {
+    at('2026-09-12T23:30:00Z'); // 06:30 on 13/09 in Vietnam
+    const service = build({ approved: [assignment()] });
+    await service.getNextShiftAssignment('emp-1', 'store-1');
+    const countBuilder = service.builders[0];
+    expect(countBuilder.andWhere).toHaveBeenCalledWith(
+      'slot.workDate = :todayStr',
+      { todayStr: '2026-09-13' },
+    );
+  });
+
+  it('done after an auto check-out carries worked minutes and the reason', async () => {
+    at('2026-09-13T08:00:00Z');
+    const service = build({
+      workedToday: 486,
+      done: assignment({
+        status: ShiftAssignmentStatus.COMPLETED,
+        attendanceStatus: 'FORGOT_CHECKOUT',
+        checkInTime: new Date('2026-09-13T03:00:00Z'),
+        checkOutTime: new Date('2026-09-13T05:15:00Z'),
+        scheduledCheckoutTime: new Date('2026-09-13T05:00:00Z'),
+        workedMinutes: 120,
+        earlyMinutes: 0,
+        isAutoCheckout: true,
+        autoCheckoutReason: 'FORGOT_CHECKOUT',
+      }),
+    });
+    expect(
+      await service.getNextShiftAssignment('emp-1', 'store-1'),
+    ).toMatchObject({
+      mode: 'done',
+      attendanceStatus: 'FORGOT_CHECKOUT',
+      checkOutTime: '2026-09-13T05:15:00.000Z',
+      scheduledCheckoutTime: '2026-09-13T05:00:00.000Z',
+      workedMinutes: 120,
+      workedMinutesToday: 486,
+      autoCheckoutReason: 'FORGOT_CHECKOUT',
+      autoCheckedOut: true,
+      onLeave: false,
+      nextShift: null,
+    });
+  });
+
+  it('a missed shift reports ABSENT, or onLeave with an approved leave', async () => {
+    at('2026-09-13T08:00:00Z');
+    const absent = build({
+      approved: [assignment({ attendanceStatus: 'ABSENT' })],
+    });
+    expect(
+      await absent.getNextShiftAssignment('emp-1', 'store-1'),
+    ).toMatchObject({
+      mode: 'done',
+      missed: true,
+      attendanceStatus: 'ABSENT',
+      onLeave: false,
+    });
+
+    const leave = build({ approved: [assignment()], onLeave: true });
+    expect(
+      await leave.getNextShiftAssignment('emp-1', 'store-1'),
+    ).toMatchObject({
+      mode: 'done',
+      missed: true,
+      attendanceStatus: null,
+      onLeave: true,
+    });
+  });
+
+  it('returns the next upcoming shift (skipping one already started)', async () => {
+    at('2026-09-13T08:00:00Z'); // 15:00 VN
+    const service = build({
+      upcoming: [
+        assignment({ id: 'started' }), // 10:00 today: already started
+        assignment({
+          id: 'tomorrow',
+          shiftSlot: {
+            ...assignment().shiftSlot,
+            workDate: '2026-09-14',
+            startTime: '08:00:00',
+            endTime: '12:00:00',
+          },
+        }),
+      ],
+    });
+    const result = await service.getNextShiftAssignment('emp-1', 'store-1');
+    expect(result.mode).toBe('none');
+    expect(result.nextShift).toEqual({
+      assignmentId: 'tomorrow',
+      workDate: '2026-09-14',
+      startTime: '08:00:00',
+      endTime: '12:00:00',
+      shiftName: 'Ca sáng',
+      startsAt: '2026-09-14T01:00:00.000Z',
+    });
+    expect(result.workedMinutesToday).toBe(0);
+  });
+
+  it("mode 'none' carries every contract field with empty defaults", async () => {
+    at('2026-09-13T08:00:00Z');
+    const service = build();
+    const result = await service.getNextShiftAssignment('emp-1', 'store-1');
+    expect(result).toMatchObject({
+      mode: 'none',
+      assignmentId: null,
+      workDate: null,
+      shiftSlotId: null,
+      shiftEnded: false,
+      missed: false,
+      onLeave: false,
+      attendanceStatus: null,
+      checkOutTime: null,
+      workedMinutes: 0,
+      earlyMinutes: 0,
+      autoCheckoutReason: null,
+      autoCheckedOut: false,
+      scheduledCheckoutTime: null,
+      workedMinutesToday: 0,
+      nextShift: null,
+    });
+    // Same keys as a 'done' response, so the app reads one shape.
+    const done = await build({
+      done: assignment({ status: ShiftAssignmentStatus.COMPLETED }),
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(Object.keys(result).sort()).toEqual(Object.keys(done).sort());
+  });
+
+  it('orders the look-ahead by the effective start time (slot over work shift)', async () => {
+    at('2026-09-13T08:00:00Z');
+    const service = build();
+    await service.getNextShiftAssignment('emp-1', 'store-1');
+    const upcomingQuery = service.builders[4];
+    expect(upcomingQuery.orderBy).toHaveBeenCalledWith('slot.workDate', 'ASC');
+    expect(upcomingQuery.addOrderBy).toHaveBeenCalledWith(
+      'COALESCE(slot.start_time, ws.start_time)',
+      'ASC',
+    );
+    expect(upcomingQuery.addOrderBy).not.toHaveBeenCalledWith(
+      'ws.startTime',
+      'ASC',
+    );
   });
 });

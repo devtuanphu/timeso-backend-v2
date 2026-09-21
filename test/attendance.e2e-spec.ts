@@ -249,7 +249,7 @@ describe('Attendance flow (e2e)', () => {
       checkOutTime: new Date('2026-07-11T10:00:00.000Z'),
       workedMinutes: 120,
       shiftEarnings: null as number | null,
-      shiftSlot: { cycle: { storeId: 'store-1' } },
+      shiftSlot: { workDate: '2026-07-11', cycle: { storeId: 'store-1' } },
       employee: {
         contracts: [
           {
@@ -260,46 +260,68 @@ describe('Attendance flow (e2e)', () => {
         ],
       },
     };
-    const queryBuilder = {
-      select: jest.fn().mockReturnThis(),
-      addSelect: jest.fn().mockReturnThis(),
-      where: jest.fn().mockReturnThis(),
-      andWhere: jest.fn().mockReturnThis(),
-      getRawOne: jest.fn().mockResolvedValue({
-        completedShifts: '4',
-        workedMinutes: '960',
-      }),
-    };
+    // The month's attendance, as loaded by the shared payroll composer.
+    const monthRows = [
+      { ...assignment, checkInTime: new Date('2026-07-11T08:00:00.000Z') },
+      ...['2026-07-08', '2026-07-09', '2026-07-10'].map((workDate, i) => ({
+        id: `earlier-${i}`,
+        status: ShiftAssignmentStatus.COMPLETED,
+        checkInTime: new Date(`${workDate}T01:00:00.000Z`),
+        workedMinutes: 280,
+        lateMinutes: i === 0 ? 5 : 0,
+        earlyMinutes: i === 1 ? 5 : 0,
+        shiftEarnings: 233333,
+        shiftSlot: { workDate },
+      })),
+      {
+        id: 'upcoming',
+        status: ShiftAssignmentStatus.APPROVED,
+        checkInTime: null,
+        shiftSlot: { workDate: '2099-07-30' },
+      },
+    ];
+    const queryBuilder: any = {};
+    for (const method of [
+      'select',
+      'addSelect',
+      'where',
+      'andWhere',
+      'leftJoinAndSelect',
+      'innerJoin',
+    ]) {
+      queryBuilder[method] = jest.fn().mockReturnValue(queryBuilder);
+    }
+    queryBuilder.getMany = jest.fn().mockResolvedValue(monthRows);
+    queryBuilder.getRawOne = jest.fn().mockResolvedValue({
+      completedShifts: '4',
+      workedMinutes: '960',
+    });
     const service = Object.create(StoresService.prototype) as any;
     service.logger = { warn: jest.fn(), debug: jest.fn(), log: jest.fn() };
     service.shiftAssignmentRepository = {
       findOne: jest.fn().mockResolvedValue(assignment),
-      save: jest.fn().mockResolvedValue(assignment),
+      update: jest.fn(async (id: string, changes: any) => {
+        if (id === assignment.id) Object.assign(assignment, changes);
+        monthRows
+          .filter((row) => row.id === id)
+          .forEach((row) => Object.assign(row, changes));
+      }),
       createQueryBuilder: jest.fn().mockReturnValue(queryBuilder),
     };
     service.monthlySummaryRepository = {
       upsert: jest.fn().mockResolvedValue(undefined),
     };
-    service.calculateEmployeeAttendanceSummary = jest.fn().mockResolvedValue({
-      totalAssignedShifts: 5,
-      completedShifts: 4,
-      workingHours: 16,
-      lateCount: 1,
-      earlyCount: 1,
-      absentCount: 0,
-      totalShiftEarnings: 400000,
-    });
-    service.payrollSettingRepository = {
+    service.payrollRuleRepository = { find: jest.fn().mockResolvedValue([]) };
+    service.salaryAdjustmentRepository = {
       findOne: jest.fn().mockResolvedValue(null),
     };
-    service.payrollRuleRepository = { find: jest.fn().mockResolvedValue([]) };
-    // Base salary now derives standard working days from the store's weekly
-    // days off. No config here means the calendar-day fallback, which is the
-    // behaviour this assertion was written against.
+    service.salaryAdvanceRequestRepository = {
+      find: jest.fn().mockResolvedValue([]),
+    };
+    // No days-off config: calendar-day fallback.
     service.shiftConfigRepository = {
       findOne: jest.fn().mockResolvedValue(null),
     };
-    service.calculateBaseSalary = jest.fn().mockReturnValue(400000);
     service.findOrCreateMonthlyPayroll = jest
       .fn()
       .mockResolvedValue({ id: 'payroll-1' });
@@ -313,31 +335,50 @@ describe('Attendance flow (e2e)', () => {
         totalPenalty: '0',
       }),
     };
-    service.employeeSalaryRepository = {
+    const salaryRepository = {
       findOne: jest.fn().mockResolvedValue(null),
-      upsert: jest.fn().mockResolvedValue(undefined),
+      create: jest.fn((value: any) => value),
+      save: jest.fn().mockResolvedValue(undefined),
+      update: jest.fn().mockResolvedValue(undefined),
       createQueryBuilder: jest.fn().mockReturnValue(salaryTotalsQuery),
     };
-    service.payrollRepository = {
-      update: jest.fn().mockResolvedValue(undefined),
+    const payrollRepository = { update: jest.fn().mockResolvedValue(undefined) };
+    service.dataSource = {
+      transaction: jest.fn((callback: any) =>
+        callback({
+          getRepository: (entity: any) =>
+            entity?.name === 'EmployeeSalary'
+              ? salaryRepository
+              : payrollRepository,
+        }),
+      ),
     };
 
     await service.processCheckoutPayroll('assignment-1');
     await service.processCheckoutPayroll('assignment-1');
 
+    // HOUR: 50,000 × 2h worked.
     expect(assignment.shiftEarnings).toBe(100000);
     expect(service.monthlySummaryRepository.upsert).toHaveBeenLastCalledWith(
       expect.objectContaining({
         completedShifts: 4,
         monthlyWorkHours: 16,
-        estimatedSalary: 400000,
+        // 50,000 × 960 minutes / 60 (rate × hours worked, whole month).
+        estimatedSalary: 800000,
         totalCompletedShifts: 4,
         totalWorkHours: 16,
       }),
       ['employeeProfileId', 'month'],
     );
-    expect(service.shiftAssignmentRepository.save).toHaveBeenCalledTimes(1);
-    expect(service.employeeSalaryRepository.upsert).toHaveBeenCalledTimes(2);
+    // The per-shift figure is written once; the retry sees it unchanged.
+    expect(
+      service.shiftAssignmentRepository.update.mock.calls.filter(
+        ([id]: [string]) => id === 'assignment-1',
+      ),
+    ).toHaveLength(1);
+    // One payslip write per job run, through the shared transactional writer.
+    expect(service.dataSource.transaction).toHaveBeenCalledTimes(2);
+    expect(salaryRepository.save).toHaveBeenCalledTimes(2);
   });
 
   it('accepts concurrent duplicate check-ins but persists only one log', async () => {

@@ -59,12 +59,16 @@ export enum WeekDaySchedule {
 
 // --- ENTITIES ---
 
-// The one-active-cycle invariant must hold across API instances. PostgreSQL
-// enforces it atomically; existing deployments must apply the equivalent
-// partial unique index through the normal migration rollout.
-@Index('uq_work_cycles_one_active_per_store', ['storeId'], {
+// One ACTIVE cycle per store applies to old-style cycles only (no
+// `recurrence_rule`): the legacy nightly slot-copy job assumes a single one.
+// Schedules created by `createShiftSchedule` carry their own recurrence rule,
+// end date and expiry, so a store may run several of them at once. PostgreSQL
+// enforces the rule atomically; existing deployments apply the equivalent
+// partial unique index through
+// scripts/migration_work_cycles_one_active_legacy_only.sql.
+@Index('uq_work_cycles_one_active_legacy_per_store', ['storeId'], {
   unique: true,
-  where: '"status" = \'ACTIVE\'',
+  where: '"status" = \'ACTIVE\' AND "recurrence_rule" IS NULL',
 })
 @Entity('work_cycles')
 export class WorkCycle extends BaseEntity {

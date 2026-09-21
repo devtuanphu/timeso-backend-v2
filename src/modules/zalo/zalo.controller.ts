@@ -1,11 +1,14 @@
 import { Controller, Post, Body, Get, Query, HttpCode, HttpStatus, Res, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { ZaloAdminGuard } from './zalo-admin.guard';
 import { ApiTags, ApiOperation, ApiBody, ApiQuery, ApiProperty } from '@nestjs/swagger';
 import { IsString, IsNumber } from 'class-validator';
 import { Response } from 'express';
 import { ZaloService } from './zalo.service';
 import { ConfigService } from '@nestjs/config';
+import { GetUser } from '../auth/decorators/get-user.decorator';
+import { ZaloOAuthStateService } from './zalo-oauth-state.service';
 
 class InitTokenDto {
   @ApiProperty({ description: 'Zalo access token' })
@@ -27,10 +30,11 @@ export class ZaloController {
   constructor(
     private readonly zaloService: ZaloService,
     private readonly configService: ConfigService,
+    private readonly oauthState: ZaloOAuthStateService,
   ) {}
 
   @Post('init-token')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, ZaloAdminGuard)
   @ApiBearerAuth()
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Khởi tạo Zalo token lần đầu (manual)' })
@@ -44,15 +48,18 @@ export class ZaloController {
   }
 
   @Get('oauth-url')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, ZaloAdminGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Lấy URL để authorize Zalo OAuth (production flow)' })
-  getOAuthUrl() {
+  getOAuthUrl(@GetUser() user: any) {
     const appId = this.configService.get('ZALO_APP_ID');
     const redirectUri = this.configService.get('ZALO_REDIRECT_URI') || 'http://localhost:3000/zalo/oauth-callback';
-    
+    // Single-use, 10-minute state bound to this admin; the public callback
+    // refuses anything else (a constant state let anyone install their token).
+    const state = this.oauthState.issue(user.userId);
+
     // Zalo OAuth 2.0 authorization URL
-    const authUrl = `https://oauth.zaloapp.com/v4/oa/permission?app_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=timeso`;
+    const authUrl = `https://oauth.zaloapp.com/v4/oa/permission?app_id=${appId}&redirect_uri=${encodeURIComponent(redirectUri)}&state=${encodeURIComponent(state)}`;
     
     return {
       message: 'Mở URL này trong browser để authorize Zalo',
@@ -61,6 +68,7 @@ export class ZaloController {
         '1. Mở URL trong browser',
         '2. Đăng nhập Zalo và cho phép quyền',
         '3. Sau khi redirect, token sẽ được tự động lưu vào DB',
+        '4. URL chỉ dùng được một lần trong 10 phút',
       ],
     };
   }
@@ -68,7 +76,26 @@ export class ZaloController {
   @Get('oauth-callback')
   @ApiOperation({ summary: 'Callback từ Zalo OAuth, exchange code lấy token' })
   @ApiQuery({ name: 'code', required: true, description: 'Authorization code từ Zalo' })
-  async oauthCallback(@Query('code') code: string, @Res() res: Response) {
+  @ApiQuery({ name: 'state', required: true, description: 'State do GET /zalo/oauth-url cấp' })
+  async oauthCallback(
+    @Query('code') code: string,
+    @Query('state') state: string,
+    @Res() res: Response,
+  ) {
+    const verdict = this.oauthState.consume(state);
+    if (!verdict.ok) {
+      res.status(400).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Zalo OAuth</title></head>
+        <body>
+          <h1>Liên kết không hợp lệ hoặc đã hết hạn</h1>
+          <p>Vui lòng gọi lại <code>GET /zalo/oauth-url</code> để lấy liên kết mới.</p>
+        </body>
+        </html>
+      `);
+      return;
+    }
     try {
       const result = await this.zaloService.exchangeCodeForToken(code);
       
@@ -125,7 +152,7 @@ export class ZaloController {
   }
 
   @Get('token-status')
-  @UseGuards(JwtAuthGuard)
+  @UseGuards(JwtAuthGuard, ZaloAdminGuard)
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Kiểm tra trạng thái token hiện tại' })
   async getTokenStatus() {

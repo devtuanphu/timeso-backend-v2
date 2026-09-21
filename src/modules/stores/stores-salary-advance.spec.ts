@@ -6,7 +6,11 @@
 import { BadRequestException } from '@nestjs/common';
 
 import { StoresService } from './stores.service';
-import { AdvanceRequestStatus } from './entities/salary-advance-request.entity';
+import {
+  AdvanceRequestStatus,
+  SalaryAdvanceRequest,
+} from './entities/salary-advance-request.entity';
+import { EmployeeSalary } from './entities/employee-salary.entity';
 
 jest.mock('uuid', () => ({ v4: () => 'test-id' }));
 
@@ -16,23 +20,53 @@ const REVIEWER = 'owner-account-1';
 function buildService() {
   const service = Object.create(StoresService.prototype) as any;
 
+  // APPROVED requests "in the database": seeded by a test, plus any request
+  // the service saves as APPROVED. `sumApprovedAdvances` reads these.
+  const approvedRows: any[] = [];
   const advanceRepo: any = {
     findOne: jest.fn(),
-    find: jest.fn().mockResolvedValue([]),
-    save: jest.fn(async (value: any) => value),
+    find: jest.fn(async () =>
+      approvedRows.filter((row) => row.status === AdvanceRequestStatus.APPROVED),
+    ),
+    save: jest.fn(async (value: any) => {
+      if (value.status === AdvanceRequestStatus.APPROVED) {
+        approvedRows.push({ ...value });
+      }
+      return value;
+    }),
     createQueryBuilder: jest.fn(() => ({
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
       getMany: jest.fn().mockResolvedValue([]),
     })),
   };
-  const employeeSalaryRepo: any = { update: jest.fn().mockResolvedValue({ affected: 1 }) };
+  const employeeSalaryRepo: any = {
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
+    // The payslip row as re-read under lock inside the review transaction;
+    // null falls back to the relation loaded with the request.
+    findOne: jest.fn().mockResolvedValue(null),
+  };
 
   service.salaryAdvanceRequestRepository = advanceRepo;
   service.employeeSalaryRepository = employeeSalaryRepo;
   service.logger = { debug: jest.fn(), warn: jest.fn(), log: jest.fn(), error: jest.fn() };
+  // Approval runs in one transaction; the shim hands out the same mocked
+  // repositories through the manager.
+  const manager = {
+    getRepository: (entity: unknown) =>
+      entity === SalaryAdvanceRequest
+        ? advanceRepo
+        : entity === EmployeeSalary
+          ? employeeSalaryRepo
+          : undefined,
+  };
+  service.dataSource = {
+    transaction: jest.fn((callback: (m: unknown) => unknown) =>
+      Promise.resolve(callback(manager)),
+    ),
+  };
 
-  return { service, advanceRepo, employeeSalaryRepo };
+  return { service, advanceRepo, employeeSalaryRepo, approvedRows };
 }
 
 function pendingRequest(over: Record<string, unknown> = {}) {
@@ -123,6 +157,105 @@ describe('reviewSalaryAdvanceRequest — approved amount', () => {
     const [, changes] = t.employeeSalaryRepo.update.mock.calls[0];
     expect(changes.netSalary).toBe(0);
     expect(changes.netSalary).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('reviewSalaryAdvanceRequest — advancePayment source of truth', () => {
+  // Regression: approval incremented the stored advancePayment. A concurrent
+  // recalculation could overwrite that increment, and a stale stored value was
+  // carried forward. It is now re-derived from the APPROVED requests.
+  it('sets advancePayment to the sum of APPROVED requests, not stored + amount', async () => {
+    const t = buildService();
+    t.approvedRows.push({
+      id: 'request-0',
+      status: AdvanceRequestStatus.APPROVED,
+      approvedAmount: 500_000,
+      requestedAmount: 500_000,
+    });
+    t.advanceRepo.findOne.mockResolvedValue(
+      pendingRequest({
+        employeeSalary: {
+          id: SALARY_ID,
+          totalIncome: 5_000_000,
+          netSalary: 4_500_000,
+          penalty: 0,
+          otherDeductions: 0,
+          // Stale: does not match the approved rows above.
+          advancePayment: 999_999,
+        },
+      }),
+    );
+
+    await t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
+      status: AdvanceRequestStatus.APPROVED,
+      approvedAmount: 1_000_000,
+    });
+
+    expect(t.service.dataSource.transaction).toHaveBeenCalledTimes(1);
+    const [id, changes] = t.employeeSalaryRepo.update.mock.calls[0];
+    expect(id).toBe(SALARY_ID);
+    expect(changes.advancePayment).toBe(1_500_000);
+    expect(changes.totalDeductions).toBe(1_500_000);
+    expect(changes.netSalary).toBe(3_500_000);
+  });
+
+  it('uses the payslip row re-read under lock for income and deductions', async () => {
+    const t = buildService();
+    t.advanceRepo.findOne.mockResolvedValue(pendingRequest());
+    t.employeeSalaryRepo.findOne.mockResolvedValue({
+      id: SALARY_ID,
+      totalIncome: 6_000_000,
+      netSalary: 6_000_000,
+      penalty: 100_000,
+      otherDeductions: 50_000,
+      advancePayment: 0,
+    });
+
+    await t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
+      status: AdvanceRequestStatus.APPROVED,
+      approvedAmount: 1_000_000,
+    });
+
+    expect(t.employeeSalaryRepo.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: SALARY_ID },
+        lock: { mode: 'pessimistic_write' },
+      }),
+    );
+    const [, changes] = t.employeeSalaryRepo.update.mock.calls[0];
+    expect(changes.totalDeductions).toBe(1_150_000);
+    expect(changes.netSalary).toBe(4_850_000);
+  });
+
+  it('refuses a request that another reviewer processed first', async () => {
+    const t = buildService();
+    t.advanceRepo.findOne
+      .mockResolvedValueOnce(pendingRequest())
+      .mockResolvedValueOnce(
+        pendingRequest({ status: AdvanceRequestStatus.APPROVED }),
+      );
+
+    await expect(
+      t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
+        status: AdvanceRequestStatus.APPROVED,
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(t.employeeSalaryRepo.update).not.toHaveBeenCalled();
+    expect(t.advanceRepo.save).not.toHaveBeenCalled();
+  });
+
+  it('does not touch the payslip when rejecting', async () => {
+    const t = buildService();
+    t.advanceRepo.findOne.mockResolvedValue(pendingRequest());
+
+    await t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
+      status: AdvanceRequestStatus.REJECTED,
+    });
+
+    expect(t.employeeSalaryRepo.update).not.toHaveBeenCalled();
+    expect(t.advanceRepo.save).toHaveBeenCalledWith(
+      expect.objectContaining({ status: AdvanceRequestStatus.REJECTED }),
+    );
   });
 });
 

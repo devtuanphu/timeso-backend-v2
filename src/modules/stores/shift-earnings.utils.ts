@@ -1,4 +1,5 @@
 import { PaymentType } from './entities/employee-contract.entity';
+import { vnMonthOf } from '../../common/utils/vn-calendar';
 
 /**
  * Earnings for a single shift, by contract payment type.
@@ -13,6 +14,11 @@ import { PaymentType } from './entities/employee-contract.entity';
  * The weekly divisor is 6, matching what the payroll path has always
  * persisted (a six-day working week). Aligning the other direction would have
  * changed money that has already been paid out.
+ *
+ * This is the per-shift DISPLAY figure (slot estimates, the owner calendar,
+ * the stored `shiftEarnings` shown in staff reports). Monthly pay is computed
+ * from monthly totals by `computeEarnedBase` in `payroll-calculation.utils.ts`
+ * and never sums these per-shift values.
  */
 
 /** Working days in a week, per the payroll rule this codebase has applied. */
@@ -36,11 +42,18 @@ export interface ShiftEarningsInput {
    * day count is used and behaviour is unchanged.
    */
   workingDaysInMonth?: number | null;
+  /**
+   * MONTH only: whether this shift is the one that carries the day's pay.
+   * A monthly salary is paid per distinct day worked, so the second and later
+   * shifts on the same day earn 0. Defaults to true.
+   */
+  countsAsWorkedDay?: boolean;
 }
 
-/** Calendar days in the month containing `date`. */
+/** Calendar days in the Vietnam month containing `date`. */
 function daysInMonthOf(date: Date): number {
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0).getDate();
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return 0;
+  return vnMonthOf(date).calendarDays;
 }
 
 /**
@@ -70,6 +83,7 @@ export function calculateShiftEarnings(
       return Math.round(base / WORKING_DAYS_PER_WEEK);
 
     case PaymentType.MONTH: {
+      if (input.countsAsWorkedDay === false) return 0;
       // Prorated across the store's WORKING days, not calendar days, so an
       // employee who works every scheduled shift earns their full monthly
       // salary. Falls back to the calendar count when the store has no weekly

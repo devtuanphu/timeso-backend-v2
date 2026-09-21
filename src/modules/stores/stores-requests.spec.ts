@@ -1067,48 +1067,130 @@ describe('StoresService - Shift & Bonus Request Features', () => {
     });
   });
 
+  // Approve/reject are owner-only (the route carries @StoreOwnerOnly()); the
+  // service re-checks ownership. The handler used to pass `user.id` (always
+  // undefined), so an arbitrary profile was stamped as approver.
   describe('approveBonusWorkRequest', () => {
+    beforeEach(() => {
+      repoMap.get(Store)!.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+    });
+
     it('should approve a pending bonus work request', async () => {
       const mockRequest = {
         id: 'bonus-1',
+        storeId: 'store-1',
         status: BonusWorkRequestStatus.PENDING,
         approvedById: null as string | null,
         rejectionReason: null as string | null,
         save: jest.fn(),
       };
       bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
+      // The owner holds no employee profile at their own store.
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue(null);
 
-      await service.approveBonusWorkRequest('bonus-1', 'approver-1');
+      await service.approveBonusWorkRequest('bonus-1', 'owner-1');
 
       expect(mockRequest.status).toBe(BonusWorkRequestStatus.APPROVED);
-      expect(mockRequest.approvedById).toBe('approver-1');
+      // approvedById is an EmployeeProfile FK; an owner without a profile is
+      // recorded as null rather than refused.
+      expect(mockRequest.approvedById).toBeNull();
+      expect(repoMap.get(EmployeeProfile)!.findOne).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { accountId: 'owner-1', storeId: 'store-1' },
+        }),
+      );
+    });
+
+    it('records the owner profile at that store when one exists', async () => {
+      const mockRequest = {
+        id: 'bonus-1',
+        storeId: 'store-1',
+        status: BonusWorkRequestStatus.PENDING,
+        approvedById: null as string | null,
+      };
+      bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({
+        id: 'owner-profile',
+      });
+
+      await service.approveBonusWorkRequest('bonus-1', 'owner-1');
+
+      expect(mockRequest.approvedById).toBe('owner-profile');
+    });
+
+    it('refuses an employee of the store', async () => {
+      const mockRequest = {
+        id: 'bonus-1',
+        storeId: 'store-1',
+        status: BonusWorkRequestStatus.PENDING,
+      };
+      bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
+
+      await expect(
+        service.approveBonusWorkRequest('bonus-1', 'staff-1'),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockRequest.status).toBe(BonusWorkRequestStatus.PENDING);
+      expect(bonusWorkRepo.save).not.toHaveBeenCalled();
+    });
+
+    it('refuses a caller with no account id', async () => {
+      await expect(
+        service.approveBonusWorkRequest('bonus-1', undefined),
+      ).rejects.toThrow(ForbiddenException);
     });
   });
 
   describe('rejectBonusWorkRequest', () => {
+    beforeEach(() => {
+      repoMap.get(Store)!.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+    });
+
     it('should reject a pending bonus work request', async () => {
       const mockRequest = {
         id: 'bonus-1',
+        storeId: 'store-1',
         status: BonusWorkRequestStatus.PENDING,
         approvedById: null as string | null,
         rejectionReason: null as string | null,
         save: jest.fn(),
       };
       bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue(null);
 
       await service.rejectBonusWorkRequest(
         'bonus-1',
-        'approver-1',
+        'owner-1',
         'Không cần thiết',
       );
 
       expect(mockRequest.status).toBe(BonusWorkRequestStatus.REJECTED);
       expect(mockRequest.rejectionReason).toBe('Không cần thiết');
     });
+
+    it('refuses an employee of the store', async () => {
+      bonusWorkRepo.findOne.mockResolvedValue({
+        id: 'bonus-1',
+        storeId: 'store-1',
+        status: BonusWorkRequestStatus.PENDING,
+      });
+
+      await expect(
+        service.rejectBonusWorkRequest('bonus-1', 'staff-1', 'x'),
+      ).rejects.toThrow(ForbiddenException);
+    });
   });
 
+  // Cancel takes the caller's account id and compares it with the account of
+  // the request's own employee profile (the handler used to pass `user.id`,
+  // which is always undefined).
   describe('cancelBonusWorkRequest', () => {
-    it('should cancel a pending bonus work request by the owner', async () => {
+    it('should cancel a pending bonus work request by the requester', async () => {
       const mockRequest = {
         id: 'bonus-1',
         employeeProfileId: 'emp-1',
@@ -1117,12 +1199,14 @@ describe('StoresService - Shift & Bonus Request Features', () => {
       };
       bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
 
-      await service.cancelBonusWorkRequest('bonus-1', 'emp-1');
+      // emp-1 belongs to account staff-1 (see the outer beforeEach).
+      await service.cancelBonusWorkRequest('bonus-1', 'staff-1');
 
       expect(mockRequest.status).toBe(BonusWorkRequestStatus.CANCELLED);
     });
 
-    it('should throw BadRequestException when cancelling from different employee', async () => {
+    // Was BadRequestException; "not your request" is an authorization failure.
+    it('should throw ForbiddenException when cancelling from a different account', async () => {
       const mockRequest = {
         id: 'bonus-1',
         employeeProfileId: 'emp-1',
@@ -1131,8 +1215,21 @@ describe('StoresService - Shift & Bonus Request Features', () => {
       bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
 
       await expect(
-        service.cancelBonusWorkRequest('bonus-1', 'emp-2'),
-      ).rejects.toThrow(BadRequestException);
+        service.cancelBonusWorkRequest('bonus-1', 'staff-2'),
+      ).rejects.toThrow(ForbiddenException);
+      expect(mockRequest.status).toBe(BonusWorkRequestStatus.PENDING);
+    });
+
+    it('refuses the store owner, who did not file the request', async () => {
+      bonusWorkRepo.findOne.mockResolvedValue({
+        id: 'bonus-1',
+        employeeProfileId: 'emp-1',
+        status: BonusWorkRequestStatus.PENDING,
+      });
+
+      await expect(
+        service.cancelBonusWorkRequest('bonus-1', 'owner-1'),
+      ).rejects.toThrow(ForbiddenException);
     });
   });
 });

@@ -112,6 +112,27 @@ export class LegacyChatMediaQueryDto extends LegacyChatPageQueryDto {
   type: 'image' | 'video' | 'document' | 'all' = 'all';
 }
 
+export class OpenDirectChatDto {
+  @IsUUID('4')
+  storeId: string;
+
+  @IsUUID('4')
+  targetAccountId: string;
+}
+
+export class ChatContactsQueryDto {
+  @IsUUID('4')
+  storeId: string;
+}
+
+export class ChatContactResponseDto {
+  accountId: string;
+  fullName: string;
+  avatar: string | null;
+  /** Chat riêng đã có giữa mình và người này (nếu có). */
+  directGroupId: string | null;
+}
+
 export class MarkChatGroupReadDto {
   @IsOptional()
   @Matches(/^(0|[1-9]\d{0,18})$/)
@@ -157,6 +178,10 @@ export class ChatGroupListItemResponseDto {
   id: string;
   name: string;
   avatar: string | null;
+  /** Chat riêng 1-1: name/avatar là của người kia. */
+  isDirect: boolean;
+  /** Chat riêng: account của người kia; nhóm thường: null. */
+  peerAccountId: string | null;
   storeId: string;
   activityAt: string;
   unreadCount: number;

@@ -1,4 +1,13 @@
-import { IsString, IsNotEmpty, IsIn, IsOptional, MaxLength, Matches } from 'class-validator';
+import {
+  ArrayMaxSize,
+  IsArray,
+  IsString,
+  IsNotEmpty,
+  IsIn,
+  IsOptional,
+  MaxLength,
+  Matches,
+} from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class RegisterDeviceDto {
@@ -24,4 +33,17 @@ export class RegisterDeviceDto {
   @IsString()
   @MaxLength(64)
   appVersion?: string;
+
+  @ApiProperty({
+    example: ['shift-alert-channels'],
+    required: false,
+    description:
+      "Khả năng của bản app: 'shift-alert-channels' = đã tạo kênh Android shift-alerts / shift-alerts-quiet. Giá trị lạ bị bỏ qua.",
+  })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(20)
+  @IsString({ each: true })
+  @MaxLength(64, { each: true })
+  capabilities?: string[];
 }

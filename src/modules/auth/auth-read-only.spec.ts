@@ -6,7 +6,7 @@ jest.mock('bcrypt', () => ({
 import * as bcrypt from 'bcrypt';
 
 import { AppType } from '../accounts/entities/account-refresh-token.entity';
-import { AuthService } from './auth.service';
+import { AuthService, hashRefreshToken } from './auth.service';
 
 const account = {
   id: 'account-1',
@@ -23,6 +23,7 @@ const createService = (
   const jwtService = {
     sign: jest.fn().mockReturnValueOnce('access-token').mockReturnValueOnce('refresh-token'),
     verify: jest.fn(),
+    decode: jest.fn().mockReturnValue({ exp: 2_000_000_000 }),
   };
   const configService = {
     get: jest.fn((key: string) => {
@@ -37,7 +38,10 @@ const createService = (
   const refreshTokenRepository = {
     create: jest.fn((value) => value),
     save: jest.fn().mockResolvedValue(undefined),
-    find: jest.fn(),
+    find: jest.fn().mockResolvedValue([]),
+    findOne: jest.fn().mockResolvedValue(null),
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
+    delete: jest.fn().mockResolvedValue(undefined),
   };
   const storesService = {
     ensureDailyReportsForOwner: jest.fn().mockResolvedValue(undefined),
@@ -106,8 +110,9 @@ describe('AuthService login in read-only mode', () => {
     expect(refreshTokenRepository.create).toHaveBeenCalledWith(
       expect.objectContaining({
         accountId: account.id,
-        tokenHash: 'hashed-refresh-token',
+        tokenHash: hashRefreshToken('refresh-token'),
         appType: AppType.OWNER_APP,
+        expiresAt: new Date(2_000_000_000 * 1000),
       }),
     );
     expect(refreshTokenRepository.save).toHaveBeenCalledTimes(1);
@@ -122,6 +127,7 @@ describe('AuthService login in read-only mode', () => {
       service.refreshToken('access-token', AppType.OWNER_APP),
     ).rejects.toMatchObject({ status: 401 });
     expect(refreshTokenRepository.find).not.toHaveBeenCalled();
+    expect(refreshTokenRepository.findOne).not.toHaveBeenCalled();
   });
 
   it('accepts a verified legacy untyped refresh token only in the bounded window', async () => {
@@ -130,9 +136,15 @@ describe('AuthService login in read-only mode', () => {
       JWT_LEGACY_UNTYPED_WINDOW_STARTED_AT: '2026-08-29T00:00:00Z',
       JWT_LEGACY_UNTYPED_CUTOFF_AT: '2026-09-05T00:00:00Z',
     });
-    jwtService.verify.mockReturnValue({ sub: account.id });
+    const iat = Math.floor(Date.now() / 1000);
+    jwtService.verify.mockReturnValue({ sub: account.id, iat });
     refreshTokenRepository.find.mockResolvedValue([
-      { tokenHash: 'hash', revokedAt: null },
+      {
+        id: 'legacy-row',
+        tokenHash: '$2b$10$legacyhash',
+        issuedAt: new Date(iat * 1000),
+        revokedAt: null,
+      },
     ]);
     (bcrypt.compare as jest.Mock).mockResolvedValue(true);
     await expect(

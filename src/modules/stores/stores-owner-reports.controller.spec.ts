@@ -1,6 +1,8 @@
 jest.mock('../../common/utils/multer-config', () => ({
   attendanceMulterConfig: {},
   multerConfig: {},
+  mixedIdentityMulterConfig: () => ({}),
+  identityImageUrl: (filename: string) => `/api/accounts/identity/image/${filename}`,
 }));
 
 import { StoresController } from './stores.controller';

@@ -89,6 +89,53 @@ describe('ChatMessageQueryService', () => {
     expect(result.data[0]).toMatchObject({ unreadCount: 1 });
   });
 
+  it('maps direct chats with isDirect and the peer account id', async () => {
+    const base = {
+      storeId: '22222222-2222-4222-8222-222222222222',
+      lastReadSequence: null,
+      activityAt: '2026-08-29T00:00:00.000Z',
+      unreadCount: 0,
+      messageId: null,
+    };
+    const query = jest.fn().mockResolvedValue([
+      {
+        ...base,
+        id: '11111111-1111-4111-8111-111111111111',
+        name: 'Chi',
+        avatar: 'uploads/chi.png',
+        isDirect: true,
+        peerAccountId: '55555555-5555-4555-8555-555555555555',
+      },
+      {
+        ...base,
+        id: '66666666-6666-4666-8666-666666666666',
+        name: 'Nhóm',
+        avatar: null,
+        isDirect: false,
+        peerAccountId: null,
+      },
+    ]);
+    const service = new ChatMessageQueryService(
+      { query } as unknown as DataSource,
+      {} as ChatAuthorizationService,
+    );
+    const result = await service.getAuthorizedGroupListV2('account-id', {
+      limit: 30,
+    });
+    const [statement] = query.mock.calls[0];
+    expect(statement).toContain('direct_key');
+    expect(statement).toContain('peer_member.account_id');
+    expect(result.data[0]).toMatchObject({
+      name: 'Chi',
+      isDirect: true,
+      peerAccountId: '55555555-5555-4555-8555-555555555555',
+    });
+    expect(result.data[1]).toMatchObject({
+      isDirect: false,
+      peerAccountId: null,
+    });
+  });
+
   it('applies a store filter and bounded legacy offset in the same list query', async () => {
     const query = jest.fn().mockResolvedValue([]);
     const service = new ChatMessageQueryService(

@@ -133,4 +133,44 @@ describe('calculateShiftEarnings', () => {
       }),
     ).toBe(300_000);
   });
+
+  // A monthly salary is paid per distinct day worked: only one shift per day
+  // (the day's owner) carries the day rate, the others show 0.
+  it('pays 0 for a MONTH shift that is not the day owner', () => {
+    const input = {
+      paymentType: PaymentType.MONTH,
+      baseSalary: 2_600_000,
+      hours: 8,
+      referenceDate: MAY_5,
+      workingDaysInMonth: 26,
+    };
+    expect(calculateShiftEarnings(input)).toBe(100_000);
+    expect(calculateShiftEarnings({ ...input, countsAsWorkedDay: true })).toBe(
+      100_000,
+    );
+    expect(calculateShiftEarnings({ ...input, countsAsWorkedDay: false })).toBe(
+      0,
+    );
+    // Other payment types ignore the flag.
+    expect(
+      calculateShiftEarnings({
+        ...input,
+        paymentType: PaymentType.SHIFT,
+        countsAsWorkedDay: false,
+      }),
+    ).toBe(2_600_000);
+  });
+
+  // Regression: the calendar-day fallback read the server clock's month.
+  // 2026-08-31T17:30Z is 1 September in Vietnam (30 days), whatever TZ is.
+  it('sizes the calendar fallback by the Vietnam month', () => {
+    expect(
+      calculateShiftEarnings({
+        paymentType: PaymentType.MONTH,
+        baseSalary: 3_000_000,
+        hours: 8,
+        referenceDate: new Date('2026-08-31T17:30:00Z'),
+      }),
+    ).toBe(100_000);
+  });
 });

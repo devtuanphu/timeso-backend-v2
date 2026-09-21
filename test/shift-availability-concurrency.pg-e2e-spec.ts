@@ -35,6 +35,14 @@ const describeWithTestDatabase = isExplicitTestDatabase
   ? describe
   : describe.skip;
 
+// Fixture ids are real UUIDs: the service SQL casts shift ids to uuid[].
+const ids = {
+  store: randomUUID(),
+  owner: randomUUID(),
+  reason: randomUUID(),
+  employee: randomUUID(),
+};
+
 class PgServiceHarness {
   readonly pids: number[] = [];
   private hold?: { acquired: () => void; wait: Promise<void> };
@@ -66,6 +74,14 @@ class PgServiceHarness {
 
   createService() {
     const service = Object.create(StoresService.prototype) as StoresService;
+    // Object.create skips the constructor, so field initializers never run.
+    (service as any).logger = {
+      log: jest.fn(),
+      debug: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      verbose: jest.fn(),
+    };
     (service as any).dataSource = {
       transaction: async <T>(callback: (manager: any) => Promise<T>) => {
         const client = await this.pool.connect();
@@ -136,7 +152,7 @@ class PgServiceHarness {
     (service as any).getShiftEmployeeOptions = jest.fn(async () => ({
       employees: [
         {
-          id: 'employee-1',
+          id: ids.employee,
           name: 'E2E employee',
           statusLabel: 'Rảnh',
           selectable: true,
@@ -201,13 +217,18 @@ class PgServiceHarness {
             )
           ).rows;
         if (entity === EmployeeProfile) {
-          const ids: string[] = where.id?._value || where.id?.value || [];
+          const profileIds: string[] =
+            where.id?._value || where.id?.value || [];
+          // The service passes TypeORM In([...]) for employmentStatus.
+          const statuses: string[] = where.employmentStatus?._value ?? [
+            where.employmentStatus,
+          ];
           return (
             await client.query(
               `SELECT id, store_id "storeId", employment_status "employmentStatus"
-               FROM employee_profiles WHERE id=ANY($1::text[]) AND store_id=$2
-                AND employment_status=$3 AND deleted_at IS NULL`,
-              [ids, where.storeId, where.employmentStatus],
+               FROM employee_profiles WHERE id=ANY($1::uuid[]) AND store_id=$2
+                AND employment_status=ANY($3::text[]) AND deleted_at IS NULL`,
+              [profileIds, where.storeId, statuses],
             )
           ).rows;
         }
@@ -330,18 +351,18 @@ describeWithTestDatabase(
       schema = `timeso_shift_e2e_${randomUUID().replace(/-/g, '')}`;
       await pool.query(`CREATE SCHEMA "${schema}"`);
       await pool.query(`
-      CREATE TABLE "${schema}".stores(id text PRIMARY KEY,owner_account_id text NOT NULL);
-      CREATE TABLE "${schema}".employee_termination_reasons(id text PRIMARY KEY,store_id text NOT NULL);
-      CREATE TABLE "${schema}".employee_profiles(id text PRIMARY KEY,store_id text NOT NULL,
-        employment_status text NOT NULL,termination_reason_id text,left_at timestamptz,deleted_at timestamptz);
-      CREATE TABLE "${schema}".work_shifts(id text PRIMARY KEY,store_id text NOT NULL,shift_name text NOT NULL,
+      CREATE TABLE "${schema}".stores(id uuid PRIMARY KEY,owner_account_id uuid NOT NULL);
+      CREATE TABLE "${schema}".employee_termination_reasons(id uuid PRIMARY KEY,store_id uuid NOT NULL);
+      CREATE TABLE "${schema}".employee_profiles(id uuid PRIMARY KEY,store_id uuid NOT NULL,
+        employment_status text NOT NULL,termination_reason_id uuid,left_at timestamptz,deleted_at timestamptz);
+      CREATE TABLE "${schema}".work_shifts(id uuid PRIMARY KEY,store_id uuid NOT NULL,shift_name text NOT NULL,
         start_time time NOT NULL,end_time time NOT NULL,default_max_staff int,color_code text,note text,is_active boolean NOT NULL);
-      CREATE TABLE "${schema}".work_cycles(id text PRIMARY KEY,store_id text NOT NULL,name text NOT NULL,
-        cycle_type text NOT NULL,start_date date NOT NULL,end_date date,work_shift_id text,recurrence_rule jsonb,status text NOT NULL);
-      CREATE TABLE "${schema}".shift_slots(id text PRIMARY KEY,cycle_id text NOT NULL,work_shift_id text NOT NULL,
+      CREATE TABLE "${schema}".work_cycles(id uuid PRIMARY KEY,store_id uuid NOT NULL,name text NOT NULL,
+        cycle_type text NOT NULL,start_date date NOT NULL,end_date date,work_shift_id uuid,recurrence_rule jsonb,status text NOT NULL);
+      CREATE TABLE "${schema}".shift_slots(id uuid PRIMARY KEY,cycle_id uuid NOT NULL,work_shift_id uuid NOT NULL,
         work_date date NOT NULL,start_time time,end_time time,max_staff int,note text,day_of_week text);
-      CREATE TABLE "${schema}".shift_assignments(id text PRIMARY KEY,shift_slot_id text NOT NULL,
-        employee_id text NOT NULL,status text NOT NULL,note text);
+      CREATE TABLE "${schema}".shift_assignments(id uuid PRIMARY KEY,shift_slot_id uuid NOT NULL,
+        employee_id uuid NOT NULL,status text NOT NULL,note text);
     `);
       harness = new PgServiceHarness(pool, schema);
     });
@@ -350,10 +371,19 @@ describeWithTestDatabase(
       await pool.query(`TRUNCATE "${schema}".shift_assignments,"${schema}".shift_slots,
       "${schema}".work_cycles,"${schema}".work_shifts,"${schema}".employee_profiles,
       "${schema}".employee_termination_reasons,"${schema}".stores`);
-      await pool.query(`INSERT INTO "${schema}".stores VALUES('store-1','owner-1');
-      INSERT INTO "${schema}".employee_termination_reasons VALUES('reason-1','store-1');
-      INSERT INTO "${schema}".employee_profiles(id,store_id,employment_status)
-        VALUES('employee-1','store-1','active')`);
+      await pool.query(`INSERT INTO "${schema}".stores VALUES($1,$2)`, [
+        ids.store,
+        ids.owner,
+      ]);
+      await pool.query(
+        `INSERT INTO "${schema}".employee_termination_reasons VALUES($1,$2)`,
+        [ids.reason, ids.store],
+      );
+      await pool.query(
+        `INSERT INTO "${schema}".employee_profiles(id,store_id,employment_status)
+          VALUES($1,$2,'active')`,
+        [ids.employee, ids.store],
+      );
       harness.pids.length = 0;
       service = harness.createService();
     });
@@ -378,7 +408,7 @@ describeWithTestDatabase(
           startTime: '07:00',
           endTime: '11:00',
           maxStaff: 1,
-          employeeIds: employee ? ['employee-1'] : [],
+          employeeIds: employee ? [ids.employee] : [],
         },
       ],
     });
@@ -386,14 +416,14 @@ describeWithTestDatabase(
     it('linearizes termination before schedule and leaves no partial schedule rows', async () => {
       const hold = harness.holdNextLock();
       const termination = service.deleteEmployee(
-        'employee-1',
-        'reason-1',
-        'owner-1',
+        ids.employee,
+        ids.reason,
+        ids.owner,
       );
       await hold.acquired;
       const schedule = service.createShiftSchedule(
-        'store-1',
-        'owner-1',
+        ids.store,
+        ids.owner,
         schedulePayload('Ca sau thôi việc') as any,
       );
       await harness.waitForTransactions(2);
@@ -413,15 +443,15 @@ describeWithTestDatabase(
     it('linearizes schedule before termination and preserves post-schedule termination semantics', async () => {
       const hold = harness.holdNextLock();
       const schedule = service.createShiftSchedule(
-        'store-1',
-        'owner-1',
+        ids.store,
+        ids.owner,
         schedulePayload('Ca trước thôi việc') as any,
       );
       await hold.acquired;
       const termination = service.deleteEmployee(
-        'employee-1',
-        'reason-1',
-        'owner-1',
+        ids.employee,
+        ids.reason,
+        ids.owner,
       );
       await harness.waitForTransactions(2);
       hold.release();
@@ -439,39 +469,37 @@ describeWithTestDatabase(
       expect(new Set(harness.pids).size).toBeGreaterThan(1);
     });
 
+    // Same-name shifts are allowed on different dates, so both schedules
+    // target the same date: the normalized names collide and exactly one of
+    // the two concurrent writers may commit.
     it.each([
-      ['legacy first', true],
-      ['batch first', false],
+      ['canonical name first', 'Ca Trùng', '  ca   trùng '],
+      ['spaced lowercase name first', '  ca   trùng ', 'Ca Trùng'],
     ])(
       'serializes normalized active-name conflicts with %s',
-      async (_label, legacyFirst) => {
+      async (_label, firstName, secondName) => {
         const hold = harness.holdNextLock();
-        const legacy = () =>
-          service.createWorkShift(
-            'store-1',
-            { shiftName: 'Ca Trùng', startTime: '07:00', endTime: '11:00' },
-            'owner-1',
-          );
-        const batch = () =>
+        const create = (name: string) =>
           service.createShiftSchedule(
-            'store-1',
-            'owner-1',
-            schedulePayload('  ca   trùng ', false) as any,
+            ids.store,
+            ids.owner,
+            schedulePayload(name, false) as any,
           );
-        const first = legacyFirst ? legacy() : batch();
+        const first = create(firstName);
         await hold.acquired;
-        const second = legacyFirst ? batch() : legacy();
+        const second = create(secondName);
         await harness.waitForTransactions(2);
         hold.release();
         await expect(first).resolves.toBeDefined();
         await expect(second).rejects.toBeInstanceOf(BadRequestException);
-        expect(
-          (
-            await pool.query(
-              `SELECT count(*) count FROM "${schema}".work_shifts`,
-            )
-          ).rows[0].count,
-        ).toBe('1');
+        await expect(second).rejects.toThrow(/chỉ được trùng khi khác ngày/);
+        const counts = (
+          await pool.query(`SELECT
+        (SELECT count(*) FROM "${schema}".work_shifts) shifts,
+        (SELECT count(*) FROM "${schema}".work_cycles) cycles,
+        (SELECT count(*) FROM "${schema}".shift_slots) slots`)
+        ).rows[0];
+        expect(counts).toEqual({ shifts: '1', cycles: '1', slots: '1' });
         expect(new Set(harness.pids).size).toBeGreaterThan(1);
       },
     );

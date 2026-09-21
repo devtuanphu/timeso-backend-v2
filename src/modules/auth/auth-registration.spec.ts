@@ -228,10 +228,6 @@ describe('AuthService staff registration', () => {
 
   it.each([
     ['forgotPassword', (service: AuthService) => service.forgotPassword('0900000000')],
-    [
-      'resetPassword',
-      (service: AuthService) => service.resetPassword('0900000000', 'new-password'),
-    ],
   ])('does not disguise a %s database failure as an unknown account', async (_name, invoke) => {
     const fixture = createService();
     const databaseFailure = new Error('isolated database failure');

@@ -119,6 +119,23 @@ describe('DevicesService', () => {
     });
   });
 
+  it('stores only known push capabilities and clears them for an older build', async () => {
+    const created = createHarness();
+    await created.service.register('account-1', {
+      ...dto,
+      capabilities: ['shift-alert-channels', 'unknown-thing'],
+    });
+    expect(created.transactionRepository.save).toHaveBeenCalledWith(
+      expect.objectContaining({ pushCapabilities: ['shift-alert-channels'] }),
+    );
+
+    const resumed = createHarness({ pushCapabilities: ['shift-alert-channels'] });
+    await resumed.service.register('account-1', dto);
+    expect(resumed.transactionRepository.save).toHaveBeenCalledWith(
+      expect.objectContaining({ pushCapabilities: [] }),
+    );
+  });
+
   it('scopes logout and invalid-token deactivation to the expected owner binding', async () => {
     const { service, repositoryUpdate, transactionUpdate } = createHarness({
       pushTokenFingerprint: 'a'.repeat(64),

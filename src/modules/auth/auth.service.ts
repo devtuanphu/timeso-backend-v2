@@ -22,7 +22,7 @@ import {
   MoreThan,
   Repository,
 } from 'typeorm';
-import { randomInt } from 'crypto';
+import { createHash, randomInt, randomUUID } from 'crypto';
 
 import { hashOtp, matchesStoredOtp } from './otp-hash';
 import {
@@ -37,15 +37,60 @@ import {
 const MIN_PASSWORD_LENGTH = 6;
 
 /**
- * Live refresh tokens kept per account and app.
- *
- * `refreshToken` cannot look a token up by value — it is stored bcrypt-hashed —
- * so it loads every live token for the account and compares them one by one.
- * Each comparison is deliberately expensive, and every login used to add
- * another row that was never revoked, so the cost grew without bound. Capping
- * the live set bounds that scan while still allowing a handful of devices.
+ * Live refresh tokens kept per account and app. Caps how many devices can stay
+ * signed in at once and bounds the legacy bcrypt fallback scan.
  */
 const MAX_LIVE_REFRESH_TOKENS = 5;
+
+/**
+ * Refresh tokens are stored as `sha256:<hex>` of the full token.
+ *
+ * They used to be bcrypt-hashed, but bcrypt only reads the first 72 bytes of
+ * its input. Every refresh JWT of one account shares those 72 bytes (header
+ * plus the start of the payload), so any old refresh token matched any live
+ * row and rotation/revocation did nothing. SHA-256 covers the whole token, and
+ * a token of this entropy does not need a slow hash.
+ */
+const REFRESH_TOKEN_HASH_PREFIX = 'sha256:';
+const LEGACY_BCRYPT_HASH_PREFIX = '$2';
+/** How far a legacy row's `issuedAt` may drift from the token's `iat`. */
+const LEGACY_REFRESH_ISSUED_AT_TOLERANCE_MS = 5_000;
+const DEFAULT_REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+const PASSWORD_RESET_TOKEN_USE = 'password_reset' as const;
+const PASSWORD_RESET_TOKEN_TTL = '15m';
+
+export function hashRefreshToken(token: string): string {
+  return `${REFRESH_TOKEN_HASH_PREFIX}${createHash('sha256')
+    .update(token)
+    .digest('hex')}`;
+}
+
+/**
+ * Binds a password-reset token to the password it replaces. Once the password
+ * changes the fingerprint no longer matches, which makes the token single-use
+ * without storing it.
+ */
+function passwordFingerprint(accountId: string, passwordHash: string): string {
+  return createHash('sha256')
+    .update(`${accountId}:${passwordHash}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+/** Rejects unknown app types instead of silently storing them. */
+export function resolveAppType(value: unknown): AppType {
+  if (value === undefined || value === null || value === '') {
+    return AppType.OWNER_APP;
+  }
+  if (Object.values(AppType).includes(value as AppType)) {
+    return value as AppType;
+  }
+  throw new BadRequestException({
+    code: 'INVALID_APP_TYPE',
+    message: 'appType không hợp lệ',
+  });
+}
 
 /**
  * Failed OTP verifications per account. See otp-rate-limit.ts for why this is
@@ -120,6 +165,75 @@ export class AuthService {
       code: 'INVALID_OR_EXPIRED_OTP',
       message: 'Mã OTP không chính xác hoặc đã hết hạn.',
     });
+  }
+
+  /** The row expires when the JWT does, so JWT_REFRESH_EXPIRES_IN is honoured. */
+  private refreshTokenExpiry(token: string, issuedAt: Date): Date {
+    const decoded = this.jwtService.decode(token) as { exp?: number } | null;
+    if (decoded && typeof decoded.exp === 'number') {
+      return new Date(decoded.exp * 1000);
+    }
+    return new Date(issuedAt.getTime() + DEFAULT_REFRESH_TTL_MS);
+  }
+
+  private passwordResetSecret(): string {
+    // A distinct secret means a reset token can never pass as an access or
+    // refresh token, whatever the strategies check.
+    return `${requireJwtSecret(this.configService)}:${PASSWORD_RESET_TOKEN_USE}`;
+  }
+
+  private issuePasswordResetToken(account: Pick<Account, 'id' | 'passwordHash'>): string {
+    return this.jwtService.sign(
+      {
+        sub: account.id,
+        tokenUse: PASSWORD_RESET_TOKEN_USE,
+        pwf: passwordFingerprint(account.id, account.passwordHash),
+      },
+      { secret: this.passwordResetSecret(), expiresIn: PASSWORD_RESET_TOKEN_TTL },
+    );
+  }
+
+  private invalidResetToken(): UnauthorizedException {
+    return new UnauthorizedException({
+      code: 'INVALID_OR_EXPIRED_RESET_TOKEN',
+      message: 'Phiên đặt lại mật khẩu không hợp lệ hoặc đã hết hạn. Vui lòng xác thực OTP lại.',
+    });
+  }
+
+  /**
+   * Rows written before the switch to SHA-256 are bcrypt hashes. bcrypt alone
+   * cannot tell tokens of one account apart (72-byte limit), so a legacy row
+   * only matches when it was also issued at the token's own `iat`. These rows
+   * expire within the refresh TTL, after which this path finds nothing.
+   */
+  private async findLegacyRefreshToken(
+    refreshToken: string,
+    issuedAtSeconds: number | undefined,
+    accountId: string,
+    appType: AppType,
+  ): Promise<AccountRefreshToken | null> {
+    if (typeof issuedAtSeconds !== 'number') return null;
+    const candidates = await this.refreshTokenRepository.find({
+      where: {
+        accountId,
+        appType,
+        revokedAt: IsNull(),
+        expiresAt: MoreThan(new Date()),
+      },
+    });
+    const issuedAtMs = issuedAtSeconds * 1000;
+    for (const row of candidates) {
+      if (!row.tokenHash?.startsWith(LEGACY_BCRYPT_HASH_PREFIX)) continue;
+      const issuedAt = row.issuedAt ? new Date(row.issuedAt).getTime() : NaN;
+      if (
+        !Number.isFinite(issuedAt) ||
+        Math.abs(issuedAt - issuedAtMs) > LEGACY_REFRESH_ISSUED_AT_TOLERANCE_MS
+      ) {
+        continue;
+      }
+      if (await bcrypt.compare(refreshToken, row.tokenHash)) return row;
+    }
+    return null;
   }
 
   /**
@@ -281,21 +395,25 @@ export class AuthService {
     };
 
     const accessToken = this.jwtService.sign(accessPayload);
-    const refreshTokenValue = this.jwtService.sign(refreshPayload, {
-      secret: requireJwtRefreshSecret(this.configService),
-      expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN'),
-    });
+    // `jti` makes every refresh token unique even when two are signed in the
+    // same second for the same account (token_hash is a unique column).
+    const refreshTokenValue = this.jwtService.sign(
+      { ...refreshPayload, jti: randomUUID() },
+      {
+        secret: requireJwtRefreshSecret(this.configService),
+        expiresIn: this.configService.get('JWT_REFRESH_EXPIRES_IN'),
+      },
+    );
 
     const readOnly = isAppReadOnlyMode(this.configService);
     if (!readOnly) {
-      // Save refresh token to DB (hashed)
-      const refreshTokenHash = await bcrypt.hash(refreshTokenValue, 10);
+      const issuedAt = new Date();
       const refreshTokenEntity = this.refreshTokenRepository.create({
         accountId: user.id,
-        tokenHash: refreshTokenHash,
+        tokenHash: hashRefreshToken(refreshTokenValue),
         appType,
-        issuedAt: new Date(),
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days matching .env
+        issuedAt,
+        expiresAt: this.refreshTokenExpiry(refreshTokenValue, issuedAt),
       });
       await this.refreshTokenRepository.save(refreshTokenEntity);
       await this.revokeStaleRefreshTokens(user.id, appType);
@@ -470,14 +588,19 @@ export class AuthService {
           { isUsed: true },
         );
         user.status = AccountStatus.ACTIVE;
-        return manager.save(Account, user);
+        return { activated: await manager.save(Account, user), resetFor: null };
       }
-      return null;
+      return { activated: null, resetFor: user };
     });
 
-    if (activatedAccount) return this.login(activatedAccount, appType);
+    if (activatedAccount.activated) {
+      return this.login(activatedAccount.activated, appType);
+    }
     return {
       message: 'Xác thực thành công. Bây giờ bạn có thể đặt lại mật khẩu mới.',
+      // The only proof reset-password accepts. It is bound to the current
+      // password, so it stops working once the password changes.
+      resetToken: this.issuePasswordResetToken(activatedAccount.resetFor!),
     };
   }
 
@@ -587,7 +710,18 @@ export class AuthService {
     }
   }
 
-  async resetPassword(phone: string, newPassword: string) {
+  /**
+   * Sets a new password. The caller must present the reset token returned by
+   * a successful forgot-password `verify-otp`; nothing else proves the OTP was
+   * entered. (The old check looked for any recently "used" OTP row, but
+   * forgot-password marks superseded codes used too, so two forgot-password
+   * calls were enough to reset any account.)
+   */
+  async resetPassword(
+    resetToken: string,
+    newPassword: string,
+    phone?: string,
+  ) {
     // Mirrors RegisterDto's rule, which this path bypassed entirely: any
     // non-empty string was accepted, so a reset could weaken an account below
     // the floor enforced at sign-up.
@@ -600,42 +734,83 @@ export class AuthService {
         message: `Mật khẩu phải ít nhất ${MIN_PASSWORD_LENGTH} ký tự`,
       });
     }
-    let normalizedPhone: string;
-    try {
-      normalizedPhone = normalizeVietnamPhone(phone);
-    } catch {
-      throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
+    if (typeof resetToken !== 'string' || !resetToken) {
+      throw this.invalidResetToken();
     }
-    const user = await this.accountsService.findByPhone(normalizedPhone);
-    if (!user) throw new UnauthorizedException('Không tìm thấy tài khoản với số điện thoại này.');
 
-    // KIỂM TRA BẢO MẬT: Phải có ít nhất 1 OTP "FORGOT_PASSWORD" đã được verify (isUsed=true)
-    // trong vòng 15 phút gần nhất để chứng minh bước verify-otp đã thực sự diễn ra.
-    const lastVerification = await this.otpRepository.findOne({
-        where: {
-            accountId: user.id,
-            type: 'FORGOT_PASSWORD',
-            isUsed: true,
-            updatedAt: MoreThan(new Date(Date.now() - 15 * 60 * 1000))
-        },
-        order: { updatedAt: 'DESC' }
-    });
-
-    if (!lastVerification) {
-        throw new UnauthorizedException('Yêu cầu chưa được xác thực hoặc mã đã hết hạn. Vui lòng verify OTP lại.');
+    let claims: { sub?: string; tokenUse?: string; pwf?: string };
+    try {
+      claims = this.jwtService.verify(resetToken, {
+        secret: this.passwordResetSecret(),
+      });
+    } catch {
+      throw this.invalidResetToken();
+    }
+    if (
+      claims.tokenUse !== PASSWORD_RESET_TOKEN_USE ||
+      typeof claims.sub !== 'string' ||
+      typeof claims.pwf !== 'string'
+    ) {
+      throw this.invalidResetToken();
     }
 
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    await this.accountsService.update(user.id, { passwordHash: hashedPassword });
+    await this.dataSource.transaction(async (manager) => {
+      const account = await manager
+        .getRepository(Account)
+        .createQueryBuilder('account')
+        .addSelect('account.passwordHash')
+        .where('account.id = :id', { id: claims.sub })
+        .setLock('pessimistic_write')
+        .getOne();
+      if (
+        !account ||
+        passwordFingerprint(account.id, account.passwordHash) !== claims.pwf
+      ) {
+        throw this.invalidResetToken();
+      }
+      if (phone) {
+        let normalizedPhone: string | null = null;
+        try {
+          normalizedPhone = normalizeVietnamPhone(phone);
+        } catch {
+          normalizedPhone = null;
+        }
+        let accountPhone: string | null = null;
+        try {
+          accountPhone = normalizeVietnamPhone(account.phone);
+        } catch {
+          accountPhone = account.phone;
+        }
+        if (!normalizedPhone || accountPhone !== normalizedPhone) {
+          throw this.invalidResetToken();
+        }
+      }
+
+      await manager.update(Account, account.id, { passwordHash: hashedPassword });
+      await manager.update(
+        AccountOtp,
+        { accountId: account.id, type: 'FORGOT_PASSWORD', isUsed: false },
+        { isUsed: true },
+      );
+      // Whoever knew the old password may hold live sessions; end them all.
+      await manager.update(
+        AccountRefreshToken,
+        { accountId: account.id, revokedAt: IsNull() },
+        { revokedAt: new Date() },
+      );
+    });
 
     return { message: 'Mật khẩu đã được đặt lại thành công.' };
   }
 
   async refreshToken(refreshToken: string, appType: AppType = AppType.OWNER_APP) {
+    const resolvedAppType = resolveAppType(appType);
     try {
-      const payload = this.jwtService.verify<TimesoJwtPayload>(refreshToken, {
-        secret: requireJwtRefreshSecret(this.configService),
-      });
+      const payload = this.jwtService.verify<TimesoJwtPayload & { iat?: number }>(
+        refreshToken,
+        { secret: requireJwtRefreshSecret(this.configService) },
+      );
 
       if (
         payload.tokenUse !== JWT_REFRESH_TOKEN_USE &&
@@ -648,41 +823,41 @@ export class AuthService {
       }
 
       const accountId = payload.sub;
-
-      // Find valid refresh tokens for this account
-      const tokens = await this.refreshTokenRepository.find({
-        where: {
+      const matchedTokenEntity =
+        (await this.refreshTokenRepository.findOne({
+          where: {
+            accountId,
+            appType: resolvedAppType,
+            tokenHash: hashRefreshToken(refreshToken),
+            revokedAt: IsNull(),
+            expiresAt: MoreThan(new Date()),
+          },
+        })) ??
+        (await this.findLegacyRefreshToken(
+          refreshToken,
+          payload.iat,
           accountId,
-          appType,
-          revokedAt: IsNull(),
-          expiresAt: MoreThan(new Date()),
-        },
-      });
-
-      // Find the one that matches our hash
-      let matchedTokenEntity: AccountRefreshToken | null = null;
-      for (const tokenEntity of tokens) {
-        const isMatch = await bcrypt.compare(refreshToken, tokenEntity.tokenHash);
-        if (isMatch) {
-          matchedTokenEntity = tokenEntity;
-          break;
-        }
-      }
+          resolvedAppType,
+        ));
 
       if (!matchedTokenEntity) {
         throw new UnauthorizedException('Refresh token is invalid or has been revoked');
       }
 
-      // Revoke the old token (Token Rotation)
-      matchedTokenEntity.revokedAt = new Date();
-      await this.refreshTokenRepository.save(matchedTokenEntity);
+      // Rotation: revoke only if still live, so two concurrent refreshes with
+      // the same token cannot both mint a new pair.
+      const revoked = await this.refreshTokenRepository.update(
+        { id: matchedTokenEntity.id, revokedAt: IsNull() },
+        { revokedAt: new Date() },
+      );
+      if (!revoked.affected) {
+        throw new UnauthorizedException('Refresh token is invalid or has been revoked');
+      }
 
-      // Get user data
       const user = await this.accountsService.findById(accountId);
       if (!user) throw new UnauthorizedException('User no longer exists');
 
-      // Generate new pair
-      return this.login(user, appType);
+      return this.login(user, resolvedAppType);
     } catch (e) {
       throw new UnauthorizedException('Invalid refresh token');
     }

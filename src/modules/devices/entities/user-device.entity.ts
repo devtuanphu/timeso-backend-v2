@@ -40,6 +40,15 @@ export class UserDevice extends BaseEntity {
   @Column({ type: 'varchar', name: 'app_version', nullable: true })
   appVersion: string | null;
 
+  /**
+   * Push capabilities the registered build declared (see
+   * push/push-capabilities.ts), e.g. 'shift-alert-channels'. Null/empty for
+   * builds that predate the field. Column added by
+   * scripts/migration_user_devices_push_capabilities.sql.
+   */
+  @Column({ type: 'simple-array', name: 'push_capabilities', nullable: true })
+  pushCapabilities: string[] | null;
+
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
 

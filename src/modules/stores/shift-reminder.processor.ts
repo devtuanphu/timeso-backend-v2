@@ -15,10 +15,15 @@ import {
   buildShiftReminderFingerprint,
   buildShiftReminderJobId,
   buildShiftReminderSuccessorJobId,
+  effectiveReminderSettings,
   parseVietnamShiftStart,
   SHIFT_REMINDER_TIMEZONE,
 } from './shift-reminder.utils';
 import { WorkCycleStatus } from './entities/shift-management.entity';
+import { formatShiftMoment } from '../../common/utils/relative-day';
+import { vnClockHHmm, vnDateString } from '../../common/utils/vn-calendar';
+import { shiftAlertChannel } from './shift-end-workflow.service';
+import { isShiftCoveredByApprovedLeave } from './leave-coverage.utils';
 
 @Processor('shift-reminders')
 export class ShiftReminderProcessor extends WorkerHost {
@@ -63,10 +68,12 @@ export class ShiftReminderProcessor extends WorkerHost {
       // Legacy jobs may still use the work-shift-only key. Always honor the
       // current preference at processing time so an opt-out cannot leak a
       // queued notification after identity-key migration.
-      if (
-        !employee.reminderSettings ||
-        employee.reminderSettings.type === 'off'
-      ) {
+      // Chưa lưu cài đặt thì dùng mặc định (nhắc trước 15 phút), cùng cách
+      // buildReminderJob tính fingerprint.
+      const reminderSettings = effectiveReminderSettings(
+        employee.reminderSettings,
+      );
+      if (reminderSettings.type === 'off') {
         this.logger.debug('Shift reminders are disabled; skipping reminder');
         return;
       }
@@ -140,7 +147,7 @@ export class ShiftReminderProcessor extends WorkerHost {
         currentIdentity,
         current.shiftId,
         currentStart,
-        employee.reminderSettings,
+        reminderSettings,
       );
 
       if (scheduleFingerprint) {
@@ -174,28 +181,50 @@ export class ShiftReminderProcessor extends WorkerHost {
         }
       }
 
-      // 3. Format shift time for message
-      const timeStr = moment(currentStart)
-        .tz('Asia/Ho_Chi_Minh')
-        .format('HH:mm');
+      // Nghỉ có phép (đơn nghỉ cả ngày đã duyệt) thì không nhắc vào ca.
+      const workDate = vnDateString(currentStart);
+      if (
+        await isShiftCoveredByApprovedLeave(
+          this.employeeRepository.manager,
+          employeeId,
+          workDate,
+          current.id,
+        )
+      ) {
+        this.logger.debug('Employee is on approved leave; skipping reminder');
+        return;
+      }
+
+      // 3. "08:00 hôm nay (21/09)" / "08:00 ngày mai (22/09)" / "08:00 ngày
+      // 25/09": luôn giữ ngày tuyệt đối; danh sách thông báo tính lại nhãn
+      // tương đối theo lúc đọc (metadata.workDates).
+      const timeStr = formatShiftMoment(workDate, vnClockHHmm(currentStart));
 
       // 4. Create and send notification
-      await this.notificationsService.create({
-        accountId: employee.accountId,
-        storeId: employee.storeId,
-        title: 'Nhắc nhở ca làm việc',
-        content: `Ca làm của bạn sẽ bắt đầu lúc ${timeStr}. Đừng quên check-in đúng giờ nhé!`,
-        type: NotificationType.SHIFT_REMINDER,
-        priority: NotificationPriority.HIGH,
-        // Chạm vào thông báo mở thẳng lịch làm việc của nhân viên.
-        actionUrl: '/(home)/workshift',
-        metadata: {
-          shiftId: current.shiftId,
-          shiftSlotId: current.shiftSlotId,
-          assignmentId: current.id,
-          type: 'shift_reminder',
+      await this.notificationsService.create(
+        {
+          accountId: employee.accountId,
+          storeId: employee.storeId,
+          title: 'Nhắc nhở ca làm việc',
+          content: `Ca làm của bạn sẽ bắt đầu lúc ${timeStr}. Đừng quên check-in đúng giờ nhé!`,
+          type: NotificationType.SHIFT_REMINDER,
+          priority: NotificationPriority.HIGH,
+          // Chạm vào thông báo mở thẳng lịch làm việc của nhân viên.
+          actionUrl: '/(home)/workshift',
+          metadata: {
+            shiftId: current.shiftId,
+            shiftSlotId: current.shiftSlotId,
+            assignmentId: current.id,
+            type: 'shift_reminder',
+            workDate,
+            workDates: [workDate],
+          },
         },
-      });
+        {
+          priority: 'high',
+          channelId: shiftAlertChannel(reminderSettings),
+        },
+      );
 
       this.logger.log('Shift reminder sent successfully');
     } catch (error) {

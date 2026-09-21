@@ -119,7 +119,7 @@ export class EmployeeSalary extends BaseEntity {
     scale: 2,
     default: 0,
   })
-  totalIncome: number; // Tổng thu nhập = baseSalary + allowances + bonus
+  totalIncome: number; // Tổng thu nhập = earnedBaseSalary (lương theo công) + tổng phụ cấp + bonus
 
   @Column({
     name: 'total_deductions',

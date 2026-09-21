@@ -36,6 +36,10 @@ import { StoreSkill } from './entities/store-skill.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { StoreProbationSetting } from './entities/store-probation-setting.entity';
 import { NotificationsService } from '../notifications/notifications.service';
+import { computeProbationEndsAt } from './career-ladder.lifecycle';
+import { KpiTask } from './entities/kpi-task.entity';
+import { KpiStatus } from './entities/employee-kpi.entity';
+import { vnDateString } from '../../common/utils/vn-calendar';
 import { NotificationType } from '../notifications/entities/notification.entity';
 
 /**
@@ -998,6 +1002,12 @@ export class CareerLadderService {
 
     // Chỉ số cộng dồn thì cộng từ lúc vào bậc, không phải từ đầu tháng: một
     // người vào bậc giữa tháng không nên được tính công của bậc trước.
+    // Computed from the KPI tasks themselves: nothing writes the monthly
+    // summary's kpiTotalCount / kpiCompletedCount (deprecated), so it was 0.
+    if (code === CriteriaCode.KPI_COMPLETION) {
+      return this.kpiCompletionPercent(profile.id);
+    }
+
     const cumulative: string[] = [
       CriteriaCode.COMPLETED_SHIFTS,
       CriteriaCode.WORK_HOURS,
@@ -1026,16 +1036,41 @@ export class CareerLadderService {
       }
       case CriteriaCode.PERFORMANCE_SCORE:
         return Number(summaries[0].performanceScore) || 0;
-      case CriteriaCode.KPI_COMPLETION: {
-        const total = sum((s) => s.kpiTotalCount);
-        if (total === 0) return 0;
-        return Math.round((sum((s) => s.kpiCompletedCount) / total) * 100);
-      }
       default:
         // Mã lạ không được coi là đã đạt; nó sẽ hiện ra là chưa đạt để chủ
         // nhìn thấy có gì đó sai trong cấu hình.
         return null;
     }
+  }
+
+  /**
+   * % of this Vietnam month's KPI tasks done (completion rate ≥ 100), over
+   * the employee's KPIs the owner has confirmed as 'Hoàn thành', ignoring
+   * hidden and deleted tasks and deleted KPIs. 0 when there are none.
+   *
+   * Only owner-confirmed KPIs count: task progress on an active KPI is
+   * self-reported by the employee and must not move career eligibility.
+   */
+  private async kpiCompletionPercent(profileId: string): Promise<number> {
+    const month = vnDateString().slice(0, 7);
+    const row = await this.dataSource
+      .getRepository(KpiTask)
+      .createQueryBuilder('task')
+      .innerJoin('task.employeeKpi', 'kpi')
+      .select('COUNT(task.id)', 'total')
+      .addSelect(
+        'COUNT(task.id) FILTER (WHERE task.completion_rate >= 100)',
+        'done',
+      )
+      .where('kpi.employee_profile_id = :profileId', { profileId })
+      .andWhere("to_char(kpi.month, 'YYYY-MM') = :month", { month })
+      .andWhere('kpi.status = :status', { status: KpiStatus.COMPLETED })
+      .andWhere('kpi.deleted_at IS NULL')
+      .andWhere('task.is_hidden = false')
+      .getRawOne();
+    const total = Number(row?.total) || 0;
+    if (total === 0) return 0;
+    return Math.round(((Number(row?.done) || 0) / total) * 100);
   }
 
   /** Tháng hiện tại, hoặc từ lúc vào bậc tới nay với chỉ số cộng dồn. */
@@ -1209,20 +1244,15 @@ export class CareerLadderService {
     return { event: result.event, evaluation: result.evaluation };
   }
 
-  /** Hạn thử việc lấy từ điều kiện days_in_rung của chính bậc đó. */
+  /**
+   * Hạn thử việc: days_in_rung nhỏ nhất (bắt buộc) trên các bậc kế tiếp, nếu
+   * không có thì của chính bậc thử việc. Same rule as hiring.
+   */
   private async probationDeadline(
     manager: EntityManager,
     rungId: string,
   ): Promise<Date | null> {
-    const tenure = await manager.findOne(StoreRungCriteria, {
-      where: {
-        rungId,
-        kind: CriteriaKind.TENURE,
-        code: CriteriaCode.DAYS_IN_RUNG,
-      },
-    });
-    const days = tenure?.value === undefined ? 0 : Number(tenure?.value ?? 0);
-    return days > 0 ? new Date(Date.now() + days * 86_400_000) : null;
+    return computeProbationEndsAt(manager, rungId, new Date());
   }
 
   /** Đưa nhân viên về bậc điểm-vào của một lộ trình khác. */

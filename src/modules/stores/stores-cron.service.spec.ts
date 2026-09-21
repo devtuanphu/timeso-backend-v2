@@ -45,3 +45,47 @@ describe('StoresCronService read-only guards', () => {
     });
   });
 });
+
+describe('StoresCronService shift-end reconcile isolation', () => {
+  const build = (shiftEndWorkflowService: Record<string, jest.Mock>) => {
+    const lockService = {
+      withLock: jest.fn(async (_key: string, _ttl: number, fn: () => any) => ({
+        ran: true,
+        result: await fn(),
+      })),
+    };
+    const service = new StoresCronService(
+      {} as any,
+      lockService as any,
+      shiftEndWorkflowService as any,
+      {} as any,
+      {} as any,
+      { get: jest.fn().mockReturnValue(undefined) } as any,
+    );
+    (service as any).logger = { warn: jest.fn(), log: jest.fn() };
+    return service;
+  };
+
+  it('still reconciles unstarted shifts when the active reconcile throws', async () => {
+    const workflows = {
+      reconcileActiveAssignments: jest.fn().mockRejectedValue(new Error('boom')),
+      reconcileUnstartedAssignments: jest.fn().mockResolvedValue({}),
+    };
+    const service = build(workflows);
+    await expect(service.handleReconcileShiftEndWorkflows()).resolves.toBeUndefined();
+    expect(workflows.reconcileUnstartedAssignments).toHaveBeenCalledTimes(1);
+    expect((service as any).logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('reconcileActiveAssignments failed'),
+    );
+  });
+
+  it('a failing unstarted reconcile does not reject the cron tick', async () => {
+    const workflows = {
+      reconcileActiveAssignments: jest.fn().mockResolvedValue(0),
+      reconcileUnstartedAssignments: jest.fn().mockRejectedValue(new Error('x')),
+    };
+    const service = build(workflows);
+    await expect(service.handleReconcileShiftEndWorkflows()).resolves.toBeUndefined();
+    expect(workflows.reconcileActiveAssignments).toHaveBeenCalledTimes(1);
+  });
+});

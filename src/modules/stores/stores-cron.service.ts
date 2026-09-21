@@ -7,6 +7,7 @@ import { DistributedLockService } from './distributed-lock.service';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 import { JobApplicationService } from './job-application.service';
 import { CareerLadderService } from './career-ladder.service';
+import { ShiftReminderService } from './shift-reminder.service';
 
 @Injectable()
 export class StoresCronService {
@@ -19,6 +20,7 @@ export class StoresCronService {
     private readonly jobApplicationService: JobApplicationService,
     private readonly careerLadderService: CareerLadderService,
     private readonly configService: ConfigService,
+    private readonly shiftReminderService?: ShiftReminderService,
   ) {}
 
   private isReadOnlyMode(): boolean {
@@ -36,8 +38,10 @@ export class StoresCronService {
   async handleRedactStaleJobApplications() {
     if (this.isReadOnlyMode()) return;
 
-    await this.lockService.withLock('cron:redact-stale-job-applications', 300, () =>
-      this.jobApplicationService.redactStaleContactDetails(),
+    await this.lockService.withLock(
+      'cron:redact-stale-job-applications',
+      300,
+      () => this.jobApplicationService.redactStaleContactDetails(),
     );
   }
 
@@ -67,6 +71,35 @@ export class StoresCronService {
     );
   }
 
+  /**
+   * Chạy 00:55 mỗi ngày: xếp nhắc ca mặc định (trước 15 phút) cho các ca
+   * APPROVED trong 48 giờ tới của nhân viên chưa từng lưu cài đặt nhắc — trước
+   * đây họ không có nhắc nào. Idempotent (job có fingerprint), có giới hạn.
+   */
+  @Cron('55 0 * * *', {
+    name: 'backfill-default-shift-reminders',
+    timeZone: 'Asia/Ho_Chi_Minh',
+  })
+  async handleBackfillDefaultShiftReminders() {
+    if (this.isReadOnlyMode() || !this.shiftReminderService) return;
+
+    await this.lockService.withLock(
+      'cron:backfill-default-shift-reminders',
+      600,
+      async () => {
+        try {
+          await this.shiftReminderService!.backfillDefaultReminders();
+        } catch (error) {
+          this.logger.warn(
+            `backfillDefaultReminders failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      },
+    );
+  }
+
   @Cron(CronExpression.EVERY_MINUTE, {
     name: 'reconcile-shift-end-workflows',
     timeZone: 'Asia/Ho_Chi_Minh',
@@ -77,7 +110,28 @@ export class StoresCronService {
     await this.lockService.withLock(
       'cron:reconcile-shift-end-workflows',
       55,
-      () => this.shiftEndWorkflowService.reconcileActiveAssignments(),
+      async () => {
+        // Mỗi bước tự bắt lỗi: bước này hỏng không được làm bỏ bước kia.
+        try {
+          await this.shiftEndWorkflowService.reconcileActiveAssignments();
+        } catch (error) {
+          this.logger.warn(
+            `reconcileActiveAssignments failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        // Ca chưa check-in: nhắc sau 5 phút, quá giờ kết thúc thì nghỉ không phép.
+        try {
+          await this.shiftEndWorkflowService.reconcileUnstartedAssignments();
+        } catch (error) {
+          this.logger.warn(
+            `reconcileUnstartedAssignments failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      },
     );
   }
 
@@ -92,15 +146,22 @@ export class StoresCronService {
   async handleCreateDailyReports() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:create-daily-reports', 300, async () => {
-      this.logger.log('Starting daily reports creation for all stores...');
-      const reports = await this.storesService.createDailyReportsForAllStores();
-      this.logger.log(`Successfully created ${reports.length} daily reports`);
-      return reports;
-    });
+    const result = await this.lockService.withLock(
+      'cron:create-daily-reports',
+      300,
+      async () => {
+        this.logger.log('Starting daily reports creation for all stores...');
+        const reports =
+          await this.storesService.createDailyReportsForAllStores();
+        this.logger.log(`Successfully created ${reports.length} daily reports`);
+        return reports;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: create-daily-reports already running on another instance');
+      this.logger.log(
+        'Skipped: create-daily-reports already running on another instance',
+      );
     }
   }
 
@@ -118,15 +179,24 @@ export class StoresCronService {
   async handleCreateMonthlyPayrolls() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:create-monthly-payrolls', 1800, async () => {
-      this.logger.log('Starting monthly payrolls creation for all stores...');
-      const payrolls = await this.storesService.createMonthlyPayrollsForAllStores();
-      this.logger.log(`Successfully created ${payrolls.length} monthly payrolls`);
-      return payrolls;
-    });
+    const result = await this.lockService.withLock(
+      'cron:create-monthly-payrolls',
+      1800,
+      async () => {
+        this.logger.log('Starting monthly payrolls creation for all stores...');
+        const payrolls =
+          await this.storesService.createMonthlyPayrollsForAllStores();
+        this.logger.log(
+          `Successfully created ${payrolls.length} monthly payrolls`,
+        );
+        return payrolls;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: create-monthly-payrolls already running on another instance');
+      this.logger.log(
+        'Skipped: create-monthly-payrolls already running on another instance',
+      );
     }
   }
 
@@ -141,15 +211,26 @@ export class StoresCronService {
   async handleCreateMonthlySummaries() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:create-monthly-employee-summaries', 600, async () => {
-      this.logger.log('Starting monthly employee summaries creation for all active employees...');
-      const summaries = await this.storesService.createMonthlySummariesForAllEmployees();
-      this.logger.log(`Successfully created ${summaries.length} monthly employee summaries`);
-      return summaries;
-    });
+    const result = await this.lockService.withLock(
+      'cron:create-monthly-employee-summaries',
+      600,
+      async () => {
+        this.logger.log(
+          'Starting monthly employee summaries creation for all active employees...',
+        );
+        const summaries =
+          await this.storesService.createMonthlySummariesForAllEmployees();
+        this.logger.log(
+          `Successfully created ${summaries.length} monthly employee summaries`,
+        );
+        return summaries;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: create-monthly-employee-summaries already running on another instance');
+      this.logger.log(
+        'Skipped: create-monthly-employee-summaries already running on another instance',
+      );
     }
   }
 
@@ -164,15 +245,25 @@ export class StoresCronService {
   async handleProcessExpiredCycles() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:process-expired-work-cycles', 300, async () => {
-      this.logger.log('Starting to process expired and scheduled-stop work cycles...');
-      const processResult = await this.storesService.processExpiredCycles();
-      this.logger.log(`Processed work cycles: ${processResult.expiredCount} expired, ${processResult.stoppedCount} stopped`);
-      return processResult;
-    });
+    const result = await this.lockService.withLock(
+      'cron:process-expired-work-cycles',
+      300,
+      async () => {
+        this.logger.log(
+          'Starting to process expired and scheduled-stop work cycles...',
+        );
+        const processResult = await this.storesService.processExpiredCycles();
+        this.logger.log(
+          `Processed work cycles: ${processResult.expiredCount} expired, ${processResult.stoppedCount} stopped`,
+        );
+        return processResult;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: process-expired-work-cycles already running on another instance');
+      this.logger.log(
+        'Skipped: process-expired-work-cycles already running on another instance',
+      );
     }
   }
 
@@ -187,15 +278,26 @@ export class StoresCronService {
   async handleGenerateDailySlots() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:generate-daily-slots', 300, async () => {
-      this.logger.log('Starting to generate slots for tomorrow for all active cycles...');
-      const generateResult = await this.storesService.generateDailySlotsForAllCycles();
-      this.logger.log(`Generated slots: ${generateResult.createdSlots} slots for ${generateResult.processedCycles} cycles`);
-      return generateResult;
-    });
+    const result = await this.lockService.withLock(
+      'cron:generate-daily-slots',
+      300,
+      async () => {
+        this.logger.log(
+          'Starting to generate slots for tomorrow for all active cycles...',
+        );
+        const generateResult =
+          await this.storesService.generateDailySlotsForAllCycles();
+        this.logger.log(
+          `Generated slots: ${generateResult.createdSlots} slots for ${generateResult.processedCycles} cycles`,
+        );
+        return generateResult;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: generate-daily-slots already running on another instance');
+      this.logger.log(
+        'Skipped: generate-daily-slots already running on another instance',
+      );
     }
   }
 
@@ -210,15 +312,26 @@ export class StoresCronService {
   async handleGenerateSlotsForIndefiniteCycles() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:generate-slots-indefinite-cycles', 300, async () => {
-      this.logger.log('Starting to generate slots for indefinite work cycles...');
-      const processResult = await this.storesService.generateDailySlotsForIndefiniteCycles();
-      this.logger.log(`Processed ${processResult.processedCount} indefinite cycles`);
-      return processResult;
-    });
+    const result = await this.lockService.withLock(
+      'cron:generate-slots-indefinite-cycles',
+      300,
+      async () => {
+        this.logger.log(
+          'Starting to generate slots for indefinite work cycles...',
+        );
+        const processResult =
+          await this.storesService.generateDailySlotsForIndefiniteCycles();
+        this.logger.log(
+          `Processed ${processResult.processedCount} indefinite cycles`,
+        );
+        return processResult;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: generate-slots-indefinite-cycles already running on another instance');
+      this.logger.log(
+        'Skipped: generate-slots-indefinite-cycles already running on another instance',
+      );
     }
   }
 
@@ -234,16 +347,25 @@ export class StoresCronService {
   async handleDetectAttendanceIssues() {
     if (this.isReadOnlyMode()) return;
 
-    const result = await this.lockService.withLock('cron:detect-attendance-issues', 300, async () => {
-      this.logger.log('Starting end-of-day attendance issues detection...');
-      await this.shiftEndWorkflowService.reconcileActiveAssignments();
-      const detectResult = await this.storesService.detectEndOfDayAttendanceIssues();
-      this.logger.log(`Attendance issues detected: ${detectResult.forgotCount} forgot clock-out, ${detectResult.unauthorizedCount} unauthorized leaves`);
-      return detectResult;
-    });
+    const result = await this.lockService.withLock(
+      'cron:detect-attendance-issues',
+      300,
+      async () => {
+        this.logger.log('Starting end-of-day attendance issues detection...');
+        await this.shiftEndWorkflowService.reconcileActiveAssignments();
+        const detectResult =
+          await this.storesService.detectEndOfDayAttendanceIssues();
+        this.logger.log(
+          `Attendance issues detected: ${detectResult.forgotCount} forgot clock-out, ${detectResult.unauthorizedCount} unauthorized leaves`,
+        );
+        return detectResult;
+      },
+    );
 
     if (!result.ran) {
-      this.logger.log('Skipped: detect-attendance-issues already running on another instance');
+      this.logger.log(
+        'Skipped: detect-attendance-issues already running on another instance',
+      );
     }
   }
 }

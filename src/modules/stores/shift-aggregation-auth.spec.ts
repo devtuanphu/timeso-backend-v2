@@ -350,6 +350,12 @@ describe('calendar mutation owner authorization', () => {
   it('only allows forward assignment transitions and rejects terminal replay', async () => {
     const service = Object.create(StoresService.prototype) as any;
     service.notifyEmployeesOfNewShifts = jest.fn().mockResolvedValue(undefined);
+    // Approving now schedules the reminder after commit (BE-4).
+    service.shiftReminderService = {
+      scheduleAssignmentReminder: jest.fn().mockResolvedValue(undefined),
+      cancelAssignmentReminders: jest.fn().mockResolvedValue(undefined),
+    };
+    service.logger = { error: jest.fn() };
     const assignment = {
       id: 'assignment-1',
       status: ShiftAssignmentStatus.PENDING,
@@ -553,6 +559,8 @@ describe('calendar mutation owner authorization', () => {
 
   it('uses a deterministic workload probe instead of silently truncating slots', async () => {
     const service = Object.create(ShiftAggregationService.prototype) as any;
+    // Store days off for the MONTH day rate; none configured = calendar days.
+    service.shiftConfigRepo = { findOne: jest.fn().mockResolvedValue(null) };
     const qb: any = {};
     for (const method of [
       'leftJoinAndSelect',
@@ -600,6 +608,8 @@ describe('calendar mutation owner authorization', () => {
   it('marks the employee calendar day using Asia/Ho_Chi_Minh at UTC midnight boundary', async () => {
     jest.useFakeTimers().setSystemTime(new Date('2026-08-23T17:30:00.000Z'));
     const service = Object.create(ShiftAggregationService.prototype) as any;
+    // Store days off for the MONTH day rate; none configured = calendar days.
+    service.shiftConfigRepo = { findOne: jest.fn().mockResolvedValue(null) };
     service.assertEmployeeCalendarAccess = jest
       .fn()
       .mockResolvedValue(undefined);
@@ -656,6 +666,8 @@ describe('calendar mutation owner authorization', () => {
   // thật sự nghỉ phép. Cờ này phải đúng từng ngày, kể cả đơn nghỉ nhiều ngày.
   it('marks only days covered by an approved leave as on leave', async () => {
     const service = Object.create(ShiftAggregationService.prototype) as any;
+    // Store days off for the MONTH day rate; none configured = calendar days.
+    service.shiftConfigRepo = { findOne: jest.fn().mockResolvedValue(null) };
     service.assertEmployeeCalendarAccess = jest
       .fn()
       .mockResolvedValue(undefined);

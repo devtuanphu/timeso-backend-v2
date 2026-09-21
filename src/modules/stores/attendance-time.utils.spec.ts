@@ -1,6 +1,7 @@
 import {
   calculateEarlyMinutes,
   calculateLateMinutes,
+  computeAttendanceDeltas,
   resolveShiftBoundaries,
 } from './attendance-time.utils';
 
@@ -92,5 +93,63 @@ describe('late and early minutes', () => {
   it('treats unknown boundaries as neither late nor early', () => {
     expect(calculateLateMinutes(null, new Date())).toBe(0);
     expect(calculateEarlyMinutes(null, new Date())).toBe(0);
+  });
+});
+
+describe('computeAttendanceDeltas', () => {
+  it('check-in 07:48 for an 08:00 shift is 12 minutes early', () => {
+    const { start, end } = resolveShiftBoundaries('2026-09-18', '08:00', '12:00');
+    expect(
+      computeAttendanceDeltas({
+        start,
+        end,
+        checkIn: new Date('2026-09-18T07:48:00+07:00'),
+      }),
+    ).toEqual({
+      lateMinutes: 0,
+      earlyArrivalMinutes: 12,
+      earlyMinutes: 0,
+      overtimeMinutes: 0,
+    });
+  });
+
+  it('cross-midnight 22:00-02:00, check-out at 02:15 is 15 minutes overtime', () => {
+    const { start, end } = resolveShiftBoundaries('2026-09-18', '22:00', '02:00');
+    expect(
+      computeAttendanceDeltas({
+        start,
+        end,
+        checkIn: new Date('2026-09-18T22:07:00+07:00'),
+        checkOut: new Date('2026-09-19T02:15:00+07:00'),
+      }),
+    ).toEqual({
+      lateMinutes: 7,
+      earlyArrivalMinutes: 0,
+      earlyMinutes: 0,
+      overtimeMinutes: 15,
+    });
+  });
+
+  it('early check-out and auto check-out', () => {
+    const { start, end } = resolveShiftBoundaries('2026-09-18', '08:00', '17:00');
+    const checkIn = new Date('2026-09-18T08:00:00+07:00');
+    expect(
+      computeAttendanceDeltas({
+        start,
+        end,
+        checkIn,
+        checkOut: new Date('2026-09-18T15:50:00+07:00'),
+      }).earlyMinutes,
+    ).toBe(70);
+    // Auto check-out at end + 15: paid to the end, no overtime.
+    expect(
+      computeAttendanceDeltas({
+        start,
+        end,
+        checkIn,
+        checkOut: new Date('2026-09-18T17:15:00+07:00'),
+        autoCheckedOut: true,
+      }),
+    ).toMatchObject({ earlyMinutes: 0, overtimeMinutes: 0 });
   });
 });

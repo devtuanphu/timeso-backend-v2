@@ -67,3 +67,39 @@ export function calculateEarlyMinutes(end: Date | null, now: Date): number {
   if (!end) return 0;
   return Math.max(0, Math.floor((end.getTime() - now.getTime()) / 60000));
 }
+
+/**
+ * Early/late deltas of one attendance against its shift, in whole minutes —
+ * the single source for the check-in/out result screens and the shift-hours
+ * history, so the wording cannot drift between them.
+ *
+ * - lateMinutes: check-in after start; earlyArrivalMinutes: check-in before it.
+ * - earlyMinutes: check-out before end; overtimeMinutes: check-out after it.
+ * An automatic check-out (forgot to check out) is paid to the shift end, so
+ * it never counts as overtime or as leaving early.
+ */
+export interface AttendanceDeltas {
+  lateMinutes: number;
+  earlyArrivalMinutes: number;
+  earlyMinutes: number;
+  overtimeMinutes: number;
+}
+
+export function computeAttendanceDeltas(input: {
+  start: Date | null;
+  end: Date | null;
+  checkIn?: Date | null;
+  checkOut?: Date | null;
+  autoCheckedOut?: boolean;
+}): AttendanceDeltas {
+  const { start, end, checkIn, checkOut } = input;
+  const minutesBetween = (from: Date, to: Date) =>
+    Math.max(0, Math.floor((to.getTime() - from.getTime()) / 60000));
+  const hasCheckOut = !!checkOut && !input.autoCheckedOut;
+  return {
+    lateMinutes: start && checkIn ? minutesBetween(start, checkIn) : 0,
+    earlyArrivalMinutes: start && checkIn ? minutesBetween(checkIn, start) : 0,
+    earlyMinutes: end && hasCheckOut ? minutesBetween(checkOut!, end) : 0,
+    overtimeMinutes: end && hasCheckOut ? minutesBetween(end, checkOut!) : 0,
+  };
+}

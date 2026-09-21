@@ -13,6 +13,8 @@ import {
   buildShiftReminderFingerprint,
   buildShiftReminderJobId,
   buildShiftReminderSuccessorJobId,
+  computeShiftReminderTriggerMs,
+  effectiveReminderSettings,
   legacyShiftReminderJobIds,
   parseVietnamShiftStart,
   SHIFT_REMINDER_JOB_VERSION,
@@ -160,18 +162,13 @@ export class ShiftReminderService {
     settings: any,
     identity: ShiftReminderIdentity = {},
   ): ReminderJob | null {
-    if (!settings || settings.type === 'off') return null;
+    // Chưa lưu cài đặt thì dùng mặc định (nhắc trước 15 phút), khớp với app.
+    settings = effectiveReminderSettings(settings);
+    if (settings.type === 'off') return null;
 
-    const shiftStart = new Date(startTime).getTime();
-    let triggerTime = shiftStart;
-    if (settings.type === '15m') triggerTime -= 15 * 60 * 1000;
-    else if (settings.type === '30m') triggerTime -= 30 * 60 * 1000;
-    else if (settings.type === '1h') triggerTime -= 60 * 60 * 1000;
-    else if (settings.type === 'custom') {
-      const { days = 0, hours = 0, minutes = 0 } = settings.custom || {};
-      triggerTime -=
-        (days * 24 * 60 * 60 + hours * 60 * 60 + minutes * 60) * 1000;
-    }
+    // Offset modes and the fixed Vietnam clock time ("Nhắc cố định").
+    const triggerTime = computeShiftReminderTriggerMs(startTime, settings);
+    if (triggerTime === null) return null;
 
     const delay = triggerTime - Date.now();
     if (delay <= 0) return null;
@@ -645,6 +642,50 @@ export class ShiftReminderService {
       `Processed shift reminder cancellation batch: requested=${uniqueIds.length}, loaded=${loaded}, cancelled=${cancelled}`,
     );
     return { requested: uniqueIds.length, loaded, cancelled };
+  }
+
+  /**
+   * Reminders for employees who never saved reminder settings, or saved
+   * settings without a reminder `type` (both use the default). Before the
+   * default (15 minutes before, see DEFAULT_REMINDER_SETTINGS) no job was
+   * queued for them, so APPROVED shifts assigned earlier have none. Bounded
+   * look-ahead window and row cap; scheduling is fingerprinted, so a repeat
+   * run leaves existing jobs untouched (idempotent).
+   */
+  async backfillDefaultReminders(
+    now: Date = new Date(),
+    options: { windowHours?: number; limit?: number } = {},
+  ): Promise<{ candidates: number }> {
+    const windowHours = options.windowHours ?? 48;
+    const limit = Math.min(Math.max(options.limit ?? 2000, 1), 5000);
+    const vnDate = (instant: Date) =>
+      new Date(instant.getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
+    const until = new Date(now.getTime() + windowHours * 3_600_000);
+    const rows: Array<{ id: string }> = await this.assignmentRepository
+      .createQueryBuilder('sa')
+      .innerJoin('sa.shiftSlot', 'slot')
+      .innerJoin('slot.cycle', 'cycle')
+      .innerJoin('sa.employee', 'employee')
+      .select('sa.id', 'id')
+      .where('sa.status = :status', { status: ShiftAssignmentStatus.APPROVED })
+      .andWhere('sa.checkInTime IS NULL')
+      // Chưa lưu cài đặt, hoặc đã lưu (vd. chỉ bật/tắt rung) nhưng chưa chọn
+      // kiểu nhắc: cả hai đều nhắc theo mặc định (DEFAULT_REMINDER_SETTINGS).
+      .andWhere(
+        "(employee.reminder_settings IS NULL OR employee.reminder_settings->>'type' IS NULL)",
+      )
+      .andWhere('cycle.status = :cycleStatus', {
+        cycleStatus: WorkCycleStatus.ACTIVE,
+      })
+      .andWhere('slot.workDate >= :from', { from: vnDate(now) })
+      .andWhere('slot.workDate <= :to', { to: vnDate(until) })
+      .orderBy('slot.workDate', 'ASC')
+      .limit(limit)
+      .getRawMany();
+    const ids = rows.map((row) => row.id);
+    if (ids.length) await this.scheduleAssignmentReminders(ids);
+    this.logger.log(`Default reminder backfill: candidates=${ids.length}`);
+    return { candidates: ids.length };
   }
 
   /**

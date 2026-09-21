@@ -42,6 +42,29 @@ describe('chat reliability migration artifacts', () => {
     expect(readme).toContain('does not backfill old chat messages');
   });
 
+  it('keeps direct-chat expand additive and index-safe', () => {
+    const expand = script('migration_chat_direct_expand.sql');
+    const verify = script('verify_chat_direct.sql');
+    expect(expand).toContain('\\set ON_ERROR_STOP on');
+    expect(expand).toContain("SET lock_timeout = '3s'");
+    expect(expand).toContain(
+      'ADD COLUMN IF NOT EXISTS direct_key varchar(200)',
+    );
+    expect(expand).toContain(
+      'CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_chat_groups_direct_key',
+    );
+    expect(expand).toContain(
+      'WHERE direct_key IS NOT NULL AND deleted_at IS NULL',
+    );
+    expect(expand).toContain('indisvalid');
+    expect(expand).toContain('\\set AUTOCOMMIT on');
+    expect(expand).not.toMatch(/^\s*ALTER TABLE[^;]*DROP COLUMN/im);
+    expect(verify).toContain('\\set ON_ERROR_STOP on');
+    expect(verify).toContain('uq_chat_groups_direct_key');
+    expect(verify).toContain('indisvalid = true');
+    expect(verify).toContain('HAVING COUNT(*) > 2');
+  });
+
   it('keeps preflight safe before additive sequence columns exist', () => {
     const preflight = script('migration_chat_reliability_v2_preflight.sql');
     expect(preflight).toContain('\\set ON_ERROR_STOP on');

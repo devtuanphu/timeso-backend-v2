@@ -816,7 +816,8 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       status: ShiftAssignmentStatus.APPROVED,
       employee: selfEmployee,
       shiftSlot: {
-        workDate: '2026-05-05',
+        // Ca còn mở: check-in sau giờ kết thúc ca giờ bị chặn trước bước QR.
+        workDate: '2099-05-05',
         workShift: { startTime: '08:00', endTime: '17:00' },
         cycle: { storeId: 'store-1' },
       },
@@ -824,6 +825,17 @@ describe('StoresService - Check-in/Check-out Integration', () => {
 
     afterEach(() => {
       delete process.env.ATTENDANCE_ENFORCEMENT_MODE;
+    });
+
+    // Qua giờ kết thúc mà chưa vào ca thì ca đã là nghỉ không phép.
+    it('rejects a check-in after the shift has ended', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        ...approvedAssignment,
+        shiftSlot: { ...approvedAssignment.shiftSlot, workDate: '2026-05-05' },
+      });
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).rejects.toThrow('Ca làm đã kết thúc nên không thể check-in');
     });
 
     it('does not reject a missing QR while enforcement is off', async () => {

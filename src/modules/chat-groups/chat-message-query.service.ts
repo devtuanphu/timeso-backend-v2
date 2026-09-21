@@ -275,8 +275,15 @@ export class ChatMessageQueryService {
     const offsetIndex = parameters.push(Math.max(0, offset));
     const rawRows = await this.dataSource.query(
       `SELECT chat_group.id,
-              chat_group.name,
-              chat_group.avatar,
+              -- Chat riêng hiện tên và ảnh của người kia.
+              CASE WHEN chat_group.direct_key IS NOT NULL
+                   THEN COALESCE(peer.full_name, chat_group.name)
+                   ELSE chat_group.name END AS name,
+              CASE WHEN chat_group.direct_key IS NOT NULL
+                   THEN peer.avatar
+                   ELSE chat_group.avatar END AS avatar,
+              (chat_group.direct_key IS NOT NULL) AS "isDirect",
+              peer.account_id AS "peerAccountId",
               chat_group.store_id AS "storeId",
               membership.last_read_sequence AS "lastReadSequence",
               COALESCE(last_message.created_at, chat_group.created_at) AS "activityAt",
@@ -318,6 +325,17 @@ export class ChatMessageQueryService {
        ) last_message ON true
        LEFT JOIN accounts sender
          ON sender.id = last_message.sender_id AND sender.deleted_at IS NULL
+       LEFT JOIN LATERAL (
+         SELECT peer_member.account_id, peer_account.full_name, peer_account.avatar
+         FROM chat_group_members peer_member
+         JOIN accounts peer_account ON peer_account.id = peer_member.account_id
+         WHERE chat_group.direct_key IS NOT NULL
+           AND peer_member.group_id = chat_group.id
+           AND peer_member.account_id <> $1
+           AND peer_member.deleted_at IS NULL
+         ORDER BY (peer_member.status = 'active') DESC, peer_member.created_at DESC
+         LIMIT 1
+       ) peer ON true
        JOIN LATERAL (
          SELECT COUNT(*) AS unread_count
          FROM chat_messages unread_message
@@ -345,6 +363,9 @@ export class ChatMessageQueryService {
           id: row.id,
           name: row.name,
           avatar: row.avatar,
+          isDirect: row.isDirect === true,
+          peerAccountId:
+            row.isDirect === true ? row.peerAccountId || null : null,
           storeId: row.storeId,
           activityAt,
           unreadCount: Number(row.unreadCount || 0),

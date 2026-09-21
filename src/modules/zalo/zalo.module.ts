@@ -4,6 +4,7 @@ import { HttpModule } from '@nestjs/axios';
 import { ZaloService } from './zalo.service';
 import { ZaloController } from './zalo.controller';
 import { ZaloToken } from './entities/zalo-token.entity';
+import { ZaloOAuthStateService } from './zalo-oauth-state.service';
 
 @Module({
   imports: [
@@ -11,7 +12,7 @@ import { ZaloToken } from './entities/zalo-token.entity';
     HttpModule,
   ],
   controllers: [ZaloController],
-  providers: [ZaloService],
+  providers: [ZaloService, ZaloOAuthStateService],
   exports: [ZaloService],
 })
 export class ZaloModule {}

@@ -62,6 +62,43 @@ export const identityMulterConfig = {
   },
 };
 
+export const IDENTITY_IMAGE_ROUTE_PREFIX = '/api/accounts/identity/image/';
+
+/** URL under which an identity image stored in IDENTITY_UPLOAD_DIR is served. */
+export const identityImageUrl = (filename: string): string =>
+  `${IDENTITY_IMAGE_ROUTE_PREFIX}${filename}`;
+
+/**
+ * For multipart forms that mix ordinary uploads (avatar, contract) with
+ * identity scans. Identity fields are written to IDENTITY_UPLOAD_DIR and must
+ * be JPEG/PNG; every other field keeps the public `./uploads` behaviour of
+ * `multerConfig`.
+ */
+export const mixedIdentityMulterConfig = (identityFields: readonly string[]) => ({
+  storage: diskStorage({
+    destination: (req, file, callback) => {
+      if (identityFields.includes(file.fieldname)) {
+        mkdirSync(IDENTITY_UPLOAD_DIR, { recursive: true });
+        return callback(null, IDENTITY_UPLOAD_DIR);
+      }
+      callback(null, './uploads');
+    },
+    filename: (req, file, callback) => {
+      callback(null, `${uuidv4()}${extname(file.originalname)}`);
+    },
+  }),
+  limits: multerConfig.limits,
+  fileFilter: (req, file, callback) => {
+    if (identityFields.includes(file.fieldname)) {
+      if (!['image/jpeg', 'image/png'].includes(file.mimetype)) {
+        return callback(new Error('Only JPEG and PNG images are allowed!'), false);
+      }
+      return callback(null, true);
+    }
+    return multerConfig.fileFilter(req, file, callback);
+  },
+});
+
 export const attendanceMulterConfig = {
   storage: memoryStorage(),
   limits: {

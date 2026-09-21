@@ -25,12 +25,14 @@ import { ChatMessageCommandService } from './chat-message-command.service';
 import { ChatMessageQueryService } from './chat-message-query.service';
 import {
   CatchUpMessagesQueryDto,
+  ChatContactsQueryDto,
   ChatGroupListV2QueryDto,
   HistoryMessagesQueryDto,
   LegacyChatPaginationQueryDto,
   LegacyChatPageQueryDto,
   LegacyChatMediaQueryDto,
   MarkChatGroupReadDto,
+  OpenDirectChatDto,
   SearchChatMessagesQueryDto,
   SendChatMessageDto,
 } from './dto/chat-v2.dto';
@@ -61,6 +63,28 @@ export class ChatGroupsController {
     });
 
     return group;
+  }
+
+  @Post('direct')
+  @ApiOperation({ summary: 'Mở (hoặc tạo) chat riêng với một thành viên cùng cửa hàng' })
+  async openDirectChat(@Body() dto: OpenDirectChatDto, @Request() req) {
+    this.abuseProtection.assertHttp('list', req.user.userId, req.ip);
+    const group = await this.chatGroupsService.openDirectChat(
+      dto.storeId,
+      dto.targetAccountId,
+      req.user.userId,
+    );
+    this.chatGateway.joinGroup(req.user.userId, group.id);
+    this.chatGateway.joinGroup(dto.targetAccountId, group.id);
+    return group;
+  }
+
+  @Get('contacts')
+  @ApiOperation({ summary: 'Những người đã chat chung với mình trong cửa hàng' })
+  @ApiQuery({ name: 'storeId', required: true })
+  async getChatContacts(@Query() query: ChatContactsQueryDto, @Request() req) {
+    this.abuseProtection.assertHttp('list', req.user.userId, req.ip);
+    return this.chatGroupsService.getChatContacts(query.storeId, req.user.userId);
   }
 
   @Get()

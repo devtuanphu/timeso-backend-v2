@@ -14,6 +14,7 @@ import {
 } from '@nestjs/common';
 import { DataSource, IsNull } from 'typeorm';
 import { StoresService } from './stores.service';
+import { addDays, getTodayDateString } from './shift-schedule.utils';
 import { FaceRecognitionService } from './face-recognition.service';
 import { AccountsService } from '../accounts/accounts.service';
 
@@ -626,6 +627,8 @@ describe('Work Shift & Cycle Management', () => {
           'templates',
           'templates.workShift',
         ],
+        // Several schedules may be active; the newest is returned.
+        order: { createdAt: 'DESC' },
       });
       expect(result).toEqual(cycle);
     });
@@ -821,7 +824,8 @@ describe('Work Shift & Cycle Management', () => {
         'c1',
         {
           stopImmediately: false,
-          scheduledStopAt: '2026-04-15',
+          // A stop date must not be in the past (BE-2); keep it ahead.
+          scheduledStopAt: addDays(getTodayDateString(), 5),
         },
         'owner-1',
       );

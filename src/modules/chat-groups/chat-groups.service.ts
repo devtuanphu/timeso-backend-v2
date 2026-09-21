@@ -5,7 +5,14 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, MoreThan, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  MoreThan,
+  Not,
+  Repository,
+} from 'typeorm';
 import { ChatGroup } from './entities/chat-group.entity';
 import { ChatGroupMember } from './entities/chat-group-member.entity';
 import { ChatMessage } from './entities/chat-message.entity';
@@ -13,9 +20,27 @@ import { CreateChatGroupDto } from './dto/create-chat-group.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { UpdateChatGroupDto } from './dto/update-chat-group.dto';
 import { ChatAuthorizationService } from './chat-authorization.service';
-import { chatAccessDenied } from './chat-errors';
+import {
+  chatAccessDenied,
+  directChatImmutable,
+  directChatInvalidTarget,
+} from './chat-errors';
 import { validateChatGroupName } from './chat-message.utils';
 import { mapActiveChatMember } from './chat-member.mapper';
+import { Store, StoreStatus } from '../stores/entities/store.entity';
+
+/** Số người tối đa trả về cho ô tìm kiếm người đã chat chung. */
+export const CHAT_CONTACTS_LIMIT = 200;
+
+/** Khoá chat riêng: '<storeId>:<accountA>:<accountB>' (hai account đã sắp xếp). */
+export const directKeyFor = (
+  storeId: string,
+  accountA: string,
+  accountB: string,
+): string => {
+  const [first, second] = [accountA, accountB].sort();
+  return `${storeId}:${first}:${second}`;
+};
 
 @Injectable()
 export class ChatGroupsService {
@@ -68,6 +93,183 @@ export class ChatGroupsService {
     });
 
     return this.getGroupDetails(groupId, userId);
+  }
+
+  /**
+   * Mở chat riêng với một thành viên cùng cửa hàng: có rồi thì trả lại, chưa
+   * có thì tạo. Nhân viên cũng mở được (khác tạo nhóm, chỉ chủ mới được), miễn
+   * cả hai đều là chủ hoặc nhân viên còn làm của cửa hàng đó — kiểm ở cả lúc
+   * tạo lẫn lúc mở lại. Mở lại thì kích hoạt lại người đã rời/bị xoá khỏi
+   * cuộc chat (không bao giờ thêm dòng thứ hai cho cùng một người).
+   */
+  async openDirectChat(storeId: string, targetAccountId: string, userId: string) {
+    if (!storeId || !targetAccountId || targetAccountId === userId) {
+      throw directChatInvalidTarget();
+    }
+    const directKey = directKeyFor(storeId, userId, targetAccountId);
+
+    const openInTransaction = () =>
+      this.dataSource.transaction(async (manager) => {
+        const store = await manager.getRepository(Store).findOne({
+          where: { id: storeId, status: StoreStatus.ACTIVE },
+          select: ['id', 'ownerAccountId'],
+        });
+        if (!store) throw chatAccessDenied();
+        await this.authorization.requireEligibleParticipants(
+          storeId,
+          [userId, targetAccountId],
+          store.ownerAccountId,
+          manager,
+        );
+        const groups = manager.getRepository(ChatGroup);
+        const existing = await groups.findOne({
+          where: { directKey },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (existing) {
+          await this.reactivateDirectMembers(manager, existing.id, [
+            userId,
+            targetAccountId,
+          ]);
+          return existing.id;
+        }
+        const group = await groups.save(
+          groups.create({
+            name: 'Chat riêng',
+            storeId,
+            createdBy: userId,
+            messagePermission: 'everyone',
+            customSenderIds: [],
+            directKey,
+          }),
+        );
+        const members = manager.getRepository(ChatGroupMember);
+        await members.save(
+          [userId, targetAccountId].map((accountId) =>
+            members.create({ groupId: group.id, accountId, status: 'active' }),
+          ),
+        );
+        return group.id;
+      });
+
+    let groupId: string;
+    try {
+      groupId = await openInTransaction();
+    } catch (error: any) {
+      // Hai người cùng bấm một lúc: chỉ mục duy nhất giữ lại một cuộc chat;
+      // chạy lại một lần để mở (và kích hoạt lại) đúng cuộc chat đó.
+      if (error?.code === '23505' || error?.driverError?.code === '23505') {
+        groupId = await openInTransaction();
+      } else {
+        throw error;
+      }
+    }
+
+    // getGroupDetails tự kiểm quyền truy cập (thành viên đang hoạt động).
+    return this.getGroupDetails(groupId, userId);
+  }
+
+  /** Mỗi người trong chat riêng có đúng một dòng thành viên đang hoạt động. */
+  private async reactivateDirectMembers(
+    manager: EntityManager,
+    groupId: string,
+    accountIds: string[],
+  ): Promise<void> {
+    const members = manager.getRepository(ChatGroupMember);
+    for (const accountId of accountIds) {
+      const latest = await members.findOne({
+        where: { groupId, accountId },
+        order: { createdAt: 'DESC' },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (latest?.status === 'active') continue;
+      const active = await members.count({
+        where: { groupId, accountId, status: 'active' },
+      });
+      if (active > 0) continue;
+      if (latest) {
+        await members.update({ id: latest.id }, { status: 'active' });
+      } else {
+        await members.save(
+          members.create({ groupId, accountId, status: 'active' }),
+        );
+      }
+    }
+  }
+
+  /**
+   * Người đã từng chat chung với mình (thành viên các nhóm mình đang ở) trong
+   * một cửa hàng — dùng cho ô tìm kiếm "Groups nội bộ". Chỉ trả người còn là
+   * chủ hoặc nhân viên còn làm của cửa hàng; tối đa CHAT_CONTACTS_LIMIT người.
+   */
+  async getChatContacts(storeId: string, userId: string) {
+    if (!storeId) return [];
+    // Người gọi phải còn là chủ hoặc nhân viên của cửa hàng đang hoạt động.
+    const store = await this.dataSource.getRepository(Store).findOne({
+      where: { id: storeId, status: StoreStatus.ACTIVE },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) throw chatAccessDenied();
+    await this.authorization.requireEligibleParticipants(
+      storeId,
+      [userId],
+      store.ownerAccountId,
+    );
+    const rows: Array<{ accountId: string; fullName: string | null; avatar: string | null }> =
+      await this.dataSource.query(
+        `SELECT contact."accountId", contact."fullName", contact.avatar
+           FROM (
+             SELECT DISTINCT other.account_id AS "accountId",
+                    account.full_name AS "fullName",
+                    account.avatar AS avatar
+               FROM chat_group_members mine
+               JOIN chat_groups chat_group
+                 ON chat_group.id = mine.group_id
+                AND chat_group.deleted_at IS NULL
+                AND chat_group.store_id = $2
+               JOIN stores store ON store.id = chat_group.store_id
+               JOIN chat_group_members other
+                 ON other.group_id = mine.group_id
+                AND other.account_id <> $1
+                AND other.status = 'active'
+                AND other.deleted_at IS NULL
+               JOIN accounts account
+                 ON account.id = other.account_id
+                AND account.status = 'active'
+                AND account.deleted_at IS NULL
+               LEFT JOIN employee_profiles employee
+                 ON employee.store_id = chat_group.store_id
+                AND employee.account_id = other.account_id
+                AND employee.deleted_at IS NULL
+              WHERE mine.account_id = $1
+                AND mine.status = 'active'
+                AND mine.deleted_at IS NULL
+                AND (store.owner_account_id = other.account_id
+                     OR employee.employment_status <> 'terminated')
+           ) contact
+          ORDER BY contact."fullName" ASC
+          LIMIT ${CHAT_CONTACTS_LIMIT}`,
+        [userId, storeId],
+      );
+    const keyByAccount = new Map(
+      rows.map((row) => [row.accountId, directKeyFor(storeId, userId, row.accountId)]),
+    );
+    const groupIdByKey = new Map<string, string>();
+    if (keyByAccount.size > 0) {
+      const directChats = await this.chatGroupRepository.find({
+        where: { directKey: In([...keyByAccount.values()]) },
+        select: ['id', 'directKey'],
+      });
+      for (const chat of directChats) {
+        if (chat.directKey) groupIdByKey.set(chat.directKey, chat.id);
+      }
+    }
+    return rows.map((row) => ({
+      accountId: row.accountId,
+      fullName: row.fullName || 'Thành viên',
+      avatar: row.avatar || null,
+      directGroupId: groupIdByKey.get(keyByAccount.get(row.accountId)!) ?? null,
+    }));
   }
 
   // Get groups by store
@@ -226,10 +428,29 @@ export class ChatGroupsService {
       order: { createdAt: 'ASC' },
     });
 
+    // Chat riêng: tên và ảnh là của người kia (kể cả khi người đó đã rời).
+    let name = group.name;
+    let avatar: string | null = group.avatar || null;
+    let peerAccountId: string | null = null;
+    if (group.directKey) {
+      const peer = await this.chatGroupMemberRepository.findOne({
+        where: { groupId, accountId: Not(userId) },
+        relations: ['account'],
+        order: { createdAt: 'DESC' },
+      });
+      if (peer) {
+        peerAccountId = peer.accountId;
+        name = peer.account?.fullName || group.name;
+        avatar = peer.account?.avatar || null;
+      }
+    }
+
     return {
       id: group.id,
-      name: group.name,
-      avatar: group.avatar || null,
+      name,
+      avatar,
+      isDirect: !!group.directKey,
+      peerAccountId,
       storeId: group.storeId,
       createdBy: group.createdBy,
       messagePermission: group.messagePermission,
@@ -344,6 +565,7 @@ export class ChatGroupsService {
   ) {
     const context = await this.authorization.requireGroupAdmin(groupId, userId);
     const group = context.group;
+    if (group.directKey) throw directChatImmutable();
 
     if (dto.customSenderIds) {
       const activeMembers = await this.chatGroupMemberRepository.find({
@@ -385,6 +607,8 @@ export class ChatGroupsService {
         lock: { mode: 'pessimistic_write' },
       });
       if (!lockedGroup) throw new ForbiddenException('CHAT_ACCESS_DENIED');
+      // Chat riêng chỉ có đúng hai người.
+      if (lockedGroup.directKey) throw directChatImmutable();
       const uniqueIds = [...new Set(memberIds)];
       const members = manager.getRepository(ChatGroupMember);
       await this.authorization.requireEligibleParticipants(
@@ -426,6 +650,7 @@ export class ChatGroupsService {
   async removeMember(groupId: string, memberId: string, userId: string) {
     const context = await this.authorization.requireGroupAdmin(groupId, userId);
     const group = context.group;
+    if (group.directKey) throw directChatImmutable();
 
     // Can't remove creator
     if (memberId === group.createdBy) {
@@ -444,6 +669,7 @@ export class ChatGroupsService {
   async leaveGroup(groupId: string, userId: string) {
     const context = await this.authorization.requireGroupAccess(groupId, userId);
     const group = context.group;
+    if (group.directKey) throw directChatImmutable();
 
     // Creator can't leave
     if (group.createdBy === userId) {

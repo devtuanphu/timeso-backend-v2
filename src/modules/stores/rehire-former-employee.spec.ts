@@ -195,4 +195,35 @@ describe('initializeEmployeeProfile — khôi phục hồ sơ cũ', () => {
     expect(saved[0]).not.toHaveProperty('deletedAt');
     expect(saved[0]).not.toHaveProperty('leftAt');
   });
+
+  // C: tenure counts from the hire. A revived row gets its own entry event,
+  // so days in rung no longer count from the previous stint (or stay 0).
+  it('records an entry career event for a revived profile', async () => {
+    const { service, manager, saved } = build();
+    manager.find.mockImplementation(async (entity: any) =>
+      entity?.name === 'StoreLadder'
+        ? [{ id: 'ladder-type', dimension: 'employment_type' }]
+        : [],
+    );
+    manager.findOne.mockImplementation(async (entity: any) =>
+      entity?.name === 'StoreLadderRung' ? { id: 'rung-official' } : null,
+    );
+
+    await service.initializeEmployeeProfile(
+      manager,
+      STORE,
+      ACCOUNT,
+      { employeeTypeId: 'type-official' } as any,
+      'old-profile',
+    );
+
+    const event = saved.find((row) => row.toRungId === 'rung-official');
+    expect(event).toMatchObject({
+      employeeProfileId: 'old-profile',
+      ladderId: 'ladder-type',
+      fromRungId: null,
+      note: 'Vào làm',
+      effectiveAt: expect.any(Date),
+    });
+  });
 });

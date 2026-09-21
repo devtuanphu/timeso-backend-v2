@@ -78,6 +78,8 @@ describe('ShiftReminderProcessor identity checks', () => {
           shiftSlotId: 'slot-1',
         }),
       }),
+      // Kênh Android có rung (mặc định) cho nhắc ca.
+      expect.objectContaining({ channelId: 'shift-alerts', priority: 'high' }),
     );
   });
 
@@ -320,5 +322,97 @@ describe('ShiftReminderProcessor identity checks', () => {
       '(wc.scheduled_stop_at IS NULL OR wc.scheduled_stop_at > NOW())',
     );
     expect(notificationsService.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('ShiftReminderProcessor defaults, leave and dated content', () => {
+  const currentStart = parseVietnamShiftStart('2030-01-01', '09:00');
+  const assignmentRow = {
+    id: 'assignment-1',
+    status: 'APPROVED',
+    shiftSlotId: 'slot-1',
+    workDate: '2030-01-01',
+    startTime: '09:00:00',
+    shiftId: 'shift-1',
+  };
+  const build = (reminderSettings: unknown, onLeave = false) => {
+    const query = jest.fn(async (sql: string) =>
+      sql.includes('employee_leave_requests')
+        ? [{ covered: onLeave }]
+        : [assignmentRow],
+    );
+    const notificationsService = {
+      create: jest.fn().mockResolvedValue(undefined),
+    };
+    const processor = new ShiftReminderProcessor(
+      notificationsService as any,
+      {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'employee-1',
+          storeId: 'store-1',
+          accountId: 'account-1',
+          account: {},
+          reminderSettings,
+        }),
+        manager: { query },
+      } as any,
+      { getJob: jest.fn() } as any,
+    );
+    const run = (fingerprintSettings: unknown) =>
+      processor.process({
+        data: {
+          employeeId: 'employee-1',
+          storeId: 'store-1',
+          shiftId: 'shift-1',
+          shiftSlotId: 'slot-1',
+          assignmentId: 'assignment-1',
+          startTime: currentStart,
+          scheduleFingerprint: buildShiftReminderFingerprint(
+            { assignmentId: 'assignment-1', shiftSlotId: 'slot-1' },
+            'shift-1',
+            currentStart,
+            fingerprintSettings,
+          ),
+        },
+      } as any);
+    return { run, notificationsService };
+  };
+
+  it('chưa lưu cài đặt: vẫn nhắc (mặc định trước 15 phút, kênh có rung)', async () => {
+    const { run, notificationsService } = build(null);
+    await run({ type: '15m' });
+    expect(notificationsService.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ channelId: 'shift-alerts' }),
+    );
+  });
+
+  it('tắt rung thì dùng kênh im lặng', async () => {
+    const { run, notificationsService } = build({ type: '15m', vibrate: false });
+    await run({ type: '15m' });
+    expect(notificationsService.create).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ channelId: 'shift-alerts-quiet' }),
+    );
+  });
+
+  it('nghỉ có phép thì không nhắc', async () => {
+    const { run, notificationsService } = build({ type: '15m' }, true);
+    await run({ type: '15m' });
+    expect(notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  it('nội dung giữ ngày dd/mm và metadata có workDates', async () => {
+    const { run, notificationsService } = build({ type: '15m' });
+    await run({ type: '15m' });
+    const [payload] = notificationsService.create.mock.calls[0];
+    expect(payload.content).toContain('09:00');
+    expect(payload.content).toContain('01/01');
+    expect(payload.metadata).toEqual(
+      expect.objectContaining({
+        workDate: '2030-01-01',
+        workDates: ['2030-01-01'],
+      }),
+    );
   });
 });

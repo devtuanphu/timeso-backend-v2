@@ -11,6 +11,7 @@ import {
 } from 'typeorm';
 import { UserDevice } from './entities/user-device.entity';
 import { RegisterDeviceDto } from './dto/register-device.dto';
+import { normalizePushCapabilities } from '../push/push-capabilities';
 
 class DeviceRegistrationRetryError extends Error {}
 export const DEVICE_BINDING_OPERATION_TIMEOUT_MS = 12_000;
@@ -260,6 +261,7 @@ export class DevicesService {
         registrationVersion: '1',
         platform: dto.platform,
         appVersion: dto.appVersion || null,
+        pushCapabilities: normalizePushCapabilities(dto.capabilities),
         isActive: true,
         lastSeenAt: new Date(),
       });
@@ -273,6 +275,9 @@ export class DevicesService {
         : winner.registrationVersion;
       winner.platform = dto.platform;
       winner.appVersion = dto.appVersion || null;
+      // Each registration states what this build supports; an older build
+      // re-registering (no field) loses the capability again.
+      winner.pushCapabilities = normalizePushCapabilities(dto.capabilities);
       winner.isActive = true;
       winner.lastSeenAt = new Date();
       winner.deletedAt = null;

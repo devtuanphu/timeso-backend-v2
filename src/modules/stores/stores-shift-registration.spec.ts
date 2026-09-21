@@ -967,6 +967,10 @@ describe('StoresService - Shift Registration Count', () => {
     it('should throw error if no slots match the daysOfWeek', async () => {
       const mockQueryBuilder = {
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue([
@@ -1014,6 +1018,10 @@ describe('StoresService - Shift Registration Count', () => {
 
       const mockQueryBuilder = {
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue(mockSlots),
@@ -1119,6 +1127,10 @@ describe('StoresService - Shift Registration Count', () => {
 
       shiftSlotRepo.createQueryBuilder.mockReturnValue({
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue(mockSlots),
@@ -1173,6 +1185,10 @@ describe('StoresService - Shift Registration Count', () => {
       ];
       shiftSlotRepo.createQueryBuilder.mockReturnValue({
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue(mockSlots),
@@ -1242,6 +1258,10 @@ describe('StoresService - Shift Registration Count', () => {
       ];
       shiftSlotRepo.createQueryBuilder.mockReturnValue({
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue(mockSlots),
@@ -1304,6 +1324,10 @@ describe('StoresService - Shift Registration Count', () => {
     it('rejects a cross-store slot even when a stale query returns it', async () => {
       shiftSlotRepo.createQueryBuilder.mockReturnValue({
         leftJoinAndSelect: jest.fn().mockReturnThis(),
+        // resolveFixedShiftRangeEnd: no open slot beyond the start date.
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
         where: jest.fn().mockReturnThis(),
         andWhere: jest.fn().mockReturnThis(),
         getMany: jest.fn().mockResolvedValue([

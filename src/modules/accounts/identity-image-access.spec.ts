@@ -15,12 +15,15 @@ describe('AccountsController identity image access', () => {
   const OWNER = 'account-1';
   const FILE = 'a9bd5385-b670-47a9-8947-f1940ee06190.jpg';
 
-  let identityRepository: { findOne: jest.Mock };
+  let identityRepository: { findOne: jest.Mock; manager: { query: jest.Mock } };
   let controller: AccountsController;
   let res: { setHeader: jest.Mock };
 
   beforeEach(() => {
-    identityRepository = { findOne: jest.fn() };
+    identityRepository = {
+      findOne: jest.fn(),
+      manager: { query: jest.fn().mockResolvedValue([]) },
+    };
     controller = new AccountsController(
       {} as any,
       identityRepository as any,
@@ -48,24 +51,44 @@ describe('AccountsController identity image access', () => {
   });
 
   // The core rule: knowing another account's filename must not be enough.
-  it('forbids reading a file the caller does not own', async () => {
+  it('forbids reading a file that belongs to another account', async () => {
     identityRepository.findOne.mockResolvedValue({
-      frontImageUrl: '/api/accounts/identity/image/someone-elses-front.jpg',
+      accountId: 'someone-else',
+      frontImageUrl: `/api/accounts/identity/image/${FILE}`,
       backImageUrl: null,
     });
     await expect(call(FILE)).rejects.toThrow(ForbiddenException);
+    expect(identityRepository.manager.query).toHaveBeenCalledWith(
+      expect.stringContaining('owner_account_id'),
+      ['someone-else', OWNER],
+    );
   });
 
-  it('scopes the lookup to the calling account', async () => {
+  it('looks the document up by the exact private URL of the file', async () => {
     identityRepository.findOne.mockResolvedValue(null);
     await expect(call(FILE, 'account-2')).rejects.toThrow(NotFoundException);
     expect(identityRepository.findOne).toHaveBeenCalledWith({
-      where: { accountId: 'account-2' },
+      where: [
+        { frontImageUrl: `/api/accounts/identity/image/${FILE}` },
+        { backImageUrl: `/api/accounts/identity/image/${FILE}` },
+      ],
     });
+  });
+
+  it("lets the owner of the employee's store past the ownership check", async () => {
+    identityRepository.findOne.mockResolvedValue({
+      accountId: 'employee-account',
+      frontImageUrl: `/api/accounts/identity/image/${FILE}`,
+      backImageUrl: null,
+    });
+    identityRepository.manager.query.mockResolvedValue([{ '?column?': 1 }]);
+    // Access is granted; the file itself does not exist in this test run.
+    await expect(call(FILE)).rejects.toThrow(NotFoundException);
   });
 
   it('404s for an owned record whose file is missing on disk', async () => {
     identityRepository.findOne.mockResolvedValue({
+      accountId: OWNER,
       frontImageUrl: `/api/accounts/identity/image/${FILE}`,
       backImageUrl: null,
     });

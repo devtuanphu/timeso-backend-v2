@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { DataSource } from 'typeorm';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ShiftAggregationController } from './shift-aggregation.controller';
 import { ShiftAggregationService, StaffingStatus } from './shift-aggregation.service';
@@ -25,7 +26,25 @@ describe('ShiftAggregationController HTTP contract', () => {
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
       controllers: [ShiftAggregationController],
-      providers: [{ provide: ShiftAggregationService, useValue: aggregationService }],
+      providers: [
+        { provide: ShiftAggregationService, useValue: aggregationService },
+        // StoreOwnerOnlyGuard reads stores.owner_account_id. Every store here
+        // belongs to owner-1 except `not-owned-store`, so the service-level
+        // assertions below keep exercising the service.
+        {
+          provide: DataSource,
+          useValue: {
+            getRepository: () => ({
+              find: jest.fn(async ({ where }: any) =>
+                (where.id.value as string[]).map((id) => ({
+                  id,
+                  ownerAccountId: id === 'not-owned-store' ? 'owner-2' : 'owner-1',
+                })),
+              ),
+            }),
+          },
+        },
+      ],
     })
       .overrideGuard(JwtAuthGuard)
       .useValue({
@@ -73,6 +92,15 @@ describe('ShiftAggregationController HTTP contract', () => {
       limit: 50,
       ownerAccountId: 'owner-1',
     });
+  });
+
+  it('refuses a store the caller does not own before reaching the service', async () => {
+    await request(app.getHttpServer())
+      .get('/stores/not-owned-store/shifts/slots')
+      .set('Authorization', 'Bearer test-token')
+      .expect(403)
+      .expect(({ body }) => expect(body.code).toBe('STORE_OWNER_REQUIRED'));
+    expect(aggregationService.getShiftSlots).not.toHaveBeenCalled();
   });
 
   it('maps a foreign-store authorization failure to HTTP 403', async () => {

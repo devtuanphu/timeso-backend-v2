@@ -22,11 +22,11 @@ const CONFIG = {
   // Credentials của test user (đã seed qua scripts/seed-full-test-data.ts)
   OWNER_CREDENTIALS: {
     email: 'test_owner@timeso.com',
-    password: 'Test123456',
+    password: process.env.OWNER_TEST_PASSWORD || '',
   },
   STAFF_CREDENTIALS: {
     email: 'test_staff@timeso.com',
-    password: 'Test123456',
+    password: process.env.STAFF_TEST_PASSWORD || '',
   },
 };
 

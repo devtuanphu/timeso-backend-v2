@@ -914,3 +914,139 @@ describe('ShiftReminderService identity', () => {
     expect(maximumRemovals).toBe(1);
   });
 });
+
+describe('ShiftReminderService fixed reminder time (B9)', () => {
+  it('delays a fixed-time job until that Vietnam clock time', () => {
+    const service = new ShiftReminderService({} as any, {} as any);
+    const now = parseVietnamShiftStart('2030-01-01', '20:00').getTime();
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      const job = (service as any).buildReminderJob(
+        'employee-1',
+        'store-1',
+        'shift-1',
+        parseVietnamShiftStart('2030-01-02', '09:00'),
+        { type: 'custom', customMode: 'fixed', fixedTimeLocal: '07:00', custom: null },
+        { assignmentId: 'assignment-1' },
+      );
+      // 20:00 -> 07:00 next morning = 11 hours.
+      expect(job.opts.delay).toBe(11 * 3_600_000);
+      expect(job.data.scheduleFingerprint).toContain('custom|fixed@07:00');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('skips a fixed-time reminder that has already passed', () => {
+    const service = new ShiftReminderService({} as any, {} as any);
+    const now = parseVietnamShiftStart('2030-01-02', '08:00').getTime();
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      expect(
+        (service as any).buildReminderJob(
+          'employee-1',
+          'store-1',
+          'shift-1',
+          parseVietnamShiftStart('2030-01-02', '09:00'),
+          { type: 'custom', customMode: 'fixed', fixedTimeLocal: '07:00' },
+          { assignmentId: 'assignment-1' },
+        ),
+      ).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+});
+
+describe('ShiftReminderService default reminder (chưa lưu cài đặt)', () => {
+  const build = (settings: unknown) => {
+    const service = new ShiftReminderService({} as any, {} as any);
+    const now = parseVietnamShiftStart('2030-01-02', '07:00').getTime();
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      return (service as any).buildReminderJob(
+        'employee-1',
+        'store-1',
+        'shift-1',
+        parseVietnamShiftStart('2030-01-02', '09:00'),
+        settings,
+        { assignmentId: 'assignment-1' },
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
+  };
+
+  it('null settings schedule a 15-minute reminder', () => {
+    const job = build(null);
+    expect(job).not.toBeNull();
+    // 07:00 -> 08:45 = 105 minutes.
+    expect(job.opts.delay).toBe(105 * 60_000);
+    expect(job.data.scheduleFingerprint).toContain('15m|15');
+  });
+
+  it("an explicit type 'off' schedules nothing", () => {
+    expect(build({ type: 'off' })).toBeNull();
+  });
+});
+
+describe('ShiftReminderService.backfillDefaultReminders', () => {
+  const build = (rows: Array<{ id: string }>) => {
+    const qb: any = {};
+    for (const method of [
+      'innerJoin',
+      'select',
+      'where',
+      'andWhere',
+      'orderBy',
+      'limit',
+    ]) {
+      qb[method] = jest.fn(() => qb);
+    }
+    qb.getRawMany = jest.fn().mockResolvedValue(rows);
+    const service = new ShiftReminderService({} as any, {
+      createQueryBuilder: jest.fn(() => qb),
+    } as any);
+    const schedule = jest
+      .spyOn(service, 'scheduleAssignmentReminders')
+      .mockResolvedValue({} as any);
+    return { service, qb, schedule };
+  };
+
+  it('schedules the next 48h of shifts for employees without saved settings', async () => {
+    const { service, qb, schedule } = build([{ id: 'a1' }, { id: 'a2' }]);
+    // 23:00 on 20/09 in Vietnam.
+    await expect(
+      service.backfillDefaultReminders(new Date('2026-09-20T16:00:00Z')),
+    ).resolves.toEqual({ candidates: 2 });
+    expect(qb.andWhere).toHaveBeenCalledWith(
+      "(employee.reminder_settings IS NULL OR employee.reminder_settings->>'type' IS NULL)",
+    );
+    expect(qb.andWhere).toHaveBeenCalledWith('slot.workDate >= :from', {
+      from: '2026-09-20',
+    });
+    expect(qb.andWhere).toHaveBeenCalledWith('slot.workDate <= :to', {
+      to: '2026-09-22',
+    });
+    expect(qb.limit).toHaveBeenCalledWith(2000);
+    expect(schedule).toHaveBeenCalledWith(['a1', 'a2']);
+  });
+
+  it('also selects employees whose saved settings have no reminder type', async () => {
+    const { service, qb } = build([{ id: 'a1' }]);
+    await service.backfillDefaultReminders(new Date('2026-09-20T16:00:00Z'));
+    const clauses: string[] = qb.andWhere.mock.calls.map(([sql]: any) => sql);
+    const settingsClause = clauses.find((sql) => sql.includes('reminder_settings'));
+    // Settings saved without `type` (e.g. only the vibrate toggle) fall back
+    // to the default 15-minute reminder, so they need a backfilled job too.
+    expect(settingsClause).toContain('reminder_settings IS NULL');
+    expect(settingsClause).toContain("reminder_settings->>'type' IS NULL");
+    expect(settingsClause).toMatch(/ OR /);
+  });
+
+  it('does nothing when there is no candidate', async () => {
+    const { service, schedule } = build([]);
+    await service.backfillDefaultReminders();
+    expect(schedule).not.toHaveBeenCalled();
+  });
+});

@@ -1,11 +1,11 @@
 const { Client } = require('pg');
 
 const client = new Client({
-  host: '150.95.113.77',
+  host: process.env.DATABASE_HOST,
   port: 5432,
-  user: 'timeso_db_v2',
-  password: 'fsceIyc0LVf7PFHT',
-  database: 'timeso_db_v2',
+  user: process.env.DATABASE_USER,
+  password: process.env.DATABASE_PASSWORD,
+  database: process.env.DATABASE_NAME,
 });
 
 async function run() {

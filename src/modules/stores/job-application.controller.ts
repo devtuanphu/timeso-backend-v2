@@ -12,6 +12,8 @@ import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
+import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { JobApplicationService } from './job-application.service';
 import {
   AcceptJobApplicationDto,
@@ -30,7 +32,7 @@ import {
 @ApiTags('Cửa hàng - Ứng tuyển')
 @ApiBearerAuth()
 @Controller('stores')
-@UseGuards(JwtAuthGuard)
+@UseGuards(JwtAuthGuard, StoreOwnerOnlyGuard)
 export class JobApplicationController {
   constructor(private readonly jobApplicationService: JobApplicationService) {}
 
@@ -72,6 +74,7 @@ export class JobApplicationController {
     );
   }
 
+  @StoreOwnerOnly()
   @Get(':storeId/job-applications')
   @ApiOperation({ summary: 'Danh sách đơn ứng tuyển của cửa hàng (chủ cửa hàng)' })
   async list(
@@ -82,6 +85,7 @@ export class JobApplicationController {
     return this.jobApplicationService.listForStore(storeId, user?.userId, query);
   }
 
+  @StoreOwnerOnly()
   @Post(':storeId/job-applications/:applicationId/accept')
   @ApiOperation({
     summary: 'Nhận vào làm việc',
@@ -102,6 +106,7 @@ export class JobApplicationController {
     );
   }
 
+  @StoreOwnerOnly()
   @Post(':storeId/job-applications/:applicationId/reject')
   @ApiOperation({ summary: 'Từ chối đơn ứng tuyển' })
   async reject(

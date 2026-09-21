@@ -685,3 +685,85 @@ describe('getCareerSummary', () => {
     ]);
   });
 });
+
+describe('probationDeadline — hạn thử việc lấy từ bậc kế tiếp (C)', () => {
+  const managerWith = (opts: { next?: any[]; own?: any }) => ({
+    find: jest.fn(async (entity: any) =>
+      entity?.name === 'StoreLadderEdge'
+        ? [{ toRungId: 'rung-official' }]
+        : (opts.next ?? []),
+    ),
+    findOne: jest.fn().mockResolvedValue(opts.own ?? null),
+  });
+
+  it("dùng days_in_rung của bậc Chính thức", async () => {
+    const service = build();
+    const before = Date.now();
+    const deadline: Date = await service.probationDeadline(
+      managerWith({ next: [{ value: 60 }] }),
+      'rung-probation',
+    );
+    const days = (deadline.getTime() - before) / 86_400_000;
+    expect(days).toBeGreaterThanOrEqual(59.99);
+    expect(days).toBeLessThan(60.01);
+  });
+
+  it('không có thì lấy của chính bậc thử việc', async () => {
+    const service = build();
+    const before = Date.now();
+    const deadline: Date = await service.probationDeadline(
+      managerWith({ own: { value: 14 } }),
+      'rung-probation',
+    );
+    expect(Math.round((deadline.getTime() - before) / 86_400_000)).toBe(14);
+  });
+});
+
+describe('metricValue — KPI_COMPLETION tính từ nhiệm vụ KPI (D6)', () => {
+  const withTasks = (row: any) => {
+    const service = build({
+      criteria: [
+        criteria({
+          code: CriteriaCode.KPI_COMPLETION,
+          value: 80,
+          label: 'Hoàn thành 80% KPI',
+        }),
+      ],
+      // The deprecated monthly counters say 3/4; they must be ignored.
+      summaries: [summary({ kpiTotalCount: 4, kpiCompletedCount: 3 })],
+    });
+    const qb: any = {};
+    for (const method of ['innerJoin', 'select', 'addSelect', 'where', 'andWhere']) {
+      qb[method] = jest.fn(() => qb);
+    }
+    qb.getRawOne = jest.fn().mockResolvedValue(row);
+    service.dataSource = { getRepository: jest.fn(() => ({ createQueryBuilder: () => qb })) };
+    return { service, qb };
+  };
+
+  it('đếm nhiệm vụ đạt 100% trên tổng nhiệm vụ tháng này', async () => {
+    const { service, qb } = withTasks({ total: '5', done: '4' });
+    const result = await service.evaluateRung(profile(), rung(), ladder());
+    expect(result.items[0]).toMatchObject({ current: 80, met: true });
+    // Only owner-confirmed KPIs: self-reported progress on an active KPI
+    // must not move career eligibility.
+    expect(qb.andWhere).toHaveBeenCalledWith('kpi.status = :status', {
+      status: 'Hoàn thành',
+    });
+    expect(qb.andWhere).not.toHaveBeenCalledWith(
+      'kpi.status IN (:...statuses)',
+      expect.anything(),
+    );
+    expect(qb.andWhere).toHaveBeenCalledWith('kpi.deleted_at IS NULL');
+    expect(qb.andWhere).toHaveBeenCalledWith('task.is_hidden = false');
+    expect(qb.where).toHaveBeenCalledWith('kpi.employee_profile_id = :profileId', {
+      profileId: PROFILE,
+    });
+  });
+
+  it('trả 0 khi không có nhiệm vụ nào', async () => {
+    const { service } = withTasks({ total: '0', done: '0' });
+    const result = await service.evaluateRung(profile(), rung(), ladder());
+    expect(result.items[0]).toMatchObject({ current: 0, met: false });
+  });
+});

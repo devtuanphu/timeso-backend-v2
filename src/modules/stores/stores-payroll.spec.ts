@@ -1,7 +1,8 @@
+import { BadRequestException, ConflictException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
-import { StoresService } from './stores.service';
+import { StoresService, monthlyPayrollLockKey } from './stores.service';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { ShiftReminderService } from './shift-reminder.service';
@@ -11,7 +12,7 @@ import {
   PayrollRuleCategory,
   PayrollCalcType,
 } from './entities/store-payroll-rule.entity';
-import { PayrollCalculationMethod } from './entities/store-payroll-setting.entity';
+import { computeEarnedBase } from './payroll-calculation.utils';
 import { PaymentStatus } from './entities/employee-salary.entity';
 import { EmploymentStatus } from './entities/employee-profile.entity';
 import {
@@ -55,7 +56,11 @@ import {
   ShiftSwap,
   CycleShiftTemplate,
 } from './entities/shift-management.entity';
-import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
+import {
+  EmployeeLeaveRequest,
+  LeaveRequestStatus,
+  LeaveType,
+} from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
 import { AttendanceLog } from './entities/attendance-log.entity';
 import { EmployeeAssetAssignment } from './entities/employee-asset-assignment.entity';
@@ -108,6 +113,16 @@ try {
   AccountFinance = class AccountFinance {};
 }
 
+/** A query builder whose SUM query resolves to `raw`. */
+function sumQuery(raw: Record<string, string>) {
+  const qb: any = {};
+  for (const method of ['select', 'addSelect', 'where', 'andWhere']) {
+    qb[method] = jest.fn().mockReturnValue(qb);
+  }
+  qb.getRawOne = jest.fn().mockResolvedValue(raw);
+  return qb;
+}
+
 function mockRepo() {
   return {
     find: jest.fn().mockResolvedValue([]),
@@ -117,6 +132,9 @@ function mockRepo() {
       Promise.resolve(Array.isArray(e) ? e : { id: 'gen-id', ...e }),
     ),
     update: jest.fn().mockResolvedValue({ affected: 1 }),
+    upsert: jest.fn().mockResolvedValue(undefined),
+    restore: jest.fn().mockResolvedValue({ affected: 1 }),
+    count: jest.fn().mockResolvedValue(0),
     delete: jest.fn().mockResolvedValue({ affected: 0 }),
     createQueryBuilder: jest.fn(() => {
       const qb: any = {};
@@ -215,183 +233,105 @@ const ENTITIES = [
 // ─── Pure Calculation Tests ─────────────────────────────────────────────────────
 describe('Payroll Calculation Logic', () => {
   /**
-   * These are pure unit tests that validate the payroll calculation formulas
-   * without needing any NestJS DI infrastructure.
-   *
-   * The formulas follow this structure:
-   * - HOURLY:  salaryAmount * (workingHours / 176)
-   * - SHIFT:   salaryAmount * completedShifts
-   * - DAY:     salaryAmount * completedShifts
-   * - MONTH:   salaryAmount * (completedShifts / daysInMonth)
-   * - SHIFT_EARNINGS: totalShiftEarnings (takes precedence)
+   * Pure unit tests of the payroll formulas. The earned-base cases call the
+   * production `computeEarnedBase` (payroll-calculation.utils.ts), which every
+   * payroll path now shares:
+   * - HOURLY:  salaryAmount × hours worked            (no longer ÷ 176)
+   * - SHIFT:   salaryAmount × completedShifts
+   * - DAY:     salaryAmount × completedShifts
+   * - WEEK:    salaryAmount × completedShifts ÷ 6
+   * - MONTH:   salaryAmount × daysWorked ÷ standard working days
+   *            (calendar days when the store has no days-off config)
+   * Stored per-shift `shiftEarnings` are display figures and no longer
+   * override the monthly total.
    *
    * Late/Early penalty (PERCENTAGE): (calculatedSalary * value/100) * count
    * Late/Early penalty (AMOUNT):     value * count
    * Absent penalty (AMOUNT):         value * absentCount
-   * Bonus (PERCENTAGE):              (calculatedSalary * value/100) * count
-   * Bonus (AMOUNT):                  value * count
    *
    * netSalary = calculatedSalary + allowances + bonus - penalties
    * netSalary >= 0 (floored at zero)
    */
-  const STANDARD_MONTHLY_HOURS = 176;
-
-  describe('calculateBaseSalary', () => {
+  describe('calculateBaseSalary (computeEarnedBase)', () => {
     function calculateBaseSalary(
       paymentType: PaymentType,
       baseSalary: number,
       workingHours: number,
       completedShifts: number,
-      hasShiftEarnings: boolean,
-      totalShiftEarnings: number,
       daysInMonth: number,
+      daysWorked = completedShifts,
     ): number {
-      if (hasShiftEarnings) {
-        return totalShiftEarnings;
-      }
-      if (paymentType === PaymentType.HOUR) {
-        return baseSalary * (workingHours / STANDARD_MONTHLY_HOURS);
-      }
-      if (paymentType === PaymentType.SHIFT) {
-        return baseSalary * completedShifts;
-      }
-      if (paymentType === PaymentType.DAY) {
-        return baseSalary * completedShifts;
-      }
-      // MONTH fallback
-      return daysInMonth > 0
-        ? baseSalary * (completedShifts / daysInMonth)
-        : baseSalary;
+      return computeEarnedBase({
+        paymentType,
+        rate: baseSalary,
+        facts: {
+          completedShifts,
+          workedMinutes: workingHours * 60,
+          daysWorked,
+        },
+        standardWorkingDays: 0,
+        calendarDays: daysInMonth,
+      });
     }
 
-    it('should use totalShiftEarnings when hasShiftEarnings=true', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        200,
-        22,
-        true,
-        15_000_000,
-        30,
-      );
-      expect(result).toBe(15_000_000);
+    // Changed: stored shift earnings used to win over the formula. The
+    // monthly figure is now always computed from monthly totals.
+    it('ignores stored shift earnings and computes MONTH from days worked', () => {
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 200, 22, 30);
+      expect(result).toBe(7_333_333);
     });
 
-    it('should calculate HOURLY salary correctly (88h = 50% of full month)', () => {
-      const result = calculateBaseSalary(
-        PaymentType.HOUR,
-        100_000,
-        88,
-        0,
-        false,
-        0,
-        30,
-      );
-      expect(result).toBeCloseTo(50_000, 0);
+    // Changed: HOURLY was salaryAmount × hours / 176 (a monthly salary
+    // prorated by hours). Approved rule: hourly pay = rate × hours worked.
+    it('should calculate HOURLY salary as rate × hours (88h)', () => {
+      const result = calculateBaseSalary(PaymentType.HOUR, 100_000, 88, 0, 30);
+      expect(result).toBe(8_800_000);
     });
 
-    it('should calculate HOURLY salary correctly (176h = 100%)', () => {
-      const result = calculateBaseSalary(
-        PaymentType.HOUR,
-        100_000,
-        176,
-        0,
-        false,
-        0,
-        30,
-      );
-      expect(result).toBe(100_000);
+    it('should calculate HOURLY salary as rate × hours (176h)', () => {
+      const result = calculateBaseSalary(PaymentType.HOUR, 100_000, 176, 0, 30);
+      expect(result).toBe(17_600_000);
     });
 
     it('should calculate SHIFT salary correctly', () => {
-      const result = calculateBaseSalary(
-        PaymentType.SHIFT,
-        500_000,
-        0,
-        22,
-        false,
-        0,
-        30,
-      );
+      const result = calculateBaseSalary(PaymentType.SHIFT, 500_000, 0, 22, 30);
       expect(result).toBe(11_000_000);
     });
 
     it('should calculate DAY salary correctly', () => {
-      const result = calculateBaseSalary(
-        PaymentType.DAY,
-        400_000,
-        0,
-        20,
-        false,
-        0,
-        30,
-      );
+      const result = calculateBaseSalary(PaymentType.DAY, 400_000, 0, 20, 30);
       expect(result).toBe(8_000_000);
     });
 
     it('should calculate MONTH salary (prorated, 30-day month)', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        0,
-        10,
-        false,
-        0,
-        30,
-      );
-      expect(result).toBeCloseTo(3_333_333, 0);
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 10, 30);
+      expect(result).toBe(3_333_333);
     });
 
     it('should calculate MONTH salary (prorated, 28-day February)', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        0,
-        14,
-        false,
-        0,
-        28,
-      );
-      expect(result).toBeCloseTo(5_000_000, 0);
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 14, 28);
+      expect(result).toBe(5_000_000);
     });
 
     it('should calculate MONTH salary (prorated, 29-day leap February)', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        0,
-        15,
-        false,
-        0,
-        29,
-      );
-      expect(result).toBeCloseTo(5_172_414, 0);
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 15, 29);
+      expect(result).toBe(5_172_414);
     });
 
     it('should calculate MONTH salary with 0 shifts = 0', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        0,
-        0,
-        false,
-        0,
-        30,
-      );
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 0, 30);
       expect(result).toBe(0);
     });
 
     it('should use full MONTH salary when shifts >= daysInMonth', () => {
-      const result = calculateBaseSalary(
-        PaymentType.MONTH,
-        10_000_000,
-        0,
-        30,
-        false,
-        0,
-        30,
-      );
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 30, 30);
       expect(result).toBe(10_000_000);
+    });
+
+    it('counts distinct days, not shifts, for MONTH', () => {
+      // 30 shifts over 15 days of a 30-day month = half the salary.
+      const result = calculateBaseSalary(PaymentType.MONTH, 10_000_000, 0, 30, 30, 15);
+      expect(result).toBe(5_000_000);
     });
   });
 
@@ -671,24 +611,19 @@ describe('Payroll Calculation Logic', () => {
       bonus: number;
       netSalary: number;
     } {
-      const STANDARD_MONTHLY_HOURS = 176;
-      let calculatedSalary = 0;
-      if (params.hasShiftEarnings) {
-        calculatedSalary = params.totalShiftEarnings;
-      } else if (params.paymentType === PaymentType.HOUR) {
-        calculatedSalary =
-          params.baseSalary * (params.workingHours / STANDARD_MONTHLY_HOURS);
-      } else if (
-        params.paymentType === PaymentType.SHIFT ||
-        params.paymentType === PaymentType.DAY
-      ) {
-        calculatedSalary = params.baseSalary * params.completedShifts;
-      } else {
-        calculatedSalary =
-          params.daysInMonth > 0
-            ? params.baseSalary * (params.completedShifts / params.daysInMonth)
-            : params.baseSalary;
-      }
+      // Stored shift earnings no longer override the monthly figure; the
+      // earned base comes from the shared production formula.
+      const calculatedSalary = computeEarnedBase({
+        paymentType: params.paymentType,
+        rate: params.baseSalary,
+        facts: {
+          completedShifts: params.completedShifts,
+          workedMinutes: params.workingHours * 60,
+          daysWorked: params.completedShifts,
+        },
+        standardWorkingDays: 0,
+        calendarDays: params.daysInMonth,
+      });
 
       let penalty = 0;
       let bonus = 0;
@@ -728,14 +663,16 @@ describe('Payroll Calculation Logic', () => {
           },
         ],
       });
-      // calculatedSalary = 10M * (20/30) = 6,666,667
-      expect(result.calculatedSalary).toBeCloseTo(6_666_667, 0);
+      // calculatedSalary = round(10M * 20/30) = 6,666,667
+      expect(result.calculatedSalary).toBe(6_666_667);
       // penalty = (6,666,667 * 5% * 2) = 666,667
       expect(result.penalty).toBeCloseTo(666_667, 0);
       // net = 6,666,667 - 666,667 = 6,000,000
       expect(result.netSalary).toBeCloseTo(6_000_000, 0);
     });
 
+    // Changed: stored shift earnings (20M) used to win; hourly pay is now
+    // rate × hours = 100,000 × 176h = 17,600,000.
     it('full payroll: hourly employee with shift earnings + bonus', () => {
       const result = runPayroll({
         paymentType: PaymentType.HOUR,
@@ -755,10 +692,10 @@ describe('Payroll Calculation Logic', () => {
           },
         ],
       });
-      expect(result.calculatedSalary).toBe(20_000_000);
+      expect(result.calculatedSalary).toBe(17_600_000);
       expect(result.bonus).toBe(200_000);
       expect(result.penalty).toBe(0);
-      expect(result.netSalary).toBe(20_200_000);
+      expect(result.netSalary).toBe(17_800_000);
     });
 
     it('full payroll: shift employee with absent penalty', () => {
@@ -995,6 +932,12 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
         storeId: STORE_ID,
         month: MONTH,
       });
+      // Payroll totals are now a SQL SUM over the payslips linked to it
+      // (previously accumulated in the loop); the mocked SUM returns the
+      // protected payslip's net.
+      employeeSalaryRepo.createQueryBuilder.mockReturnValue(
+        sumQuery({ estimatedPayment: '9999999', totalBonus: '0', totalPenalty: '0' }),
+      );
 
       const result = await service.createMonthlyPayrollForStore(
         STORE_ID,
@@ -1083,7 +1026,8 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
 
   describe('createMonthlyPayrollsForAllStores', () => {
     it('reconciles the previous month and scaffolds the current month for each store', async () => {
-      const spy = jest.spyOn(service, 'createMonthlyPayrollForStore');
+      // The cron now calls the shared rebuild with Vietnam months.
+      const spy = jest.spyOn(service as any, 'rebuildStorePayrollForMonth');
       (service as any).storeRepository.find = jest
         .fn()
         .mockResolvedValue([{ id: STORE_ID, status: 'active' }]);
@@ -1098,10 +1042,8 @@ describe('StoresService - Payroll upsert protection & orphan fix', () => {
 
       // Called twice per store: once for the previous month (June), once for "now" (July).
       expect(spy).toHaveBeenCalledTimes(2);
-      const calledMonths = spy.mock.calls.map((args) =>
-        (args[1] as Date).getMonth(),
-      );
-      expect(calledMonths).toEqual([5, 6]); // June (5), July (6)
+      const calledMonths = spy.mock.calls.map((args: any[]) => args[1].key);
+      expect(calledMonths).toEqual(['2026-06-01', '2026-07-01']);
     });
   });
 });
@@ -1273,5 +1215,951 @@ describe('StoresService - deferred checkout payroll', () => {
 
     expect(result).toEqual(expect.objectContaining({ matched: false }));
     expect(profileRepo.update).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Phase 2: payroll money correctness ─────────────────────────────────────
+// Regressions for: recalculation deleting payslips (and, through the FK
+// cascade, their salary advances); month/day boundaries read from the server
+// clock; and the payroll paths disagreeing on the formula.
+
+async function buildPayrollHarness() {
+  const repoMap = new Map<any, ReturnType<typeof mockRepo>>();
+  const providers = ENTITIES.map((entity) => {
+    const mock = mockRepo();
+    repoMap.set(entity, mock);
+    return { provide: getRepositoryToken(entity), useValue: mock };
+  });
+  const managers: any[] = [];
+  const module: TestingModule = await Test.createTestingModule({
+    providers: [
+      StoresService,
+      ...providers,
+      {
+        provide: AccountsService,
+        useValue: { findById: jest.fn(), findByEmail: jest.fn() },
+      },
+      { provide: FaceRecognitionService, useValue: {} },
+      {
+        // Deliberately exposes only `query` and `getRepository`: any attempt
+        // to run a raw DELETE through the manager fails the test.
+        provide: DataSource,
+        useValue: {
+          transaction: (callback: (manager: any) => unknown) => {
+            const manager = {
+              query: jest.fn().mockResolvedValue([]),
+              getRepository: (entity: any) => repoMap.get(entity),
+            };
+            managers.push(manager);
+            return Promise.resolve(callback(manager));
+          },
+        },
+      },
+      {
+        provide: ShiftReminderService,
+        useValue: { scheduleReminder: jest.fn(), cancelReminder: jest.fn() },
+      },
+      {
+        provide: NotificationsService,
+        useValue: { create: jest.fn().mockResolvedValue({}) },
+      },
+    ],
+  }).compile();
+  return {
+    service: module.get<StoresService>(StoresService),
+    repo: (entity: any) => repoMap.get(entity)!,
+    managers,
+  };
+}
+
+/** Query builder whose getMany resolves to `rows` (records bound params). */
+function listQuery(rows: any[]) {
+  const qb: any = {};
+  for (const method of [
+    'leftJoinAndSelect',
+    'innerJoin',
+    'where',
+    'andWhere',
+    'select',
+    'addSelect',
+  ]) {
+    qb[method] = jest.fn().mockReturnValue(qb);
+  }
+  qb.getMany = jest.fn().mockResolvedValue(rows);
+  qb.getRawOne = jest.fn().mockResolvedValue(null);
+  return qb;
+}
+
+/** COMPLETED assignments, one per listed work date. */
+function completedOn(dates: string[]) {
+  return dates.map((workDate, i) => ({
+    id: `sa-${i}`,
+    status: ShiftAssignmentStatus.COMPLETED,
+    checkInTime: new Date(`${workDate}T01:00:00Z`),
+    workedMinutes: 480,
+    lateMinutes: 0,
+    earlyMinutes: 0,
+    shiftSlot: { workDate },
+  }));
+}
+
+const julyDates = Array.from(
+  { length: 31 },
+  (_, i) => `2026-07-${String(i + 1).padStart(2, '0')}`,
+);
+
+describe('StoresService - payroll rebuild never deletes payslips', () => {
+  const STORE_ID = 'store-1';
+  const EMPLOYEE_ID = 'emp-1';
+  const monthlyEmployee = {
+    id: EMPLOYEE_ID,
+    storeId: STORE_ID,
+    employmentStatus: EmploymentStatus.ACTIVE,
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 10_000_000,
+        paymentType: PaymentType.MONTH,
+        allowances: {},
+      },
+    ],
+  };
+
+  afterEach(() => jest.clearAllMocks());
+
+  it('keeps an approved advance when recalculating', async () => {
+    const h = await buildPayrollHarness();
+    const salaryRepo = h.repo(EmployeeSalary);
+    h.repo(EmployeeProfile).find.mockResolvedValue([monthlyEmployee]);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    salaryRepo.findOne.mockResolvedValue({
+      id: 's1',
+      employeeProfileId: EMPLOYEE_ID,
+      monthlyPayrollId: 'payroll-1',
+      paymentStatus: PaymentStatus.PENDING,
+      otherDeductions: 0,
+    });
+    h.repo(SalaryAdvanceRequest).find.mockResolvedValue([
+      { approvedAmount: 1_000_000, requestedAmount: 1_000_000 },
+    ]);
+    // Every day of July worked; no days-off config → 31 calendar days.
+    h.repo(ShiftAssignment).createQueryBuilder.mockReturnValue(
+      listQuery(completedOn(julyDates)),
+    );
+
+    await h.service.recalculatePayroll(STORE_ID, '2026-07-01');
+
+    expect(salaryRepo.delete).not.toHaveBeenCalled();
+    expect(salaryRepo.save).not.toHaveBeenCalled();
+    expect(salaryRepo.update).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({
+        earnedBaseSalary: 10_000_000,
+        totalIncome: 10_000_000,
+        advancePayment: 1_000_000,
+        totalDeductions: 1_000_000,
+        netSalary: 9_000_000,
+        workingDays: 31,
+      }),
+    );
+    // The row is loaded under lock, including soft-deleted rows.
+    expect(salaryRepo.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        withDeleted: true,
+        lock: { mode: 'pessimistic_write' },
+      }),
+    );
+    // The per-(store, month) advisory lock uses the Vietnam month.
+    // C3: unpadded month, the pre-refactor key format, so old and new
+    // instances contend on the same lock during a rolling deploy.
+    expect(h.managers[0].query).toHaveBeenCalledWith(
+      expect.stringContaining('pg_advisory_xact_lock'),
+      [`monthly-payroll:${STORE_ID}:2026-7`],
+    );
+  });
+
+  // Regression: the no-contract branch always INSERTed, violating the unique
+  // (employee, month) key when a PENDING row existed and rolling back the
+  // whole recalculation.
+  it('updates, not inserts, the payslip of an employee without a contract', async () => {
+    const h = await buildPayrollHarness();
+    const salaryRepo = h.repo(EmployeeSalary);
+    h.repo(EmployeeProfile).find.mockResolvedValue([
+      { ...monthlyEmployee, contracts: [] },
+    ]);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    salaryRepo.findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.PENDING,
+    });
+
+    await h.service.recalculatePayroll(STORE_ID, '2026-07-01');
+
+    expect(salaryRepo.save).not.toHaveBeenCalled();
+    expect(salaryRepo.update).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ earnedBaseSalary: 0, netSalary: 0 }),
+    );
+  });
+
+  it('finds, updates and restores a soft-deleted PENDING payslip', async () => {
+    const h = await buildPayrollHarness();
+    const salaryRepo = h.repo(EmployeeSalary);
+    h.repo(EmployeeProfile).find.mockResolvedValue([monthlyEmployee]);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    salaryRepo.findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.PENDING,
+      deletedAt: new Date('2026-07-10T00:00:00Z'),
+    });
+
+    await h.service.createMonthlyPayrollForStore(STORE_ID, '2026-07');
+
+    expect(salaryRepo.save).not.toHaveBeenCalled();
+    expect(salaryRepo.update).toHaveBeenCalledWith('s1', expect.any(Object));
+    expect(salaryRepo.restore).toHaveBeenCalledWith('s1');
+  });
+
+  it('rejects an invalid month instead of guessing', async () => {
+    const h = await buildPayrollHarness();
+    await expect(
+      h.service.recalculatePayroll(STORE_ID, '13/2026'),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  // Regression: on a UTC host the 00:10 VN cron on the 1st saw the previous
+  // month, re-closed the month before last and never scaffolded the new one.
+  it('uses Vietnam months at the cron boundary', async () => {
+    const h = await buildPayrollHarness();
+    h.repo(Store).find.mockResolvedValue([{ id: STORE_ID }]);
+    const spy = jest
+      .spyOn(h.service as any, 'rebuildStorePayrollForMonth')
+      .mockResolvedValue({ id: 'payroll-1' });
+
+    await h.service.createMonthlyPayrollsForAllStores(
+      new Date('2026-08-31T17:10:00Z'), // 00:10 on 1 September in Vietnam
+    );
+
+    expect(spy.mock.calls.map((args: any[]) => args[1].key)).toEqual([
+      '2026-08-01',
+      '2026-09-01',
+    ]);
+  });
+
+  it('refuses to delete a payslip or payroll that has advance requests', async () => {
+    const h = await buildPayrollHarness();
+    h.repo(SalaryAdvanceRequest).count.mockResolvedValue(1);
+    await expect(h.service.deleteEmployeeSalary('s1')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(h.repo(EmployeeSalary).delete).not.toHaveBeenCalled();
+
+    const countQuery: any = {};
+    for (const method of ['innerJoin', 'where', 'withDeleted']) {
+      countQuery[method] = jest.fn().mockReturnValue(countQuery);
+    }
+    countQuery.getCount = jest.fn().mockResolvedValue(2);
+    h.repo(SalaryAdvanceRequest).createQueryBuilder.mockReturnValue(countQuery);
+    await expect(h.service.deletePayroll('payroll-1')).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(h.repo(MonthlyPayroll).delete).not.toHaveBeenCalled();
+    // C4: soft-deleted payslips and advances still hold the foreign key.
+    expect(countQuery.withDeleted).toHaveBeenCalled();
+    expect(h.repo(SalaryAdvanceRequest).count).toHaveBeenCalledWith({
+      where: { employeeSalaryId: 's1' },
+      withDeleted: true,
+    });
+  });
+});
+
+describe('StoresService - checkout payroll uses the shift work date', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  // Regression: the payslip month came from the check-out instant's local
+  // month, so an overnight shift on 31 August updated September.
+  it('files an overnight shift under the month it started in', async () => {
+    const h = await buildPayrollHarness();
+    const assignmentRepo = h.repo(ShiftAssignment);
+    assignmentRepo.findOne.mockResolvedValue({
+      id: 'assignment-1',
+      employeeId: 'emp-1',
+      status: ShiftAssignmentStatus.COMPLETED,
+      checkOutTime: new Date('2026-08-31T23:30:00Z'), // 06:30 on 1 Sep VN
+      workedMinutes: 480,
+      shiftEarnings: null,
+      shiftSlot: { workDate: '2026-08-31', cycle: { storeId: 'store-1' } },
+      employee: {
+        contracts: [
+          {
+            id: 'contract-1',
+            isActive: true,
+            salaryAmount: 3_100_000,
+            paymentType: PaymentType.MONTH,
+            allowances: {},
+          },
+        ],
+      },
+    });
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+
+    await h.service.processCheckoutPayroll('assignment-1');
+
+    const attendanceQuery = assignmentRepo.createQueryBuilder.mock.results[0].value;
+    expect(attendanceQuery.andWhere).toHaveBeenCalledWith(
+      'slot.workDate >= :monthStart',
+      { monthStart: '2026-08-01' },
+    );
+    expect(attendanceQuery.andWhere).toHaveBeenCalledWith(
+      'slot.workDate < :monthEnd',
+      { monthEnd: '2026-09-01' },
+    );
+
+    const [summary] = h.repo(EmployeeMonthlySummary).upsert.mock.calls[0];
+    expect(summary.month.getFullYear()).toBe(2026);
+    expect(summary.month.getMonth()).toBe(7); // August
+
+    const inserted = h.repo(EmployeeSalary).create.mock.calls[0][0];
+    expect(inserted.month.getMonth()).toBe(7);
+    expect(inserted.monthlyPayrollId).toBe('payroll-1');
+
+    // Day rate over August's 31 calendar days (no days-off config).
+    expect(assignmentRepo.update).toHaveBeenCalledWith('assignment-1', {
+      shiftEarnings: 100_000,
+    });
+  });
+});
+
+describe('StoresService - checkout payroll reads under the payroll lock (C1)', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('reads attendance and pay inputs on the transaction manager, after the lock', async () => {
+    const h = await buildPayrollHarness();
+    const assignmentRepo = h.repo(ShiftAssignment);
+    assignmentRepo.findOne.mockResolvedValue({
+      id: 'assignment-1',
+      employeeId: 'emp-1',
+      status: ShiftAssignmentStatus.COMPLETED,
+      checkOutTime: new Date('2026-08-20T10:00:00Z'),
+      workedMinutes: 480,
+      shiftEarnings: null,
+      shiftSlot: { workDate: '2026-08-20', cycle: { storeId: 'store-1' } },
+      employee: {
+        contracts: [
+          {
+            id: 'contract-1',
+            isActive: true,
+            salaryAmount: 3_100_000,
+            paymentType: PaymentType.MONTH,
+            allowances: {},
+          },
+        ],
+      },
+    });
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+
+    const order: string[] = [];
+    const manager = {
+      query: jest.fn(async () => {
+        order.push('lock');
+        return [];
+      }),
+      getRepository: jest.fn((entity: any) => {
+        order.push(`manager:${entity.name}`);
+        return h.repo(entity);
+      }),
+    };
+    (h.service as any).dataSource = {
+      transaction: (callback: (m: any) => unknown) =>
+        Promise.resolve(callback(manager)),
+    };
+
+    await h.service.processCheckoutPayroll('assignment-1');
+
+    const lock = order.indexOf('lock');
+    expect(lock).toBeGreaterThanOrEqual(0);
+    for (const entity of [
+      'ShiftAssignment',
+      'SalaryAdjustment',
+      'StorePayrollRule',
+      'StoreShiftConfig',
+      'EmployeeSalary',
+    ]) {
+      expect(order.indexOf(`manager:${entity}`)).toBeGreaterThan(lock);
+    }
+    // The attendance query was built from the manager's repository.
+    const attendanceQuery = assignmentRepo.createQueryBuilder.mock.results[0].value;
+    expect(attendanceQuery.andWhere).toHaveBeenCalledWith(
+      'slot.workDate >= :monthStart',
+      { monthStart: '2026-08-01' },
+    );
+    // No pay input is read outside the transaction.
+    expect(h.repo(StorePayrollRule).find).toHaveBeenCalledTimes(1);
+    expect(h.repo(StoreShiftConfig).findOne).toHaveBeenCalledTimes(1);
+  });
+
+  it('keys the advisory lock as <year>-<unpadded month>', () => {
+    expect(
+      monthlyPayrollLockKey('store-1', {
+        year: 2026,
+        monthIndex: 8,
+      } as any),
+    ).toBe('monthly-payroll:store-1:2026-9');
+  });
+});
+
+describe('StoresService - live estimate equals the persisted payslip', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  it('returns the same net salary that generation writes', async () => {
+    const h = await buildPayrollHarness();
+    const employee = {
+      id: 'emp-1',
+      storeId: 'store-1',
+      employmentStatus: EmploymentStatus.ACTIVE,
+      contracts: [
+        {
+          id: 'contract-1',
+          isActive: true,
+          salaryAmount: 10_000_000,
+          paymentType: PaymentType.MONTH,
+          allowances: { an: 500_000 },
+        },
+      ],
+    };
+    h.repo(EmployeeProfile).find.mockResolvedValue([employee]);
+    h.repo(EmployeeProfile).findOne.mockResolvedValue(employee);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    h.repo(EmployeeSalary).findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.PENDING,
+      otherDeductions: 0,
+    });
+    h.repo(SalaryAdvanceRequest).find.mockResolvedValue([
+      { approvedAmount: 1_000_000 },
+    ]);
+    h.repo(StorePayrollRule).find.mockResolvedValue([
+      {
+        category: PayrollRuleCategory.FINE,
+        ruleType: 'LATE',
+        calcType: PayrollCalcType.PERCENTAGE,
+        value: 1,
+      },
+    ]);
+    h.repo(StoreShiftConfig).findOne.mockResolvedValue({ daysOff: ['SUNDAY'] });
+    const facts = completedOn(julyDates.slice(0, 12)).map((row, i) => ({
+      ...row,
+      lateMinutes: i < 2 ? 5 : 0,
+    }));
+    h.repo(ShiftAssignment).createQueryBuilder.mockImplementation(() =>
+      listQuery(facts),
+    );
+
+    await h.service.createMonthlyPayrollForStore('store-1', '2026-07');
+    const [, written] = h.repo(EmployeeSalary).update.mock.calls[0];
+    const estimate = await h.service.getEstimatedSalary(
+      'emp-1',
+      'store-1',
+      '07/2026',
+    );
+
+    // July 2026 with Sundays off = 27 working days; 12 days worked.
+    expect(estimate.standardWorkingDays).toBe(27);
+    expect(estimate.daysWorked).toBe(12);
+    expect(estimate.earnedBaseSalary).toBe(written.earnedBaseSalary);
+    expect(estimate.earnedBaseSalary).toBe(Math.round((10_000_000 * 12) / 27));
+    expect(estimate.estimatedSalary).toBe(written.netSalary);
+    expect(estimate.month).toBe('2026-07');
+    expect(estimate.isFinalized).toBe(false);
+
+    // The salary screen shows the same live figures for the pending month,
+    // with the rule lines that add up to the penalty, and writes nothing.
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      {
+        id: 's1',
+        employeeProfileId: 'emp-1',
+        paymentStatus: PaymentStatus.PENDING,
+        netSalary: 0,
+        penalty: 0,
+        otherDeductions: 0,
+        employeeProfile: { storeId: 'store-1' },
+      },
+    ]);
+    const updatesBefore = h.repo(EmployeeSalary).update.mock.calls.length;
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '07/2026');
+    expect(slip).toMatchObject({
+      isEstimate: true,
+      netSalary: estimate.estimatedSalary,
+      earnedBaseSalary: estimate.earnedBaseSalary,
+      penalty: written.penalty,
+    });
+    const fines = slip.adjustmentBreakdown.filter(
+      (line: any) => line.kind === 'FINE',
+    );
+    expect(fines).toEqual([
+      expect.objectContaining({ ruleType: 'LATE', count: 2 }),
+    ]);
+    expect(
+      fines.reduce((sum: number, line: any) => sum + line.amount, 0),
+    ).toBe(written.penalty);
+    expect(h.repo(EmployeeSalary).update.mock.calls.length).toBe(updatesBefore);
+
+    // A finalized payslip keeps its stored figures; the breakdown is only
+    // shown when it adds up to them.
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      {
+        id: 's1',
+        employeeProfileId: 'emp-1',
+        paymentStatus: PaymentStatus.APPROVED,
+        netSalary: 123,
+        earnedBaseSalary: written.earnedBaseSalary,
+        bonus: 0,
+        penalty: 999,
+        employeeProfile: { storeId: 'store-1' },
+      },
+    ]);
+    const [approved]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-07');
+    expect(approved).toMatchObject({
+      isEstimate: false,
+      netSalary: 123,
+      adjustmentBreakdown: null,
+    });
+  });
+});
+
+describe('StoresService - approved leave is never an absence in payroll (M1)', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
+
+  const LEAVE_DATE = '2026-07-20';
+  const employee = {
+    id: 'emp-1',
+    storeId: 'store-1',
+    employmentStatus: EmploymentStatus.ACTIVE,
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 10_000_000,
+        paymentType: PaymentType.MONTH,
+        allowances: {},
+      },
+    ],
+  };
+  const rules = [
+    {
+      category: PayrollRuleCategory.FINE,
+      ruleType: 'ABSENT',
+      calcType: PayrollCalcType.AMOUNT,
+      value: 200_000,
+    },
+    {
+      category: PayrollRuleCategory.BONUS,
+      ruleType: 'ATTENDANCE',
+      calcType: PayrollCalcType.AMOUNT,
+      value: 300_000,
+    },
+  ];
+
+  /** 10 worked days plus an APPROVED, never-checked-in shift on LEAVE_DATE. */
+  async function run(leaves: any[]) {
+    // Early August (VN): July, including LEAVE_DATE, is in the past.
+    jest.useFakeTimers({
+      now: new Date('2026-08-05T03:00:00Z'),
+      doNotFake: [
+        'nextTick',
+        'setImmediate',
+        'setTimeout',
+        'setInterval',
+        'clearTimeout',
+        'clearInterval',
+        'queueMicrotask',
+      ],
+    });
+    const h = await buildPayrollHarness();
+    h.repo(EmployeeProfile).find.mockResolvedValue([employee]);
+    h.repo(EmployeeProfile).findOne.mockResolvedValue(employee);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    h.repo(EmployeeSalary).findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.PENDING,
+      otherDeductions: 0,
+    });
+    h.repo(StorePayrollRule).find.mockResolvedValue(rules);
+    h.repo(StoreShiftConfig).findOne.mockResolvedValue({ daysOff: ['SUNDAY'] });
+    h.repo(EmployeeLeaveRequest).find.mockResolvedValue(leaves);
+    const rows = [
+      ...completedOn(julyDates.slice(0, 10)),
+      {
+        id: 'sa-leave',
+        status: ShiftAssignmentStatus.APPROVED,
+        checkInTime: null,
+        attendanceStatus: AttendanceStatus.ABSENT,
+        workedMinutes: null,
+        lateMinutes: 0,
+        earlyMinutes: 0,
+        shiftSlot: { workDate: LEAVE_DATE },
+      },
+    ];
+    h.repo(ShiftAssignment).createQueryBuilder.mockImplementation(() =>
+      listQuery(rows),
+    );
+
+    await h.service.createMonthlyPayrollForStore('store-1', '2026-07');
+    const [, written] = h.repo(EmployeeSalary).update.mock.calls[0];
+    const estimate = await h.service.getEstimatedSalary(
+      'emp-1',
+      'store-1',
+      '2026-07',
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      {
+        id: 's1',
+        employeeProfileId: 'emp-1',
+        paymentStatus: PaymentStatus.PENDING,
+        netSalary: 0,
+        penalty: 0,
+        otherDeductions: 0,
+        employeeProfile: { storeId: 'store-1' },
+      },
+    ]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-07');
+    return { h, written, estimate, slip };
+  }
+
+  const leave = (over: Record<string, unknown> = {}) => ({
+    id: 'leave-1',
+    employeeProfileId: 'emp-1',
+    storeId: 'store-1',
+    status: LeaveRequestStatus.APPROVED,
+    type: LeaveType.SICK,
+    startDate: '2026-07-19',
+    endDate: '2026-07-21',
+    startTime: null,
+    endTime: null,
+    shiftAssignmentId: null,
+    ...over,
+  });
+
+  it('approved full-day leave on a past date: no absence, no ABSENT fine, estimate and breakdown agree', async () => {
+    const { h, written, estimate, slip } = await run([leave()]);
+
+    expect(written.unauthorizedLeaveDays).toBe(0);
+    expect(written.penalty).toBe(0);
+    // No absence, no late arrival: the attendance bonus is earned.
+    expect(written.bonus).toBe(300_000);
+    expect(estimate.estimatedSalary).toBe(written.netSalary);
+    expect(slip).toMatchObject({
+      isEstimate: true,
+      unauthorizedLeaveDays: 0,
+      penalty: 0,
+      bonus: 300_000,
+      netSalary: written.netSalary,
+    });
+    expect(
+      slip.adjustmentBreakdown.filter((line: any) => line.kind === 'FINE'),
+    ).toEqual([]);
+    expect(slip.adjustmentBreakdown).toEqual([
+      expect.objectContaining({ kind: 'BONUS', ruleType: 'ATTENDANCE', amount: 300_000 }),
+    ]);
+    // The leave rows were read for the employee's month, approved only.
+    expect(h.repo(EmployeeLeaveRequest).find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          employeeProfileId: 'emp-1',
+          status: LeaveRequestStatus.APPROVED,
+        }),
+      }),
+    );
+  });
+
+  it('a late/early request or a timed leave for another shift is not authorized leave', async () => {
+    for (const leaves of [
+      [leave({ type: LeaveType.LATE })],
+      [
+        leave({
+          type: LeaveType.PERSONAL,
+          startTime: '08:00',
+          endTime: '12:00',
+          shiftAssignmentId: 'another-shift',
+        }),
+      ],
+      [leave({ startDate: '2026-07-21', endDate: '2026-07-22' })],
+    ]) {
+      const { written, slip } = await run(leaves);
+      expect(written.unauthorizedLeaveDays).toBe(1);
+      expect(written.penalty).toBe(200_000);
+      expect(written.bonus).toBe(0);
+      expect(slip).toMatchObject({ penalty: 200_000, unauthorizedLeaveDays: 1 });
+      jest.useRealTimers();
+      jest.clearAllMocks();
+    }
+  });
+
+  it('a timed leave attached to that exact shift is authorized', async () => {
+    const { written } = await run([
+      leave({
+        type: LeaveType.PERSONAL,
+        startTime: '08:00',
+        endTime: '12:00',
+        shiftAssignmentId: 'sa-leave',
+      }),
+    ]);
+    expect(written.unauthorizedLeaveDays).toBe(0);
+    expect(written.penalty).toBe(0);
+  });
+});
+
+describe('StoresService - daily report days are Vietnam days', () => {
+  afterEach(() => jest.useRealTimers());
+
+  function reportService() {
+    const service = Object.create(StoresService.prototype) as any;
+    service.dailyReportRepository = {
+      findOne: jest.fn().mockResolvedValue(null),
+      create: jest.fn((value: any) => value),
+      save: jest.fn(async (value: any) => value),
+    };
+    return service;
+  }
+
+  // Regression: `setHours(0,0,0,0)` on the server clock made the 00:05 VN
+  // cron create yesterday's report on a UTC host.
+  it('creates today in Vietnam by default', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-08-31T17:05:00Z'));
+    const service = reportService();
+
+    await service.createDailyReportForStore('store-1');
+
+    const { reportDate } = service.dailyReportRepository.create.mock.calls[0][0];
+    expect(reportDate.getFullYear()).toBe(2026);
+    expect(reportDate.getMonth()).toBe(8);
+    expect(reportDate.getDate()).toBe(1);
+  });
+
+  it('accepts an explicit Vietnam date string', async () => {
+    const service = reportService();
+    await service.createDailyReportForStore('store-1', '2026-12-31');
+    const { reportDate } = service.dailyReportRepository.create.mock.calls[0][0];
+    expect([reportDate.getFullYear(), reportDate.getMonth(), reportDate.getDate()]).toEqual([
+      2026, 11, 31,
+    ]);
+  });
+
+  // Regression: `shiftEnd.setHours(22, 0)` on a UTC host put the end at
+  // 22:00 UTC (05:00 VN next day), so every shift ending after 16:30 VN was
+  // skipped by the 23:30 VN cron.
+  it('detects a shift that ended at 22:00 when the cron runs at 23:30 VN', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-01T16:30:00Z'));
+    const service = Object.create(StoresService.prototype) as any;
+    service.storeRepository = {
+      find: jest.fn().mockResolvedValue([{ id: 'store-1' }]),
+    };
+    service.shiftSlotRepository = {
+      find: jest.fn().mockResolvedValue([
+        {
+          id: 'evening',
+          workDate: '2026-09-01',
+          workShift: { startTime: '14:00', endTime: '22:00' },
+        },
+        {
+          id: 'overnight',
+          workDate: '2026-09-01',
+          workShift: { startTime: '22:00', endTime: '06:00' },
+        },
+      ]),
+    };
+    service.shiftAssignmentRepository = {
+      find: jest.fn().mockResolvedValue([
+        {
+          id: 'a-absent',
+          shiftSlotId: 'evening',
+          employeeId: 'absent',
+          status: ShiftAssignmentStatus.APPROVED,
+          attendanceStatus: 'ABSENT',
+          checkInTime: null,
+        },
+        {
+          id: 'a-forgot',
+          shiftSlotId: 'evening',
+          employeeId: 'forgot',
+          status: ShiftAssignmentStatus.COMPLETED,
+          attendanceStatus: 'FORGOT_CHECKOUT',
+          checkInTime: new Date('2026-09-01T07:00:00Z'),
+          checkOutTime: new Date('2026-09-01T15:15:00Z'),
+        },
+        {
+          id: 'a-leave',
+          shiftSlotId: 'evening',
+          employeeId: 'on-leave',
+          status: ShiftAssignmentStatus.APPROVED,
+          attendanceStatus: null,
+          checkInTime: null,
+        },
+        {
+          id: 'a-overtime',
+          shiftSlotId: 'evening',
+          employeeId: 'overtime-pending',
+          status: ShiftAssignmentStatus.CONFIRMED,
+          attendanceStatus: null,
+          checkInTime: new Date('2026-09-01T07:00:00Z'),
+          checkOutTime: null,
+        },
+        {
+          shiftSlotId: 'overnight',
+          employeeId: 'still-working',
+          status: ShiftAssignmentStatus.CONFIRMED,
+          checkInTime: new Date('2026-09-01T15:00:00Z'),
+          checkOutTime: null,
+        },
+      ]),
+    };
+    service.appendToDailyReport = jest.fn();
+    service.dataSource = {
+      query: jest.fn(async (_sql: string, params: unknown[]) => [
+        { covered: params[2] === 'a-leave' },
+      ]),
+    };
+
+    const result = await service.detectEndOfDayAttendanceIssues();
+
+    expect(service.shiftSlotRepository.find).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ workDate: '2026-09-01' }),
+      }),
+    );
+    // Report mirrors the per-minute truth (ABSENT / FORGOT_CHECKOUT) and the
+    // approved full-day leave; an open shift waiting on overtime is neither.
+    expect(result).toEqual({
+      forgotCount: 1,
+      unauthorizedCount: 1,
+      authorizedCount: 1,
+    });
+    expect(service.appendToDailyReport).toHaveBeenCalledWith(
+      'store-1',
+      'authorizedLeaves',
+      'on-leave',
+    );
+    expect(service.appendToDailyReport).not.toHaveBeenCalledWith(
+      'store-1',
+      expect.anything(),
+      'overtime-pending',
+    );
+    expect(service.appendToDailyReport).toHaveBeenCalledWith(
+      'store-1',
+      'unauthorizedLeaves',
+      'absent',
+    );
+    expect(service.appendToDailyReport).toHaveBeenCalledWith(
+      'store-1',
+      'forgotClockOut',
+      'forgot',
+    );
+    expect(service.appendToDailyReport).not.toHaveBeenCalledWith(
+      'store-1',
+      'forgotClockOut',
+      'still-working',
+    );
+  });
+});
+
+describe('StoresService - payslip recompute after a shift is marked ABSENT', () => {
+  afterEach(() => jest.clearAllMocks());
+
+  const employee = {
+    id: 'emp-1',
+    storeId: 'store-1',
+    employmentStatus: EmploymentStatus.ACTIVE,
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 3_100_000,
+        paymentType: PaymentType.MONTH,
+        allowances: {},
+      },
+    ],
+  };
+
+  it('rewrites the pending payslip of the work-date month through the single writer', async () => {
+    const h = await buildPayrollHarness();
+    h.repo(EmployeeProfile).findOne.mockResolvedValue(employee);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    h.repo(EmployeeSalary).findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.PENDING,
+      otherDeductions: 0,
+    });
+
+    await expect(
+      h.service.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: 'emp-1',
+        storeId: 'store-1',
+        workDate: '2026-08-31',
+      }),
+    ).resolves.toBe('updated');
+
+    const attendanceQuery =
+      h.repo(ShiftAssignment).createQueryBuilder.mock.results[0].value;
+    expect(attendanceQuery.andWhere).toHaveBeenCalledWith(
+      'slot.workDate >= :monthStart',
+      { monthStart: '2026-08-01' },
+    );
+    expect(h.repo(EmployeeSalary).update).toHaveBeenCalledWith(
+      's1',
+      expect.objectContaining({ monthlyPayrollId: 'payroll-1' }),
+    );
+    expect(h.repo(EmployeeSalary).delete).not.toHaveBeenCalled();
+    expect(h.repo(MonthlyPayroll).update).toHaveBeenCalledWith(
+      'payroll-1',
+      expect.any(Object),
+    );
+  });
+
+  it('leaves an APPROVED payslip untouched', async () => {
+    const h = await buildPayrollHarness();
+    h.repo(EmployeeProfile).findOne.mockResolvedValue(employee);
+    h.repo(MonthlyPayroll).findOne.mockResolvedValue({ id: 'payroll-1' });
+    h.repo(EmployeeSalary).findOne.mockResolvedValue({
+      id: 's1',
+      paymentStatus: PaymentStatus.APPROVED,
+      monthlyPayrollId: 'payroll-1',
+    });
+
+    await expect(
+      h.service.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: 'emp-1',
+        storeId: 'store-1',
+        workDate: '2026-08-20',
+      }),
+    ).resolves.toBe('protected');
+    expect(h.repo(EmployeeSalary).update).not.toHaveBeenCalled();
+    expect(h.repo(EmployeeSalary).delete).not.toHaveBeenCalled();
+  });
+
+  it('skips staff who are not rostered, or an invalid date', async () => {
+    const h = await buildPayrollHarness();
+    h.repo(EmployeeProfile).findOne.mockResolvedValue({
+      ...employee,
+      employmentStatus: EmploymentStatus.TERMINATED,
+    });
+    await expect(
+      h.service.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: 'emp-1',
+        storeId: 'store-1',
+        workDate: '2026-08-20',
+      }),
+    ).resolves.toBe('skipped');
+    await expect(
+      h.service.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: 'emp-1',
+        storeId: 'store-1',
+        workDate: 'junk',
+      }),
+    ).resolves.toBe('skipped');
+    expect(h.repo(EmployeeSalary).update).not.toHaveBeenCalled();
   });
 });

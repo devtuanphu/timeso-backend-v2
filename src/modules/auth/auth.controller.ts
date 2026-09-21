@@ -9,7 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBody } from '@nestjs/swagger';
-import { AuthService } from './auth.service';
+import { AuthService, resolveAppType } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import {
   LoginResponseDto,
@@ -18,6 +18,7 @@ import {
   ResendOtpResponseDto,
 } from './dto/auth-response.dto';
 import { VerifyOtpDto } from './dto/verify-otp.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { GetUser } from './decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
@@ -76,7 +77,7 @@ export class AuthController {
     @GetUser() user: { userId: string; email: string },
     @Body() body: { appType?: string },
   ) {
-    const appType = (body.appType as AppType) || AppType.OWNER_APP;
+    const appType = resolveAppType(body?.appType);
     // Revoke all refresh tokens for this account + appType
     await this.refreshTokenRepository.update(
       { accountId: user.userId, appType, revokedAt: null as any },
@@ -124,7 +125,7 @@ export class AuthController {
         'Email/Số điện thoại hoặc mật khẩu không đúng',
       );
     }
-    return this.authService.login(user, body.appType || 'OWNER_APP');
+    return this.authService.login(user, resolveAppType(body.appType));
   }
 
   @Post('register')
@@ -217,7 +218,8 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Đặt lại mật khẩu mới',
-    description: 'Đặt lại mật khẩu sau khi đã verify OTP thành công',
+    description:
+      'Đặt lại mật khẩu bằng resetToken nhận được từ verify-otp (type forgot-password)',
   })
   @ApiResponse({
     status: 200,
@@ -228,17 +230,19 @@ export class AuthController {
     schema: {
       type: 'object',
       properties: {
+        resetToken: { type: 'string' },
         phone: { type: 'string', example: '0901234567' },
         newPassword: { type: 'string', example: 'newPassword123' },
       },
-      required: ['phone', 'newPassword'],
+      required: ['resetToken', 'newPassword'],
     },
   })
-  async resetPassword(
-    @Body('phone') phone: string,
-    @Body('newPassword') newPassword: string,
-  ) {
-    return this.authService.resetPassword(phone, newPassword);
+  async resetPassword(@Body() body: ResetPasswordDto) {
+    return this.authService.resetPassword(
+      body.resetToken,
+      body.newPassword,
+      body.phone,
+    );
   }
 
   @Post('refresh-token')
@@ -268,8 +272,8 @@ export class AuthController {
   })
   async refreshToken(
     @Body('refresh_token') rfToken: string,
-    @Body('appType') appType: any,
+    @Body('appType') appType: unknown,
   ) {
-    return this.authService.refreshToken(rfToken, appType);
+    return this.authService.refreshToken(rfToken, resolveAppType(appType));
   }
 }
