@@ -79,7 +79,7 @@ describe('ca chưa check-in', () => {
     expect(service.notificationsService.create).toHaveBeenCalledWith(
       expect.objectContaining({
         title: 'Bạn chưa check-in',
-        actionUrl: '/check-in-flow',
+        actionUrl: '/',
         metadata: expect.objectContaining({
           type: 'CHECK_IN_REMINDER',
           assignmentId: 'a1',

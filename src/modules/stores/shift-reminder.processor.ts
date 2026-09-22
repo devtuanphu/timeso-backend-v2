@@ -49,7 +49,9 @@ export class ShiftReminderProcessor extends WorkerHost {
       scheduleFingerprint,
     } = job.data;
 
-    this.logger.log('Processing shift reminder');
+    // Non-PII correlation id for every log line of this job.
+    const tag = `[assignment=${assignmentId || '-'} job=${job.id ?? '-'}]`;
+    this.logger.log(`Processing shift reminder ${tag}`);
 
     try {
       // 1. Fetch employee to get accountId and verify they still exist
@@ -59,9 +61,7 @@ export class ShiftReminderProcessor extends WorkerHost {
       });
 
       if (!employee || !employee.account) {
-        this.logger.warn(
-          'Reminder recipient is unavailable; skipping reminder',
-        );
+        this.logger.warn(`Reminder recipient is unavailable; skipping reminder ${tag}`);
         return;
       }
 
@@ -74,7 +74,7 @@ export class ShiftReminderProcessor extends WorkerHost {
         employee.reminderSettings,
       );
       if (reminderSettings.type === 'off') {
-        this.logger.debug('Shift reminders are disabled; skipping reminder');
+        this.logger.debug(`Shift reminders are disabled; skipping reminder ${tag}`);
         return;
       }
 
@@ -84,7 +84,7 @@ export class ShiftReminderProcessor extends WorkerHost {
       if (!scheduleFingerprint) {
         const legacyMoment = moment(startTime);
         if (!legacyMoment.isValid()) {
-          this.logger.debug('Legacy shift reminder time is invalid');
+          this.logger.debug(`Legacy shift reminder time is invalid ${tag}`);
           return;
         }
         const localStart = legacyMoment.tz(SHIFT_REMINDER_TIMEZONE);
@@ -126,13 +126,13 @@ export class ShiftReminderProcessor extends WorkerHost {
       );
 
       if (!assignment || assignment.length === 0) {
-        this.logger.debug('Shift assignment is unavailable; skipping reminder');
+        this.logger.debug(`Shift assignment is unavailable; skipping reminder ${tag}`);
         return;
       }
 
       const current = assignment[0];
       if (!current || !current.workDate || !current.startTime) {
-        this.logger.debug('Shift schedule is incomplete; skipping reminder');
+        this.logger.debug(`Shift schedule is incomplete; skipping reminder ${tag}`);
         return;
       }
       const currentStart = parseVietnamShiftStart(
@@ -152,7 +152,7 @@ export class ShiftReminderProcessor extends WorkerHost {
 
       if (scheduleFingerprint) {
         if (scheduleFingerprint !== currentFingerprint) {
-          this.logger.debug('Superseded shift reminder skipped');
+          this.logger.debug(`Superseded shift reminder skipped ${tag}`);
           return;
         }
       } else {
@@ -161,7 +161,7 @@ export class ShiftReminderProcessor extends WorkerHost {
           !Number.isFinite(legacyStart) ||
           legacyStart !== currentStart.getTime()
         ) {
-          this.logger.debug('Stale legacy shift reminder skipped');
+          this.logger.debug(`Stale legacy shift reminder skipped ${tag}`);
           return;
         }
         const currentV2Ids = [
@@ -175,7 +175,7 @@ export class ShiftReminderProcessor extends WorkerHost {
         for (const currentV2Id of currentV2Ids) {
           const replacementJob = await this.reminderQueue.getJob(currentV2Id);
           if (replacementJob && replacementJob.id !== job.id) {
-            this.logger.debug('Legacy shift reminder replaced by current job');
+            this.logger.debug(`Legacy shift reminder replaced by current job ${tag}`);
             return;
           }
         }
@@ -191,7 +191,7 @@ export class ShiftReminderProcessor extends WorkerHost {
           current.id,
         )
       ) {
-        this.logger.debug('Employee is on approved leave; skipping reminder');
+        this.logger.debug(`Employee is on approved leave; skipping reminder ${tag}`);
         return;
       }
 
@@ -226,9 +226,9 @@ export class ShiftReminderProcessor extends WorkerHost {
         },
       );
 
-      this.logger.log('Shift reminder sent successfully');
+      this.logger.log(`Shift reminder sent successfully ${tag}`);
     } catch (error) {
-      this.logger.error('Shift reminder processing failed');
+      this.logger.error(`Shift reminder processing failed ${tag}`);
       throw error;
     }
   }

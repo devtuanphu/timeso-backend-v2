@@ -54,6 +54,59 @@ export const shiftAlertChannel = (reminderSettings: unknown): string =>
 
 type ReminderMinute = 0 | 5 | 10 | 15;
 
+/** Where check-in / check-out reminders open in the staff app: Home. */
+export const SHIFT_ATTENDANCE_ACTION_URL = '/';
+
+/**
+ * Minutes after the effective end (shift end, or approved overtime end) at
+ * which a shift that was never checked out is closed as FORGOT_CHECKOUT.
+ */
+export const AUTO_CHECKOUT_GRACE_MINUTES = 15;
+
+/**
+ * Note stored on a PENDING overtime request that timed out: the shift was
+ * auto-closed at its scheduled end (FORGOT_CHECKOUT) and the request is
+ * CANCELLED so it can no longer be approved.
+ */
+export const PENDING_OVERTIME_EXPIRED_NOTE =
+  'Hết hạn: yêu cầu tăng ca chưa được duyệt trước khi hệ thống tự kết thúc ca.';
+
+/**
+ * When a still-open shift with a PENDING (never decided) overtime request is
+ * auto-closed: the later of the scheduled end and the requested overtime end,
+ * plus the grace. Pay stops at the scheduled end (unapproved overtime is not
+ * paid). Without a requested end time, the scheduled end + grace.
+ */
+export const pendingOvertimeAutoCheckoutAt = (
+  effectiveEndAt: Date,
+  request?: Pick<BonusWorkRequest, 'requestDate' | 'endTime'> | null,
+): Date => {
+  let last = effectiveEndAt.getTime();
+  const requestedEnd = overtimeEndAt(request, effectiveEndAt);
+  if (requestedEnd && requestedEnd.getTime() > last) last = requestedEnd.getTime();
+  return new Date(last + AUTO_CHECKOUT_GRACE_MINUTES * 60_000);
+};
+
+/**
+ * The Vietnam instant an overtime request ends. An end clock earlier than
+ * the shift end on the same request date is read as the next day (overtime
+ * running past midnight).
+ */
+export const overtimeEndAt = (
+  request: Pick<BonusWorkRequest, 'requestDate' | 'endTime'> | null | undefined,
+  shiftEndAt?: Date,
+): Date | null => {
+  if (!request?.requestDate || !request?.endTime) return null;
+  const date = String(request.requestDate).slice(0, 10);
+  const clock = String(request.endTime).slice(0, 8);
+  const at = new Date(`${date}T${clock.length === 5 ? `${clock}:00` : clock}+07:00`);
+  if (Number.isNaN(at.getTime())) return null;
+  if (shiftEndAt && at.getTime() < shiftEndAt.getTime() - 12 * 3_600_000) {
+    at.setTime(at.getTime() + 86_400_000);
+  }
+  return at;
+};
+
 /** Job hàng đợi 'attendance-background': tính lại phiếu lương một nhân viên. */
 export const RECOMPUTE_EMPLOYEE_PAYSLIP_JOB = 'recompute-employee-payslip';
 
@@ -197,6 +250,7 @@ export class ShiftEndWorkflowService {
       relations: [
         'shiftSlot',
         'shiftSlot.cycle',
+        'shiftSlot.workShift',
         'employee',
         'employee.account',
       ],
@@ -255,18 +309,24 @@ export class ShiftEndWorkflowService {
 
     const accountId = assignment.employee?.accountId;
     if (!accountId) return;
+    this.logger.log(
+      `Shift-end reminder +${data.reminderMinute} [assignment=${data.assignmentId}]`,
+    );
     await this.notificationsService.create(
       {
         accountId,
         storeId: assignment.shiftSlot?.cycle?.storeId,
         title: 'Đã đến giờ kết thúc ca',
-        content:
-          data.reminderMinute === 0
-            ? 'Bạn muốn chấm công ra hay gửi yêu cầu tăng ca?'
-            : `Bạn chưa chấm công ra sau ${data.reminderMinute} phút.`,
+        content: this.checkoutReminderContent(
+          assignment,
+          workflow,
+          data.reminderMinute,
+        ),
         type: NotificationType.SHIFT_CHECKOUT_REMINDER,
         priority: NotificationPriority.URGENT,
-        actionUrl: '/check-in-flow',
+        // Home picks the right assignment and mode; '/check-in-flow' opened
+        // without them failed ("Không xác định được ca làm việc").
+        actionUrl: SHIFT_ATTENDANCE_ACTION_URL,
         metadata: this.buildNotificationData(assignment, workflow),
       },
       {
@@ -279,25 +339,68 @@ export class ShiftEndWorkflowService {
     );
   }
 
+  /**
+   * "Ca 08:00-17:00 hôm nay (22/09) đã kết thúc. …": the date is the slot's
+   * work date (an overnight shift keeps the day it started), always with the
+   * absolute dd/mm so the list can re-label it at read time (metadata
+   * workDates).
+   */
+  private checkoutReminderContent(
+    assignment: ShiftAssignment,
+    workflow: ShiftEndWorkflow,
+    reminderMinute: ReminderMinute,
+  ): string {
+    const slot = assignment.shiftSlot;
+    const workDate = String(slot?.workDate ?? '').slice(0, 10);
+    const dated = /^\d{4}-\d{2}-\d{2}$/.test(workDate);
+    const label = dated
+      ? this.shiftLabel(
+          workDate,
+          slot?.startTime || slot?.workShift?.startTime,
+          slot?.endTime || slot?.workShift?.endTime,
+        )
+      : 'ca';
+    const subject =
+      workflow.state === ShiftEndWorkflowState.OVERTIME_APPROVED
+        ? `Giờ tăng ca của ${label}`
+        : label.replace(/^ca/, 'Ca');
+    return reminderMinute === 0
+      ? `${subject} đã kết thúc. Bạn muốn chấm công ra hay gửi yêu cầu tăng ca?`
+      : `${subject} đã kết thúc ${reminderMinute} phút. Bạn chưa chấm công ra.`;
+  }
+
   private buildNotificationData(
     assignment: ShiftAssignment,
     workflow: ShiftEndWorkflow,
   ) {
+    const workDate = String(assignment.shiftSlot?.workDate ?? '').slice(0, 10);
+    const dated = /^\d{4}-\d{2}-\d{2}$/.test(workDate);
     return {
       type: 'SHIFT_END_ACTION_REQUIRED',
       assignmentId: assignment.id,
       shiftSlotId: assignment.shiftSlotId,
       storeId: assignment.shiftSlot?.cycle?.storeId || '',
-      workDate: assignment.shiftSlot?.workDate || '',
+      workDate: dated ? workDate : '',
+      ...(dated ? { workDates: [workDate] } : {}),
       scheduledEndAt: workflow.effectiveEndAt.toISOString(),
       categoryId: 'SHIFT_END_ACTIONS',
-      defaultRoute: '/check-in-flow',
+      defaultRoute: SHIFT_ATTENDANCE_ACTION_URL,
     };
   }
 
+  /**
+   * Closes a shift that was never checked out as FORGOT_CHECKOUT, paid up to
+   * `effectiveEndAt` (the shift end, or the approved overtime end).
+   *
+   * - An APPROVED overtime request no longer blocks forever: the shift closes
+   *   once its approved end + grace has passed (earlier calls return false).
+   * - A PENDING overtime request blocks, unless `options.pendingOvertimeDue`
+   *   says its timeout (pendingOvertimeAutoCheckoutAt) has passed.
+   */
   async autoCheckout(
     assignmentId: string,
     effectiveEndAt: Date,
+    options: { pendingOvertimeDue?: boolean; now?: Date } = {},
   ): Promise<boolean> {
     const result = await this.dataSource.transaction(async (manager) => {
       const assignment = await manager.findOne(ShiftAssignment, {
@@ -311,7 +414,7 @@ export class ShiftEndWorkflowService {
       });
       if (!assignment?.checkInTime || assignment.checkOutTime) return null;
 
-      const pendingOvertime = await manager.findOne(BonusWorkRequest, {
+      const overtimeRequests = await manager.find(BonusWorkRequest, {
         where: {
           shiftAssignmentId: assignmentId,
           status: In([
@@ -320,7 +423,25 @@ export class ShiftEndWorkflowService {
           ]),
         },
       });
-      if (pendingOvertime) return null;
+      const nowMs = (options.now ?? new Date()).getTime();
+      const expiredPendingIds: string[] = [];
+      for (const request of overtimeRequests ?? []) {
+        if (request.status === BonusWorkRequestStatus.PENDING) {
+          if (!options.pendingOvertimeDue) return null;
+          expiredPendingIds.push(request.id);
+          continue;
+        }
+        // APPROVED: never close before the approved end + grace, even when
+        // called with the original shift end.
+        const approvedEnd = overtimeEndAt(request, effectiveEndAt);
+        if (
+          approvedEnd &&
+          nowMs <
+            approvedEnd.getTime() + AUTO_CHECKOUT_GRACE_MINUTES * 60_000
+        ) {
+          return null;
+        }
+      }
 
       const autoCheckoutAt = new Date();
       const workedMinutes = Math.max(
@@ -350,6 +471,23 @@ export class ShiftEndWorkflowService {
         .execute();
       if (!updated.affected) return null;
 
+      // The pending overtime timed out and the shift is closed at its
+      // scheduled end: resolve the request so it cannot be approved later
+      // (an approval would never be paid). Same transaction as the close.
+      if (expiredPendingIds.length > 0) {
+        await manager.update(
+          BonusWorkRequest,
+          {
+            id: In(expiredPendingIds),
+            status: BonusWorkRequestStatus.PENDING,
+          },
+          {
+            status: BonusWorkRequestStatus.CANCELLED,
+            rejectionReason: PENDING_OVERTIME_EXPIRED_NOTE,
+          },
+        );
+      }
+
       await manager.save(
         AttendanceLog,
         manager.create(AttendanceLog, {
@@ -369,6 +507,7 @@ export class ShiftEndWorkflowService {
       return { assignment, autoCheckoutAt };
     });
     if (!result) return false;
+    this.logger.log(`Auto-checkout FORGOT_CHECKOUT [assignment=${assignmentId}]`);
 
     await this.profileRepository.update(result.assignment.employeeId, {
       workingStatus: WorkingStatus.IDLE,
@@ -465,9 +604,9 @@ export class ShiftEndWorkflowService {
       where: { shiftAssignmentId: request.shiftAssignmentId },
     });
     if (!workflow) return;
-    const effectiveEndAt = new Date(
-      `${request.requestDate}T${request.endTime}+07:00`,
-    );
+    const effectiveEndAt =
+      overtimeEndAt(request, workflow.scheduledEndAt) ??
+      new Date(`${request.requestDate}T${request.endTime}+07:00`);
     await this.workflowRepository.update(workflow.id, {
       state: ShiftEndWorkflowState.OVERTIME_APPROVED,
       effectiveEndAt,
@@ -684,7 +823,9 @@ export class ShiftEndWorkflowService {
         content: `${this.shiftLabel(workDate, startTime, endTime, now).replace(/^ca/, 'Ca')} đã bắt đầu. Check-in ngay để không bị tính nghỉ không phép.`,
         type: NotificationType.SHIFT_REMINDER,
         priority: NotificationPriority.HIGH,
-        actionUrl: '/check-in-flow',
+        // Home picks the right assignment and mode; '/check-in-flow' opened
+        // without them failed ("Không xác định được ca làm việc").
+        actionUrl: SHIFT_ATTENDANCE_ACTION_URL,
         metadata: {
           type: 'CHECK_IN_REMINDER',
           assignmentId: assignment.id,
@@ -741,16 +882,49 @@ export class ShiftEndWorkflowService {
       select: ['id'],
     });
     for (const assignment of assignments) {
-      await this.scheduleForAssignment(assignment.id);
-      const workflow = await this.workflowRepository.findOne({
-        where: { shiftAssignmentId: assignment.id },
-      });
-      if (
-        workflow &&
-        Date.now() >= workflow.effectiveEndAt.getTime() + 15 * 60_000 &&
-        workflow.state === ShiftEndWorkflowState.ACTIVE
-      ) {
-        await this.autoCheckout(assignment.id, workflow.effectiveEndAt);
+      try {
+        await this.scheduleForAssignment(assignment.id);
+        const workflow = await this.workflowRepository.findOne({
+          where: { shiftAssignmentId: assignment.id },
+        });
+        if (!workflow) continue;
+        const now = Date.now();
+        if (
+          (workflow.state === ShiftEndWorkflowState.ACTIVE ||
+            workflow.state === ShiftEndWorkflowState.OVERTIME_APPROVED) &&
+          now >=
+            workflow.effectiveEndAt.getTime() +
+              AUTO_CHECKOUT_GRACE_MINUTES * 60_000
+        ) {
+          await this.autoCheckout(assignment.id, workflow.effectiveEndAt);
+          continue;
+        }
+        if (workflow.state === ShiftEndWorkflowState.OVERTIME_PENDING) {
+          // An overtime request nobody decided must not keep the shift open
+          // forever: close it once the requested overtime end + grace passed.
+          const request = workflow.overtimeRequestId
+            ? await this.bonusWorkRepository.findOne({
+                where: { id: workflow.overtimeRequestId },
+              })
+            : null;
+          if (
+            now >=
+            pendingOvertimeAutoCheckoutAt(
+              workflow.effectiveEndAt,
+              request,
+            ).getTime()
+          ) {
+            await this.autoCheckout(assignment.id, workflow.effectiveEndAt, {
+              pendingOvertimeDue: true,
+            });
+          }
+        }
+      } catch (error) {
+        this.logger.warn(
+          `reconcileActiveAssignments failed [assignment=${assignment.id}]: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
     }
     return assignments.length;

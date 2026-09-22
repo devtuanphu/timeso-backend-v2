@@ -990,7 +990,7 @@ describe('ShiftReminderService default reminder (chưa lưu cài đặt)', () =>
   });
 });
 
-describe('ShiftReminderService.backfillDefaultReminders', () => {
+describe('ShiftReminderService.reconcileUpcomingReminders (backfill)', () => {
   const build = (rows: Array<{ id: string }>) => {
     const qb: any = {};
     for (const method of [
@@ -999,6 +999,7 @@ describe('ShiftReminderService.backfillDefaultReminders', () => {
       'where',
       'andWhere',
       'orderBy',
+      'addOrderBy',
       'limit',
     ]) {
       qb[method] = jest.fn(() => qb);
@@ -1013,15 +1014,16 @@ describe('ShiftReminderService.backfillDefaultReminders', () => {
     return { service, qb, schedule };
   };
 
-  it('schedules the next 48h of shifts for employees without saved settings', async () => {
+  it('schedules the next 48h of approved, not-started shifts for every employee', async () => {
     const { service, qb, schedule } = build([{ id: 'a1' }, { id: 'a2' }]);
     // 23:00 on 20/09 in Vietnam.
     await expect(
-      service.backfillDefaultReminders(new Date('2026-09-20T16:00:00Z')),
+      service.reconcileUpcomingReminders(new Date('2026-09-20T16:00:00Z')),
     ).resolves.toEqual({ candidates: 2 });
-    expect(qb.andWhere).toHaveBeenCalledWith(
-      "(employee.reminder_settings IS NULL OR employee.reminder_settings->>'type' IS NULL)",
-    );
+    expect(qb.where).toHaveBeenCalledWith('sa.status = :status', {
+      status: 'APPROVED',
+    });
+    expect(qb.andWhere).toHaveBeenCalledWith('sa.checkInTime IS NULL');
     expect(qb.andWhere).toHaveBeenCalledWith('slot.workDate >= :from', {
       from: '2026-09-20',
     });
@@ -1032,21 +1034,35 @@ describe('ShiftReminderService.backfillDefaultReminders', () => {
     expect(schedule).toHaveBeenCalledWith(['a1', 'a2']);
   });
 
-  it('also selects employees whose saved settings have no reminder type', async () => {
+  it('includes employees with saved settings (e.g. 30m), excluding only type off', async () => {
     const { service, qb } = build([{ id: 'a1' }]);
-    await service.backfillDefaultReminders(new Date('2026-09-20T16:00:00Z'));
+    await service.reconcileUpcomingReminders(new Date('2026-09-20T16:00:00Z'));
     const clauses: string[] = qb.andWhere.mock.calls.map(([sql]: any) => sql);
     const settingsClause = clauses.find((sql) => sql.includes('reminder_settings'));
-    // Settings saved without `type` (e.g. only the vibrate toggle) fall back
-    // to the default 15-minute reminder, so they need a backfilled job too.
+    // No longer limited to "never saved settings": a saved {type:'30m'} whose
+    // Redis job was lost is re-created too.
     expect(settingsClause).toContain('reminder_settings IS NULL');
-    expect(settingsClause).toContain("reminder_settings->>'type' IS NULL");
-    expect(settingsClause).toMatch(/ OR /);
+    expect(settingsClause).toContain("reminder_settings->>'type' <> 'off'");
+    expect(settingsClause).not.toMatch(/^\(employee\.reminder_settings IS NULL OR employee\.reminder_settings->>'type' IS NULL\)$/);
+  });
+
+  it('bounds the row cap', async () => {
+    const { service, qb } = build([]);
+    await service.reconcileUpcomingReminders(new Date(), { limit: 999_999 });
+    expect(qb.limit).toHaveBeenCalledWith(5000);
+  });
+
+  it('the old name delegates to the reconcile', async () => {
+    const { service, schedule } = build([{ id: 'a1' }]);
+    await expect(service.backfillDefaultReminders()).resolves.toEqual({
+      candidates: 1,
+    });
+    expect(schedule).toHaveBeenCalledWith(['a1']);
   });
 
   it('does nothing when there is no candidate', async () => {
     const { service, schedule } = build([]);
-    await service.backfillDefaultReminders();
+    await service.reconcileUpcomingReminders();
     expect(schedule).not.toHaveBeenCalled();
   });
 });

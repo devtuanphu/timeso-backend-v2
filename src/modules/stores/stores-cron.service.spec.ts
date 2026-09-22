@@ -1,4 +1,4 @@
-import { StoresCronService } from './stores-cron.service';
+import { STARTUP_REMINDER_RECONCILE_DELAY_MS, StoresCronService } from './stores-cron.service';
 
 describe('StoresCronService read-only guards', () => {
   it('returns from every cron handler before locks, queries, or workflows', async () => {
@@ -87,5 +87,77 @@ describe('StoresCronService shift-end reconcile isolation', () => {
     const service = build(workflows);
     await expect(service.handleReconcileShiftEndWorkflows()).resolves.toBeUndefined();
     expect(workflows.reconcileActiveAssignments).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('StoresCronService upcoming reminder reconcile (R5)', () => {
+  afterEach(() => jest.useRealTimers());
+
+  const build = (readOnly = false) => {
+    const lockService = {
+      withLock: jest.fn(async (_key: string, _ttl: number, fn: () => any) => ({
+        ran: true,
+        result: await fn(),
+      })),
+    };
+    const reminders = {
+      reconcileUpcomingReminders: jest.fn().mockResolvedValue({ candidates: 3 }),
+    };
+    const service = new StoresCronService(
+      {} as any,
+      lockService as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      { get: jest.fn().mockReturnValue(readOnly ? 'true' : undefined) } as any,
+      reminders as any,
+    );
+    (service as any).logger = { warn: jest.fn(), log: jest.fn() };
+    return { service, lockService, reminders };
+  };
+
+  it('runs hourly (minute 55, VN time) under a distributed lock', async () => {
+    const { Reflector } = jest.requireActual('@nestjs/core');
+    const { SCHEDULE_CRON_OPTIONS } = jest.requireActual(
+      '@nestjs/schedule/dist/schedule.constants',
+    );
+    const handler = Object.getOwnPropertyDescriptor(
+      StoresCronService.prototype,
+      'handleBackfillDefaultShiftReminders',
+    )?.value as object;
+    const options = new Reflector().get(SCHEDULE_CRON_OPTIONS, handler);
+    expect(options).toMatchObject({
+      cronTime: '55 * * * *',
+      timeZone: 'Asia/Ho_Chi_Minh',
+    });
+
+    const { service, lockService, reminders } = build();
+    await service.handleBackfillDefaultShiftReminders();
+    expect(lockService.withLock).toHaveBeenCalledWith(
+      'cron:backfill-default-shift-reminders',
+      600,
+      expect.any(Function),
+    );
+    expect(reminders.reconcileUpcomingReminders).toHaveBeenCalledTimes(1);
+  });
+
+  it('runs once shortly after start-up, and never in read-only mode', async () => {
+    jest.useFakeTimers();
+    const { service, reminders } = build();
+    service.onApplicationBootstrap();
+    expect(reminders.reconcileUpcomingReminders).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(STARTUP_REMINDER_RECONCILE_DELAY_MS);
+    expect(reminders.reconcileUpcomingReminders).toHaveBeenCalledTimes(1);
+
+    const readOnly = build(true);
+    readOnly.service.onApplicationBootstrap();
+    await jest.advanceTimersByTimeAsync(STARTUP_REMINDER_RECONCILE_DELAY_MS);
+    expect(readOnly.reminders.reconcileUpcomingReminders).not.toHaveBeenCalled();
+
+    const stopped = build();
+    stopped.service.onApplicationBootstrap();
+    stopped.service.onApplicationShutdown();
+    await jest.advanceTimersByTimeAsync(STARTUP_REMINDER_RECONCILE_DELAY_MS);
+    expect(stopped.reminders.reconcileUpcomingReminders).not.toHaveBeenCalled();
   });
 });

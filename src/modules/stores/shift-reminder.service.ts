@@ -258,7 +258,9 @@ export class ShiftReminderService {
       await this.releaseReminderMutationLock(lease);
     }
 
-    this.logger.log(`Scheduled shift reminder in ${job.opts.delay}ms`);
+    this.logger.log(
+      `Scheduled shift reminder in ${job.opts.delay}ms [job=${job.opts.jobId}]`,
+    );
   }
 
   private async loadAuthoritativeAssignments(assignmentIds: string[]) {
@@ -356,6 +358,9 @@ export class ShiftReminderService {
     await this.renewReminderMutationLock(lease);
     job.opts.jobId = replacementJobId;
     await this.reminderQueue.add(job.name, job.data, job.opts);
+    this.logger.debug(
+      `Scheduled shift reminder [assignment=${assignmentId} delayMs=${job.opts.delay}]`,
+    );
     return true;
   }
 
@@ -645,14 +650,19 @@ export class ShiftReminderService {
   }
 
   /**
-   * Reminders for employees who never saved reminder settings, or saved
-   * settings without a reminder `type` (both use the default). Before the
-   * default (15 minutes before, see DEFAULT_REMINDER_SETTINGS) no job was
-   * queued for them, so APPROVED shifts assigned earlier have none. Bounded
-   * look-ahead window and row cap; scheduling is fingerprinted, so a repeat
-   * run leaves existing jobs untouched (idempotent).
+   * Re-creates the pre-shift reminder job of every APPROVED, not-yet-started
+   * assignment in a bounded look-ahead window, whatever the employee's saved
+   * settings (except an explicit `type: 'off'`, which never has a job).
+   *
+   * Reminder jobs live only in Redis; if delayed jobs are lost (restart
+   * without persistence, flush, eviction, new Redis) nothing else would
+   * re-create them for employees with saved settings. Scheduling goes
+   * through the authoritative per-assignment path: the stable jobId plus the
+   * schedule fingerprint make a repeat run a no-op for jobs that still exist
+   * (idempotent), and shifts whose reminder time has passed are skipped.
+   * Bounded by `windowHours` and `limit` (max 5000 rows per run).
    */
-  async backfillDefaultReminders(
+  async reconcileUpcomingReminders(
     now: Date = new Date(),
     options: { windowHours?: number; limit?: number } = {},
   ): Promise<{ candidates: number }> {
@@ -669,10 +679,9 @@ export class ShiftReminderService {
       .select('sa.id', 'id')
       .where('sa.status = :status', { status: ShiftAssignmentStatus.APPROVED })
       .andWhere('sa.checkInTime IS NULL')
-      // Chưa lưu cài đặt, hoặc đã lưu (vd. chỉ bật/tắt rung) nhưng chưa chọn
-      // kiểu nhắc: cả hai đều nhắc theo mặc định (DEFAULT_REMINDER_SETTINGS).
+      // Mọi nhân viên, trừ người đã tắt nhắc ca (type 'off' không có job).
       .andWhere(
-        "(employee.reminder_settings IS NULL OR employee.reminder_settings->>'type' IS NULL)",
+        "(employee.reminder_settings IS NULL OR employee.reminder_settings->>'type' IS NULL OR employee.reminder_settings->>'type' <> 'off')",
       )
       .andWhere('cycle.status = :cycleStatus', {
         cycleStatus: WorkCycleStatus.ACTIVE,
@@ -680,12 +689,28 @@ export class ShiftReminderService {
       .andWhere('slot.workDate >= :from', { from: vnDate(now) })
       .andWhere('slot.workDate <= :to', { to: vnDate(until) })
       .orderBy('slot.workDate', 'ASC')
+      .addOrderBy('sa.id', 'ASC')
       .limit(limit)
       .getRawMany();
     const ids = rows.map((row) => row.id);
     if (ids.length) await this.scheduleAssignmentReminders(ids);
-    this.logger.log(`Default reminder backfill: candidates=${ids.length}`);
+    this.logger.log(
+      `Upcoming reminder reconcile: candidates=${ids.length}${
+        ids.length >= limit ? ' (limit reached)' : ''
+      }`,
+    );
     return { candidates: ids.length };
+  }
+
+  /**
+   * @deprecated Kept for callers of the old name: the backfill now covers
+   * every approved upcoming shift (see reconcileUpcomingReminders).
+   */
+  async backfillDefaultReminders(
+    now: Date = new Date(),
+    options: { windowHours?: number; limit?: number } = {},
+  ): Promise<{ candidates: number }> {
+    return this.reconcileUpcomingReminders(now, options);
   }
 
   /**

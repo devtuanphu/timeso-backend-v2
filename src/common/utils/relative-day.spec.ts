@@ -73,9 +73,38 @@ describe('describeWorkDateRange', () => {
     ).toBe('từ 20/09 đến 25/09 (có hôm nay)');
   });
   it('khoảng không có hôm nay', () => {
-    expect(describeWorkDateRange(['2026-09-23', '2026-09-25'], now)).toBe(
-      'từ 23/09 đến 25/09',
+    expect(describeWorkDateRange(['2026-09-24', '2026-09-26'], now)).toBe(
+      'từ 24/09 đến 26/09',
     );
+  });
+  it('khoảng bắt đầu ngày mai / ngày kia thì ghi nhãn ngày đầu', () => {
+    expect(describeWorkDateRange(['2026-09-22', '2026-09-25'], now)).toBe(
+      'từ ngày mai (22/09) đến 25/09',
+    );
+    expect(describeWorkDateRange(['2026-09-23', '2026-09-25'], now)).toBe(
+      'từ ngày kia (23/09) đến 25/09',
+    );
+  });
+  it('khoảng bắt đầu ngày mai được đọc lại đúng theo ngày đọc', () => {
+    const stored = `Bạn có ca ${describeWorkDateRange(['2026-09-22', '2026-09-25'], now)}.`;
+    expect(stored).toBe('Bạn có ca từ ngày mai (22/09) đến 25/09.');
+    const dates = ['2026-09-22', '2026-09-25'];
+    // Đọc hôm sau: ngày đầu là hôm nay.
+    expect(rerenderRelativeDays(stored, dates, at('2026-09-22T03:00:00Z'))).toBe(
+      'Bạn có ca từ 22/09 đến 25/09 (có hôm nay).',
+    );
+    // Đọc hôm trước nữa: ngày đầu là ngày kia.
+    expect(rerenderRelativeDays(stored, dates, at('2026-09-20T03:00:00Z'))).toBe(
+      'Bạn có ca từ ngày kia (22/09) đến 25/09.',
+    );
+    // Đọc sau khi hết khoảng: chỉ còn ngày tuyệt đối.
+    expect(rerenderRelativeDays(stored, dates, at('2026-09-27T03:00:00Z'))).toBe(
+      'Bạn có ca từ 22/09 đến 25/09.',
+    );
+    // Dạng cũ đã lưu cũng được gắn nhãn khi đọc.
+    expect(
+      rerenderRelativeDays('Bạn có ca từ 22/09 đến 25/09.', dates, at('2026-09-21T03:00:00Z')),
+    ).toBe('Bạn có ca từ ngày mai (22/09) đến 25/09.');
   });
 });
 
@@ -200,8 +229,12 @@ describe('workDateRange {from,to} là khoảng liên tục', () => {
     expect(
       rerenderRelativeDays(content, dates, at('2026-10-10T03:00:00Z'), opts),
     ).toBe(`${content} (có hôm nay)`);
+    // Khoảng bắt đầu ngày mai: nhãn cho ngày đầu, không có hậu tố.
     expect(
       rerenderRelativeDays(content, dates, at('2026-08-31T03:00:00Z'), opts),
+    ).toBe(content.replace('từ 01/09', 'từ ngày mai (01/09)'));
+    expect(
+      rerenderRelativeDays(content, dates, at('2026-08-20T03:00:00Z'), opts),
     ).toBe(content);
     // Ranh giới giờ VN: 00:30 ngày 01/09 VN = 17:30 UTC ngày 31/08.
     expect(

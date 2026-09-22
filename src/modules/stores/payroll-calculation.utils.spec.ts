@@ -329,17 +329,68 @@ describe('computeRuleAdjustments', () => {
       calcType: PayrollCalcType.AMOUNT,
       value: 300_000,
     };
-    expect(computeRuleAdjustments([bonusRule], facts(), 0).bonus).toBe(300_000);
+    const worked = { completedShifts: 3 };
+    expect(computeRuleAdjustments([bonusRule], facts(worked), 0).bonus).toBe(300_000);
     expect(
-      computeRuleAdjustments([bonusRule], facts({ lateCount: 1 }), 0).bonus,
+      computeRuleAdjustments([bonusRule], facts({ ...worked, lateCount: 1 }), 0).bonus,
     ).toBe(0);
     expect(
       computeRuleAdjustments(
         [{ ...bonusRule, ruleType: 'GENERAL', value: 100_000 }],
-        facts({ lateCount: 1 }),
+        facts({ ...worked, lateCount: 1 }),
         0,
       ).bonus,
     ).toBe(100_000);
+  });
+
+  it('pays no attendance or general bonus for a month with no completed shift', () => {
+    const rules = [
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: 'ATTENDANCE',
+        calcType: PayrollCalcType.AMOUNT,
+        value: 200_000,
+      },
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: 'GENERAL',
+        calcType: PayrollCalcType.AMOUNT,
+        value: 100_000,
+      },
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: null as any,
+        calcType: PayrollCalcType.AMOUNT,
+        value: 50_000,
+      },
+    ];
+    expect(computeRuleAdjustments(rules, facts(), 0)).toEqual({
+      bonus: 0,
+      penalty: 0,
+    });
+    const { computeRuleAdjustmentBreakdown: breakdown } = jest.requireActual(
+      './payroll-calculation.utils',
+    );
+    expect(breakdown(rules, facts(), 0)).toEqual([]);
+    // One completed shift is enough.
+    expect(
+      computeRuleAdjustments(rules, facts({ completedShifts: 1 }), 0).bonus,
+    ).toBe(350_000);
+    // A fine is still charged without a completed shift (e.g. absences).
+    expect(
+      computeRuleAdjustments(
+        [
+          {
+            category: PayrollRuleCategory.FINE,
+            ruleType: 'ABSENT',
+            calcType: PayrollCalcType.AMOUNT,
+            value: 100_000,
+          },
+        ],
+        facts({ absentCount: 2 }),
+        0,
+      ).penalty,
+    ).toBe(200_000);
   });
 });
 
@@ -444,7 +495,7 @@ describe('computeRuleAdjustmentBreakdown', () => {
   ];
 
   it('lines sum exactly to the bonus and penalty totals', () => {
-    const facts = { lateCount: 3, earlyCount: 2, absentCount: 1 };
+    const facts = { lateCount: 3, earlyCount: 2, absentCount: 1, completedShifts: 5 };
     const earned = 7_123_457;
     const lines = computeRuleAdjustmentBreakdown(rules, facts, earned);
     const totals = computeRuleAdjustments(rules, facts, earned);
@@ -469,7 +520,7 @@ describe('computeRuleAdjustmentBreakdown', () => {
     expect(
       computeRuleAdjustmentBreakdown(
         rules.filter((rule) => rule.category === PayrollRuleCategory.FINE),
-        { lateCount: 0, earlyCount: 0, absentCount: 0 },
+        { lateCount: 0, earlyCount: 0, absentCount: 0, completedShifts: 5 },
         1_000_000,
       ),
     ).toEqual([]);

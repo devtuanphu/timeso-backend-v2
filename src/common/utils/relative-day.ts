@@ -72,7 +72,9 @@ export interface WorkDateRangeOptions {
 /**
  * Nhiều ngày làm: một ngày thì như describeWorkDate; nhiều ngày thì
  * "từ 20/09 đến 25/09", thêm " (có hôm nay)" khi một trong các ngày là hôm nay
- * (hoặc, với khoảng liên tục, khi hôm nay nằm trong khoảng).
+ * (hoặc, với khoảng liên tục, khi hôm nay nằm trong khoảng). Khoảng bắt đầu
+ * ngày mai / ngày kia thì ghi nhãn cho ngày đầu: "từ ngày mai (23/09) đến
+ * 25/09".
  */
 export function describeWorkDateRange(
   dates: readonly string[],
@@ -86,7 +88,12 @@ export function describeWorkDateRange(
   const includesToday = options.continuousRange
     ? sorted[0] <= today && today <= sorted[sorted.length - 1]
     : sorted.some((date) => relativeDayLabel(date, now) === 'hôm nay');
-  const range = `từ ${ddmm(sorted[0])} đến ${ddmm(sorted[sorted.length - 1])}`;
+  const end = ddmm(sorted[sorted.length - 1]);
+  const startLabel = relativeDayLabel(sorted[0], now);
+  if (startLabel === 'ngày mai' || startLabel === 'ngày kia') {
+    return `từ ${startLabel} (${ddmm(sorted[0])}) đến ${end}`;
+  }
+  const range = `từ ${ddmm(sorted[0])} đến ${end}`;
   return includesToday ? `${range} (có hôm nay)` : range;
 }
 
@@ -119,9 +126,13 @@ export function rerenderRelativeDays(
     result = result.replace(pattern, describeWorkDate(date, now));
   }
   if (sorted.length > 1) {
-    const range = `từ ${ddmm(sorted[0])} đến ${ddmm(sorted[sorted.length - 1])}`;
+    // Every stored form of the range: "từ 23/09 đến 25/09[ (có hôm nay)]",
+    // "từ ngày mai (23/09) đến 25/09" and what the per-date pass above made
+    // of the start ("từ hôm nay (23/09) …", "từ ngày 23/09 …").
+    const start = escapeRegExp(ddmm(sorted[0]));
+    const end = escapeRegExp(ddmm(sorted[sorted.length - 1]));
     const rangePattern = new RegExp(
-      `${escapeRegExp(range)}(?: \\(có hôm nay\\))?`,
+      `từ (?:(?:hôm nay|ngày mai|ngày kia) \\(${start}\\)|ngày ${start}|${start}) đến ${end}(?![/\\d])(?: \\(có hôm nay\\))?`,
       'g',
     );
     result = result.replace(

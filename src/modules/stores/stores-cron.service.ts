@@ -1,7 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnApplicationBootstrap,
+  OnApplicationShutdown,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
+import { isLocalApiOnly } from '../../app-runtime.config';
 import { StoresService } from './stores.service';
 import { DistributedLockService } from './distributed-lock.service';
 import { ShiftEndWorkflowService } from './shift-end-workflow.service';
@@ -9,8 +15,15 @@ import { JobApplicationService } from './job-application.service';
 import { CareerLadderService } from './career-ladder.service';
 import { ShiftReminderService } from './shift-reminder.service';
 
+/** Delay before the start-up reminder reconcile, so boot is not slowed. */
+export const STARTUP_REMINDER_RECONCILE_DELAY_MS = 30_000;
+
 @Injectable()
-export class StoresCronService {
+export class StoresCronService
+  implements OnApplicationBootstrap, OnApplicationShutdown
+{
+  private startupReminderTimer: NodeJS.Timeout | null = null;
+
   private readonly logger = new Logger(StoresCronService.name);
 
   constructor(
@@ -72,11 +85,13 @@ export class StoresCronService {
   }
 
   /**
-   * Chạy 00:55 mỗi ngày: xếp nhắc ca mặc định (trước 15 phút) cho các ca
-   * APPROVED trong 48 giờ tới của nhân viên chưa từng lưu cài đặt nhắc — trước
-   * đây họ không có nhắc nào. Idempotent (job có fingerprint), có giới hạn.
+   * Mỗi giờ (phút 55) và một lần lúc khởi động: xếp lại nhắc trước ca cho MỌI
+   * ca APPROVED chưa bắt đầu trong 48 giờ tới (trừ người đã tắt nhắc). Job nhắc
+   * chỉ nằm trong Redis; nếu Redis mất job thì trước đây không ai tạo lại cho
+   * nhân viên đã lưu cài đặt. Idempotent (jobId cố định + fingerprint), có giới
+   * hạn số dòng; khoá phân tán để chỉ một instance chạy.
    */
-  @Cron('55 0 * * *', {
+  @Cron('55 * * * *', {
     name: 'backfill-default-shift-reminders',
     timeZone: 'Asia/Ho_Chi_Minh',
   })
@@ -88,16 +103,44 @@ export class StoresCronService {
       600,
       async () => {
         try {
-          await this.shiftReminderService!.backfillDefaultReminders();
+          await this.shiftReminderService!.reconcileUpcomingReminders();
         } catch (error) {
           this.logger.warn(
-            `backfillDefaultReminders failed: ${
+            `reconcileUpcomingReminders failed: ${
               error instanceof Error ? error.message : String(error)
             }`,
           );
         }
       },
     );
+  }
+
+  /**
+   * Start-up catch-up for reminder jobs lost while the process (or Redis)
+   * was down. Runs once, shortly after boot, only where cron jobs run.
+   */
+  onApplicationBootstrap() {
+    if (isLocalApiOnly() || this.isReadOnlyMode() || !this.shiftReminderService) {
+      return;
+    }
+    this.startupReminderTimer = setTimeout(() => {
+      this.startupReminderTimer = null;
+      void this.handleBackfillDefaultShiftReminders().catch((error) =>
+        this.logger.warn(
+          `Startup reminder reconcile failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        ),
+      );
+    }, STARTUP_REMINDER_RECONCILE_DELAY_MS);
+    this.startupReminderTimer.unref?.();
+  }
+
+  onApplicationShutdown() {
+    if (this.startupReminderTimer) {
+      clearTimeout(this.startupReminderTimer);
+      this.startupReminderTimer = null;
+    }
   }
 
   @Cron(CronExpression.EVERY_MINUTE, {

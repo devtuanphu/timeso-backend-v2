@@ -49,14 +49,15 @@ const assignment = (over: Record<string, unknown> = {}) => ({
 
 /**
  * Wires the query-builder calls the method makes, in order: the day's shift
- * count, the active assignment, the approved candidates, then (terminal
- * states only) today's worked total and the upcoming-shift look-ahead, and
- * the already-processed fallback.
+ * count, today's worked total, the active assignment, today's + yesterday's
+ * assignments (approved candidates and finished shifts together), then
+ * (terminal states only) the upcoming-shift look-ahead.
  */
 function build({
   active = null,
   approved = [],
   done = null,
+  loaded,
   workedToday = 0,
   upcoming = [],
   onLeave = false,
@@ -64,6 +65,7 @@ function build({
   active?: unknown;
   approved?: unknown[];
   done?: unknown;
+  loaded?: unknown[];
   workedToday?: number;
   upcoming?: unknown[];
   onLeave?: boolean;
@@ -71,15 +73,15 @@ function build({
   const service = Object.create(StoresService.prototype) as any;
   service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
 
+  const rows = loaded ?? [...approved, ...(done ? [done] : [])];
   const builders = [
-    builderReturning({ getCount: jest.fn().mockResolvedValue(approved.length) }),
-    builderReturning({ getOne: jest.fn().mockResolvedValue(active) }),
-    builderReturning({ getMany: jest.fn().mockResolvedValue(approved) }),
+    builderReturning({ getCount: jest.fn().mockResolvedValue(rows.length) }),
     builderReturning({
       getRawOne: jest.fn().mockResolvedValue({ total: String(workedToday) }),
     }),
+    builderReturning({ getOne: jest.fn().mockResolvedValue(active) }),
+    builderReturning({ getMany: jest.fn().mockResolvedValue(rows) }),
     builderReturning({ getMany: jest.fn().mockResolvedValue(upcoming) }),
-    builderReturning({ getOne: jest.fn().mockResolvedValue(done) }),
   ];
   const queue = [...builders];
   service.shiftAssignmentRepository = {
@@ -354,5 +356,215 @@ describe('getNextShiftAssignment — additive attendance fields', () => {
       'ws.startTime',
       'ASC',
     );
+  });
+});
+
+describe('getNextShiftAssignment — R5: relevant shift, deltas, worked today', () => {
+  afterEach(() => jest.useRealTimers());
+
+  const shiftOn = (
+    id: string,
+    workDate: string,
+    startTime: string,
+    endTime: string,
+    over: Record<string, unknown> = {},
+  ) =>
+    assignment({
+      id,
+      shiftSlot: {
+        id: `slot-${id}`,
+        workDate,
+        location: '',
+        note: '',
+        workShift: { shiftName: `Ca ${id}`, startTime, endTime },
+      },
+      ...over,
+    });
+
+  it('check-in and check-out modes carry workedMinutesToday', async () => {
+    at('2026-09-13T08:00:00Z'); // 15:00 VN
+    const afternoon = shiftOn('pm', '2026-09-13', '16:00', '20:00');
+    const checkIn = await build({
+      approved: [afternoon],
+      workedToday: 240,
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(checkIn).toMatchObject({ mode: 'check-in', workedMinutesToday: 240 });
+
+    const checkOut = await build({
+      active: shiftOn('pm', '2026-09-13', '14:00', '20:00', {
+        status: ShiftAssignmentStatus.CONFIRMED,
+        checkInTime: new Date('2026-09-13T06:50:00Z'),
+      }),
+      workedToday: 240,
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(checkOut).toMatchObject({
+      mode: 'check-out',
+      workedMinutesToday: 240,
+      // 13:50 check-in for a 14:00 shift.
+      earlyArrivalMinutes: 10,
+      overtimeMinutes: 0,
+    });
+  });
+
+  it('done mode reports early arrival and overtime like the result screens', async () => {
+    at('2026-09-13T12:00:00Z'); // 19:00 VN
+    const result = await build({
+      done: shiftOn('am', '2026-09-13', '08:00', '17:00', {
+        status: ShiftAssignmentStatus.COMPLETED,
+        checkInTime: new Date('2026-09-13T00:48:00Z'), // 07:48
+        checkOutTime: new Date('2026-09-13T10:20:00Z'), // 17:20
+        workedMinutes: 572,
+      }),
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(result).toMatchObject({
+      mode: 'done',
+      earlyArrivalMinutes: 12,
+      overtimeMinutes: 20,
+      earlyMinutes: 0,
+    });
+
+    // An automatic check-out is never overtime.
+    const auto = await build({
+      done: shiftOn('am', '2026-09-13', '08:00', '17:00', {
+        status: ShiftAssignmentStatus.COMPLETED,
+        checkInTime: new Date('2026-09-13T01:00:00Z'),
+        checkOutTime: new Date('2026-09-13T10:15:00Z'),
+        isAutoCheckout: true,
+        autoCheckoutReason: 'FORGOT_CHECKOUT',
+      }),
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(auto).toMatchObject({ overtimeMinutes: 0, autoCheckedOut: true });
+  });
+
+  it('a missed morning shift does not hide the afternoon shift completed after it', async () => {
+    at('2026-09-13T12:00:00Z'); // 19:00 VN
+    const morning = shiftOn('am', '2026-09-13', '08:00', '12:00', {
+      attendanceStatus: 'ABSENT',
+    });
+    const afternoon = shiftOn('pm', '2026-09-13', '13:00', '17:00', {
+      status: ShiftAssignmentStatus.COMPLETED,
+      checkInTime: new Date('2026-09-13T06:00:00Z'),
+      checkOutTime: new Date('2026-09-13T10:00:00Z'),
+      workedMinutes: 240,
+    });
+    const result = await build({
+      loaded: [morning, afternoon],
+      workedToday: 240,
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(result).toMatchObject({
+      mode: 'done',
+      assignmentId: 'pm',
+      missed: false,
+      workedMinutesToday: 240,
+    });
+
+    // The other way round: the later missed shift is the one shown.
+    const done = await build({
+      loaded: [
+        shiftOn('am', '2026-09-13', '08:00', '12:00', {
+          status: ShiftAssignmentStatus.COMPLETED,
+          checkInTime: new Date('2026-09-13T01:00:00Z'),
+          checkOutTime: new Date('2026-09-13T05:00:00Z'),
+        }),
+        shiftOn('pm', '2026-09-13', '13:00', '17:00'),
+      ],
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(done).toMatchObject({ mode: 'done', assignmentId: 'pm', missed: true });
+  });
+
+  it("after midnight, yesterday's overnight shift is still returned", async () => {
+    // 01:00 VN on 14/09: yesterday's 22:00-06:00 shift not checked into yet.
+    at('2026-09-13T18:00:00Z');
+    const overnight = shiftOn('night', '2026-09-13', '22:00', '06:00');
+    const service = build({ approved: [overnight] });
+    const running = await service.getNextShiftAssignment('emp-1', 'store-1');
+    expect(running).toMatchObject({
+      mode: 'check-in',
+      assignmentId: 'night',
+      workDate: '2026-09-13',
+    });
+    const loadedQuery = service.builders[3];
+    expect(loadedQuery.andWhere).toHaveBeenCalledWith(
+      'slot.workDate IN (:...workDates)',
+      { workDates: ['2026-09-13', '2026-09-14'] },
+    );
+
+    // 07:00 VN: it ended with an automatic check-out.
+    at('2026-09-14T00:00:00Z');
+    const finished = await build({
+      done: shiftOn('night', '2026-09-13', '22:00', '06:00', {
+        status: ShiftAssignmentStatus.COMPLETED,
+        attendanceStatus: 'FORGOT_CHECKOUT',
+        checkInTime: new Date('2026-09-13T15:00:00Z'),
+        checkOutTime: new Date('2026-09-13T23:15:00Z'),
+        scheduledCheckoutTime: new Date('2026-09-13T23:00:00Z'),
+        isAutoCheckout: true,
+      }),
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(finished).toMatchObject({
+      mode: 'done',
+      assignmentId: 'night',
+      attendanceStatus: 'FORGOT_CHECKOUT',
+    });
+  });
+
+  it("a normal shift of yesterday is not shown today", async () => {
+    at('2026-09-14T01:00:00Z'); // 08:00 VN on 14/09
+    const result = await build({
+      done: shiftOn('y', '2026-09-13', '08:00', '12:00', {
+        status: ShiftAssignmentStatus.COMPLETED,
+        checkInTime: new Date('2026-09-13T01:00:00Z'),
+        checkOutTime: new Date('2026-09-13T05:00:00Z'),
+      }),
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(result.mode).toBe('none');
+    expect(result).toMatchObject({ earlyArrivalMinutes: 0, overtimeMinutes: 0 });
+  });
+
+  it("uses the slot's own times over the work shift's", async () => {
+    at('2026-09-13T02:00:00Z'); // 09:00 VN
+    const result = await build({
+      approved: [
+        assignment({
+          shiftSlot: {
+            ...assignment().shiftSlot,
+            startTime: '10:30:00',
+            endTime: '12:30:00',
+          },
+        }),
+      ],
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(result).toMatchObject({ startTime: '10:30:00', endTime: '12:30:00' });
+  });
+
+  it('a leave-covered shift does not block check-in for the next real shift', async () => {
+    at('2026-09-13T02:00:00Z'); // 09:00 VN
+    const morning = shiftOn('am', '2026-09-13', '08:00', '12:00');
+    const afternoon = shiftOn('pm', '2026-09-13', '12:00', '17:00');
+    const service = build({ approved: [morning, afternoon] });
+    // Only the morning shift is covered by the approved leave.
+    service.dataSource.query = jest.fn(
+      async (_sql: string, params: unknown[]) => [{ covered: params[2] === 'am' }],
+    );
+    expect(await service.getNextShiftAssignment('emp-1', 'store-1')).toMatchObject({
+      mode: 'check-in',
+      assignmentId: 'pm',
+      onLeave: false,
+    });
+  });
+
+  it('returns the leave shift as onLeave when no other shift is actionable', async () => {
+    at('2026-09-13T02:00:00Z'); // 09:00 VN
+    const morning = shiftOn('am', '2026-09-13', '08:00', '12:00');
+    const afternoon = shiftOn('pm', '2026-09-13', '12:00', '17:00');
+    const result = await build({
+      approved: [morning, afternoon],
+      onLeave: true,
+    }).getNextShiftAssignment('emp-1', 'store-1');
+    expect(result).toMatchObject({
+      mode: 'check-in',
+      assignmentId: 'am',
+      onLeave: true,
+    });
   });
 });

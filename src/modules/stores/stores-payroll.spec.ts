@@ -1609,10 +1609,28 @@ describe('StoresService - checkout payroll reads under the payroll lock (C1)', (
   });
 });
 
+const FAKE_TIMER_KEEP_ASYNC = [
+  'nextTick',
+  'setImmediate',
+  'setTimeout',
+  'setInterval',
+  'clearTimeout',
+  'clearInterval',
+  'queueMicrotask',
+] as const;
+
 describe('StoresService - live estimate equals the persisted payslip', () => {
-  afterEach(() => jest.clearAllMocks());
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
 
   it('returns the same net salary that generation writes', async () => {
+    // 25 July VN: July is the current month, shown live.
+    jest.useFakeTimers({
+      now: new Date('2026-07-25T03:00:00Z'),
+      doNotFake: [...FAKE_TIMER_KEEP_ASYNC],
+    });
     const h = await buildPayrollHarness();
     const employee = {
       id: 'emp-1',
@@ -1766,9 +1784,10 @@ describe('StoresService - approved leave is never an absence in payroll (M1)', (
 
   /** 10 worked days plus an APPROVED, never-checked-in shift on LEAVE_DATE. */
   async function run(leaves: any[]) {
-    // Early August (VN): July, including LEAVE_DATE, is in the past.
+    // 31 July, 17:00 VN: LEAVE_DATE is a past date and July is still the
+    // current month (only the current month is shown live).
     jest.useFakeTimers({
-      now: new Date('2026-08-05T03:00:00Z'),
+      now: new Date('2026-07-31T10:00:00Z'),
       doNotFake: [
         'nextTick',
         'setImmediate',
@@ -2161,5 +2180,179 @@ describe('StoresService - payslip recompute after a shift is marked ABSENT', () 
       }),
     ).resolves.toBe('skipped');
     expect(h.repo(EmployeeSalary).update).not.toHaveBeenCalled();
+  });
+});
+
+describe('StoresService - salary screen: current month live, past months stored (R5)', () => {
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.clearAllMocks();
+  });
+
+  const employee = {
+    id: 'emp-1',
+    storeId: 'store-1',
+    employmentStatus: EmploymentStatus.ACTIVE,
+    account: { fullName: 'An' },
+    contracts: [
+      {
+        id: 'contract-1',
+        isActive: true,
+        salaryAmount: 25_000,
+        paymentType: PaymentType.HOUR,
+        // Raised after the stored payslip was last written.
+        allowances: { an: 800_000 },
+      },
+    ],
+  };
+  const bonusRule = {
+    name: 'Thưởng chuyên cần',
+    category: PayrollRuleCategory.BONUS,
+    ruleType: 'ATTENDANCE',
+    calcType: PayrollCalcType.AMOUNT,
+    value: 200_000,
+  };
+
+  async function harness(nowIso: string, rows: any[]) {
+    jest.useFakeTimers({
+      now: new Date(nowIso),
+      doNotFake: [
+        'nextTick',
+        'setImmediate',
+        'setTimeout',
+        'setInterval',
+        'clearTimeout',
+        'clearInterval',
+        'queueMicrotask',
+      ],
+    });
+    const h = await buildPayrollHarness();
+    h.repo(EmployeeProfile).findOne.mockResolvedValue(employee);
+    h.repo(StorePayrollRule).find.mockResolvedValue([bonusRule]);
+    h.repo(StoreShiftConfig).findOne.mockResolvedValue({ daysOff: ['SUNDAY'] });
+    h.repo(ShiftAssignment).createQueryBuilder.mockImplementation(() =>
+      listQuery(rows),
+    );
+    return h;
+  }
+
+  const storedPending = {
+    id: 's1',
+    employeeProfileId: 'emp-1',
+    paymentStatus: PaymentStatus.PENDING,
+    earnedBaseSalary: 900_000,
+    allowances: { an: 500_000 },
+    bonus: 200_000,
+    penalty: 0,
+    advancePayment: 0,
+    otherDeductions: 0,
+    totalIncome: 1_600_000,
+    totalDeductions: 0,
+    netSalary: 1_600_000,
+    employeeProfile: { storeId: 'store-1' },
+  };
+
+  it('current month: allowances rows add up to totalIncome (contract allowances, not the stale jsonb)', async () => {
+    // 10 shifts × 240 min in September; today 22/09 VN.
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(
+        Array.from({ length: 10 }, (_, i) => `2026-09-${String(i + 1).padStart(2, '0')}`),
+      ).map((row) => ({ ...row, workedMinutes: 240 })),
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([{ ...storedPending }]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-09');
+    expect(slip.isEstimate).toBe(true);
+    expect(slip.allowances).toEqual({ an: 800_000 });
+    expect(slip.allowancesTotal).toBe(800_000);
+    expect(slip.earnedBaseSalary).toBe(1_000_000);
+    expect(slip.earnedBaseSalary + slip.allowancesTotal + slip.bonus).toBe(
+      slip.totalIncome,
+    );
+    expect(slip.totalIncome).toBe(2_000_000);
+  });
+
+  it('past month: a PENDING payslip keeps its stored figures (no repricing with today\'s contract)', async () => {
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(['2026-08-03', '2026-08-04']),
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([{ ...storedPending }]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-08');
+    expect(slip).toMatchObject({
+      isEstimate: false,
+      isFinalized: false,
+      earnedBaseSalary: 900_000,
+      allowances: { an: 500_000 },
+      allowancesTotal: 500_000,
+      netSalary: 1_600_000,
+    });
+    expect(h.repo(EmployeeSalary).update).not.toHaveBeenCalled();
+
+    h.repo(EmployeeSalary).findOne.mockResolvedValue({ ...storedPending });
+    const estimate = await h.service.getEstimatedSalary('emp-1', 'store-1', '2026-08');
+    expect(estimate).toMatchObject({ estimatedSalary: 1_600_000, isFinalized: false });
+  });
+
+  it('current month with no payslip row: one live estimate row equal to the Home estimate', async () => {
+    const h = await harness(
+      '2026-09-02T03:00:00Z',
+      completedOn(['2026-09-01']).map((row) => ({ ...row, workedMinutes: 240 })),
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([]);
+    const rows: any[] = await h.service.getEmployeeSalaries('emp-1', '09/2026');
+    expect(rows).toHaveLength(1);
+    const [row] = rows;
+    const estimate = await h.service.getEstimatedSalary('emp-1', 'store-1', '2026-09');
+    expect(row).toMatchObject({
+      id: null,
+      isEstimate: true,
+      isFinalized: false,
+      employeeProfileId: 'emp-1',
+      paymentStatus: PaymentStatus.PENDING,
+      earnedBaseSalary: 100_000,
+      allowancesTotal: 800_000,
+      bonus: 200_000,
+      netSalary: estimate.estimatedSalary,
+    });
+    expect(row.employeeProfile).toMatchObject({ account: { fullName: 'An' } });
+    expect(row.adjustmentBreakdown).toEqual([
+      expect.objectContaining({ kind: 'BONUS', ruleType: 'ATTENDANCE', amount: 200_000 }),
+    ]);
+    // Nothing is written.
+    expect(h.repo(EmployeeSalary).save).not.toHaveBeenCalled();
+    expect(h.repo(EmployeeSalary).update).not.toHaveBeenCalled();
+  });
+
+  it('a past month with no payslip row stays empty', async () => {
+    const h = await harness('2026-09-22T03:00:00Z', []);
+    h.repo(EmployeeSalary).find.mockResolvedValue([]);
+    await expect(h.service.getEmployeeSalaries('emp-1', '2026-08')).resolves.toEqual([]);
+  });
+
+  it('an empty month earns no attendance bonus', async () => {
+    const h = await harness('2026-10-01T03:00:00Z', []);
+    h.repo(EmployeeSalary).find.mockResolvedValue([]);
+    const [row]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-10');
+    expect(row).toMatchObject({ bonus: 0, earnedBaseSalary: 0, netSalary: 800_000 });
+    expect(row.adjustmentBreakdown).toEqual([]);
+  });
+});
+
+describe('StoresService - new stores get no default bonus/fine rules (R5)', () => {
+  it('seeds only benefit rules', async () => {
+    const h = await buildPayrollHarness();
+    await h.service.createDefaultPayrollSetting('store-1');
+    const created = h
+      .repo(StorePayrollRule)
+      .create.mock.calls.map(([rule]: any[]) => rule);
+    expect(created.length).toBeGreaterThan(0);
+    expect(
+      created.filter(
+        (rule: any) =>
+          rule.category === PayrollRuleCategory.BONUS ||
+          rule.category === PayrollRuleCategory.FINE,
+      ),
+    ).toEqual([]);
   });
 });

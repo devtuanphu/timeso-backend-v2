@@ -35,10 +35,14 @@ import {
 import { calculateShiftEarnings } from './shift-earnings.utils';
 import { countWorkingDaysInMonth } from './working-days.utils';
 import {
+  toMonthMarker,
   vnDateString,
   vnMiddayInstant,
   vnMonthOfDateString,
 } from '../../common/utils/vn-calendar';
+import { SalaryAdjustment } from './entities/salary-adjustment.entity';
+import { pickDayOwnerAssignmentIds } from './payroll-calculation.utils';
+import { resolveShiftBoundaries } from './attendance-time.utils';
 
 
 // ── Helper Maps ────────────────────────────────────────────────────────────────
@@ -191,6 +195,12 @@ export interface EmployeeScheduleDay {
     startTime: string;
     endTime: string;
     hours: number | null;
+    /**
+     * Exact minutes behind `hours` (which is rounded to 0.1 h): worked minutes
+     * for a completed shift, scheduled minutes otherwise, 0 when absent or on
+     * leave without a check-in.
+     */
+    minutes: number;
     salary: number;
     status: string;
     location: string | null;
@@ -201,7 +211,27 @@ export interface EmployeeScheduleDay {
     attendanceStatus: string | null;
     /** Ca được phủ bởi đơn nghỉ cả ngày đã duyệt (nghỉ có phép). */
     onLeave: boolean;
+    /**
+     * Pay this shift earned, as payroll pays it: COMPLETED shifts only (the
+     * stored per-shift figure, or — until the check-out payroll job stored it
+     * — the same formula from worked hours, with the MONTH one-shift-per-day
+     * rule). null for any shift not completed.
+     */
+    earnedSalary: number | null;
+    /** COMPLETED but the stored figure is not written yet (earnedSalary is computed). */
+    earningsPending: boolean;
+    /** Approved, never checked in, and ended (or marked ABSENT): nghỉ không phép. */
+    isAbsent: boolean;
+    /**
+     * Short Vietnamese attendance text for the calendar: 'Đúng giờ',
+     * 'Đi trễ', 'Về sớm', 'Đi trễ · Về sớm', 'Quên chấm công ra',
+     * 'Nghỉ không phép', 'Nghỉ phép', 'Đang làm việc'; null when nothing
+     * happened yet (upcoming shift).
+     */
+    attendanceLabel: string | null;
   }[];
+  /** Sum of the day's earnedSalary (completed shifts only), whole VND. */
+  earnedTotal: number;
 }
 
 export interface EmployeeScheduleGridResponse {
@@ -215,9 +245,18 @@ export interface EmployeeScheduleGridResponse {
   };
   schedule: EmployeeScheduleDay[];
   summary: {
+    /** Hours of the range: worked for completed, scheduled for upcoming; absent/leave excluded. */
     totalHoursPerWeek: number;
+    /** Exact minutes behind totalHoursPerWeek (sum of each shift's `minutes`, no rounding). */
+    totalMinutes: number;
+    /** Actual worked minutes of completed shifts in the range (no scheduled time), exact. */
+    workedMinutes: number;
+    /** Distinct days with a shift that is not absent and not on leave. */
     daysPerWeek: number;
+    /** Sum of `salary`: earned for completed, estimate for upcoming; absent/leave excluded. */
     salaryPerWeek: number;
+    /** Sum of earnedSalary: what payroll pays for the range so far. */
+    earnedPerWeek: number;
   };
 }
 
@@ -280,6 +319,8 @@ export class ShiftAggregationService {
     private readonly payrollRuleRepo: Repository<StorePayrollRule>,
     @InjectRepository(StoreShiftConfig)
     private readonly shiftConfigRepo: Repository<StoreShiftConfig>,
+    @InjectRepository(SalaryAdjustment)
+    private readonly salaryAdjustmentRepo?: Repository<SalaryAdjustment>,
   ) { }
 
   // ── 1. List Shift Slots ────────────────────────────────────────────────────
@@ -876,6 +917,64 @@ export class ShiftAggregationService {
     const today = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Ho_Chi_Minh',
     }).format(new Date());
+    const nowMs = Date.now();
+
+    const onLeaveOf = (a: ShiftAssignment) => {
+      const dateStr = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+      return approvedLeaves.some((leave) => leaveCoversShift(leave, dateStr, a.id));
+    };
+    const earned = await this.computeEarnedSalaries(assignments, daysOff);
+
+    const presentShift = (a: ShiftAssignment, dateStr: string) => {
+      const onLeave = onLeaveOf(a);
+      const isAbsent = this.isAbsentAssignment(a, onLeave, nowMs);
+      const completed = a.status === ShiftAssignmentStatus.COMPLETED;
+      const earnedSalary = completed ? (earned.get(a.id)?.amount ?? 0) : null;
+      // Not paid: absent, or covered by an approved leave without a check-in.
+      const unpaid = isAbsent || (onLeave && !a.checkInTime);
+      const minutes = unpaid
+        ? 0
+        : completed
+          ? Math.max(0, Math.round(Number(a.workedMinutes) || 0))
+          : this.assignmentMinutes(a);
+      const hours = unpaid
+        ? 0
+        : completed
+          ? Math.round((minutes / 60) * 10) / 10
+          : this.assignmentHours(a);
+      const salary = unpaid
+        ? 0
+        : completed
+          ? (earnedSalary ?? 0)
+          : this.estimateAssignmentSalary(a, undefined, daysOff);
+      return {
+        id: a.shiftSlotId,
+        assignmentId: a.id,
+        slotId: a.shiftSlotId,
+        type: this.inferShiftType(
+          a.shiftSlot?.workShift?.shiftName || '',
+          a.shiftSlot?.workShift?.startTime || '',
+        ),
+        shiftName: a.shiftSlot?.workShift?.shiftName || 'Ca làm',
+        startTime:
+          a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '',
+        endTime: a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || '',
+        hours,
+        minutes,
+        salary,
+        status: a.status,
+        location: a.shiftSlot?.location || null,
+        attendanceStatus: a.attendanceStatus ?? null,
+        onLeave,
+        earnedSalary,
+        earningsPending: completed ? (earned.get(a.id)?.pending ?? false) : false,
+        isAbsent,
+        attendanceLabel: this.attendanceLabel(a, onLeave, isAbsent),
+        _dateStr: dateStr,
+        _unpaid: unpaid,
+        _completed: completed,
+      };
+    };
 
     const schedule: EmployeeScheduleDay[] = dateRange.map((date) => {
       const dateStr = date.toISOString().split('T')[0];
@@ -885,6 +984,7 @@ export class ShiftAggregationService {
       const dayOfWeek = new Date(dateStr)
         .toLocaleDateString('en-US', { weekday: 'long' })
         .toUpperCase();
+      const shifts = dayAssignments.map((a) => presentShift(a, dateStr));
 
       return {
         date: dateStr,
@@ -897,39 +997,29 @@ export class ShiftAggregationService {
             String(leave.startDate).slice(0, 10) <= dateStr &&
             String(leave.endDate).slice(0, 10) >= dateStr,
         ),
-        shifts: dayAssignments.map((a) => ({
-          id: a.shiftSlotId,
-          assignmentId: a.id,
-          slotId: a.shiftSlotId,
-          type: this.inferShiftType(
-            a.shiftSlot?.workShift?.shiftName || '',
-            a.shiftSlot?.workShift?.startTime || '',
-          ),
-          shiftName: a.shiftSlot?.workShift?.shiftName || 'Ca làm',
-          startTime:
-            a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '',
-          endTime:
-            a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || '',
-          hours: this.assignmentHours(a),
-          salary: this.estimateAssignmentSalary(a, undefined, daysOff),
-          status: a.status,
-          location: a.shiftSlot?.location || null,
-          attendanceStatus: a.attendanceStatus ?? null,
-          onLeave: approvedLeaves.some((leave) =>
-            leaveCoversShift(leave, dateStr, a.id),
-          ),
-        })),
+        shifts: shifts.map(
+          ({ _dateStr, _unpaid, _completed, ...shift }) => shift,
+        ),
+        earnedTotal: shifts.reduce(
+          (sum, shift) => sum + (shift.earnedSalary ?? 0),
+          0,
+        ),
       };
     });
 
-    const totalHours = assignments.reduce(
-      (sum, a) => sum + this.assignmentHours(a),
-      0,
+    const allShifts = assignments.map((a) =>
+      presentShift(a, String(a.shiftSlot?.workDate ?? '').slice(0, 10)),
     );
-    const workingDays = new Set(assignments.map((a) => a.shiftSlot?.workDate))
-      .size;
-    const totalSalary = assignments.reduce(
-      (sum, a) => sum + this.estimateAssignmentSalary(a, undefined, daysOff),
+    const counted = allShifts.filter((shift) => !shift._unpaid);
+    const totalHours = counted.reduce((sum, shift) => sum + (shift.hours || 0), 0);
+    const totalMinutes = counted.reduce((sum, shift) => sum + shift.minutes, 0);
+    const workedMinutes = counted
+      .filter((shift) => shift._completed)
+      .reduce((sum, shift) => sum + shift.minutes, 0);
+    const workingDays = new Set(counted.map((shift) => shift._dateStr)).size;
+    const totalSalary = counted.reduce((sum, shift) => sum + shift.salary, 0);
+    const totalEarned = allShifts.reduce(
+      (sum, shift) => sum + (shift.earnedSalary ?? 0),
       0,
     );
 
@@ -945,8 +1035,11 @@ export class ShiftAggregationService {
       schedule,
       summary: {
         totalHoursPerWeek: Math.round(totalHours * 10) / 10,
+        totalMinutes,
+        workedMinutes,
         daysPerWeek: workingDays,
         salaryPerWeek: Math.round(totalSalary),
+        earnedPerWeek: Math.round(totalEarned),
       },
     };
   }
@@ -957,6 +1050,26 @@ export class ShiftAggregationService {
    * Số giờ theo lịch của 1 slot (không phải giờ thực làm).
    * Dùng cho ước tính lương HOUR và tổng-giờ-dự-kiến. Xử lý ca qua nửa đêm.
    */
+  private slotDurationMinutes(slot?: ShiftSlot | null): number {
+    if (!slot) return 0;
+    const startTime = slot.startTime || slot.workShift?.startTime || '';
+    const endTime = slot.endTime || slot.workShift?.endTime || '';
+    if (!startTime || !endTime) return 0;
+    const start = new Date(`1970-01-01T${startTime}Z`).getTime();
+    let end = new Date(`1970-01-01T${endTime}Z`).getTime();
+    if (Number.isNaN(start) || Number.isNaN(end)) return 0;
+    if (end < start) end += 24 * 60 * 60 * 1000;
+    return Math.round((end - start) / 60000);
+  }
+
+  /** Exact-minute counterpart of assignmentHours (no 0.1 h rounding). */
+  private assignmentMinutes(a: ShiftAssignment, slot?: ShiftSlot | null): number {
+    if (a.workedMinutes && a.workedMinutes > 0) {
+      return Math.round(a.workedMinutes);
+    }
+    return this.slotDurationMinutes(slot || a.shiftSlot);
+  }
+
   private slotDurationHours(slot?: ShiftSlot | null): number {
     if (!slot) return 0;
     const startTime = slot.startTime || slot.workShift?.startTime || '';
@@ -1025,6 +1138,133 @@ export class ShiftAggregationService {
         workingDaysInMonth: this.workingDaysFor(workDate, daysOff),
       }) ?? 0
     );
+  }
+
+  /**
+   * Approved, never checked in, not on approved leave, and either marked
+   * ABSENT or past its end: payroll counts it absent and pays nothing.
+   */
+  private isAbsentAssignment(
+    a: ShiftAssignment,
+    onLeave: boolean,
+    nowMs: number,
+  ): boolean {
+    if (a.status !== ShiftAssignmentStatus.APPROVED || a.checkInTime || onLeave) {
+      return false;
+    }
+    if (a.attendanceStatus === AttendanceStatus.ABSENT) return true;
+    const slot = a.shiftSlot;
+    const { end } = resolveShiftBoundaries(
+      String(slot?.workDate ?? '').slice(0, 10),
+      slot?.startTime || slot?.workShift?.startTime,
+      slot?.endTime || slot?.workShift?.endTime,
+    );
+    return end !== null && end.getTime() <= nowMs;
+  }
+
+  /** Short attendance text for the calendar (see EmployeeScheduleDay). */
+  private attendanceLabel(
+    a: ShiftAssignment,
+    onLeave: boolean,
+    isAbsent: boolean,
+  ): string | null {
+    if (isAbsent) return 'Nghỉ không phép';
+    if (onLeave && !a.checkInTime) return 'Nghỉ phép';
+    switch (a.attendanceStatus) {
+      case AttendanceStatus.FORGOT_CHECKOUT:
+        return 'Quên chấm công ra';
+      case AttendanceStatus.LATE_AND_EARLY:
+        return 'Đi trễ · Về sớm';
+      case AttendanceStatus.LATE:
+        return a.checkInTime && !a.checkOutTime ? 'Đang làm việc' : 'Đi trễ';
+      case AttendanceStatus.EARLY:
+        return 'Về sớm';
+      case AttendanceStatus.ABSENT:
+        return 'Nghỉ không phép';
+      default:
+        break;
+    }
+    if (a.checkInTime && !a.checkOutTime) return 'Đang làm việc';
+    if (a.status === ShiftAssignmentStatus.COMPLETED) return 'Đúng giờ';
+    return null;
+  }
+
+  /**
+   * Earned pay of every COMPLETED assignment, as payroll computes it: the
+   * stored `shiftEarnings` (written by the check-out payroll job); when not
+   * stored yet, the same calculateShiftEarnings call the job makes — worked
+   * hours, the month's rate (latest salary adjustment of that month, else the
+   * contract), the store's working days, and for MONTH the day-owner rule
+   * (only the earliest completed shift of a day carries the day rate).
+   */
+  private async computeEarnedSalaries(
+    assignments: ShiftAssignment[],
+    daysOff: WeekDay[] | null,
+  ): Promise<Map<string, { amount: number; pending: boolean }>> {
+    const result = new Map<string, { amount: number; pending: boolean }>();
+    const completed = assignments.filter(
+      (a) => a.status === ShiftAssignmentStatus.COMPLETED,
+    );
+    const pending = completed.filter((a) => a.shiftEarnings == null);
+    for (const a of completed) {
+      if (a.shiftEarnings != null) {
+        result.set(a.id, { amount: Math.round(Number(a.shiftEarnings) || 0), pending: false });
+      }
+    }
+    if (!pending.length) return result;
+
+    const owners = pickDayOwnerAssignmentIds(
+      completed.map((a) => ({
+        id: a.id,
+        workDate: String(a.shiftSlot?.workDate ?? '').slice(0, 10),
+        status: a.status,
+        checkInTime: a.checkInTime,
+      })),
+    );
+    // Salary adjustments of the months involved (bounded: the grid range).
+    const employeeId = pending[0].employeeId;
+    const monthKeys = [
+      ...new Set(
+        pending
+          .map((a) => vnMonthOfDateString(String(a.shiftSlot?.workDate ?? '')))
+          .filter((m): m is NonNullable<typeof m> => !!m)
+          .map((m) => m.key),
+      ),
+    ];
+    const rateByMonth = new Map<string, number>();
+    if (this.salaryAdjustmentRepo && employeeId && monthKeys.length) {
+      for (const key of monthKeys) {
+        const month = vnMonthOfDateString(key)!;
+        const adjustment = await this.salaryAdjustmentRepo.findOne({
+          where: { employeeProfileId: employeeId, effectiveMonth: toMonthMarker(month) },
+          order: { createdAt: 'DESC' },
+        });
+        if (adjustment) {
+          const rate = Number(adjustment.newSalary);
+          if (Number.isFinite(rate)) rateByMonth.set(key, rate);
+        }
+      }
+    }
+
+    for (const a of pending) {
+      const contract = (a.employee as any)?.contracts?.find((c: any) => c.isActive);
+      const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+      const monthKey = vnMonthOfDateString(workDate)?.key;
+      const adjusted = monthKey ? rateByMonth.get(monthKey) : undefined;
+      const rate = adjusted ?? (Number(contract?.salaryAmount) || 0);
+      const amount = contract
+        ? (calculateShiftEarnings({
+            paymentType: contract.paymentType,
+            baseSalary: rate,
+            hours: (Number(a.workedMinutes) || 0) / 60,
+            referenceDate: vnMiddayInstant(workDate),
+            workingDaysInMonth: this.workingDaysFor(workDate, daysOff),
+            countsAsWorkedDay: owners.has(a.id),
+          }) ?? 0)
+        : 0;
+      result.set(a.id, { amount, pending: true });
+    }
+    return result;
   }
 
   /** The store's weekly days off (null when it has no shift config). */

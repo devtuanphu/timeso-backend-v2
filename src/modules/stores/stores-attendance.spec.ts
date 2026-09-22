@@ -702,6 +702,31 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
     });
 
+    it('a duplicate check-in after an early first one still reports the early minutes', async () => {
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        id: 'a1',
+        // 07:48 VN for an 08:00 shift.
+        checkInTime: new Date('2026-09-22T00:48:00Z'),
+        lateMinutes: 0,
+        attendanceStatus: 'ON_TIME',
+        status: ShiftAssignmentStatus.CONFIRMED,
+        employee: selfEmployee,
+        shiftSlot: {
+          workDate: '2026-09-22',
+          workShift: { startTime: '08:00:00', endTime: '17:00:00' },
+        },
+      });
+      await expect(
+        service.checkInWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).resolves.toEqual(
+        expect.objectContaining({
+          alreadyRecorded: true,
+          earlyArrivalMinutes: 12,
+          lateMinutes: 0,
+        }),
+      );
+    });
+
     it('should reject if assignment not APPROVED', async () => {
       shiftAssignmentRepo.findOne.mockResolvedValue({
         id: 'a1',
@@ -792,6 +817,38 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       await expect(
         service.checkOutWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
       ).resolves.toEqual(expect.objectContaining({ alreadyRecorded: true }));
+    });
+
+    it('a duplicate check-out after a late first one still reports the overtime minutes', async () => {
+      const recorded = {
+        id: 'a1',
+        checkInTime: new Date('2026-09-22T01:00:00Z'),
+        // 17:20 VN for a shift ending at 17:00.
+        checkOutTime: new Date('2026-09-22T10:20:00Z'),
+        earlyMinutes: 0,
+        workedMinutes: 560,
+        status: ShiftAssignmentStatus.COMPLETED,
+        employee: selfEmployee,
+        shiftSlot: {
+          workDate: '2026-09-22',
+          workShift: { startTime: '08:00:00', endTime: '17:00:00' },
+        },
+      };
+      shiftAssignmentRepo.findOne.mockResolvedValue(recorded);
+      await expect(
+        service.checkOutWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).resolves.toEqual(
+        expect.objectContaining({ alreadyRecorded: true, overtimeMinutes: 20 }),
+      );
+      // An automatic check-out is never overtime.
+      shiftAssignmentRepo.findOne.mockResolvedValue({
+        ...recorded,
+        isAutoCheckout: true,
+        autoCheckoutReason: 'FORGOT_CHECKOUT',
+      });
+      await expect(
+        service.checkOutWithFace('a1', Buffer.from('fake'), SELF_ACCOUNT),
+      ).resolves.toEqual(expect.objectContaining({ overtimeMinutes: 0 }));
     });
 
     it('should reject a caller who does not own the assignment', async () => {

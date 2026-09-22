@@ -100,10 +100,16 @@ describe('getEmployeeShiftHours rows', () => {
       statusKeys: ['late', 'early'],
     });
     expect(byId.auto).toMatchObject({
-      status: 'Quên chấm công',
+      status: 'Quên chấm công ra',
       autoCheckedOut: true,
       overtimeMinutes: 0,
       scheduledCheckoutTime: '2026-09-10T05:00:00.000Z',
+    });
+    // 272 + 0 + 0 worked minutes: legacy hours/remainder plus the exact total.
+    expect(result).toMatchObject({
+      totalHours: 4,
+      totalMinutes: 32,
+      totalWorkedMinutes: 272,
     });
     expect(result.tabCounts).toMatchObject({
       overtime: 1,

@@ -1141,6 +1141,21 @@ describe('StoresService - Shift & Bonus Request Features', () => {
         service.approveBonusWorkRequest('bonus-1', undefined),
       ).rejects.toThrow(ForbiddenException);
     });
+
+    it('refuses a cancelled or expired request (m4)', async () => {
+      const mockRequest = {
+        id: 'bonus-1',
+        storeId: 'store-1',
+        status: BonusWorkRequestStatus.CANCELLED,
+      };
+      bonusWorkRepo.findOne.mockResolvedValue(mockRequest);
+
+      await expect(
+        service.approveBonusWorkRequest('bonus-1', 'owner-1'),
+      ).rejects.toThrow(BadRequestException);
+      expect(mockRequest.status).toBe(BonusWorkRequestStatus.CANCELLED);
+      expect(bonusWorkRepo.save).not.toHaveBeenCalled();
+    });
   });
 
   describe('rejectBonusWorkRequest', () => {

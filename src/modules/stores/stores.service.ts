@@ -286,6 +286,7 @@ import {
   computeNetFromIncome,
   computePayslip,
   computeRuleAdjustmentBreakdown,
+  sumAllowances,
   PayslipAdjustmentLine,
   computePayslipTotals,
   MonthlyAttendanceFacts,
@@ -1307,52 +1308,13 @@ export class StoresService {
     });
     const savedSetting = await this.payrollSettingRepository.save(setting);
 
-    // 1. Create Default Rules (Bonuses, Fines, Benefits)
+    // 1. Default rules: benefits only. Bonus and fine rules are no longer
+    // seeded — they were paid/charged before the owner ever configured them
+    // (a 200.000đ "Thưởng chuyên cần" on an empty month). Owners add their own
+    // bonus/fine rules in the payroll settings.
+    // scripts/deactivate_seeded_payroll_rules.sql retires the untouched
+    // copies already seeded for existing stores.
     const defaultRules = [
-      // Bonuses
-      {
-        name: 'Thưởng chuyên cần',
-        category: PayrollRuleCategory.BONUS,
-        ruleType: 'ATTENDANCE',
-        calcType: PayrollCalcType.AMOUNT,
-        value: 200000,
-      },
-      {
-        name: 'Thưởng hiệu suất',
-        category: PayrollRuleCategory.BONUS,
-        ruleType: 'KPI',
-        calcType: PayrollCalcType.AMOUNT,
-        value: 200000,
-      },
-      // Fines
-      {
-        name: 'Vi phạm nội quy',
-        category: PayrollRuleCategory.FINE,
-        ruleType: 'DISCIPLINE',
-        calcType: PayrollCalcType.AMOUNT,
-        value: 200000,
-      },
-      {
-        name: 'Vi phạm đi trễ - về sớm',
-        category: PayrollRuleCategory.FINE,
-        ruleType: 'LATE_EARLY',
-        calcType: PayrollCalcType.AMOUNT,
-        value: 50000,
-      },
-      {
-        name: 'Không check in-out',
-        category: PayrollRuleCategory.FINE,
-        ruleType: 'MISSING_CHECK',
-        calcType: PayrollCalcType.AMOUNT,
-        value: 200000,
-      },
-      {
-        name: 'Vắng mặt không phép',
-        category: PayrollRuleCategory.FINE,
-        ruleType: 'ABSENT',
-        calcType: PayrollCalcType.SHIFT,
-        value: 1,
-      },
       // Benefits
       {
         name: 'Làm việc ngày tết',
@@ -6623,9 +6585,11 @@ export class StoresService {
       const who = profile?.account?.fullName?.trim() || 'Một nhân viên';
       const shiftName = slot?.workShift?.shiftName || 'ca làm việc';
       // "hôm nay (18/09)" / "ngày mai (19/09)" / "ngày 25/09" thay cho ngày thô YYYY-MM-DD.
-      const when = slot?.workDate
-        ? ` ${describeWorkDate(String(slot.workDate))}`
+      const workDate = slot?.workDate
+        ? String(slot.workDate).slice(0, 10)
         : '';
+      const dated = /^\d{4}-\d{2}-\d{2}$/.test(workDate);
+      const when = dated ? ` ${describeWorkDate(workDate)}` : '';
 
       await this.notificationsService.create({
         accountId: store.ownerAccountId,
@@ -6641,6 +6605,8 @@ export class StoresService {
           storeId,
           slotId,
           employeeProfileId: employeeId,
+          // Lets the list re-label "hôm nay / ngày mai" at read time.
+          ...(dated ? { workDate, workDates: [workDate] } : {}),
         },
       });
     } catch (error) {
@@ -9085,37 +9051,66 @@ export class StoresService {
       ],
     });
     if (!vnMonth) return rows;
-    // One month = at most one payslip: show it live, like the Home estimate.
+    // One month = at most one payslip. Only the current VN month is shown
+    // live; a past month keeps what was stored (never repriced with today's
+    // contract, rate or rules).
     const selectedMonth = vnMonth;
+    const isCurrentMonth = selectedMonth.key === vnMonthOf().key;
+    if (!rows.length) {
+      // No payslip row yet (e.g. the first days of the month, before any
+      // check-out): the same live estimate as the Home card, so the salary
+      // screen is not empty while Home shows a number. Never written.
+      if (!isCurrentMonth) return [];
+      const estimate = await this.buildEstimatePayslipRow(
+        employeeProfileId,
+        selectedMonth,
+      );
+      return estimate ? [estimate] : [];
+    }
     return Promise.all(
-      rows.map((row) => this.presentPayslipForMonth(row, selectedMonth)),
+      rows.map((row) =>
+        this.presentPayslipForMonth(row, selectedMonth, isCurrentMonth),
+      ),
     );
   }
 
   /**
    * A payslip as the salary screen shows it for one month.
    *
-   * - Not finalized (PENDING/REJECTED): the figures are recomputed live with
-   *   the same composer as the Home estimate and recalculation, so both
-   *   screens agree (for example an absence fine applied before the payslip
-   *   is next rewritten). Read-only: nothing is written; `isEstimate: true`.
-   * - APPROVED/PAID: the stored figures, `isEstimate: false`.
+   * - Current VN month, not finalized (PENDING/REJECTED): the figures are
+   *   recomputed live with the same composer as the Home estimate and
+   *   recalculation, so both screens agree (for example an absence fine
+   *   applied before the payslip is next rewritten). Read-only: nothing is
+   *   written; `isEstimate: true`.
+   * - APPROVED/PAID, or any month before the current VN month: the stored
+   *   figures, `isEstimate: false`.
    *
    * `adjustmentBreakdown` lists the automatic bonus/fine lines; it is null
    * when it cannot be shown to add up to the payslip's bonus and penalty.
+   * `allowancesTotal` is the sum of the returned `allowances`, which always
+   * add up with earnedBaseSalary + bonus to totalIncome.
    */
   private async presentPayslipForMonth(
     row: EmployeeSalary,
     month: VnMonth,
+    isCurrentMonth = true,
   ): Promise<
     EmployeeSalary & {
       isEstimate: boolean;
+      isFinalized: boolean;
+      allowancesTotal: number;
       adjustmentBreakdown: PayslipAdjustmentLine[] | null;
     }
   > {
+    const isFinalized = this.isProtectedPayslip(row);
     const storeId = row.employeeProfile?.storeId;
     if (!storeId) {
-      return { ...row, isEstimate: false, adjustmentBreakdown: null } as any;
+      return Object.assign(row, {
+        isEstimate: false,
+        isFinalized,
+        allowancesTotal: sumAllowances(row.allowances),
+        adjustmentBreakdown: null,
+      });
     }
     const live = await this.composeLivePayslip(
       row.employeeProfileId,
@@ -9123,7 +9118,7 @@ export class StoresService {
       month,
       row,
     );
-    if (this.isProtectedPayslip(row)) {
+    if (isFinalized || !isCurrentMonth) {
       const lines = computeRuleAdjustmentBreakdown(
         live.rules,
         live.facts,
@@ -9138,14 +9133,31 @@ export class StoresService {
         sum('FINE') === Math.round(Number(row.penalty) || 0);
       return Object.assign(row, {
         isEstimate: false,
+        isFinalized,
+        allowancesTotal: sumAllowances(row.allowances),
         adjustmentBreakdown: consistent ? lines : null,
       });
     }
     const payslip = live.payslip;
-    return Object.assign(row, {
+    return Object.assign(row, this.livePayslipFields(live), {
+      isEstimate: true,
+      isFinalized: false,
+      allowancesTotal: payslip.allowancesTotal,
+    });
+  }
+
+  /** The money/attendance fields of a live payslip, as the screen reads them. */
+  private livePayslipFields(
+    live: Awaited<ReturnType<StoresService['composeLivePayslip']>>,
+  ) {
+    const payslip = live.payslip;
+    return {
       baseSalary: payslip.baseSalary,
       paymentType: payslip.paymentType,
       earnedBaseSalary: payslip.earnedBaseSalary,
+      // The allowances the live income was computed from (the contract's),
+      // not the stored jsonb, so Phụ cấp + earned + bonus = totalIncome.
+      allowances: (live.contract?.allowances ?? {}) as Record<string, number>,
       bonus: payslip.bonus,
       penalty: payslip.penalty,
       workingDays: payslip.workingDays,
@@ -9156,13 +9168,50 @@ export class StoresService {
       totalIncome: payslip.totalIncome,
       totalDeductions: payslip.totalDeductions,
       netSalary: payslip.netSalary,
-      isEstimate: true,
       adjustmentBreakdown: computeRuleAdjustmentBreakdown(
         live.rules,
         live.facts,
         payslip.earnedBaseSalary,
       ),
+    };
+  }
+
+  /**
+   * A not-yet-stored payslip for the current month, built by the live
+   * composer (`id: null`, `isEstimate: true`). Read-only.
+   */
+  private async buildEstimatePayslipRow(
+    employeeProfileId: string,
+    month: VnMonth,
+  ) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: employeeProfileId },
+      relations: ['account', 'storeRole', 'employeeType'],
     });
+    if (!profile?.storeId) return null;
+    const live = await this.composeLivePayslip(
+      employeeProfileId,
+      profile.storeId,
+      month,
+      null,
+    );
+    return {
+      id: null,
+      employeeProfileId,
+      employeeProfile: profile,
+      monthlyPayrollId: null,
+      monthlyPayroll: null,
+      month: toMonthMarker(month),
+      paymentStatus: PaymentStatus.PENDING,
+      approvedBy: null,
+      approvedAt: null,
+      paidAt: null,
+      notes: null,
+      ...this.livePayslipFields(live),
+      isEstimate: true,
+      isFinalized: false,
+      allowancesTotal: live.payslip.allowancesTotal,
+    };
   }
 
   /**
@@ -9205,7 +9254,13 @@ export class StoresService {
       existingSalaryId: existing?.id ?? null,
       otherDeductions: existing?.otherDeductions,
     });
-    return { facts, payslip, rules, standardWorkingDays };
+    return {
+      facts,
+      payslip,
+      rules,
+      standardWorkingDays,
+      contract: activeContract,
+    };
   }
 
   async getEmployeeSalaryById(id: string) {
@@ -9251,7 +9306,11 @@ export class StoresService {
     const existing = await this.employeeSalaryRepository.findOne({
       where: { employeeProfileId, month: toMonthMarker(month) },
     });
-    if (existing && this.isProtectedPayslip(existing)) {
+    // A finalized payslip, or any stored payslip of a month before the
+    // current VN month, is shown as stored (never repriced with today's
+    // contract): only the current month is estimated live.
+    const isCurrentMonth = month.key === vnMonthOf().key;
+    if (existing && (this.isProtectedPayslip(existing) || !isCurrentMonth)) {
       const facts = summarizeMonthlyAttendance(
         await this.loadMonthlyAssignments(employeeProfileId, storeId, month),
         vnDateString(),
@@ -9263,7 +9322,7 @@ export class StoresService {
         workingHours: facts.workingHours,
         daysWorked: facts.daysWorked,
         standardWorkingDays,
-        isFinalized: true,
+        isFinalized: this.isProtectedPayslip(existing),
         month: month.label,
       };
     }
@@ -15721,7 +15780,7 @@ export class StoresService {
           statusKeys.push('absent');
           break;
         case AttendanceStatus.FORGOT_CHECKOUT:
-          status = 'Quên chấm công';
+          status = 'Quên chấm công ra';
           statusColor = '#F95555';
           tabCounts.forgot++;
           statusKeys.push('forgot');
@@ -15787,7 +15846,10 @@ export class StoresService {
     return {
       completedShifts,
       totalHours: Math.floor(totalMinutes / 60),
+      // Legacy: the minutes part left over after totalHours (0-59).
       totalMinutes: totalMinutes % 60,
+      // Exact worked minutes of the month (all listed shifts, before the tab filter).
+      totalWorkedMinutes: totalMinutes,
       shiftsTrend: 0,
       hoursTrend: 0,
       shifts: filteredShifts,
@@ -16528,6 +16590,13 @@ export class StoresService {
     if (!request)
       throw new NotFoundException('Không tìm thấy yêu cầu bổ sung công');
     await this.assertOwnerStoreAccess(request.storeId, ownerAccountId);
+    // Withdrawn by the employee, or expired when the shift was auto-closed
+    // before approval (never paid): no longer reviewable.
+    if (request.status === BonusWorkRequestStatus.CANCELLED) {
+      throw new BadRequestException(
+        'Yêu cầu đã bị hủy hoặc đã hết hạn, không thể duyệt',
+      );
+    }
     const approverProfile = await this.profileRepository.findOne({
       where: { accountId: ownerAccountId, storeId: request.storeId },
       select: ['id'],
@@ -16912,6 +16981,9 @@ export class StoresService {
         matched: true,
         alreadyRecorded: true,
         lateMinutes: assignment.lateMinutes,
+        // A duplicate submit shows the same "Sớm X" as the first response.
+        earlyArrivalMinutes:
+          this.storedAttendanceDeltas(assignment).earlyArrivalMinutes,
         attendanceStatus: assignment.attendanceStatus,
         checkInTime: assignment.checkInTime.toISOString(),
         gpsDistance: null,
@@ -17052,6 +17124,12 @@ export class StoresService {
         alreadyRecorded: true,
         distance: matchResult.distance,
         lateMinutes: persistence.assignment.lateMinutes,
+        // A duplicate submit shows the same result as the first one.
+        earlyArrivalMinutes: computeAttendanceDeltas({
+          start: shiftStart,
+          end: null,
+          checkIn: persistence.assignment.checkInTime,
+        }).earlyArrivalMinutes,
         attendanceStatus: persistence.assignment.attendanceStatus,
         checkInTime: persistence.assignment.checkInTime.toISOString(),
         gpsDistance: null,
@@ -17127,6 +17205,8 @@ export class StoresService {
         matched: true,
         alreadyRecorded: true,
         earlyMinutes: assignment.earlyMinutes,
+        // A duplicate submit shows the same "Ra muộn X" as the first response.
+        overtimeMinutes: this.storedAttendanceDeltas(assignment).overtimeMinutes,
         workedMinutes: assignment.workedMinutes,
         attendanceStatus: assignment.attendanceStatus,
         checkOutTime: assignment.checkOutTime.toISOString(),
@@ -17255,6 +17335,17 @@ export class StoresService {
         alreadyRecorded: true,
         distance: matchResult.distance,
         earlyMinutes: persistence.assignment.earlyMinutes,
+        // A duplicate submit shows the same result as the first one (0 when
+        // the stored check-out was automatic).
+        overtimeMinutes: computeAttendanceDeltas({
+          start: null,
+          end: shiftEnd,
+          checkOut: persistence.assignment.checkOutTime,
+          autoCheckedOut: !!(
+            persistence.assignment.isAutoCheckout ||
+            persistence.assignment.autoCheckoutReason
+          ),
+        }).overtimeMinutes,
         workedMinutes: persistence.assignment.workedMinutes,
         attendanceStatus: persistence.assignment.attendanceStatus,
         checkOutTime: persistence.assignment.checkOutTime.toISOString(),
@@ -17946,10 +18037,28 @@ export class StoresService {
     }));
   }
 
+  /**
+   * The shift the staff Home / "Hôm nay" cards and the check-in flow act on.
+   *
+   * Selection (Vietnam time):
+   *  1. check-out: a checked-in, not checked-out shift (any date, so an
+   *     overnight shift stays actionable after midnight);
+   *  2. check-in: the earliest APPROVED, not-started shift that has not ended,
+   *     among today's shifts and yesterday's overnight shift ending today;
+   *  3. done: among the same shifts, the finished one (completed, or ended
+   *     without a check-in = missed) that STARTED LATEST — so a missed
+   *     morning shift no longer hides the afternoon shift completed after it;
+   *  4. none.
+   * Every mode carries the same keys, including workedMinutesToday (completed
+   * shifts whose work date is today) and the early/overtime deltas computed
+   * like the check-in/out result screens (computeAttendanceDeltas).
+   */
   async getNextShiftAssignment(employeeProfileId: string, storeId: string) {
+    const now = new Date();
     // Vietnam calendar day, whatever the server timezone (a UTC host saw
     // "yesterday" between 00:00 and 07:00 VN).
-    const todayStr = vnDateString(new Date());
+    const todayStr = vnDateString(now);
+    const yesterdayStr = vnDateString(new Date(now.getTime() - 86_400_000));
 
     this.logger.log(
       `[getNextShiftAssignment] employeeProfileId=${employeeProfileId}, storeId=${storeId}, todayStr=${todayStr}`,
@@ -17972,35 +18081,56 @@ export class StoresService {
       })
       .getCount();
 
-    const now = new Date();
     // Comparison happens on real instants: `endTime` is a bare clock time, and
     // resolveShiftBoundaries anchors it to the work date in Asia/Ho_Chi_Minh,
     // rolling a 22:00-02:00 shift onto the following day.
-    const hasEnded = (assignment: ShiftAssignment): boolean => {
-      const shift = assignment.shiftSlot?.workShift;
-      const { end } = resolveShiftBoundaries(
-        assignment.shiftSlot?.workDate ?? todayStr,
-        assignment.shiftSlot?.startTime ?? shift?.startTime,
-        assignment.shiftSlot?.endTime ?? shift?.endTime,
+    const boundsOf = (assignment: ShiftAssignment) => {
+      const slot = assignment.shiftSlot;
+      const shift = slot?.workShift;
+      return resolveShiftBoundaries(
+        String(slot?.workDate ?? todayStr).slice(0, 10),
+        slot?.startTime ?? shift?.startTime,
+        slot?.endTime ?? shift?.endTime,
       );
+    };
+    const hasEnded = (assignment: ShiftAssignment): boolean => {
+      const { end } = boundsOf(assignment);
       // No usable end time means we cannot prove it is over, so it stays open.
       return end !== null && end.getTime() <= now.getTime();
     };
+    const startMs = (assignment: ShiftAssignment): number =>
+      boundsOf(assignment).start?.getTime() ?? Number.NEGATIVE_INFINITY;
 
     // Additive attendance facts for the Home / "Hôm nay" cards.
-    const attendanceFields = (assignment: ShiftAssignment) => ({
-      attendanceStatus: assignment.attendanceStatus ?? null,
-      checkOutTime: assignment.checkOutTime?.toISOString() || null,
-      workedMinutes: assignment.workedMinutes ?? 0,
-      earlyMinutes: assignment.earlyMinutes ?? 0,
-      autoCheckoutReason: assignment.autoCheckoutReason ?? null,
-      autoCheckedOut: !!(
+    const attendanceFields = (assignment: ShiftAssignment) => {
+      const autoCheckedOut = !!(
         assignment.isAutoCheckout || assignment.autoCheckoutReason
-      ),
-      // Auto check-out: the shift end the employee is paid up to.
-      scheduledCheckoutTime:
-        assignment.scheduledCheckoutTime?.toISOString?.() || null,
-    });
+      );
+      const { start, end } = boundsOf(assignment);
+      const deltas = computeAttendanceDeltas({
+        start,
+        end,
+        checkIn: assignment.checkInTime ?? null,
+        checkOut: assignment.checkOutTime ?? null,
+        autoCheckedOut,
+      });
+      return {
+        attendanceStatus: assignment.attendanceStatus ?? null,
+        checkOutTime: assignment.checkOutTime?.toISOString() || null,
+        workedMinutes: assignment.workedMinutes ?? 0,
+        earlyMinutes: assignment.earlyMinutes ?? 0,
+        // Same maths as the check-in/out result screens: minutes checked in
+        // before the start, and checked out after the end (0 on auto
+        // check-out).
+        earlyArrivalMinutes: deltas.earlyArrivalMinutes,
+        overtimeMinutes: deltas.overtimeMinutes,
+        autoCheckoutReason: assignment.autoCheckoutReason ?? null,
+        autoCheckedOut,
+        // Auto check-out: the shift end the employee is paid up to.
+        scheduledCheckoutTime:
+          assignment.scheduledCheckoutTime?.toISOString?.() || null,
+      };
+    };
     const onLeaveFor = (assignment: ShiftAssignment) =>
       assignment.checkInTime
         ? Promise.resolve(false)
@@ -18010,6 +18140,29 @@ export class StoresService {
             String(assignment.shiftSlot?.workDate ?? todayStr).slice(0, 10),
             assignment.id,
           );
+    const shiftFields = (assignment: ShiftAssignment) => {
+      const slot = assignment.shiftSlot;
+      const ws = slot?.workShift;
+      return {
+        assignmentId: assignment.id,
+        shiftName: ws?.shiftName || '',
+        // The slot's own times override its work shift's.
+        startTime: slot?.startTime || ws?.startTime || '',
+        endTime: slot?.endTime || ws?.endTime || '',
+        workDate: slot?.workDate || todayStr,
+        shiftSlotId: slot?.id || null,
+        checkInTime: assignment.checkInTime?.toISOString() || null,
+        lateMinutes: assignment.lateMinutes || 0,
+        location: slot?.location || ws?.location || '',
+        note: slot?.note || '',
+      };
+    };
+
+    const workedMinutesToday = await this.sumWorkedMinutesOn(
+      employeeProfileId,
+      storeId,
+      todayStr,
+    );
 
     // 1) Check if there's an active assignment (checked in but not checked out) in this store
     const activeAssignment = await this.shiftAssignmentRepository
@@ -18027,135 +18180,35 @@ export class StoresService {
       .getOne();
 
     if (activeAssignment) {
-      const ws = activeAssignment.shiftSlot?.workShift;
       this.logger.log(
         `[getNextShiftAssignment] Found active (checked-in) assignment: ${activeAssignment.id}`,
       );
       return {
-        assignmentId: activeAssignment.id,
+        ...shiftFields(activeAssignment),
         mode: 'check-out' as const,
-        shiftName: ws?.shiftName || '',
-        startTime: ws?.startTime || '',
-        endTime: ws?.endTime || '',
         workDate: activeAssignment.shiftSlot?.workDate || null,
-        shiftSlotId: activeAssignment.shiftSlot?.id || null,
-        checkInTime: activeAssignment.checkInTime?.toISOString() || null,
-        lateMinutes: activeAssignment.lateMinutes || 0,
-        location: activeAssignment.shiftSlot?.location || ws?.location || '',
-        note: activeAssignment.shiftSlot?.note || '',
         // Still checked in after the shift's end time — the app can prompt to
         // check out rather than letting it run silently past closing.
         shiftEnded: hasEnded(activeAssignment),
         missed: false,
         onLeave: false,
         ...attendanceFields(activeAssignment),
-        totalShiftsToday,
-      };
-    }
-
-    // 2) Find the next approved assignment for TODAY in this store.
-    //
-    //    Every candidate is loaded rather than just the earliest, because a
-    //    shift whose end time has already passed must not be offered for
-    //    check-in. Previously this query had no notion of the current time at
-    //    all, so at 15:00 it still invited the employee into a 10:00-12:00
-    //    shift they had missed, with nothing anywhere saying it was over.
-    const approvedCandidates = await this.shiftAssignmentRepository
-      .createQueryBuilder('a')
-      .leftJoinAndSelect('a.shiftSlot', 'slot')
-      .leftJoinAndSelect('slot.workShift', 'ws')
-      .leftJoinAndSelect('slot.cycle', 'cycle')
-      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
-      .andWhere('a.status = :status', {
-        status: ShiftAssignmentStatus.APPROVED,
-      })
-      .andWhere('a.checkInTime IS NULL')
-      .andWhere('slot.workDate = :todayStr', { todayStr })
-      .andWhere('cycle.storeId = :storeId', { storeId })
-      .orderBy('ws.startTime', 'ASC')
-      .getMany();
-
-    const approvedAssignment = approvedCandidates.find((a) => !hasEnded(a));
-    // Approved, never checked into, and the clock has run out on it.
-    const missedAssignment = approvedCandidates.find(hasEnded);
-
-    if (approvedAssignment) {
-      const ws = approvedAssignment.shiftSlot?.workShift;
-      this.logger.log(
-        `[getNextShiftAssignment] Found approved assignment for today: ${approvedAssignment.id}, shift=${ws?.shiftName}`,
-      );
-      return {
-        assignmentId: approvedAssignment.id,
-        mode: 'check-in' as const,
-        shiftName: ws?.shiftName || '',
-        startTime: ws?.startTime || '',
-        endTime: ws?.endTime || '',
-        workDate: approvedAssignment.shiftSlot?.workDate || todayStr,
-        shiftSlotId: approvedAssignment.shiftSlot?.id || null,
-        checkInTime: null,
-        lateMinutes: 0,
-        location: approvedAssignment.shiftSlot?.location || ws?.location || '',
-        note: approvedAssignment.shiftSlot?.note || '',
-        shiftEnded: false,
-        missed: false,
-        onLeave: await onLeaveFor(approvedAssignment),
-        ...attendanceFields(approvedAssignment),
-        totalShiftsToday,
-      };
-    }
-
-    // Terminal states below also carry today's worked total and the next
-    // scheduled shift (any day) for the "Ca tiếp theo" line.
-    const [workedMinutesToday, nextShift] = await Promise.all([
-      this.sumWorkedMinutesOn(employeeProfileId, storeId, todayStr),
-      this.findNextUpcomingShift(employeeProfileId, storeId, todayStr, now),
-    ]);
-
-    // 2b) Nothing left to act on, but a shift today was missed outright. Report
-    //     it instead of silently falling through, so the app can say so rather
-    //     than showing "no shift today" to someone who did have one.
-    if (missedAssignment) {
-      const ws = missedAssignment.shiftSlot?.workShift;
-      this.logger.log(
-        `[getNextShiftAssignment] Shift ${missedAssignment.id} ended without a check-in`,
-      );
-      return {
-        assignmentId: missedAssignment.id,
-        mode: 'done' as const,
-        shiftName: ws?.shiftName || '',
-        startTime: ws?.startTime || '',
-        endTime: ws?.endTime || '',
-        workDate: missedAssignment.shiftSlot?.workDate || todayStr,
-        shiftSlotId: missedAssignment.shiftSlot?.id || null,
-        checkInTime: null,
-        lateMinutes: 0,
-        location: missedAssignment.shiftSlot?.location || ws?.location || '',
-        note: missedAssignment.shiftSlot?.note || '',
-        shiftEnded: true,
-        missed: true,
-        // attendanceStatus is 'ABSENT' once the per-minute reconcile marked
-        // it; null for that first minute, or when onLeave (approved full-day
-        // leave → "Nghỉ phép", never ABSENT).
-        onLeave: await onLeaveFor(missedAssignment),
-        ...attendanceFields(missedAssignment),
         workedMinutesToday,
-        nextShift,
         totalShiftsToday,
       };
     }
 
-    // 3) No actionable shift (not waiting for check-in, not currently working).
-    //    But the employee may still HAVE a shift today that is already done
-    //    (checked in + checked out / COMPLETED) or checked in via another flow.
-    //    Return it so the "Hôm nay" card stays consistent with the schedule grid
-    //    instead of wrongly showing "Không có ca".
-    const doneAssignment = await this.shiftAssignmentRepository
+    // Today's shifts plus yesterday's (for an overnight shift ending today).
+    // Bounded: one employee, one store, two work dates.
+    const loaded = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
       .leftJoinAndSelect('a.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
       .leftJoinAndSelect('slot.cycle', 'cycle')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
-      .andWhere('slot.workDate = :todayStr', { todayStr })
+      .andWhere('slot.workDate IN (:...workDates)', {
+        workDates: [yesterdayStr, todayStr],
+      })
       .andWhere('cycle.storeId = :storeId', { storeId })
       .andWhere('a.status IN (:...statuses)', {
         statuses: [
@@ -18164,35 +18217,105 @@ export class StoresService {
           ShiftAssignmentStatus.COMPLETED,
         ],
       })
-      // Latest first: on a two-shift day the card should reflect where the
-      // employee actually is now, not the shift they finished this morning.
-      .orderBy('ws.startTime', 'DESC')
-      .getOne();
+      .orderBy('slot.workDate', 'ASC')
+      .addOrderBy('COALESCE(slot.start_time, ws.start_time)', 'ASC')
+      .addOrderBy('a.id', 'ASC')
+      // Many-to-one joins only, so a plain LIMIT is exact.
+      .limit(50)
+      .getMany();
+    const relevant = (loaded ?? []).filter((assignment) => {
+      const workDate = String(assignment.shiftSlot?.workDate ?? '').slice(0, 10);
+      if (workDate === todayStr) return true;
+      if (workDate !== yesterdayStr) return false;
+      // Yesterday's shift only when it runs past midnight into today.
+      const { end } = boundsOf(assignment);
+      return end !== null && vnDateString(end) === todayStr;
+    });
+    const byStart = (x: ShiftAssignment, y: ShiftAssignment) =>
+      startMs(x) - startMs(y) || (x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
 
-    if (doneAssignment) {
-      const ws = doneAssignment.shiftSlot?.workShift;
+    // 2) The next approved shift still actionable. A shift whose end time has
+    //    passed is never offered for check-in. A shift covered by approved
+    //    leave is skipped in favour of a later real shift, and is returned
+    //    (as onLeave) only when no other candidate remains.
+    const approvedCandidates = relevant
+      .filter(
+        (a) =>
+          a.status === ShiftAssignmentStatus.APPROVED &&
+          !a.checkInTime &&
+          !hasEnded(a),
+      )
+      .sort(byStart);
+    let approvedAssignment: ShiftAssignment | undefined;
+    let approvedOnLeave = false;
+    for (const candidate of approvedCandidates) {
+      if (!(await onLeaveFor(candidate))) {
+        approvedAssignment = candidate;
+        approvedOnLeave = false;
+        break;
+      }
+      if (!approvedAssignment) {
+        approvedAssignment = candidate;
+        approvedOnLeave = true;
+      }
+    }
+
+    if (approvedAssignment) {
       this.logger.log(
-        `[getNextShiftAssignment] Found already-processed assignment for today: ${doneAssignment.id}, status=${doneAssignment.status}`,
+        `[getNextShiftAssignment] Found approved assignment: ${approvedAssignment.id}`,
       );
       return {
-        assignmentId: doneAssignment.id,
+        ...shiftFields(approvedAssignment),
+        mode: 'check-in' as const,
+        checkInTime: null,
+        lateMinutes: 0,
+        shiftEnded: false,
+        missed: false,
+        onLeave: approvedOnLeave,
+        ...attendanceFields(approvedAssignment),
+        workedMinutesToday,
+        totalShiftsToday,
+      };
+    }
+
+    // Terminal states below also carry the next scheduled shift (any day)
+    // for the "Ca tiếp theo" line.
+    const nextShift = await this.findNextUpcomingShift(
+      employeeProfileId,
+      storeId,
+      todayStr,
+      now,
+    );
+
+    // 3) Finished shifts: completed (checked in and out, or auto checked out)
+    //    or missed (approved, never checked in, and the clock ran out). The
+    //    latest-starting one reflects where the employee is now.
+    const terminal = relevant
+      .filter((a) =>
+        a.status === ShiftAssignmentStatus.APPROVED && !a.checkInTime
+          ? hasEnded(a)
+          : true,
+      )
+      .sort(byStart);
+    const doneAssignment = terminal[terminal.length - 1];
+
+    if (doneAssignment) {
+      const missed = !doneAssignment.checkInTime;
+      this.logger.log(
+        `[getNextShiftAssignment] Terminal assignment: ${doneAssignment.id}, status=${doneAssignment.status}, missed=${missed}`,
+      );
+      return {
+        ...shiftFields(doneAssignment),
         mode: 'done' as const,
-        shiftName: ws?.shiftName || '',
-        startTime: ws?.startTime || '',
-        endTime: ws?.endTime || '',
-        workDate: doneAssignment.shiftSlot?.workDate || todayStr,
-        shiftSlotId: doneAssignment.shiftSlot?.id || null,
-        checkInTime: doneAssignment.checkInTime?.toISOString() || null,
-        lateMinutes: doneAssignment.lateMinutes || 0,
         shiftEnded: hasEnded(doneAssignment),
-        // Status is COMPLETED but nothing was ever recorded against it.
-        missed: !doneAssignment.checkInTime,
+        // Never checked in: attendanceStatus is 'ABSENT' once the per-minute
+        // reconcile marked it; null for that first minute, or when onLeave
+        // (approved full-day leave → "Nghỉ phép", never ABSENT).
+        missed,
         onLeave: await onLeaveFor(doneAssignment),
         ...attendanceFields(doneAssignment),
         workedMinutesToday,
         nextShift,
-        location: doneAssignment.shiftSlot?.location || ws?.location || '',
-        note: doneAssignment.shiftSlot?.note || '',
         totalShiftsToday,
       };
     }
@@ -18221,6 +18344,8 @@ export class StoresService {
       checkOutTime: null,
       workedMinutes: 0,
       earlyMinutes: 0,
+      earlyArrivalMinutes: 0,
+      overtimeMinutes: 0,
       autoCheckoutReason: null,
       autoCheckedOut: false,
       scheduledCheckoutTime: null,
@@ -18228,6 +18353,27 @@ export class StoresService {
       nextShift,
       totalShiftsToday,
     };
+  }
+
+  /**
+   * Early-arrival / overtime minutes of a recorded attendance, from its stored
+   * check-in/out against the slot's Vietnam boundaries — the same maths as
+   * the first check-in/out response (computeAttendanceDeltas).
+   */
+  private storedAttendanceDeltas(assignment: ShiftAssignment) {
+    const slot = assignment.shiftSlot;
+    const { start, end } = resolveShiftBoundaries(
+      slot?.workDate,
+      slot?.startTime || slot?.workShift?.startTime,
+      slot?.endTime || slot?.workShift?.endTime,
+    );
+    return computeAttendanceDeltas({
+      start,
+      end,
+      checkIn: assignment.checkInTime ?? null,
+      checkOut: assignment.checkOutTime ?? null,
+      autoCheckedOut: !!(assignment.isAutoCheckout || assignment.autoCheckoutReason),
+    });
   }
 
   /** Worked minutes of the employee's completed shifts on a VN work date. */

@@ -184,16 +184,28 @@ export function computeEarnedBase(input: {
   }
 }
 
+/** Facts the bonus/fine rules read. */
+export type RuleAdjustmentFacts = Pick<
+  MonthlyAttendanceFacts,
+  'lateCount' | 'earlyCount' | 'absentCount' | 'completedShifts'
+>;
+
+/** A bonus is only ever paid for a month with at least one COMPLETED shift. */
+const hasCompletedWork = (facts: RuleAdjustmentFacts): boolean =>
+  toFiniteNumber(facts.completedShifts) > 0;
+
 /**
  * Bonus and penalty from the store's active rules.
  * - FINE LATE / EARLY: AMOUNT value × count; PERCENTAGE earned × value% × count.
  * - FINE ABSENT: AMOUNT only, value × count.
- * - BONUS ATTENDANCE: value when there was no late arrival and no absence.
- * - BONUS with no rule type or GENERAL: value, unconditionally.
+ * - BONUS ATTENDANCE: value when at least one shift was COMPLETED in the
+ *   month and there was no late arrival and no absence.
+ * - BONUS with no rule type or GENERAL: value, once at least one shift was
+ *   COMPLETED in the month (nothing is paid for a month with no work).
  */
 export function computeRuleAdjustments(
   rules: PayrollRuleInput[],
-  facts: Pick<MonthlyAttendanceFacts, 'lateCount' | 'earlyCount' | 'absentCount'>,
+  facts: RuleAdjustmentFacts,
   earnedBase: number,
 ): { bonus: number; penalty: number } {
   let bonus = 0;
@@ -223,6 +235,7 @@ export function computeRuleAdjustments(
         penalty += toFiniteNumber(rule.value) * facts.absentCount;
       }
     } else if (rule.category === PayrollRuleCategory.BONUS) {
+      if (!hasCompletedWork(facts)) continue;
       if (
         rule.ruleType === 'ATTENDANCE' &&
         facts.lateCount === 0 &&
@@ -266,7 +279,7 @@ const ADJUSTMENT_LABELS: Record<string, string> = {
  */
 export function computeRuleAdjustmentBreakdown(
   rules: Array<PayrollRuleInput & { name?: string | null }>,
-  facts: Pick<MonthlyAttendanceFacts, 'lateCount' | 'earlyCount' | 'absentCount'>,
+  facts: RuleAdjustmentFacts,
   earnedBase: number,
 ): PayslipAdjustmentLine[] {
   const raw: Array<PayslipAdjustmentLine & { exact: number }> = [];
@@ -316,6 +329,7 @@ export function computeRuleAdjustmentBreakdown(
         );
       }
     } else if (rule.category === PayrollRuleCategory.BONUS) {
+      if (!hasCompletedWork(facts)) continue;
       if (
         rule.ruleType === 'ATTENDANCE' &&
         facts.lateCount === 0 &&
