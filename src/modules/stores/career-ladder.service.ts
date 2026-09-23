@@ -6,7 +6,15 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  IsNull,
+  MoreThanOrEqual,
+  Repository,
+} from 'typeorm';
+import { stintFloor } from './employment-stint.utils';
 
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import {
@@ -1005,7 +1013,7 @@ export class CareerLadderService {
     // Computed from the KPI tasks themselves: nothing writes the monthly
     // summary's kpiTotalCount / kpiCompletedCount (deprecated), so it was 0.
     if (code === CriteriaCode.KPI_COMPLETION) {
-      return this.kpiCompletionPercent(profile.id);
+      return this.kpiCompletionPercent(profile.id, stintFloor(profile.joinedAt));
     }
 
     const cumulative: string[] = [
@@ -1051,9 +1059,12 @@ export class CareerLadderService {
    * Only owner-confirmed KPIs count: task progress on an active KPI is
    * self-reported by the employee and must not move career eligibility.
    */
-  private async kpiCompletionPercent(profileId: string): Promise<number> {
+  private async kpiCompletionPercent(
+    profileId: string,
+    stint: Date | null = null,
+  ): Promise<number> {
     const month = vnDateString().slice(0, 7);
-    const row = await this.dataSource
+    const query = this.dataSource
       .getRepository(KpiTask)
       .createQueryBuilder('task')
       .innerJoin('task.employeeKpi', 'kpi')
@@ -1066,8 +1077,10 @@ export class CareerLadderService {
       .andWhere("to_char(kpi.month, 'YYYY-MM') = :month", { month })
       .andWhere('kpi.status = :status', { status: KpiStatus.COMPLETED })
       .andWhere('kpi.deleted_at IS NULL')
-      .andWhere('task.is_hidden = false')
-      .getRawOne();
+      .andWhere('task.is_hidden = false');
+    // A rehired employee's KPIs from the previous stint do not count.
+    if (stint) query.andWhere('kpi.created_at >= :stint', { stint });
+    const row = await query.getRawOne();
     const total = Number(row?.total) || 0;
     if (total === 0) return 0;
     return Math.round(((Number(row?.done) || 0) / total) * 100);
@@ -1406,9 +1419,26 @@ export class CareerLadderService {
     });
   }
 
+  /**
+   * Floor for the current employment stint (see employment-stint.utils): a
+   * rehired employee's entries and events from the previous stint are kept
+   * but not shown. Null means no filter.
+   */
+  private async currentStintFloor(profileId: string): Promise<Date | null> {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'joinedAt'],
+    });
+    return stintFloor(profile?.joinedAt);
+  }
+
   async getCapabilityEntries(profileId: string) {
+    const floor = await this.currentStintFloor(profileId);
     return this.capabilityRepository.find({
-      where: { employeeProfileId: profileId },
+      where: {
+        employeeProfileId: profileId,
+        ...(floor ? { awardedAt: MoreThanOrEqual(floor) } : {}),
+      },
       order: { awardedAt: 'DESC' },
       take: 100,
     });
@@ -1419,8 +1449,12 @@ export class CareerLadderService {
   // ---------------------------------------------------------------------
 
   async getCareerHistory(profileId: string) {
+    const floor = await this.currentStintFloor(profileId);
     const events = await this.eventRepository.find({
-      where: { employeeProfileId: profileId },
+      where: {
+        employeeProfileId: profileId,
+        ...(floor ? { effectiveAt: MoreThanOrEqual(floor) } : {}),
+      },
       order: { effectiveAt: 'DESC' },
       relations: ['ladder', 'decidedByAccount'],
       take: 200,
@@ -1625,6 +1659,7 @@ export class CareerLadderService {
       where: { storeId: profile.storeId, isActive: true },
       order: { dimension: 'ASC' },
     });
+    const stint = stintFloor(profile.joinedAt);
 
     const stages: any[] = [];
     for (const ladder of ladders) {
@@ -1654,10 +1689,16 @@ export class CareerLadderService {
       // thấp hơn. Lộ trình phân nhánh làm `level` chỉ còn là thứ tự hiển thị:
       // người lên Ca trưởng qua nhánh Bánh tráng chưa từng làm Thu ngân, dù
       // Thu ngân đứng cùng hàng.
+      // Only events of the current employment stint: a rehired employee
+      // starts the ladder again (see getCareerHistory).
       const traversed = new Set(
         (
           await this.eventRepository.find({
-            where: { employeeProfileId: profile.id, ladderId: ladder.id },
+            where: {
+              employeeProfileId: profile.id,
+              ladderId: ladder.id,
+              ...(stint ? { effectiveAt: MoreThanOrEqual(stint) } : {}),
+            },
             select: ['id', 'fromRungId', 'toRungId'],
           })
         ).flatMap((e) =>

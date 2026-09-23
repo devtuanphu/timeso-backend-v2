@@ -26,7 +26,8 @@ import { WORKING_DAYS_PER_WEEK } from './shift-earnings.utils';
  * Totals are sums of those integers. Per-shift `shiftEarnings` is a display
  * figure rounded per shift and is never summed into a payslip, so the sum of
  * a month's `shiftEarnings` can differ from `earnedBaseSalary` by less than
- * 1 VND per shift.
+ * 1 VND per shift. The one exception is a same-month rehire: shifts of the
+ * previous stint keep their stored `shiftEarnings` (computeStintSplitEarnedBase).
  */
 
 export interface PayrollAssignmentFact {
@@ -39,7 +40,11 @@ export interface PayrollAssignmentFact {
   workedMinutes?: number | null;
   lateMinutes?: number | null;
   earlyMinutes?: number | null;
-  /** Stored per-shift display figure; never used by the monthly maths. */
+  /**
+   * Stored per-shift figure written at check-out. The monthly maths ignores
+   * it, except for shifts of a previous employment stint in the same month
+   * (see computeStintSplitEarnedBase), which keep the pay recorded for them.
+   */
   shiftEarnings?: number | null;
   /**
    * An approved full-day leave (or a timed leave attached to this exact
@@ -452,16 +457,25 @@ export function computePayslip(input: {
   calendarDays: number;
   advancePayment: number;
   otherDeductions?: number;
+  /**
+   * Earned base already computed by the caller (a same-month rehire, see
+   * computeStintSplitEarnedBase). When omitted it is computed from `facts`
+   * at `rate`. Bonus and fine rules always read the whole month's `facts`.
+   */
+  earnedBaseSalary?: number | null;
 }): PayslipComputation {
   const paymentType = resolvePayrollPaymentType(input.paymentType);
   const rate = toFiniteNumber(input.rate);
-  const earnedBaseSalary = computeEarnedBase({
-    paymentType,
-    rate,
-    facts: input.facts,
-    standardWorkingDays: input.standardWorkingDays,
-    calendarDays: input.calendarDays,
-  });
+  const earnedBaseSalary =
+    input.earnedBaseSalary != null && Number.isFinite(Number(input.earnedBaseSalary))
+      ? Math.round(Number(input.earnedBaseSalary))
+      : computeEarnedBase({
+          paymentType,
+          rate,
+          facts: input.facts,
+          standardWorkingDays: input.standardWorkingDays,
+          calendarDays: input.calendarDays,
+        });
   const { bonus, penalty } = computeRuleAdjustments(
     input.rules,
     input.facts,
@@ -521,4 +535,81 @@ export function pickDayOwnerAssignmentIds(
     }
   }
   return new Set(Array.from(best.values(), (entry) => entry.id));
+}
+
+/** Pricing of one contract, for computeStintSplitEarnedBase. */
+export interface StintPricing {
+  paymentType: PaymentType | string | null | undefined;
+  rate: number;
+}
+
+/**
+ * Earned base for a month that holds shifts of two employment stints (the
+ * employee was terminated and rehired within the month and the payslip is
+ * still PENDING/REJECTED). One payslip covers the month, but each stint is
+ * priced with its own contract:
+ * - Shifts before `stintStartDate` (the VN date the current stint started)
+ *   belong to the previous stint. A COMPLETED one contributes the
+ *   `shiftEarnings` stored at its check-out, which was priced with the
+ *   contract of that time. When that figure is missing (null) the shift is
+ *   priced with `prior` (the previous stint's contract), or with `current`
+ *   when no previous contract is known.
+ * - Shifts on or after `stintStartDate` are priced with `current` from their
+ *   attendance facts, exactly like a normal month.
+ *
+ * Returns null when the month has no previous-stint shift, so the caller
+ * keeps the normal single-contract path.
+ */
+export function computeStintSplitEarnedBase(input: {
+  assignments: PayrollAssignmentFact[];
+  stintStartDate: string | null | undefined;
+  todayVn: string;
+  current: StintPricing;
+  prior: StintPricing | null;
+  standardWorkingDays: number;
+  calendarDays: number;
+}): {
+  earnedBase: number;
+  currentStintEarned: number;
+  priorStintEarned: number;
+} | null {
+  const start = input.stintStartDate;
+  if (!start) return null;
+  const isPrior = (a: PayrollAssignmentFact) => {
+    const date = workDateOf(a.workDate);
+    return date !== '' && date < start;
+  };
+  if (!input.assignments.some(isPrior)) return null;
+
+  const price = (pricing: StintPricing, rows: PayrollAssignmentFact[]) =>
+    rows.length
+      ? computeEarnedBase({
+          paymentType: resolvePayrollPaymentType(pricing.paymentType),
+          rate: toFiniteNumber(pricing.rate),
+          facts: summarizeMonthlyAttendance(rows, input.todayVn),
+          standardWorkingDays: input.standardWorkingDays,
+          calendarDays: input.calendarDays,
+        })
+      : 0;
+
+  const priorCompleted = input.assignments.filter(
+    (a) => isPrior(a) && a.status === ShiftAssignmentStatus.COMPLETED,
+  );
+  const stored = priorCompleted
+    .filter((a) => a.shiftEarnings != null)
+    .reduce((sum, a) => sum + Math.round(toFiniteNumber(a.shiftEarnings)), 0);
+  const repriced = price(
+    input.prior ?? input.current,
+    priorCompleted.filter((a) => a.shiftEarnings == null),
+  );
+  const priorStintEarned = stored + repriced;
+  const currentStintEarned = price(
+    input.current,
+    input.assignments.filter((a) => !isPrior(a)),
+  );
+  return {
+    earnedBase: priorStintEarned + currentStintEarned,
+    currentStintEarned,
+    priorStintEarned,
+  };
 }

@@ -10,6 +10,10 @@ import {
   describeWorkDateRange,
   workDatesMetadata,
 } from '../../common/utils/relative-day';
+import {
+  isSlotRegistrationClosed,
+  normalizeWorkDate,
+} from './shift-registration-window';
 
 /**
  * - assigned: chủ xếp ca cho nhân viên;
@@ -104,4 +108,148 @@ export function buildShiftNotification(
  */
 export function shiftNotificationDateMetadata(shifts: ShiftForNotification[]) {
   return workDatesMetadata(shifts.map((shift) => shift.workDate));
+}
+
+/**
+ * A shift announced as "Có ca mới để đăng ký". `assignedProfileIds` are the
+ * people already holding a seat on it: they are never told about that shift
+ * (the picked person gets "Bạn có ca làm mới" instead).
+ */
+export interface AnnouncedShift extends ShiftForNotification {
+  assignedProfileIds?: string[];
+}
+
+/** The announced shifts a given employee is not already booked on. */
+export function shiftsOpenTo(
+  profileId: string,
+  shifts: AnnouncedShift[],
+): AnnouncedShift[] {
+  return shifts.filter(
+    (shift) => !(shift.assignedProfileIds ?? []).includes(profileId),
+  );
+}
+
+/** One owner-created shift row of a schedule, repeated on every work date. */
+export interface CreatedShiftDraft {
+  shiftName?: string | null;
+  startTime?: string | null;
+  endTime?: string | null;
+  maxStaff: number;
+  /** Employee profile ids the owner picked for this shift. */
+  employeeIds: string[];
+}
+
+/**
+ * What the "Có ca mới để đăng ký" notice announces for a new schedule:
+ * shifts that still have a free seat and have not started yet (VN time).
+ * A full shift (every seat picked, the owner app's default of one seat and
+ * one picked person) announces nothing to others. Each shift carries the
+ * profiles picked for it, so nobody is told about a shift they already hold;
+ * profiles picked for every such shift are excluded altogether.
+ */
+export function selectCreatedShiftAnnouncement(
+  drafts: CreatedShiftDraft[],
+  workDates: string[],
+  now: Date = new Date(),
+): { shifts: AnnouncedShift[]; excludeProfileIds: string[] } {
+  const openDrafts = drafts
+    .filter((draft) => draft.employeeIds.length < draft.maxStaff)
+    .map((draft) => ({
+      employeeIds: draft.employeeIds,
+      shifts: workDates
+        .map((workDate) => ({
+          workDate,
+          startTime: draft.startTime,
+          endTime: draft.endTime,
+          shiftName: draft.shiftName,
+          assignedProfileIds: [...new Set(draft.employeeIds)],
+        }))
+        .filter((shift) => !isSlotRegistrationClosed(shift, null, now)),
+    }))
+    .filter((draft) => draft.shifts.length > 0);
+  const excludeProfileIds = openDrafts.length
+    ? [...new Set(openDrafts[0].employeeIds)].filter((profileId) =>
+        openDrafts.every((draft) => draft.employeeIds.includes(profileId)),
+      )
+    : [];
+  return {
+    shifts: openDrafts.flatMap((draft) => draft.shifts),
+    excludeProfileIds,
+  };
+}
+
+/** An existing slot, as read after the owner changed it. */
+export interface SlotSeatState {
+  workDate: string | Date;
+  startTime?: string | null;
+  endTime?: string | null;
+  /** Effective seat count (slot override, else template); 0/null = unlimited. */
+  maxStaff: number | null;
+  shiftName?: string | null;
+  /** The work shift template's times, used when the slot has no override. */
+  templateStartTime?: string | null;
+  templateEndTime?: string | null;
+  /** Profiles holding a seat (every assignment that is not CANCELLED). */
+  holderProfileIds: string[];
+}
+
+/**
+ * The announcement for an existing slot that just gained a free seat (the
+ * owner raised `maxStaff`, or cancelled someone): null when the slot is full
+ * or has already started (VN time).
+ */
+export function selectFreeSeatAnnouncement(
+  slot: SlotSeatState,
+  now: Date = new Date(),
+): AnnouncedShift | null {
+  const workDate = normalizeWorkDate(slot.workDate);
+  if (!workDate) return null;
+  const holders = [...new Set(slot.holderProfileIds)];
+  const seats = Number(slot.maxStaff) || 0;
+  if (seats > 0 && holders.length >= seats) return null;
+  const startTime = slot.startTime ?? slot.templateStartTime ?? null;
+  if (isSlotRegistrationClosed({ workDate, startTime }, null, now)) return null;
+  return {
+    workDate,
+    startTime,
+    endTime: slot.endTime ?? slot.templateEndTime ?? null,
+    shiftName: slot.shiftName ?? null,
+    assignedProfileIds: holders,
+  };
+}
+
+/**
+ * Keeps one slot from being announced again and again (the owner removing
+ * several people, or raising the seat count step by step): a slot is
+ * announced at most once per window. Per process and in memory — a restart
+ * or a second instance can announce once more, which is acceptable for a
+ * best-effort notice. Bounded: old entries are pruned.
+ */
+export class SlotAnnouncementThrottle {
+  private readonly last = new Map<string, number>();
+
+  constructor(
+    private readonly windowMs = 15 * 60_000,
+    private readonly maxEntries = 5_000,
+  ) {}
+
+  /** True when the slot may be announced now (and records it). */
+  claim(slotId: string, nowMs: number = Date.now()): boolean {
+    const previous = this.last.get(slotId);
+    if (previous !== undefined && nowMs - previous < this.windowMs) {
+      return false;
+    }
+    if (this.last.size >= this.maxEntries) {
+      for (const [key, at] of this.last) {
+        if (nowMs - at >= this.windowMs) this.last.delete(key);
+      }
+      if (this.last.size >= this.maxEntries) {
+        const oldest = this.last.keys().next().value;
+        if (oldest !== undefined) this.last.delete(oldest);
+      }
+    }
+    this.last.delete(slotId);
+    this.last.set(slotId, nowMs);
+    return true;
+  }
 }

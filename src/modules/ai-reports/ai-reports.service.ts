@@ -23,6 +23,10 @@ import {
   AttendanceStatus,
 } from '../stores/entities/shift-management.entity';
 import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
+import {
+  currentStintSql,
+  stintStartVnDate,
+} from '../stores/employment-stint.utils';
 
 @Injectable()
 export class AiReportsService {
@@ -1163,6 +1167,8 @@ export class AiReportsService {
       .where('o.store_id = :storeId', { storeId })
       .andWhere('o.created_at BETWEEN :start AND :end', { start, end })
       .andWhere('o.employee_id IS NOT NULL')
+      // A rehired employee is ranked on the current stint only.
+      .andWhere(currentStintSql('e', 'o.created_at'))
       .setParameters({
         completed: OrderStatus.COMPLETED,
         cancelled: OrderStatus.CANCELLED,
@@ -1173,13 +1179,17 @@ export class AiReportsService {
       .orderBy('"totalRevenue"', 'DESC')
       .getRawMany();
 
-    // Get employee work hours from shift assignments
-    const employeeWorkStats = await this.shiftAssignmentRepository
+    // Get employee work hours from shift assignments, per employee and work
+    // date so a rehired employee's shifts before the VN date the current
+    // stint started (the payroll boundary) can be left out.
+    const employeeWorkDays = await this.shiftAssignmentRepository
       .createQueryBuilder('sa')
       .innerJoin('sa.employee', 'e')
       .innerJoin('sa.shiftSlot', 'slot')
       .innerJoin('slot.cycle', 'cycle')
       .select('e.id', 'employeeId')
+      .addSelect('e.joined_at', 'joinedAt')
+      .addSelect("to_char(slot.work_date, 'YYYY-MM-DD')", 'workDate')
       .addSelect('SUM(sa."worked_minutes")', 'totalWorkMinutes')
       .addSelect('COUNT(sa.id)', 'completedShifts')
       .where('cycle.storeId = :storeId', { storeId })
@@ -1191,20 +1201,38 @@ export class AiReportsService {
         end: end.toISOString().split('T')[0],
       })
       .groupBy('e.id')
+      .addGroupBy('slot.work_date')
       .getRawMany();
 
     // Create a map for quick lookup
-    const workStatsMap = new Map(
-      employeeWorkStats.map((w) => [w.employeeId, w]),
-    );
+    const workStatsMap = new Map<
+      string,
+      { totalWorkMinutes: string; completedShifts: string }
+    >();
+    for (const day of employeeWorkDays) {
+      const stintStart = stintStartVnDate(day.joinedAt);
+      const workDate = String(day.workDate).slice(0, 10);
+      if (stintStart && workDate < stintStart) continue;
+      const current = workStatsMap.get(day.employeeId);
+      workStatsMap.set(day.employeeId, {
+        totalWorkMinutes: String(
+          Number(current?.totalWorkMinutes || 0) +
+            Number(day.totalWorkMinutes || 0),
+        ),
+        completedShifts: String(
+          Number(current?.completedShifts || 0) +
+            Number(day.completedShifts || 0),
+        ),
+      });
+    }
 
     // Combine and calculate metrics
     let maxRevenue = 0;
     let maxHours = 0;
 
     const employees: EmployeeRankingItem[] = employeeOrderStats.map((emp) => {
-      const workStats = workStatsMap.get(emp.employeeId) || {};
-      const totalWorkMinutes = parseInt(workStats.totalWorkMinutes || '0');
+      const workStats = workStatsMap.get(emp.employeeId);
+      const totalWorkMinutes = parseInt(workStats?.totalWorkMinutes || '0');
       const hours = Math.round((totalWorkMinutes / 60) * 10) / 10; // Convert to hours with 1 decimal
       const revenue = parseFloat(emp.totalRevenue || '0');
 

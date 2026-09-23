@@ -76,6 +76,8 @@ import {
 import {
   EmployeeContract,
   PaymentType,
+  isNoLaborContract,
+  NO_LABOR_CONTRACT_NAME,
 } from './entities/employee-contract.entity';
 import { ContractTemplate } from './entities/contract-template.entity';
 import { WorkShift } from './entities/work-shift.entity';
@@ -121,6 +123,13 @@ import {
   LeaveRequestStatus,
 } from './entities/employee-leave-request.entity';
 import { EmployeeFace } from './entities/employee-face.entity';
+import { ChatGroupMember } from '../chat-groups/entities/chat-group-member.entity';
+import {
+  currentStintContracts,
+  currentStintSql,
+  stintFloor,
+  stintStartVnDate,
+} from './employment-stint.utils';
 import {
   AttendanceLog,
   AttendanceLogType,
@@ -268,6 +277,11 @@ import { describeWorkDate } from '../../common/utils/relative-day';
 import { NotificationsService } from '../notifications/notifications.service';
 import {
   buildShiftNotification,
+  selectCreatedShiftAnnouncement,
+  selectFreeSeatAnnouncement,
+  shiftsOpenTo,
+  SlotAnnouncementThrottle,
+  AnnouncedShift,
   shiftNotificationDateMetadata,
   ShiftForNotification,
   ShiftNotificationKind,
@@ -294,6 +308,7 @@ import {
   PayslipComputation,
   pickDayOwnerAssignmentIds,
   summarizeMonthlyAttendance,
+  computeStintSplitEarnedBase,
 } from './payroll-calculation.utils';
 import {
   parseVnMonthInput,
@@ -313,6 +328,14 @@ import {
   computeAttendanceDeltas,
   resolveShiftBoundaries,
 } from './attendance-time.utils';
+import { DEFAULT_ANDROID_CHANNEL } from '../push/push-capabilities';
+import {
+  isSlotRegistrationClosed,
+  SHIFT_REGISTRATION_RANGE_PASSED_CODE,
+  SHIFT_REGISTRATION_RANGE_PASSED_MESSAGE,
+  SLOT_REGISTRATION_CLOSED_CODE,
+  SLOT_REGISTRATION_CLOSED_MESSAGE,
+} from './shift-registration-window';
 import {
   describeAttendanceViolation,
   evaluateAttendanceRules,
@@ -990,6 +1013,15 @@ const defaultTimekeepingSettingData = (storeId: string) => ({
   isActive: true,
 });
 
+/**
+ * Notes written on assignments the owner (or the system on the owner's
+ * behalf) created. Used to keep them out of the staff's "Huỷ ca sắp tới".
+ */
+const OWNER_ASSIGNMENT_NOTES = [
+  'Owner assigned during shift creation',
+  'Auto-assigned from cycle',
+] as const;
+
 @Injectable()
 export class StoresService {
   private readonly logger = new Logger(StoresService.name);
@@ -1626,18 +1658,30 @@ export class StoresService {
       .withDeleted()
       .where('profile.accountId = :accountId', { accountId: account.id })
       .getMany();
-    const hasTargetHistory = profiles.some(
-      (profile) => profile.storeId === storeId,
-    );
-    // Only real employment blocks a new application. A PENDING profile is the
+    // Only real employment blocks a hire. A PENDING profile elsewhere is the
     // applicant's own pending request, and counting it would have stopped them
     // applying anywhere else — including re-applying after a rejection.
     const isAssigned = profiles.some((profile) =>
       isEmployedStatus(profile.employmentStatus),
     );
-    if (hasTargetHistory || isAssigned) {
+    if (isAssigned) {
       return { eligible: false as const };
     }
+    // Mirrors `attachExistingEmployee`, so the lookup and the attach agree:
+    //  - a live PENDING profile here is an open job application — hire through
+    //    the application, or it would stay PENDING;
+    //  - a former employee here (terminated or soft-deleted) may be rehired;
+    //  - any other profile here is not attachable.
+    const atStore = profiles.filter((profile) => profile.storeId === storeId);
+    const former = atStore.find(
+      (profile) =>
+        profile.employmentStatus === EmploymentStatus.TERMINATED ||
+        !!profile.deletedAt,
+    );
+    if (atStore.some((profile) => profile !== former)) {
+      return { eligible: false as const };
+    }
+    const leftAt = former ? (former.leftAt ?? former.deletedAt ?? null) : null;
     return {
       eligible: true as const,
       account: {
@@ -1646,6 +1690,11 @@ export class StoresService {
         avatar: account.avatar || null,
         phone: normalizeVietnamPhone(account.phone),
       },
+      // Additive. No termination reason here; that stays on the applications
+      // card.
+      formerEmployee: former
+        ? { leftAt: leftAt ? new Date(leftAt).toISOString() : null }
+        : null,
     };
   }
 
@@ -2581,7 +2630,7 @@ export class StoresService {
     lookup: { accountId?: string; phone?: string },
   ) {
     await this.assertOwnerStoreAccess(storeId, ownerAccountId);
-    const profileId = await this.dataSource.transaction(async (manager) => {
+    const attached = await this.dataSource.transaction(async (manager) => {
       const store = await manager.findOne(Store, {
         where: { id: storeId, ownerAccountId },
       });
@@ -2651,16 +2700,31 @@ export class StoresService {
       if (profiles.some((profile) => isEmployedStatus(profile.employmentStatus))) {
         throw this.employeeAttachConflict();
       }
-      const profile = await this.initializeEmployeeProfile(
+      // Reviving a former employee starts a fresh stint; promoting the
+      // applicant's own PENDING profile does not.
+      const revivesFormerStint = !pendingAtStore && !!formerAtStore;
+      const initialized = await this.initializeEmployeeProfile(
         manager,
         storeId,
         account.id,
         data,
         reusableId,
+        { revivesFormerStint },
       );
-      return profile.id;
+      return {
+        profileId: initialized.profile.id,
+        rehire: {
+          revived: revivesFormerStint,
+          currentMonthPayslipLocked: initialized.currentMonthPayslipLocked,
+        },
+      };
     });
-    return this.getEmployeeById(profileId);
+    // `rehire` is additive: existing clients read the result for truthiness
+    // or its `profile`, and ignore unknown keys.
+    return {
+      ...(await this.getEmployeeById(attached.profileId)),
+      rehire: attached.rehire,
+    };
   }
 
   private invalidStoreReference(): BadRequestException {
@@ -2789,13 +2853,34 @@ export class StoresService {
      * inserting a second profile for the same (store, account).
      */
     promoteProfileId?: string,
-  ): Promise<EmployeeProfile> {
+    options: {
+      /**
+       * True when `promoteProfileId` is a former employee's row (terminated or
+       * soft-deleted) being rehired. The row is kept — one profile per
+       * (account, store) — but everything that belonged to the previous stint
+       * is closed first and the profile's own state is reset, so the rehire
+       * looks like a new employee. False for promoting a PENDING applicant.
+       */
+      revivesFormerStint?: boolean;
+    } = {},
+  ): Promise<{ profile: EmployeeProfile; currentMonthPayslipLocked: boolean }> {
+    const revivesFormerStint = !!(promoteProfileId && options.revivesFormerStint);
     await this.assertEmployeeReferences(manager, storeId, data);
     // Thử việc nay là một bậc trên lộ trình chứ không còn là một con số ngày
     // của cửa hàng: loại nhân viên được chọn tự nói nó có phải thử việc không,
     // và hạn lấy từ điều kiện days_in_rung của chính bậc đó.
     const { employeeTypeId, employmentStatus, probationEndsAt } =
       await this.resolveHireEmploymentType(manager, storeId, data.employeeTypeId);
+    if (revivesFormerStint) {
+      // Must run before the new contract and the asset re-issue below: it
+      // deactivates the old contract and returns old assets to stock, so
+      // re-issuing the same item nets to zero.
+      await this.resetFormerStintForRehire(
+        manager,
+        { id: promoteProfileId as string, storeId, accountId },
+        new Date(),
+      );
+    }
     const profile = await manager.save(
       EmployeeProfile,
       manager.create(EmployeeProfile, {
@@ -2820,6 +2905,24 @@ export class StoresService {
               deletedAt: null,
               leftAt: null,
               terminationReasonId: null,
+            }
+          : {}),
+        // A rehire starts from a clean profile. `undefined` would make
+        // TypeORM keep the previous stint's value, so omitted fields are
+        // written as explicit nulls here.
+        ...(revivesFormerStint
+          ? {
+              storeRoleId: (data.storeRoleId ?? null) as any,
+              workShiftId: (data.workShiftId ?? null) as any,
+              skillId: data.skillId ?? null,
+              // Nullable column typed `string` on the entity.
+              employeeTypeId: (employeeTypeId ?? null) as any,
+              probationEndsAt: probationEndsAt ?? null,
+              capabilityPoints: 0,
+              workingStatus: WorkingStatus.OFF,
+              preferredShiftTypes: null,
+              shiftPreferenceNote: null,
+              reminderSettings: null,
             }
           : {}),
       }),
@@ -2847,12 +2950,36 @@ export class StoresService {
       currentMonth,
       manager,
     );
+    if (revivesFormerStint) {
+      // `createOrUpdateMonthlySummary` returns an existing row untouched, so a
+      // same-month rehire would show the previous stint's counters. This row
+      // is display data only (payroll reads assignments); past months stay.
+      await manager.update(
+        EmployeeMonthlySummary,
+        { employeeProfileId: profile.id, month: currentMonth },
+        {
+          totalShifts: 0,
+          completedShifts: 0,
+          monthlyWorkHours: 0,
+          lateArrivalsCount: 0,
+          onTimeArrivalsCount: 0,
+          earlyDeparturesCount: 0,
+          unauthorizedLeavesCount: 0,
+          authorizedLeavesCount: 0,
+          estimatedSalary: 0,
+          performanceScore: 0,
+          totalCompletedShifts: 0,
+          totalWorkHours: 0,
+          baseSalary: salaryAmount,
+        },
+      );
+    }
     const monthlyPayroll = await this.findOrCreateMonthlyPayroll(
       storeId,
       vnMonth,
       manager,
     );
-    await this.upsertInitialEmployeeSalary(manager, {
+    const salaryResult = await this.upsertInitialEmployeeSalary(manager, {
       employeeProfileId: profile.id,
       month: currentMonth,
       monthlyPayrollId: monthlyPayroll.id,
@@ -2860,7 +2987,114 @@ export class StoresService {
       paymentType: data.contract?.paymentType,
     });
     await this.assignInitialAssets(manager, storeId, profile.id, data.assetIds);
-    return profile;
+    return {
+      profile,
+      currentMonthPayslipLocked:
+        revivesFormerStint && salaryResult === 'locked',
+    };
+  }
+
+  /**
+   * Closes what the previous stint of a former employee left open, inside the
+   * rehire transaction. Everything is a status flag — nothing is deleted, and
+   * payslips, attendance logs, salary advances and past monthly summaries are
+   * never touched.
+   *
+   *   1. active contracts → inactive (payroll picks the active contract);
+   *   2. ASSIGNED assets → RETURNED and restocked (DAMAGED/LOST untouched).
+   *      Assets are locked by id ascending, the same order as
+   *      `assignInitialAssets`, which runs later in the same transaction;
+   *   3. active face registrations → inactive (check-in requires a new one);
+   *   4. active memberships in store group chats → removed, except direct
+   *      chats and groups the person created (the chat module forbids those
+   *      transitions);
+   *   5. not-yet-started shift assignments → cancelled (backstop for people
+   *      terminated before termination did this itself);
+   *   6. requests still PENDING (leave, shift change, swap, KPI approval,
+   *      salary advance) → closed, the same backstop via
+   *      `closePendingRequestsOfLeaver`.
+   */
+  private async resetFormerStintForRehire(
+    manager: EntityManager,
+    p: { id: string; storeId: string; accountId: string },
+    now: Date,
+  ): Promise<void> {
+    const contracts = await manager.update(
+      EmployeeContract,
+      { employeeProfileId: p.id, isActive: true },
+      { isActive: false },
+    );
+
+    const held = await manager
+      .getRepository(EmployeeAssetAssignment)
+      .createQueryBuilder('ea')
+      .where('ea.employeeProfileId = :id AND ea.status = :status', {
+        id: p.id,
+        status: AssetAssignmentStatus.ASSIGNED,
+      })
+      .setLock('pessimistic_write')
+      .getMany();
+    if (held.length) {
+      const quantityByAsset = new Map<string, number>();
+      for (const row of held) {
+        quantityByAsset.set(
+          row.assetId,
+          (quantityByAsset.get(row.assetId) ?? 0) + Number(row.quantity || 0),
+        );
+      }
+      const assetIds = [...quantityByAsset.keys()].sort();
+      const assets = await manager
+        .getRepository(Asset)
+        .createQueryBuilder('asset')
+        .where('asset.id IN (:...assetIds)', { assetIds })
+        .andWhere('asset.storeId = :storeId', { storeId: p.storeId })
+        .orderBy('asset.id', 'ASC')
+        .setLock('pessimistic_write')
+        .getMany();
+      for (const asset of assets) {
+        asset.currentStock =
+          Number(asset.currentStock) + (quantityByAsset.get(asset.id) ?? 0);
+        await manager.save(Asset, asset);
+      }
+      await manager.update(
+        EmployeeAssetAssignment,
+        { id: In(held.map((row) => row.id)) },
+        {
+          status: AssetAssignmentStatus.RETURNED,
+          returnedDate: now,
+          returnNote:
+            'Tự động thu hồi khi nhận lại nhân viên (kết thúc đợt làm việc trước)',
+        },
+      );
+    }
+
+    const faces = await manager.update(
+      EmployeeFace,
+      { employeeProfileId: p.id, isActive: true },
+      { isActive: false },
+    );
+
+    const chats = await manager
+      .createQueryBuilder()
+      .update(ChatGroupMember)
+      .set({ status: 'removed' })
+      .where('account_id = :accountId', { accountId: p.accountId })
+      .andWhere("status = 'active'")
+      .andWhere('deleted_at IS NULL')
+      .andWhere(
+        'group_id IN (SELECT g.id FROM chat_groups g WHERE g.store_id = :storeId AND g.direct_key IS NULL AND g.created_by <> :accountId AND g.deleted_at IS NULL)',
+        { storeId: p.storeId, accountId: p.accountId },
+      )
+      .execute();
+
+    const shifts = await this.cancelFutureShiftAssignments(manager, p.id, now);
+    // Backstop for people terminated before termination closed these: old
+    // pending leave/shift/swap/KPI/advance requests must not resurface.
+    await this.closePendingRequestsOfLeaver(manager, p.id);
+
+    this.logger.log(
+      `[Rehire] profile=${p.id} contracts=${contracts?.affected ?? 0} assets=${held.length} faces=${faces?.affected ?? 0} chats=${chats?.affected ?? 0} shifts=${shifts.length}`,
+    );
   }
 
   private async assignInitialAssets(
@@ -3063,6 +3297,12 @@ export class StoresService {
 
     if (!profile) return null;
 
+    // Only the current stint: a rehired employee's previous contracts and
+    // activity stay in the database but are not shown as current. The active
+    // contract comes first, so clients reading `contracts[0]` get it.
+    const floor = stintFloor(profile.joinedAt);
+    profile.contracts = currentStintContracts(profile.contracts, floor);
+
     // 1. Lấy thống kê tháng hiện tại (tháng Việt Nam)
     const currentMonth = toMonthMarker(vnMonthOf());
     const summary = await this.monthlySummaryRepository.findOne({
@@ -3074,7 +3314,10 @@ export class StoresService {
 
     // 2. Lấy hoạt động gần đây (lịch sử chấm công)
     const assignments = await this.shiftAssignmentRepository.find({
-      where: { employeeId: profileId },
+      where: {
+        employeeId: profileId,
+        ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+      },
       relations: ['shiftSlot', 'shiftSlot.workShift'],
       order: {
         createdAt: 'DESC',
@@ -3295,9 +3538,26 @@ export class StoresService {
     if (years > 0) tenureDisplay += `${years} năm `;
     if (months > 0 || years === 0) tenureDisplay += `${months} tháng`;
 
-    // 4. Xử lý danh sách đánh giá
+    // 4. Xử lý danh sách đánh giá (chỉ trong đợt làm việc hiện tại)
+    // `performance_date` is a date column, so it is compared with the VN
+    // calendar date the stint started (an assessment dated on the rehire day
+    // belongs to the new stint), not with the timestamp floor.
+    const stintStart = stintStartVnDate(profile.joinedAt);
+    const assessmentDateKey = (value: Date | string | null | undefined) =>
+      typeof value === 'string'
+        ? value.slice(0, 10)
+        : value instanceof Date && Number.isFinite(value.getTime())
+          ? vnDateString(value)
+          : '';
     const assessments = (summary?.performances || [])
-      .sort((a, b) => b.performanceDate.getTime() - a.performanceDate.getTime())
+      .filter(
+        (p) => !stintStart || assessmentDateKey(p.performanceDate) >= stintStart,
+      )
+      .sort((a, b) =>
+        assessmentDateKey(b.performanceDate).localeCompare(
+          assessmentDateKey(a.performanceDate),
+        ),
+      )
       .map((p) => ({
         type: p.type,
         title: p.title,
@@ -3359,6 +3619,14 @@ export class StoresService {
     const startDate = new Date(month.getFullYear(), month.getMonth(), 1);
     const endDate = new Date(month.getFullYear(), month.getMonth() + 1, 0);
 
+    // Only the current stint of a rehired employee (staff calendar included).
+    const stintProfile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'joinedAt'],
+    });
+    const floor = stintFloor(stintProfile?.joinedAt);
+    const sinceStint = floor ? { createdAt: MoreThanOrEqual(floor) } : {};
+
     // 1. Get Leave Requests
     const leaveRequests = await this.leaveRequestRepository.find({
       where: {
@@ -3367,14 +3635,15 @@ export class StoresService {
           startDate.toISOString().split('T')[0],
           endDate.toISOString().split('T')[0],
         ),
+        ...sinceStint,
       },
     });
 
     // 2. Get Shift Swaps
     const swaps = await this.shiftSwapRepository.find({
       where: [
-        { requestedByEmployeeId: profileId },
-        { toEmployeeId: profileId },
+        { requestedByEmployeeId: profileId, ...sinceStint },
+        { toEmployeeId: profileId, ...sinceStint },
       ],
       relations: [
         'fromAssignment',
@@ -3395,6 +3664,7 @@ export class StoresService {
             endDate.toISOString().split('T')[0],
           ),
         },
+        ...sinceStint,
       },
       relations: ['shiftSlot', 'shiftSlot.workShift'],
     });
@@ -3922,6 +4192,12 @@ export class StoresService {
       const summary = summaryMap.get(employee.id);
       return {
         ...employee,
+        // Only the current stint's contracts of a rehired employee, active
+        // first (the list reads `contracts[0]` for the expiry date).
+        contracts: currentStintContracts(
+          employee.contracts,
+          stintFloor(employee.joinedAt),
+        ),
         totalShifts: summary?.totalShifts || 0,
         completedShifts: summary?.completedShifts || 0,
         onTimeArrivalsCount: summary?.onTimeArrivalsCount || 0,
@@ -4011,15 +4287,144 @@ export class StoresService {
         throw new NotFoundException('Lý do thôi việc không hợp lệ');
       }
 
+      const now = new Date();
+      // Shifts the leaver was booked for (and has not started) are withdrawn
+      // so the slot frees up and nobody is counted absent. No reminder queue
+      // call is needed: the reminder processor only sends for APPROVED
+      // assignments of non-deleted employees, and `cancelAssignmentReminders`
+      // would skip these rows anyway because it loads the (now soft-deleted)
+      // employee relation.
+      await this.cancelFutureShiftAssignments(manager, profile.id, now);
+      // Requests still waiting for approval are closed with the employment, so
+      // they never resurface in the approval tab after a rehire.
+      await this.closePendingRequestsOfLeaver(manager, profile.id);
+
       profile.employmentStatus = EmploymentStatus.TERMINATED;
       profile.terminationReasonId = reasonId;
-      profile.leftAt = new Date();
+      profile.leftAt = now;
       await manager.save(EmployeeProfile, profile);
       return manager.softDelete(EmployeeProfile, {
         id: profileId,
         storeId: profile.storeId,
       });
     });
+  }
+
+  /**
+   * Closes a leaver's requests that are still PENDING, inside the
+   * termination transaction (and again at a rehire, as a backstop): leave
+   * and shift-change requests and salary advances become CANCELLED; shift
+   * swaps and KPI approval requests (whose status has no CANCELLED value)
+   * become REJECTED with a note, whether the leaver asked for the swap or was
+   * its target. Decided requests are never touched.
+   */
+  private async closePendingRequestsOfLeaver(
+    manager: EntityManager,
+    profileId: string,
+  ): Promise<void> {
+    await manager
+      .getRepository(EmployeeLeaveRequest)
+      .update(
+        { employeeProfileId: profileId, status: LeaveRequestStatus.PENDING },
+        { status: LeaveRequestStatus.CANCELLED },
+      );
+    await manager
+      .getRepository(ShiftChangeRequest)
+      .update(
+        {
+          employeeProfileId: profileId,
+          status: ShiftChangeRequestStatus.PENDING,
+        },
+        { status: ShiftChangeRequestStatus.CANCELLED },
+      );
+    const swapNote = 'Nhân viên đã nghỉ việc';
+    for (const column of ['requestedByEmployeeId', 'toEmployeeId'] as const) {
+      await manager
+        .getRepository(ShiftSwap)
+        .update(
+          { [column]: profileId, status: ShiftSwapStatus.PENDING },
+          { status: ShiftSwapStatus.REJECTED, note: swapNote },
+        );
+    }
+    // KPI approval requests have no CANCELLED status (a Postgres enum), so a
+    // pending one is closed as REJECTED with the same note as swaps.
+    await manager
+      .getRepository(KpiApprovalRequest)
+      .update(
+        { employeeProfileId: profileId, status: KpiRequestStatus.PENDING },
+        { status: KpiRequestStatus.REJECTED, note: swapNote },
+      );
+    // A pending salary advance was never paid; APPROVED ones are payroll
+    // history and stay as they are.
+    await manager
+      .getRepository(SalaryAdvanceRequest)
+      .update(
+        { employeeProfileId: profileId, status: AdvanceRequestStatus.PENDING },
+        { status: AdvanceRequestStatus.CANCELLED },
+      );
+  }
+
+  /**
+   * Cancels an employee's PENDING/APPROVED shift assignments that have not
+   * started yet. Used at termination and, as a backstop for people terminated
+   * before this existed, when a former employee is rehired.
+   *
+   * Never touches CONFIRMED/COMPLETED rows, rows with a check-in, or a shift
+   * that already started today (the absence reconcile owns those). Attendance
+   * logs and payslips are not touched. Returns the cancelled ids.
+   */
+  private async cancelFutureShiftAssignments(
+    manager: EntityManager,
+    profileId: string,
+    now: Date,
+  ): Promise<string[]> {
+    const today = vnDateString(now);
+    const rows = await manager
+      .getRepository(ShiftAssignment)
+      .createQueryBuilder('a')
+      .innerJoin('a.shiftSlot', 'slot')
+      .leftJoin('slot.workShift', 'ws')
+      .select('a.id', 'id')
+      .addSelect('slot.workDate', 'workDate')
+      .addSelect('slot.startTime', 'slotStartTime')
+      .addSelect('ws.startTime', 'shiftStartTime')
+      .where('a.employeeId = :profileId', { profileId })
+      .andWhere('a.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.PENDING,
+          ShiftAssignmentStatus.APPROVED,
+        ],
+      })
+      .andWhere('a.checkInTime IS NULL')
+      .andWhere('slot.workDate >= :today', { today })
+      .getRawMany<{
+        id: string;
+        workDate: string | Date;
+        slotStartTime: string | null;
+        shiftStartTime: string | null;
+      }>();
+
+    const ids = rows
+      .filter((row) => {
+        const workDate =
+          row.workDate instanceof Date
+            ? vnDateString(row.workDate)
+            : String(row.workDate).slice(0, 10);
+        const time = row.slotStartTime || row.shiftStartTime;
+        if (!time) return workDate > today;
+        try {
+          return parseVietnamShiftStart(workDate, time).getTime() > now.getTime();
+        } catch {
+          return workDate > today;
+        }
+      })
+      .map((row) => row.id);
+    if (!ids.length) return [];
+
+    await manager
+      .getRepository(ShiftAssignment)
+      .update({ id: In(ids) }, { status: ShiftAssignmentStatus.CANCELLED });
+    return ids;
   }
 
   /**
@@ -4045,6 +4450,11 @@ export class StoresService {
     });
   }
 
+  /**
+   * Restores a soft-deleted employee and continues the old stint (old
+   * contracts and assets stay as they were). Shift assignments cancelled at
+   * termination are NOT brought back; the owner re-assigns them.
+   */
   async restoreEmployee(profileId: string, ownerAccountId: string) {
     const profileBeforeLock = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -4147,6 +4557,21 @@ export class StoresService {
     )
       sanitizedData.durationMonths = undefined;
 
+    // "Không hợp đồng": no labor contract, but the pay rate is kept for
+    // payroll. Marked by `noLaborContract: true`, `durationMonths: 0` or the
+    // name itself (the only marker older backends also accept), and stored
+    // as duration 0, no end date, that name.
+    const noLaborContract =
+      sanitizedData.noLaborContract === true ||
+      sanitizedData.noLaborContract === 'true' ||
+      isNoLaborContract(sanitizedData);
+    delete sanitizedData.noLaborContract;
+    if (noLaborContract) {
+      sanitizedData.durationMonths = 0;
+      sanitizedData.endDate = null;
+      sanitizedData.contractName = NO_LABOR_CONTRACT_NAME;
+    }
+
     // Tự động tính end_date nếu có duration_months và start_date
     if (sanitizedData.durationMonths && sanitizedData.startDate) {
       const startDate = new Date(sanitizedData.startDate);
@@ -4172,15 +4597,28 @@ export class StoresService {
     const contract = repository.create({
       ...sanitizedData,
       employeeProfileId: profileId,
-    });
-    return repository.save(contract);
+    }) as unknown as EmployeeContract;
+    const saved = await repository.save(contract);
+    saved.noLaborContract = isNoLaborContract(saved);
+    return saved;
   }
 
+  /**
+   * The employee's current contract: active first, then newest, and only
+   * from the current stint of a rehired employee (null when none).
+   */
   async getLatestContract(profileId: string) {
-    return this.contractRepository.findOne({
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'joinedAt'],
+    });
+    const contracts = await this.contractRepository.find({
       where: { employeeProfileId: profileId },
       order: { createdAt: 'DESC' },
     });
+    return (
+      currentStintContracts(contracts, stintFloor(profile?.joinedAt))[0] ?? null
+    );
   }
 
   // Contract Template management
@@ -4945,18 +5383,11 @@ export class StoresService {
         });
       void this.notifyEmployeesOfNewShifts(assignmentIds, 'assigned');
     }
+    const announcement = selectCreatedShiftAnnouncement(drafts, workDates);
     void this.notifyEmployeesOfCreatedShifts(
       storeId,
-      drafts
-        .filter((draft) => draft.employeeIds.length < draft.maxStaff)
-        .flatMap((draft) =>
-          workDates.map((workDate) => ({
-            workDate,
-            startTime: draft.startTime,
-            endTime: draft.endTime,
-            shiftName: draft.shiftName,
-          })),
-        ),
+      announcement.shifts,
+      announcement.excludeProfileIds,
     );
 
     return publicResult;
@@ -4969,44 +5400,74 @@ export class StoresService {
    */
   private async notifyEmployeesOfCreatedShifts(
     storeId: string,
-    openShifts: ShiftForNotification[],
+    shifts: AnnouncedShift[],
+    excludeProfileIds: string[] = [],
   ): Promise<void> {
-    if (!openShifts.length) return;
+    // Shifts that already started or passed cannot be registered any more.
+    const now = new Date();
+    const openShifts = shifts.filter(
+      (shift) => !isSlotRegistrationClosed(shift, null, now),
+    );
+    if (!openShifts.length) {
+      if (shifts.length) {
+        this.logger.debug(
+          `[notifyEmployeesOfCreatedShifts] store=${storeId} openShifts=0 closedShifts=${shifts.length}`,
+        );
+      }
+      return;
+    }
     try {
+      // Only people who can register (ACTIVE, PROBATION) are told.
       const employees = await this.profileRepository.find({
-        where: { storeId, employmentStatus: In([...EMPLOYED_STATUSES]) },
+        where: {
+          storeId,
+          employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
+        },
         select: ['id', 'accountId', 'reminderSettings'],
       });
-      const recipients = [
-        ...new Set(
-          employees
-            .filter(
-              (employee) =>
-                !!employee.accountId &&
-                shouldNotifyNewShifts(employee.reminderSettings),
-            )
-            .map((employee) => employee.accountId as string),
-        ),
-      ];
-      if (!recipients.length) return;
-      const { title, content } = buildShiftNotification('created', openShifts);
+      const excluded = new Set(excludeProfileIds);
+      const candidates = employees.filter(
+        (employee) => !!employee.accountId && !excluded.has(employee.id),
+      );
+      const wanting = candidates.filter((employee) =>
+        shouldNotifyNewShifts(employee.reminderSettings),
+      );
+      const optedOut = candidates.length - wanting.length;
+      // Each person is told only about the shifts they do not already hold.
+      // One notice per account.
+      const byAccount = new Map<string, AnnouncedShift[]>();
+      for (const employee of wanting) {
+        const own = shiftsOpenTo(employee.id, openShifts);
+        if (own.length && !byAccount.has(employee.accountId as string)) {
+          byAccount.set(employee.accountId as string, own);
+        }
+      }
+      const recipients = [...byAccount.keys()];
+      let sent = 0;
       for (const accountId of recipients) {
+        const own = byAccount.get(accountId) as AnnouncedShift[];
+        const { title, content } = buildShiftNotification('created', own);
         try {
-          await this.notificationsService.create({
-            accountId,
-            storeId,
-            title,
-            content,
-            type: NotificationType.SYSTEM,
-            priority: NotificationPriority.NORMAL,
-            // Mở thẳng lịch làm việc, nơi nhân viên đăng ký ca.
-            actionUrl: '/(home)/workshift',
-            metadata: {
-              type: 'SHIFT_CREATED',
+          await this.notificationsService.create(
+            {
+              accountId,
               storeId,
-              ...shiftNotificationDateMetadata(openShifts),
+              title,
+              content,
+              type: NotificationType.SYSTEM,
+              priority: NotificationPriority.NORMAL,
+              // Mở thẳng lịch làm việc, nơi nhân viên đăng ký ca.
+              actionUrl: '/(home)/workshift',
+              metadata: {
+                type: 'SHIFT_CREATED',
+                storeId,
+                ...shiftNotificationDateMetadata(own),
+              },
             },
-          });
+            // Not a shift alert: the channel every app build creates.
+            { channelId: DEFAULT_ANDROID_CHANNEL },
+          );
+          sent++;
         } catch (error) {
           this.logger.warn(
             `[notifyEmployeesOfCreatedShifts] could not notify an employee of store ${storeId}: ${
@@ -5015,9 +5476,77 @@ export class StoresService {
           );
         }
       }
+      // Counts only: no account ids, names or content.
+      this.logger.log(
+        `[notifyEmployeesOfCreatedShifts] store=${storeId} openShifts=${openShifts.length} recipients=${sent}/${recipients.length} employees=${employees.length} excluded=${employees.length - candidates.length} optedOut=${optedOut}`,
+      );
     } catch (error) {
       this.logger.warn(
         `[notifyEmployeesOfCreatedShifts] could not load employees of store ${storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** See SlotAnnouncementThrottle; created lazily (tests build via prototype). */
+  private freeSeatThrottle?: SlotAnnouncementThrottle;
+
+  /**
+   * After commit, best effort: when an existing slot of an active cycle just
+   * gained a free seat (the owner raised `maxStaff` or cancelled someone) and
+   * has not started (VN time), tell the store's other eligible staff "Có ca
+   * mới để đăng ký". Seat holders and `excludeProfileIds` (e.g. the person
+   * just removed) are not told. A slot is announced at most once per
+   * throttle window. Logs counts only.
+   */
+  private async announceFreeSeatsOfSlot(
+    slotId: string,
+    trigger: 'max_staff_raised' | 'assignment_cancelled',
+    excludeProfileIds: string[] = [],
+  ): Promise<void> {
+    try {
+      const slot = await this.shiftSlotRepository.findOne({
+        where: { id: slotId },
+        relations: ['cycle', 'workShift', 'assignments'],
+      });
+      const storeId = slot?.cycle?.storeId;
+      if (!slot || !storeId || slot.cycle.status !== WorkCycleStatus.ACTIVE) {
+        return;
+      }
+      const holderProfileIds = (slot.assignments || [])
+        .filter((a) => a.status !== ShiftAssignmentStatus.CANCELLED)
+        .map((a) => a.employeeId);
+      const shift = selectFreeSeatAnnouncement({
+        workDate: slot.workDate,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
+        maxStaff: slot.maxStaff ?? slot.workShift?.defaultMaxStaff ?? null,
+        shiftName: slot.workShift?.shiftName ?? null,
+        templateStartTime: slot.workShift?.startTime ?? null,
+        templateEndTime: slot.workShift?.endTime ?? null,
+        holderProfileIds,
+      });
+      if (!shift) {
+        this.logger.debug(
+          `[announceFreeSeatsOfSlot] trigger=${trigger} skipped=full_or_started holders=${holderProfileIds.length}`,
+        );
+        return;
+      }
+      this.freeSeatThrottle ??= new SlotAnnouncementThrottle();
+      if (!this.freeSeatThrottle.claim(slotId)) {
+        this.logger.debug(
+          `[announceFreeSeatsOfSlot] trigger=${trigger} skipped=recently_announced`,
+        );
+        return;
+      }
+      await this.notifyEmployeesOfCreatedShifts(storeId, [shift], [
+        ...holderProfileIds,
+        ...excludeProfileIds,
+      ]);
+    } catch (error) {
+      this.logger.warn(
+        `[announceFreeSeatsOfSlot] trigger=${trigger} failed: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
@@ -5983,7 +6512,7 @@ export class StoresService {
     if (data.maxStaff !== undefined) updateData.maxStaff = data.maxStaff;
     if (data.note !== undefined) updateData.note = data.note;
 
-    await this.dataSource.transaction(async (manager) => {
+    const seatsRaised = await this.dataSource.transaction(async (manager) => {
       await lockStoreShiftAvailability(manager, storeId);
       const store = await manager.findOne(Store, {
         where: { id: storeId },
@@ -6009,7 +6538,24 @@ export class StoresService {
         );
       }
       await manager.update(ShiftSlot, slotId, updateData);
+      if (data.maxStaff === undefined) return false;
+      const next = Number(data.maxStaff) || 0;
+      const previous = Number(lockedSlot.maxStaff) || 0;
+      // 0/null is "unlimited" (a null override inherits the template, so a
+      // change from null is treated as a possible raise; the announcement
+      // re-checks the real free seats).
+      return (
+        lockedSlot.maxStaff === null ||
+        next > previous ||
+        (next === 0 && previous > 0)
+      );
     });
+    if (seatsRaised) {
+      // More seats than before: others may now sign up (if it is not full).
+      void this.announceFreeSeatsOfSlot(slotId, 'max_staff_raised').catch(
+        () => undefined,
+      );
+    }
     if (data.startTime !== undefined) {
       const assignments = await this.shiftAssignmentRepository.find({
         where: {
@@ -6395,6 +6941,18 @@ export class StoresService {
         throw new BadRequestException('Đã quá hạn đăng ký ca làm việc');
       }
 
+      // Staff cannot sign up for a slot that already started or is in the
+      // past (VN time). The owner can still assign to fix records.
+      if (
+        !authorizedOwnerAssign &&
+        isSlotRegistrationClosed(slot, workShift, now)
+      ) {
+        throw new BadRequestException({
+          code: SLOT_REGISTRATION_CLOSED_CODE,
+          message: SLOT_REGISTRATION_CLOSED_MESSAGE,
+        });
+      }
+
       // Check capacity (0 or null = unlimited)
       const activeCount =
         assignments.filter((a) => a.status !== ShiftAssignmentStatus.CANCELLED)
@@ -6740,6 +7298,19 @@ export class StoresService {
         nextStatus === ShiftAssignmentStatus.APPROVED
       ) {
         void this.notifyEmployeesOfNewShifts([assignmentId], 'approved');
+      }
+      // The owner took someone off a booked shift: the seat is free again.
+      // (Rejecting a PENDING registration is a decision on a request, not an
+      // unassignment, and is not announced.)
+      if (
+        previousStatus === ShiftAssignmentStatus.APPROVED &&
+        nextStatus === ShiftAssignmentStatus.CANCELLED
+      ) {
+        void this.announceFreeSeatsOfSlot(
+          saved.shiftSlotId,
+          'assignment_cancelled',
+          [saved.employeeId],
+        ).catch(() => undefined);
       }
       // After commit, from the status read under the lock. The owner app
       // approves through this route, which scheduled no reminder before.
@@ -7703,7 +8274,7 @@ export class StoresService {
           manager,
         );
       }
-      const profile = await this.initializeEmployeeProfile(
+      const { profile } = await this.initializeEmployeeProfile(
         manager,
         data.storeId,
         newAccount.id,
@@ -7980,6 +8551,7 @@ export class StoresService {
             existingSalaryId: existing?.id ?? null,
             otherDeductions: existing?.otherDeductions,
             now,
+            stint: employee,
           }));
         }
 
@@ -8275,10 +8847,25 @@ export class StoresService {
     existingSalaryId?: string | null;
     otherDeductions?: number | null;
     now?: Date;
+    /**
+     * The employee's current stint (`joinedAt`) and contracts. When the month
+     * also holds shifts of a previous stint (a same-month rehire), those keep
+     * the pay stored at their check-out; see computeStintSplitEarnedBase.
+     * Omitted or a null `joinedAt` (legacy rows): one contract for the month.
+     */
+    stint?: {
+      joinedAt?: Date | null;
+      contracts?: EmployeeContract[] | null;
+    };
   }): Promise<{
     facts: MonthlyAttendanceFacts;
     assignments: PayrollAssignmentFact[];
     payslip: PayslipComputation;
+    /**
+     * Earned base of the current stint only, when the month also holds a
+     * previous stint's shifts (same-month rehire); null otherwise.
+     */
+    currentStintEarned: number | null;
   }> {
     const assignments = await this.loadMonthlyAssignments(
       p.employeeProfileId,
@@ -8286,15 +8873,48 @@ export class StoresService {
       p.month,
       p.manager,
     );
-    const facts = summarizeMonthlyAttendance(
-      assignments,
-      vnDateString(p.now ?? new Date()),
-    );
+    const todayVn = vnDateString(p.now ?? new Date());
+    const facts = summarizeMonthlyAttendance(assignments, todayVn);
     const advancePayment = await this.sumApprovedAdvances(
       p.existingSalaryId,
       p.manager,
     );
+    // Same-month rehire: the previous stint's shifts keep their old pricing,
+    // the current stint's shifts are priced with the current contract. Bonus
+    // and fine rules still read the whole month's facts.
+    const floor = stintFloor(p.stint?.joinedAt);
+    const priorContract = floor
+      ? ((p.stint?.contracts ?? [])
+          .filter(
+            (c) =>
+              !c.isActive &&
+              c.createdAt &&
+              new Date(c.createdAt).getTime() < floor.getTime(),
+          )
+          .sort(
+            (a, b) =>
+              new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+          )[0] ?? null)
+      : null;
+    const split = computeStintSplitEarnedBase({
+      assignments,
+      stintStartDate: stintStartVnDate(p.stint?.joinedAt),
+      todayVn,
+      current: {
+        paymentType: p.contract?.paymentType ?? null,
+        rate: p.contract ? p.rate : 0,
+      },
+      prior: priorContract
+        ? {
+            paymentType: priorContract.paymentType,
+            rate: Number(priorContract.salaryAmount) || 0,
+          }
+        : null,
+      standardWorkingDays: p.standardWorkingDays,
+      calendarDays: p.month.calendarDays,
+    });
     const payslip = computePayslip({
+      earnedBaseSalary: split?.earnedBase ?? null,
       paymentType: p.contract?.paymentType ?? null,
       rate: p.contract ? p.rate : 0,
       allowances: p.contract?.allowances ?? null,
@@ -8305,7 +8925,12 @@ export class StoresService {
       advancePayment,
       otherDeductions: Number(p.otherDeductions) || 0,
     });
-    return { facts, assignments, payslip };
+    return {
+      facts,
+      assignments,
+      payslip,
+      currentStintEarned: split?.currentStintEarned ?? null,
+    };
   }
 
   // --- Store Payroll Payment History ---
@@ -8928,7 +9553,15 @@ export class StoresService {
       baseSalary: number;
       paymentType?: PaymentType;
     },
-  ): Promise<void> {
+  ): Promise<'inserted' | 'updated' | 'locked'> {
+    // Same-month rehire: the single (profile, month) payslip is reused. While
+    // it is PENDING/REJECTED, rebuild and checkout compute it from all of that
+    // month's assignments: the earlier stint's shifts keep the pay stored at
+    // their check-out (their old contract), and the new stint's shifts are
+    // priced with the new contract (computeStintSplitEarnedBase). An APPROVED/PAID payslip is never
+    // rewritten ('locked'): the new stint's shifts that month are then not
+    // added automatically, which the rehire response reports as
+    // `rehire.currentMonthPayslipLocked`.
     const repository = manager.getRepository(EmployeeSalary);
     const existing = await repository.findOne({
       where: {
@@ -8947,7 +9580,7 @@ export class StoresService {
           earnedBaseSalary: 0,
         }),
       );
-      return;
+      return 'inserted';
     }
 
     if (
@@ -8962,7 +9595,7 @@ export class StoresService {
         });
       }
       if (existing.deletedAt) await repository.restore(existing.id);
-      return;
+      return 'locked';
     }
 
     await repository.update(existing.id, {
@@ -8971,6 +9604,7 @@ export class StoresService {
       ...(data.paymentType ? { paymentType: data.paymentType } : {}),
     });
     if (existing.deletedAt) await repository.restore(existing.id);
+    return 'updated';
   }
 
   async createEmployeeSalary(
@@ -9253,6 +9887,7 @@ export class StoresService {
       standardWorkingDays,
       existingSalaryId: existing?.id ?? null,
       otherDeductions: existing?.otherDeductions,
+      stint: profile ?? undefined,
     });
     return {
       facts,
@@ -9674,6 +10309,9 @@ export class StoresService {
     if (storeId) {
       query.andWhere(':storeId = ANY(kpi.store_ids)', { storeId });
     }
+
+    // A rehired employee's KPIs from the previous stint are kept but hidden.
+    query.andWhere(currentStintSql('profile', 'kpi.created_at'));
 
     if (month) {
       query.andWhere("to_char(kpi.month, 'YYYY-MM') = :month", { month });
@@ -10156,6 +10794,8 @@ export class StoresService {
       .orderBy('request.created_at', 'DESC');
 
     scope(query);
+    // Requests about a KPI from a rehired employee's previous stint are hidden.
+    query.andWhere(currentStintSql('profile', 'kpi.created_at'));
 
     if (month) {
       query.andWhere("to_char(kpi.month, 'YYYY-MM') = :month", { month });
@@ -12666,8 +13306,17 @@ export class StoresService {
 
   // Employee Asset Management
   async getEmployeeAssets(profileId: string) {
+    // Only assets issued in the current stint; a rehire returns the old ones.
+    const stintProfile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'joinedAt'],
+    });
+    const floor = stintFloor(stintProfile?.joinedAt);
     const assignments = await this.assetAssignmentRepository.find({
-      where: { employeeProfileId: profileId },
+      where: {
+        employeeProfileId: profileId,
+        ...(floor ? { assignedDate: MoreThanOrEqual(floor) } : {}),
+      },
       relations: [
         'asset',
         'asset.assetUnit',
@@ -12856,29 +13505,53 @@ export class StoresService {
     status: AssetAssignmentStatus,
     returnNote?: string,
   ) {
-    const assignment = await this.assetAssignmentRepository.findOne({
-      where: { id: assignmentId },
-      relations: ['asset'],
-    });
+    // One transaction with the same lock order as the rehire restock
+    // (assignment row, then asset row), and a conditional status update, so
+    // a concurrent return or rehire can never return the same row twice or
+    // double-count the stock.
+    await this.dataSource.transaction(async (manager) => {
+      const assignment = await manager
+        .getRepository(EmployeeAssetAssignment)
+        .createQueryBuilder('ea')
+        .where('ea.id = :assignmentId', { assignmentId })
+        .setLock('pessimistic_write')
+        .getOne();
 
-    if (!assignment)
-      throw new NotFoundException('Không tìm thấy bản ghi cấp phát');
-    if (assignment.status !== AssetAssignmentStatus.ASSIGNED) {
-      throw new BadRequestException(
-        'Tài sản này đã được thu hồi hoặc không còn hiệu lực',
+      if (!assignment)
+        throw new NotFoundException('Không tìm thấy bản ghi cấp phát');
+      const alreadyClosed = () =>
+        new BadRequestException(
+          'Tài sản này đã được thu hồi hoặc không còn hiệu lực',
+        );
+      if (assignment.status !== AssetAssignmentStatus.ASSIGNED) {
+        throw alreadyClosed();
+      }
+
+      const updated = await manager.update(
+        EmployeeAssetAssignment,
+        { id: assignment.id, status: AssetAssignmentStatus.ASSIGNED },
+        {
+          status,
+          returnedDate: new Date(),
+          returnNote: returnNote || null,
+        },
       );
-    }
+      if (!updated.affected) throw alreadyClosed();
 
-    assignment.status = status;
-    assignment.returnedDate = new Date();
-    assignment.returnNote = returnNote || null;
-
-    await this.assetAssignmentRepository.save(assignment);
-
-    if (status === AssetAssignmentStatus.RETURNED) {
-      assignment.asset.currentStock += assignment.quantity;
-      await this.assetRepository.save(assignment.asset);
-    }
+      if (status === AssetAssignmentStatus.RETURNED) {
+        const asset = await manager
+          .getRepository(Asset)
+          .createQueryBuilder('asset')
+          .where('asset.id = :assetId', { assetId: assignment.assetId })
+          .setLock('pessimistic_write')
+          .getOne();
+        if (asset) {
+          asset.currentStock =
+            Number(asset.currentStock) + Number(assignment.quantity || 0);
+          await manager.save(Asset, asset);
+        }
+      }
+    });
 
     return { message: 'Đã thu hồi tài sản thành công' };
   }
@@ -13008,6 +13681,10 @@ export class StoresService {
     if (filters.month) {
       queryBuilder.andWhere('salary.month = :month', { month: filters.month });
     }
+
+    // A rehired employee's advance requests from the previous stint are
+    // kept (payroll history) but not listed.
+    queryBuilder.andWhere(currentStintSql('profile', 'request.requested_at'));
 
     const requests = await queryBuilder.getMany();
 
@@ -13386,9 +14063,26 @@ export class StoresService {
     return savedAdjustment;
   }
 
+  /**
+   * Floor of a profile's current employment stint (see
+   * employment-stint.utils); null for a legacy or unknown profile, which
+   * means "do not filter".
+   */
+  private async currentStintFloorOf(profileId: string): Promise<Date | null> {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: ['id', 'joinedAt'],
+    });
+    return stintFloor(profile?.joinedAt);
+  }
+
   async getSalaryAdjustments(employeeProfileId: string) {
+    const floor = await this.currentStintFloorOf(employeeProfileId);
     return this.salaryAdjustmentRepository.find({
-      where: { employeeProfileId },
+      where: {
+        employeeProfileId,
+        ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+      },
       relations: ['createdBy', 'reasonDetail'],
       order: { effectiveMonth: 'DESC', createdAt: 'DESC' },
     });
@@ -13474,9 +14168,13 @@ export class StoresService {
   }
 
   async getEmployeeSalaryHistory(profileId: string, page = 1, limit = 10) {
+    const floor = await this.currentStintFloorOf(profileId);
     const [data, total] =
       await this.employeePaymentHistoryRepository.findAndCount({
-        where: { employeeProfileId: profileId },
+        where: {
+          employeeProfileId: profileId,
+          ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+        },
         order: { paymentDate: 'DESC' },
         relations: ['store'],
         skip: (page - 1) * limit,
@@ -13696,8 +14394,11 @@ export class StoresService {
       );
     }
 
-    // 2. Lấy hợp đồng đang hiệu lực
-    const activeContract = profile.contracts?.find((c) => c.isActive);
+    // 2. Lấy hợp đồng đang hiệu lực (chỉ trong đợt làm việc hiện tại)
+    const floor = stintFloor(profile.joinedAt);
+    const activeContract = currentStintContracts(profile.contracts, floor).find(
+      (c) => c.isActive,
+    );
 
     // Tính số ngày còn lại của hợp đồng
     let daysRemaining: number | null = null;
@@ -13710,7 +14411,10 @@ export class StoresService {
 
     // 3. Lấy lịch sử thanh toán (Mới tạo ở bước trước)
     const paymentHistory = await this.employeePaymentHistoryRepository.find({
-      where: { employeeProfileId },
+      where: {
+        employeeProfileId,
+        ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+      },
       order: { paymentDate: 'DESC' },
     });
 
@@ -13760,8 +14464,11 @@ export class StoresService {
     const now = new Date();
     const currentMonthStart = toMonthMarker(vnMonthOf(now));
 
-    // 1. Tìm hợp đồng đang hiệu lực
-    const activeContract = profile.contracts?.find((c) => c.isActive);
+    // 1. Tìm hợp đồng đang hiệu lực (chỉ trong đợt làm việc hiện tại)
+    const floor = stintFloor(profile.joinedAt);
+    const activeContract = currentStintContracts(profile.contracts, floor).find(
+      (c) => c.isActive,
+    );
 
     // 2. Lấy trạng thái trả lương tháng hiện tại
     const currentSalary = await this.employeeSalaryRepository.findOne({
@@ -13771,9 +14478,12 @@ export class StoresService {
       },
     });
 
-    // 3. Lấy lịch sử điều chỉnh lương
+    // 3. Lấy lịch sử điều chỉnh lương (đợt làm việc hiện tại)
     const adjustmentHistory = await this.salaryAdjustmentRepository.find({
-      where: { employeeProfileId: profile.id },
+      where: {
+        employeeProfileId: profile.id,
+        ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+      },
       relations: ['createdBy'],
       order: { effectiveMonth: 'DESC', createdAt: 'DESC' },
     });
@@ -13891,8 +14601,12 @@ export class StoresService {
 
     return Promise.all(
       profiles.map(async (profile) => {
-        // 1. Tìm hợp đồng đang hiệu lực
-        const activeContract = profile.contracts?.find((c) => c.isActive);
+        // 1. Tìm hợp đồng đang hiệu lực (chỉ trong đợt làm việc hiện tại)
+        const floor = stintFloor(profile.joinedAt);
+        const activeContract = currentStintContracts(
+          profile.contracts,
+          floor,
+        ).find((c) => c.isActive);
 
         // 2. Lấy trạng thái trả lương tháng hiện tại
         const currentSalary = await this.employeeSalaryRepository.findOne({
@@ -13902,9 +14616,12 @@ export class StoresService {
           },
         });
 
-        // 3. Lấy lịch sử điều chỉnh lương
+        // 3. Lấy lịch sử điều chỉnh lương (đợt làm việc hiện tại)
         const adjustmentHistory = await this.salaryAdjustmentRepository.find({
-          where: { employeeProfileId: profile.id },
+          where: {
+            employeeProfileId: profile.id,
+            ...(floor ? { createdAt: MoreThanOrEqual(floor) } : {}),
+          },
           relations: ['createdBy'],
           order: { effectiveMonth: 'DESC', createdAt: 'DESC' },
         });
@@ -17462,6 +18179,7 @@ export class StoresService {
           existingSalaryId: existing?.id ?? null,
           otherDeductions: existing?.otherDeductions,
           now: new Date(),
+          stint: employee,
         }));
       }
       const outcome = await this.upsertEmployeePayslip(manager, {
@@ -17560,18 +18278,31 @@ export class StoresService {
         rules: payrollRules,
         standardWorkingDays,
         now: new Date(),
+        stint: assignment.employee ?? undefined,
       });
       return { ...composed, rate, standardWorkingDays };
     };
 
     let facts: MonthlyAttendanceFacts;
     let payslip: PayslipComputation;
+    let monthAssignments: PayrollAssignmentFact[];
+    let currentStintEarned: number | null | undefined;
     if (!activeContract) {
-      ({ facts, payslip } = await composeCheckoutPayslip());
+      ({
+        facts,
+        payslip,
+        assignments: monthAssignments,
+        currentStintEarned,
+      } = await composeCheckoutPayslip());
     } else {
       // Same writer and lock as generation/recalculation, so a checkout job
       // and a recalculation for the same store and month serialize.
-      ({ facts, payslip } = await this.dataSource.transaction(
+      ({
+        facts,
+        payslip,
+        assignments: monthAssignments,
+        currentStintEarned,
+      } = await this.dataSource.transaction(
         async (manager) => {
           const payroll = await this.findOrCreateMonthlyPayroll(
             storeId,
@@ -17594,7 +18325,13 @@ export class StoresService {
               workDate !== null &&
               a.workDate === workDate,
           );
-          if (!loadedIds.has(assignment.id)) {
+          // A shift of a previous stint (before a same-month rehire) keeps the
+          // figure priced with its own contract; the new contract never
+          // reprices it (see computeStintSplitEarnedBase).
+          const stintStart = stintStartVnDate(assignment.employee?.joinedAt);
+          if (stintStart && workDate !== null && workDate < stintStart) {
+            targets.length = 0;
+          } else if (!loadedIds.has(assignment.id)) {
             targets.push({
               id: assignment.id,
               workDate: workDate ?? '',
@@ -17639,7 +18376,21 @@ export class StoresService {
       ));
     }
 
-    const cumulative = await this.shiftAssignmentRepository
+    // The payslip above keeps every assignment of the month, so a same-month
+    // rehire is paid for both stints, each at its own contract's pricing. The display summary below covers only
+    // the current stint (from the VN date of `joinedAt`). Known edge: a shift
+    // worked earlier on the rehire day itself is counted in the new stint.
+    const since = stintStartVnDate(assignment.employee?.joinedAt);
+    const stintFacts = since
+      ? summarizeMonthlyAttendance(
+          monthAssignments.filter(
+            (a) => String(a.workDate).slice(0, 10) >= since,
+          ),
+          vnDateString(),
+        )
+      : facts;
+
+    const cumulativeQuery = this.shiftAssignmentRepository
       .createQueryBuilder('assignment')
       .select('COUNT(assignment.id)', 'completedShifts')
       .addSelect('COALESCE(SUM(assignment.workedMinutes), 0)', 'workedMinutes')
@@ -17648,28 +18399,41 @@ export class StoresService {
       })
       .andWhere('assignment.status = :status', {
         status: ShiftAssignmentStatus.COMPLETED,
-      })
-      .getRawOne<{ completedShifts: string; workedMinutes: string }>();
+      });
+    if (since) {
+      cumulativeQuery.innerJoin(
+        'assignment.shiftSlot',
+        'slot',
+        'slot.workDate >= :since',
+        { since },
+      );
+    }
+    const cumulative = await cumulativeQuery.getRawOne<{
+      completedShifts: string;
+      workedMinutes: string;
+    }>();
 
     const onTimeArrivalsCount = Math.max(
       0,
-      facts.completedShifts - facts.lateCount,
+      stintFacts.completedShifts - stintFacts.lateCount,
     );
-    const performanceScore = facts.completedShifts
-      ? Math.round((onTimeArrivalsCount / facts.completedShifts) * 100)
+    const performanceScore = stintFacts.completedShifts
+      ? Math.round((onTimeArrivalsCount / stintFacts.completedShifts) * 100)
       : 0;
     await this.monthlySummaryRepository.upsert(
       {
         employeeProfileId: assignment.employeeId,
         month: toMonthMarker(month),
-        totalShifts: facts.totalAssignedShifts,
-        completedShifts: facts.completedShifts,
-        monthlyWorkHours: facts.workingHours,
-        lateArrivalsCount: facts.lateCount,
+        totalShifts: stintFacts.totalAssignedShifts,
+        completedShifts: stintFacts.completedShifts,
+        monthlyWorkHours: stintFacts.workingHours,
+        lateArrivalsCount: stintFacts.lateCount,
         onTimeArrivalsCount,
-        earlyDeparturesCount: facts.earlyCount,
-        unauthorizedLeavesCount: facts.absentCount,
-        estimatedSalary: payslip.earnedBaseSalary,
+        earlyDeparturesCount: stintFacts.earlyCount,
+        unauthorizedLeavesCount: stintFacts.absentCount,
+        // After a same-month rehire the payslip pays both stints, but the
+        // employee list shows what the current stint earned.
+        estimatedSalary: currentStintEarned ?? payslip.earnedBaseSalary,
         baseSalary: Number(activeContract?.salaryAmount) || 0,
         performanceScore,
         totalCompletedShifts: Number(cumulative?.completedShifts || 0),
@@ -18490,32 +19254,96 @@ export class StoresService {
       throw new ForbiddenException('Bạn chỉ có thể huỷ ca của chính mình');
     }
 
-    // Local date parts, not toISOString(): at UTC+7 the UTC day is still
-    // yesterday for the first seven hours, which would cancel today's shift.
+    // Vietnam calendar day and start instant, whatever the server TZ.
     const now = new Date();
-    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const today = vnDateString(now);
     const query = this.shiftAssignmentRepository
       .createQueryBuilder('a')
-      .leftJoin('a.shiftSlot', 'slot')
-      .leftJoin('slot.cycle', 'cycle')
+      .innerJoin('a.shiftSlot', 'slot')
+      .innerJoin('slot.cycle', 'cycle')
+      .leftJoin('slot.workShift', 'ws')
+      .select('a.id', 'id')
+      .addSelect('a.status', 'status')
+      .addSelect('slot.workDate', 'workDate')
+      .addSelect('slot.startTime', 'slotStartTime')
+      .addSelect('ws.startTime', 'shiftStartTime')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('cycle.storeId = :storeId', { storeId })
-      .andWhere('a.status = :status', {
-        status: ShiftAssignmentStatus.APPROVED,
-      })
       .andWhere('a.checkInTime IS NULL')
-      .andWhere('slot.workDate >= :today', { today });
+      .andWhere('slot.workDate >= :today', { today })
+      .andWhere(
+        new Brackets((origin) => {
+          // No origin column exists, so self-registration is inferred:
+          // - PENDING: only a staff self-registration (fixed or one-off)
+          //   is created PENDING; every owner assignment is created APPROVED.
+          origin.where('a.status = :pending', {
+            pending: ShiftAssignmentStatus.PENDING,
+          });
+          // - APPROVED: a self-registration the owner approved later, i.e.
+          //   the row changed after it was inserted. An owner assignment is
+          //   inserted APPROVED (updated_at = created_at) and is never
+          //   touched before check-in; the known owner notes are excluded too.
+          origin.orWhere(
+            new Brackets((approved) => {
+              approved
+                .where('a.status = :approved', {
+                  approved: ShiftAssignmentStatus.APPROVED,
+                })
+                .andWhere(
+                  "a.updated_at > a.created_at + interval '2 seconds'",
+                )
+                .andWhere(
+                  '(a.note IS NULL OR a.note NOT IN (:...ownerNotes))',
+                  { ownerNotes: [...OWNER_ASSIGNMENT_NOTES] },
+                );
+            }),
+          );
+        }),
+      );
     if (workShiftId) {
       query.andWhere('slot.workShiftId = :workShiftId', { workShiftId });
     }
 
-    const doomed = await query.select(['a.id']).getMany();
+    const rows = await query.getRawMany<{
+      id: string;
+      status: ShiftAssignmentStatus;
+      workDate: string | Date;
+      slotStartTime: string | null;
+      shiftStartTime: string | null;
+    }>();
+    // Only shifts that have not started yet (VN time).
+    const doomed = rows.filter(
+      (row) =>
+        !isSlotRegistrationClosed(
+          { workDate: row.workDate, startTime: row.slotStartTime },
+          { startTime: row.shiftStartTime },
+          now,
+        ),
+    );
     if (doomed.length === 0) return { cancelled: 0 };
 
+    // Guarded write: a row checked in or decided meanwhile is left alone.
     await this.shiftAssignmentRepository.update(
-      { id: In(doomed.map((a) => a.id)) },
+      {
+        id: In(doomed.map((a) => a.id)),
+        status: In([
+          ShiftAssignmentStatus.PENDING,
+          ShiftAssignmentStatus.APPROVED,
+        ]),
+        checkInTime: IsNull(),
+      },
       { status: ShiftAssignmentStatus.CANCELLED },
     );
+    const approvedIds = doomed
+      .filter((a) => a.status === ShiftAssignmentStatus.APPROVED)
+      .map((a) => a.id);
+    if (approvedIds.length) {
+      try {
+        await this.shiftReminderService.cancelAssignmentReminders(approvedIds);
+      } catch {
+        this.logger.error('Failed to cancel reminders of withdrawn shifts');
+      }
+    }
     return { cancelled: doomed.length };
   }
 
@@ -18617,20 +19445,34 @@ export class StoresService {
       data.daysOfWeek &&
       data.daysOfWeek.length > 0
     ) {
+      // Past days cannot be registered: a range that already ended is
+      // rejected, and a start date before today (VN) moves to today.
+      const todayVn = vnDateString(new Date());
+      if (data.endDate && String(data.endDate).slice(0, 10) < todayVn) {
+        throw new BadRequestException({
+          code: SHIFT_REGISTRATION_RANGE_PASSED_CODE,
+          message: SHIFT_REGISTRATION_RANGE_PASSED_MESSAGE,
+        });
+      }
+      const startDate =
+        String(data.startDate).slice(0, 10) < todayVn
+          ? todayVn
+          : data.startDate;
       const rangeEnd = await this.resolveFixedShiftRangeEnd(
         data.storeId,
         data.workShiftId,
-        data.startDate,
+        startDate,
         data.endDate,
       );
       const slots = await this.shiftSlotRepository
         .createQueryBuilder('slot')
         .leftJoinAndSelect('slot.cycle', 'cycle')
+        .leftJoinAndSelect('slot.workShift', 'workShift')
         .where('slot.workShiftId = :workShiftId', {
           workShiftId: data.workShiftId,
         })
         .andWhere('cycle.storeId = :storeId', { storeId: data.storeId })
-        .andWhere('slot.workDate >= :startDate', { startDate: data.startDate })
+        .andWhere('slot.workDate >= :startDate', { startDate })
         .andWhere('slot.workDate <= :endDate', {
           endDate: rangeEnd,
         })
@@ -18652,7 +19494,10 @@ export class StoresService {
           d = dateObj.getDate();
         }
         const day = new Date(Number(y), Number(m) - 1, Number(d)).getDay();
-        return data.daysOfWeek!.includes(day);
+        return (
+          data.daysOfWeek!.includes(day) &&
+          !isSlotRegistrationClosed(slot, slot.workShift)
+        );
       });
 
       if (matchedSlots.length === 0) {
@@ -18705,6 +19550,12 @@ export class StoresService {
             where: { id: lockedSlot.workShiftId },
           });
 
+          // Authoritative re-check under the lock: skip slots that already
+          // started or are in the past (VN time).
+          if (isSlotRegistrationClosed(lockedSlot, lockedWorkShift, now)) {
+            continue;
+          }
+
           // Check deadline
           if (
             slot.cycle?.registrationDeadline &&
@@ -18752,7 +19603,7 @@ export class StoresService {
 
         if (successCount === 0) {
           throw new BadRequestException(
-            'Tất cả các ca bạn chọn đều đã đầy hoặc bạn đã đăng ký.',
+            'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
           );
         }
 

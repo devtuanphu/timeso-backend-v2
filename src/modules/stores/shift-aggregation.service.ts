@@ -42,6 +42,7 @@ import {
 } from '../../common/utils/vn-calendar';
 import { SalaryAdjustment } from './entities/salary-adjustment.entity';
 import { pickDayOwnerAssignmentIds } from './payroll-calculation.utils';
+import { stintFloor, stintStartVnDate } from './employment-stint.utils';
 import { resolveShiftBoundaries } from './attendance-time.utils';
 
 
@@ -881,7 +882,12 @@ export class ShiftAggregationService {
     if (!emp) return null;
     const daysOff = await this.loadDaysOff(storeId);
 
-    const assignments = await this.shiftAssignmentRepo
+    // A rehired employee's grid (staff calendar and income cards, owner
+    // per-employee grid) shows only the current stint: shifts from the VN
+    // date the stint started, the same boundary payroll uses.
+    const stintStart = stintStartVnDate(emp.joinedAt);
+
+    const assignmentQuery = this.shiftAssignmentRepo
       .createQueryBuilder('sa')
       .leftJoinAndSelect('sa.shiftSlot', 'slot')
       .leftJoinAndSelect('slot.workShift', 'ws')
@@ -901,17 +907,26 @@ export class ShiftAggregationService {
           ShiftAssignmentStatus.CONFIRMED,
           ShiftAssignmentStatus.COMPLETED,
         ],
-      })
+      });
+    if (stintStart) {
+      assignmentQuery.andWhere('slot.workDate >= :stintStart', { stintStart });
+    }
+    const assignments = await assignmentQuery
       .orderBy('slot.workDate', 'ASC')
       .getMany();
 
-    const approvedLeaves = await this.leaveRequestRepo
+    const leaveQuery = this.leaveRequestRepo
       .createQueryBuilder('leave')
       .where('leave.employeeProfileId = :employeeId', { employeeId })
       .andWhere('leave.status = :status', { status: LeaveRequestStatus.APPROVED })
       .andWhere('leave.startDate <= :to', { to })
-      .andWhere('leave.endDate >= :from', { from })
-      .getMany();
+      .andWhere('leave.endDate >= :from', { from });
+    // Leave approved in a previous stint does not belong to this one.
+    const leaveFloor = stintFloor(emp.joinedAt);
+    if (leaveFloor) {
+      leaveQuery.andWhere('leave.createdAt >= :leaveFloor', { leaveFloor });
+    }
+    const approvedLeaves = await leaveQuery.getMany();
 
     const dateRange = this.getDateRange(from, to);
     const today = new Intl.DateTimeFormat('en-CA', {
@@ -1938,8 +1953,17 @@ export class ShiftAggregationService {
     await this.assertEmployeeCalendarAccess(storeId, employeeId, params.ownerAccountId);
     this.requireDateRange(from, to);
 
-    const fromDate = new Date(`${from}T00:00:00+07:00`);
     const toDate = new Date(`${to}T23:59:59.999+07:00`);
+    // Only the current stint of a rehired employee: nothing recorded before
+    // it started (same floor as the owner's employee detail views).
+    const stintProfile = await this.employeeProfileRepo.findOne({
+      where: { id: employeeId, storeId },
+      select: ['id', 'joinedAt'],
+    });
+    const floor = stintFloor(stintProfile?.joinedAt);
+    const rangeStart = new Date(`${from}T00:00:00+07:00`);
+    const fromDate =
+      floor && floor.getTime() > rangeStart.getTime() ? floor : rangeStart;
 
     // 1. Fetch Attendance Logs
     const attendanceLogs = await this.attendanceLogRepo

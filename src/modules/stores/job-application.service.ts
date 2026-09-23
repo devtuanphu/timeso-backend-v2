@@ -414,6 +414,10 @@ export class JobApplicationService {
       applicationId: application.id,
       status: JobApplicationStatus.ACCEPTED,
       employeeProfileId: employeeProfileId ?? null,
+      // Additive: `{ revived, currentMonthPayslipLocked }` when the hire
+      // revived a former employee's profile; null otherwise or when the
+      // follow-up read failed (the fallback object carries no rehire info).
+      rehire: employee?.rehire ?? null,
     };
   }
 
@@ -522,6 +526,9 @@ export class JobApplicationService {
       });
     }
     await this.closePendingProfile(application);
+    // Reached only after the conditional claim succeeded, so a repeated
+    // withdraw (Conflict above) never notifies the owner twice.
+    await this.notifyOwnerOfWithdrawal(application);
     return { storeId, status: JobApplicationStatus.CANCELLED };
   }
 
@@ -645,6 +652,37 @@ export class JobApplicationService {
         },
       }),
     );
+  }
+
+  /**
+   * Tells the owner an applicant withdrew. The whole lookup runs inside
+   * `notifySafely`, so a failed store read or push never fails the withdraw.
+   * `application` is the in-memory row loaded before the redaction, and only
+   * the (sanitised) display name is used — no phone or email in the payload.
+   */
+  private async notifyOwnerOfWithdrawal(application: JobApplication) {
+    await this.notifySafely('owner-application-withdrawn', async () => {
+      const store = await this.storeRepository.findOne({
+        where: { id: application.storeId },
+        select: ['id', 'name', 'ownerAccountId'],
+      });
+      if (!store?.ownerAccountId) return;
+      await this.notificationsService.create({
+        accountId: store.ownerAccountId,
+        storeId: application.storeId,
+        title: 'Ứng viên đã thu hồi đơn',
+        content: `${sanitizeDisplayName(application.fullName) || 'Một ứng viên'} đã thu hồi thông tin ứng tuyển vào ${store.name}.`,
+        type: NotificationType.SYSTEM,
+        priority: NotificationPriority.NORMAL,
+        actionUrl: OWNER_APPLICATIONS_ROUTE,
+        metadata: {
+          type: 'JOB_APPLICATION_WITHDRAWN',
+          applicationId: application.id,
+          storeId: application.storeId,
+          screen: OWNER_APPLICATIONS_ROUTE,
+        },
+      });
+    });
   }
 
   private async notifyApplicantAccepted(

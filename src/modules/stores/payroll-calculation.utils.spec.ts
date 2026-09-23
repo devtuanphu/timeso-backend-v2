@@ -13,6 +13,7 @@ import {
   computePayslip,
   computePayslipTotals,
   computeRuleAdjustments,
+  computeStintSplitEarnedBase,
   MonthlyAttendanceFacts,
   PayrollAssignmentFact,
   pickDayOwnerAssignmentIds,
@@ -524,5 +525,108 @@ describe('computeRuleAdjustmentBreakdown', () => {
         1_000_000,
       ),
     ).toEqual([]);
+  });
+});
+
+describe('computeStintSplitEarnedBase (same-month rehire)', () => {
+  // September 2026, 26 standard working days. Previous stint: MONTH
+  // 5,200,000 (200,000 per day worked), terminated on the 5th. Rehired on
+  // the 10th on an HOUR contract at 30,000 per hour.
+  const prior = { paymentType: PaymentType.MONTH, rate: 5_200_000 };
+  const current = { paymentType: PaymentType.HOUR, rate: 30_000 };
+  const month = (over: Partial<PayrollAssignmentFact>[] = []) => [
+    completed('old-1', '2026-09-03', { shiftEarnings: 200_000, ...over[0] }),
+    completed('old-2', '2026-09-04', { shiftEarnings: 200_000, ...over[1] }),
+    completed('new-1', '2026-09-12', { workedMinutes: 240, ...over[2] }),
+  ];
+  const run = (
+    assignments: PayrollAssignmentFact[],
+    priorPricing: typeof prior | null = prior,
+  ) =>
+    computeStintSplitEarnedBase({
+      assignments,
+      stintStartDate: '2026-09-10',
+      todayVn: '2026-09-22',
+      current,
+      prior: priorPricing,
+      standardWorkingDays: 26,
+      calendarDays: 30,
+    });
+
+  it('keeps the stored old pricing and prices the new stint with the new contract', () => {
+    // 200,000 + 200,000 stored, plus 4 h × 30,000 = 120,000.
+    expect(run(month())).toEqual({
+      earnedBase: 520_000,
+      priorStintEarned: 400_000,
+      currentStintEarned: 120_000,
+    });
+    // Repricing the whole month at the new contract would have paid
+    // 20 h × 30,000 = 600,000.
+  });
+
+  it('prices a previous-stint shift without a stored figure with the previous contract', () => {
+    // old-2 has no shiftEarnings: 5,200,000 ÷ 26 × 1 day = 200,000.
+    expect(run(month([{}, { shiftEarnings: null }]))?.earnedBase).toBe(520_000);
+  });
+
+  it('falls back to the current contract when no previous contract is known', () => {
+    // old-2 at 8 h × 30,000 = 240,000.
+    expect(
+      run(month([{}, { shiftEarnings: null }]), null)?.earnedBase,
+    ).toBe(560_000);
+  });
+
+  it('never pays a previous-stint shift that was not completed', () => {
+    const rows = month();
+    rows[1] = { ...rows[1], status: ShiftAssignmentStatus.APPROVED, checkInTime: null };
+    expect(run(rows)?.priorStintEarned).toBe(200_000);
+  });
+
+  it('returns null without a previous-stint shift or without a stint start', () => {
+    expect(run([completed('new-1', '2026-09-12')])).toBeNull();
+    expect(
+      computeStintSplitEarnedBase({
+        assignments: month(),
+        stintStartDate: null,
+        todayVn: '2026-09-22',
+        current,
+        prior,
+        standardWorkingDays: 26,
+        calendarDays: 30,
+      }),
+    ).toBeNull();
+  });
+
+  it('computePayslip uses the split base and applies rules to the whole month', () => {
+    const assignments = month([{ lateMinutes: 10 }]);
+    const split = run(assignments)!;
+    const payslip = computePayslip({
+      paymentType: current.paymentType,
+      rate: current.rate,
+      allowances: null,
+      rules: [
+        {
+          category: PayrollRuleCategory.FINE,
+          ruleType: 'LATE',
+          calcType: PayrollCalcType.AMOUNT,
+          value: 50_000,
+        },
+      ],
+      facts: summarizeMonthlyAttendance(assignments, '2026-09-22'),
+      standardWorkingDays: 26,
+      calendarDays: 30,
+      advancePayment: 0,
+      earnedBaseSalary: split.earnedBase,
+    });
+    // The late arrival was in the previous stint and is still fined.
+    expect(payslip).toMatchObject({
+      earnedBaseSalary: 520_000,
+      penalty: 50_000,
+      totalIncome: 520_000,
+      netSalary: 470_000,
+      workingDays: 3,
+      baseSalary: 30_000,
+      paymentType: PaymentType.HOUR,
+    });
   });
 });

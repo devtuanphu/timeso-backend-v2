@@ -1,9 +1,11 @@
 import { StoresService } from './stores.service';
 import {
   buildShiftNotification,
+  selectCreatedShiftAnnouncement,
   shiftNotificationDateMetadata,
 } from './shift-assignment-notification';
 import { NotificationType } from '../notifications/entities/notification.entity';
+import { In } from 'typeorm';
 
 // Mốc "bây giờ" xa các ngày trong test để nội dung giữ dạng dd/mm.
 const FAR = new Date('2026-01-01T03:00:00Z');
@@ -316,9 +318,17 @@ describe('thông báo ca kèm "hôm nay / ngày mai / ngày kia"', () => {
 });
 
 describe('StoresService.notifyEmployeesOfCreatedShifts — chủ mở ca mới để đăng ký', () => {
+  // 2026-09-22 10:00 giờ Việt Nam.
+  beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(new Date('2026-09-22T03:00:00Z'));
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
   const build = (profiles: unknown[]) => {
     const service = Object.create(StoresService.prototype) as any;
-    service.logger = { warn: jest.fn() };
+    service.logger = { warn: jest.fn(), log: jest.fn(), debug: jest.fn() };
     service.profileRepository = { find: jest.fn().mockResolvedValue(profiles) };
     service.notificationsService = { create: jest.fn().mockResolvedValue({}) };
     return service;
@@ -358,7 +368,90 @@ describe('StoresService.notifyEmployeesOfCreatedShifts — chủ mở ca mới �
           workDates: ['2026-09-25'],
         },
       }),
+      { channelId: 'default' },
     );
+  });
+
+  it('chỉ hỏi hồ sơ đang làm hoặc thử việc (bỏ nghỉ phép)', async () => {
+    const service = build([]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', open);
+    const where = service.profileRepository.find.mock.calls[0][0].where;
+    expect(where.storeId).toBe('store-1');
+    expect(where.employmentStatus).toEqual(In(['active', 'probation']));
+  });
+
+  it('bỏ qua người đã được xếp vào mọi ca đang mở', async () => {
+    const service = build([
+      { id: 'p1', accountId: 'acc-1', reminderSettings: null },
+      { id: 'p2', accountId: 'acc-2', reminderSettings: null },
+    ]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', open, ['p1']);
+    expect(service.notificationsService.create).toHaveBeenCalledTimes(1);
+    expect(service.notificationsService.create).toHaveBeenCalledWith(
+      expect.objectContaining({ accountId: 'acc-2' }),
+      { channelId: 'default' },
+    );
+  });
+
+  it('không báo ca đã bắt đầu hoặc đã qua', async () => {
+    const service = build([
+      { id: 'p1', accountId: 'acc-1', reminderSettings: null },
+    ]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', [
+      { workDate: '2026-09-21', startTime: '08:00', shiftName: 'Ca hôm qua' },
+      { workDate: '2026-09-22', startTime: '09:00', shiftName: 'Ca đã vào' },
+      ...open,
+    ]);
+    expect(service.notificationsService.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ workDates: ['2026-09-25'] }),
+      }),
+      { channelId: 'default' },
+    );
+  });
+
+  it('mọi ca đều đã qua thì không tải hồ sơ, không báo ai', async () => {
+    const service = build([
+      { id: 'p1', accountId: 'acc-1', reminderSettings: null },
+    ]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', [
+      { workDate: '2026-09-21', startTime: '08:00' },
+    ]);
+    expect(service.profileRepository.find).not.toHaveBeenCalled();
+    expect(service.notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  it('thiếu khóa hoặc giá trị không phải boolean vẫn tính là bật', async () => {
+    const service = build([
+      { id: 'p1', accountId: 'acc-1', reminderSettings: {} },
+      {
+        id: 'p2',
+        accountId: 'acc-2',
+        reminderSettings: { notifyNewShifts: 'false' },
+      },
+    ]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', open);
+    expect(service.notificationsService.create).toHaveBeenCalledTimes(2);
+  });
+
+  it('ghi một dòng log chỉ có số đếm, không có tài khoản', async () => {
+    const service = build([
+      { id: 'p1', accountId: 'acc-on', reminderSettings: null },
+      {
+        id: 'p2',
+        accountId: 'acc-off',
+        reminderSettings: { notifyNewShifts: false },
+      },
+      { id: 'p3', accountId: 'acc-ex', reminderSettings: null },
+    ]);
+    await service.notifyEmployeesOfCreatedShifts('store-1', open, ['p3']);
+    expect(service.logger.log).toHaveBeenCalledTimes(1);
+    const line = service.logger.log.mock.calls[0][0] as string;
+    expect(line).toBe(
+      '[notifyEmployeesOfCreatedShifts] store=store-1 openShifts=1 recipients=1/1 employees=3 excluded=1 optedOut=1',
+    );
+    expect(line).not.toContain('acc-');
+    expect(line).not.toContain('Ca sáng');
   });
 
   it('lịch không còn chỗ trống thì không báo ai', async () => {
@@ -376,5 +469,67 @@ describe('StoresService.notifyEmployeesOfCreatedShifts — chủ mở ca mới �
     await expect(
       service.notifyEmployeesOfCreatedShifts('store-1', open),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('selectCreatedShiftAnnouncement — ca nào được báo "Có ca mới"', () => {
+  // 2026-09-22 10:00 giờ Việt Nam.
+  const NOW = new Date('2026-09-22T03:00:00Z');
+  const draft = (
+    shiftName: string,
+    startTime: string,
+    maxStaff: number,
+    employeeIds: string[],
+  ) => ({ shiftName, startTime, endTime: '23:00', maxStaff, employeeIds });
+
+  it('chỉ lấy ca còn chỗ và chưa bắt đầu', () => {
+    const { shifts } = selectCreatedShiftAnnouncement(
+      [draft('Sáng', '08:00', 2, []), draft('Tối', '18:00', 1, ['p1'])],
+      ['2026-09-22', '2026-09-23'],
+      NOW,
+    );
+    // Ca sáng hôm nay đã bắt đầu; ca tối đã đủ người.
+    expect(shifts).toEqual([
+      {
+        workDate: '2026-09-23',
+        startTime: '08:00',
+        endTime: '23:00',
+        shiftName: 'Sáng',
+        assignedProfileIds: [],
+      },
+    ]);
+  });
+
+  it('loại người đã có mặt ở mọi ca đang mở, giữ người chỉ có một ca', () => {
+    const { excludeProfileIds } = selectCreatedShiftAnnouncement(
+      [
+        draft('Sáng', '08:00', 3, ['p1', 'p2']),
+        draft('Tối', '18:00', 3, ['p1']),
+      ],
+      ['2026-09-24'],
+      NOW,
+    );
+    expect(excludeProfileIds).toEqual(['p1']);
+  });
+
+  it('ca đã qua hết không tính khi xét loại trừ', () => {
+    // Ca sáng chỉ có ngày hôm nay đã bắt đầu: p2 chưa có ca tối nên vẫn được báo.
+    const result = selectCreatedShiftAnnouncement(
+      [draft('Sáng', '08:00', 3, ['p2']), draft('Tối', '18:00', 3, ['p1'])],
+      ['2026-09-22'],
+      NOW,
+    );
+    expect(result.shifts.map((shift) => shift.shiftName)).toEqual(['Tối']);
+    expect(result.excludeProfileIds).toEqual(['p1']);
+  });
+
+  it('không còn ca mở thì không có gì để báo', () => {
+    expect(
+      selectCreatedShiftAnnouncement(
+        [draft('Sáng', '08:00', 1, ['p1'])],
+        ['2026-09-24'],
+        NOW,
+      ),
+    ).toEqual({ shifts: [], excludeProfileIds: [] });
   });
 });

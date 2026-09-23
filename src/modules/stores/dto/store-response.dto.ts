@@ -328,6 +328,13 @@ export class ContractResponseDto {
   @ApiProperty({ required: false, description: 'Thời hạn hợp đồng (tháng)' })
   durationMonths: number;
 
+  @ApiProperty({
+    required: false,
+    description:
+      'true = "Không hợp đồng": không có hợp đồng lao động, dòng này chỉ mang mức lương (durationMonths = 0, contractName = "Không hợp đồng")',
+  })
+  noLaborContract?: boolean;
+
   @ApiProperty()
   salaryType: string;
 

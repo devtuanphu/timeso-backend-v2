@@ -510,3 +510,142 @@ describe('ShiftAggregationService employee schedule grid pay = payroll (R5)', ()
     });
   });
 });
+
+describe('ShiftAggregationService — current stint only (rehire)', () => {
+  // Rehired at 10:00 VN on 2026-09-10.
+  const JOINED = new Date('2026-09-10T03:00:00.000Z');
+
+  const gridService = (joinedAt: Date | null) => {
+    const service = Object.create(ShiftAggregationService.prototype) as any;
+    service.assertEmployeeCalendarAccess = jest.fn().mockResolvedValue(undefined);
+    service.loadDaysOff = jest.fn().mockResolvedValue(null);
+    service.estimateAssignmentSalary = jest.fn().mockReturnValue(0);
+    const employee: any = queryBuilder();
+    employee.getOne = jest.fn().mockResolvedValue({
+      id: 'employee-1',
+      joinedAt,
+      account: { fullName: 'An' },
+    });
+    service.employeeProfileRepo = { createQueryBuilder: jest.fn(() => employee) };
+    const assignments = queryBuilder([]);
+    service.shiftAssignmentRepo = { createQueryBuilder: jest.fn(() => assignments) };
+    const leaves = queryBuilder([]);
+    service.leaveRequestRepo = { createQueryBuilder: jest.fn(() => leaves) };
+    return { service, assignments, leaves };
+  };
+
+  const grid = (service: any) =>
+    service.getEmployeeScheduleGrid({
+      storeId: 'store-1',
+      employeeId: 'employee-1',
+      from: '2026-09-01',
+      to: '2026-09-30',
+      ownerAccountId: 'owner-1',
+    });
+
+  it('schedule grid only loads shifts from the VN date the stint started', async () => {
+    const { service, assignments } = gridService(JOINED);
+
+    await grid(service);
+
+    expect(assignments.andWhere).toHaveBeenCalledWith(
+      'slot.workDate >= :stintStart',
+      { stintStart: '2026-09-10' },
+    );
+  });
+
+  it('uses the VN date of joinedAt (late evening UTC is the next VN day)', async () => {
+    // 2026-09-09T18:30Z is 01:30 on 2026-09-10 in Vietnam.
+    const { service, assignments } = gridService(new Date('2026-09-09T18:30:00Z'));
+
+    await grid(service);
+
+    expect(assignments.andWhere).toHaveBeenCalledWith(
+      'slot.workDate >= :stintStart',
+      { stintStart: '2026-09-10' },
+    );
+  });
+
+  it('schedule grid is unfiltered for a legacy profile without joinedAt', async () => {
+    const { service, assignments, leaves } = gridService(null);
+
+    await grid(service);
+
+    expect(assignments.andWhere).not.toHaveBeenCalledWith(
+      'slot.workDate >= :stintStart',
+      expect.anything(),
+    );
+    expect(leaves.andWhere).not.toHaveBeenCalledWith(
+      'leave.createdAt >= :leaveFloor',
+      expect.anything(),
+    );
+  });
+
+  it('schedule grid ignores leave approved in the previous stint', async () => {
+    const { service, leaves } = gridService(JOINED);
+
+    await grid(service);
+
+    const call = leaves.andWhere.mock.calls.find(
+      ([sql]: [string]) => sql === 'leave.createdAt >= :leaveFloor',
+    );
+    expect(call).toBeDefined();
+    expect(call[1].leaveFloor.toISOString()).toBe('2026-09-10T02:59:00.000Z');
+  });
+
+  const activitiesService = (joinedAt: Date | null) => {
+    const service = Object.create(ShiftAggregationService.prototype) as any;
+    service.assertEmployeeCalendarAccess = jest.fn().mockResolvedValue(undefined);
+    service.employeeProfileRepo = {
+      findOne: jest.fn().mockResolvedValue({ id: 'employee-1', joinedAt }),
+    };
+    const qbs = {
+      logs: queryBuilder([]),
+      assignments: queryBuilder([]),
+      changes: queryBuilder([]),
+      leaves: queryBuilder([]),
+    };
+    service.attendanceLogRepo = { createQueryBuilder: jest.fn(() => qbs.logs) };
+    service.shiftAssignmentRepo = { createQueryBuilder: jest.fn(() => qbs.assignments) };
+    service.shiftChangeRequestRepo = { createQueryBuilder: jest.fn(() => qbs.changes) };
+    service.leaveRequestRepo = { createQueryBuilder: jest.fn(() => qbs.leaves) };
+    service.shiftSlotRepo = { createQueryBuilder: jest.fn(() => queryBuilder([])) };
+    return { service, qbs };
+  };
+
+  const fromBound = (qb: any) =>
+    qb.andWhere.mock.calls.find(
+      ([clause]: [string]) => clause.includes('>= :from'),
+    )?.[1]?.from as Date;
+
+  it('activities start at the stint floor when it is inside the range', async () => {
+    const { service, qbs } = activitiesService(JOINED);
+
+    await service.getEmployeeActivities({
+      storeId: 'store-1',
+      employeeId: 'employee-1',
+      from: '2026-09-01',
+      to: '2026-09-30',
+      ownerAccountId: 'owner-1',
+    });
+
+    // joinedAt − 60 s tolerance.
+    for (const qb of Object.values(qbs)) {
+      expect(fromBound(qb).toISOString()).toBe('2026-09-10T02:59:00.000Z');
+    }
+  });
+
+  it('activities keep the requested range when it starts after the stint', async () => {
+    const { service, qbs } = activitiesService(JOINED);
+
+    await service.getEmployeeActivities({
+      storeId: 'store-1',
+      employeeId: 'employee-1',
+      from: '2026-09-15',
+      to: '2026-09-30',
+      ownerAccountId: 'owner-1',
+    });
+
+    expect(fromBound(qbs.logs).toISOString()).toBe('2026-09-14T17:00:00.000Z');
+  });
+});

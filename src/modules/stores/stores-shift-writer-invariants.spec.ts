@@ -7,8 +7,37 @@ import {
 import { Store } from './entities/store.entity';
 import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
 import { WorkShift } from './entities/work-shift.entity';
-import { ShiftAssignment } from './entities/shift-management.entity';
+import {
+  ShiftAssignment,
+  ShiftSwap,
+} from './entities/shift-management.entity';
+import { EmployeeLeaveRequest } from './entities/employee-leave-request.entity';
+import { ShiftChangeRequest } from './entities/shift-change-request.entity';
 import { StoresService } from './stores.service';
+import { KpiApprovalRequest } from './entities/kpi-approval-request.entity';
+import { SalaryAdvanceRequest } from './entities/salary-advance-request.entity';
+
+const rawQb = (rows: any[], clauses: string[] = []) => {
+  const qb: any = {};
+  for (const method of [
+    'innerJoin',
+    'leftJoin',
+    'select',
+    'addSelect',
+  ]) {
+    qb[method] = jest.fn(() => qb);
+  }
+  qb.where = jest.fn((clause: string) => {
+    clauses.push(clause);
+    return qb;
+  });
+  qb.andWhere = jest.fn((clause: string) => {
+    clauses.push(clause);
+    return qb;
+  });
+  qb.getRawMany = jest.fn(async () => rows);
+  return qb;
+};
 
 describe('StoresService shift predicate writers', () => {
   const createService = () => {
@@ -56,6 +85,11 @@ describe('StoresService shift predicate writers', () => {
       }),
       save: jest.fn(async (_entity: unknown, value: unknown) => value),
       softDelete: jest.fn(async () => ({ affected: 1 })),
+      // Termination withdraws future shifts first; nothing to cancel here.
+      getRepository: () => ({
+        createQueryBuilder: () => rawQb([]),
+        update: jest.fn(),
+      }),
     };
     (service as any).dataSource = {
       transaction: jest.fn(async (callback: (value: any) => unknown) =>
@@ -103,6 +137,10 @@ describe('StoresService shift predicate writers', () => {
       }),
       save: jest.fn(),
       softDelete: jest.fn(),
+      getRepository: () => ({
+        createQueryBuilder: () => rawQb([]),
+        update: jest.fn(),
+      }),
     };
     (service as any).dataSource = {
       transaction: jest.fn(async (callback: (value: any) => unknown) =>
@@ -115,6 +153,135 @@ describe('StoresService shift predicate writers', () => {
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(manager.save).not.toHaveBeenCalled();
     expect(manager.softDelete).not.toHaveBeenCalled();
+  });
+
+  it('cancels not-yet-started future shifts before soft-deleting the leaver', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    // 12:00 in Vietnam on 2026-09-22.
+    jest.setSystemTime(new Date('2026-09-22T05:00:00.000Z'));
+    try {
+      const service = createService();
+      (service as any).profileRepository = {
+        findOne: jest.fn(async () => ({ id: 'employee-1', storeId: 'store-1' })),
+      };
+      const clauses: string[] = [];
+      const update = jest.fn(async () => ({ affected: 2 }));
+      const leaveUpdate = jest.fn(async () => ({ affected: 1 }));
+      const changeUpdate = jest.fn(async () => ({ affected: 1 }));
+      const swapUpdate = jest.fn(async () => ({ affected: 1 }));
+      const kpiUpdate = jest.fn(async () => ({ affected: 1 }));
+      const advanceUpdate = jest.fn(async () => ({ affected: 1 }));
+      const manager = {
+        query: jest.fn(async () => []),
+        findOne: jest.fn(async (entity: unknown) => {
+          if (entity === EmployeeProfile) {
+            return {
+              id: 'employee-1',
+              storeId: 'store-1',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            };
+          }
+          if (entity === Store) return { id: 'store-1', ownerAccountId: 'owner-1' };
+          if (entity === EmployeeTerminationReason) {
+            return { id: 'reason-1', storeId: 'store-1' };
+          }
+          return null;
+        }),
+        save: jest.fn(async (_entity: unknown, value: unknown) => value),
+        softDelete: jest.fn(async () => ({ affected: 1 })),
+        getRepository: jest.fn((entity: unknown) => {
+          if (entity === EmployeeLeaveRequest) return { update: leaveUpdate };
+          if (entity === ShiftChangeRequest) return { update: changeUpdate };
+          if (entity === ShiftSwap) return { update: swapUpdate };
+          if (entity === KpiApprovalRequest) return { update: kpiUpdate };
+          if (entity === SalaryAdvanceRequest) return { update: advanceUpdate };
+          expect(entity).toBe(ShiftAssignment);
+          return {
+            createQueryBuilder: () =>
+              rawQb(
+                [
+                  // Tomorrow, approved.
+                  { id: 'future-approved', workDate: '2026-09-23', slotStartTime: '08:00', shiftStartTime: null },
+                  // Later today, pending; time from the work shift.
+                  { id: 'later-today-pending', workDate: '2026-09-22', slotStartTime: null, shiftStartTime: '18:00:00' },
+                  // Started earlier today: left for the absence reconcile.
+                  { id: 'started-today', workDate: '2026-09-22', slotStartTime: '07:00', shiftStartTime: null },
+                ],
+                clauses,
+              ),
+            update,
+          };
+        }),
+      };
+      (service as any).dataSource = {
+        transaction: jest.fn(async (callback: (value: any) => unknown) =>
+          callback(manager),
+        ),
+      };
+
+      await service.deleteEmployee('employee-1', 'reason-1', 'owner-1');
+
+      expect(update).toHaveBeenCalledTimes(1);
+      const [criteria, changes] = (update.mock.calls[0] as any[]);
+      expect(criteria.id.value).toEqual(['future-approved', 'later-today-pending']);
+      expect(changes).toEqual({ status: 'CANCELLED' });
+      // Checked-in rows and past days are excluded in SQL.
+      expect(clauses).toEqual(
+        expect.arrayContaining([
+          'a.checkInTime IS NULL',
+          'slot.workDate >= :today',
+          'a.status IN (:...statuses)',
+        ]),
+      );
+      expect(update.mock.invocationCallOrder[0]).toBeLessThan(
+        manager.softDelete.mock.invocationCallOrder[0],
+      );
+
+      // The leaver's PENDING requests are closed in the same transaction:
+      // leave and shift-change requests CANCELLED, swaps (no CANCELLED
+      // status) REJECTED whether the leaver asked or was the target.
+      expect(leaveUpdate).toHaveBeenCalledWith(
+        { employeeProfileId: 'employee-1', status: 'PENDING' },
+        { status: 'CANCELLED' },
+      );
+      expect(changeUpdate).toHaveBeenCalledWith(
+        { employeeProfileId: 'employee-1', status: 'PENDING' },
+        { status: 'CANCELLED' },
+      );
+      expect(swapUpdate).toHaveBeenCalledTimes(2);
+      expect(swapUpdate).toHaveBeenCalledWith(
+        { requestedByEmployeeId: 'employee-1', status: 'PENDING' },
+        expect.objectContaining({ status: 'REJECTED' }),
+      );
+      expect(swapUpdate).toHaveBeenCalledWith(
+        { toEmployeeId: 'employee-1', status: 'PENDING' },
+        expect.objectContaining({ status: 'REJECTED' }),
+      );
+      // KPI approvals have no CANCELLED status: closed as REJECTED. Pending
+      // salary advances (never paid) are CANCELLED; decided ones untouched.
+      expect(kpiUpdate).toHaveBeenCalledWith(
+        { employeeProfileId: 'employee-1', status: 'Chờ duyệt' },
+        { status: 'Từ chối', note: 'Nhân viên đã nghỉ việc' },
+      );
+      expect(advanceUpdate).toHaveBeenCalledWith(
+        { employeeProfileId: 'employee-1', status: 'Chờ duyệt' },
+        { status: 'Đã hủy' },
+      );
+      for (const fn of [
+        leaveUpdate,
+        changeUpdate,
+        swapUpdate,
+        kpiUpdate,
+        advanceUpdate,
+      ]) {
+        expect(fn.mock.invocationCallOrder[0]).toBeLessThan(
+          manager.softDelete.mock.invocationCallOrder[0],
+        );
+      }
+      expect((service as any).dataSource.transaction).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   // Chủ cửa hàng cho phép trùng tên ca miễn khác ngày; ca mẫu trong cài đặt

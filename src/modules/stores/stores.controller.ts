@@ -4841,7 +4841,7 @@ export class StoresController {
   @ApiOperation({
     summary: 'Huỷ các ca sắp tới mà nhân viên đã đăng ký',
     description:
-      'Dùng khi nhân viên tắt đăng ký ca cố định. Lịch cố định không phải một bản ghi riêng — nó sinh ra từng ca rời — nên thao tác này rút lại các ca chưa bắt đầu, không đụng vào lịch sử đã làm.',
+      'Dùng khi nhân viên tắt đăng ký ca cố định. Lịch cố định không phải một bản ghi riêng — nó sinh ra từng ca rời — nên thao tác này rút lại các ca chưa bắt đầu (giờ Việt Nam) do chính nhân viên tự đăng ký — đang chờ duyệt hoặc đã được duyệt — không đụng vào ca chủ cửa hàng xếp và lịch sử đã làm.',
   })
   async cancelUpcomingShiftRegistrations(
     @Query('employeeProfileId', ParseUUIDPipe) employeeProfileId: string,

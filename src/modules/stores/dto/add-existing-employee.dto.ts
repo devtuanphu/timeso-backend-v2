@@ -1,6 +1,7 @@
 import { Type } from 'class-transformer';
 import {
   IsArray,
+  IsBoolean,
   IsEnum,
   IsInt,
   IsNumber,
@@ -44,12 +45,23 @@ export class ExistingEmployeeContractDto {
   @IsString()
   endDate?: string;
 
+  /** 0 = "Không hợp đồng" (no labor contract; the pay rate still applies). */
   @IsOptional()
   @Type(() => Number)
   @IsInt()
-  @Min(1)
+  @Min(0)
   @Max(1200)
   durationMonths?: number;
+
+  /**
+   * True: the employee works without a labor contract ("Không hợp đồng"). The
+   * row is still created to carry the pay rate. Sending
+   * `contractName: 'Không hợp đồng'` has the same effect and is also accepted
+   * by older backends.
+   */
+  @IsOptional()
+  @IsBoolean()
+  noLaborContract?: boolean;
 
   @IsOptional()
   @Type(() => Number)

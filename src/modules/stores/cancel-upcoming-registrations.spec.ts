@@ -1,4 +1,5 @@
 import { ForbiddenException } from '@nestjs/common';
+import { Brackets } from 'typeorm';
 
 import { StoresService } from './stores.service';
 import { ShiftAssignmentStatus } from './entities/shift-management.entity';
@@ -6,42 +7,80 @@ import { ShiftAssignmentStatus } from './entities/shift-management.entity';
 /**
  * A "fixed" registration fans out into one ShiftAssignment per matching slot
  * with nothing linking them, so switching the fixed schedule off cannot delete
- * a registration record — there isn't one. It withdraws the shifts that have
- * not started yet, and must not touch anything already worked.
+ * a registration record — there isn't one. It withdraws the caller's own
+ * self-registered shifts that have not started yet (PENDING, or APPROVED by
+ * the owner later), never an owner assignment, and never anything worked.
  */
 const STORE = 'store-1';
 const PROFILE = 'profile-1';
 const ACCOUNT = 'account-1';
+// 2026-09-22 10:00 in Vietnam (03:00 UTC).
+const NOW = new Date('2026-09-22T03:00:00Z');
 
-function build(profile: unknown, doomed: { id: string }[] = []) {
-  const service = Object.create(StoresService.prototype) as any;
-  const conditions: Record<string, unknown> = {};
-  const builder: any = {
-    leftJoin: jest.fn(() => builder),
-    where: jest.fn((clause: string, params: any) => {
-      Object.assign(conditions, params ?? {});
-      conditions[clause] = true;
-      return builder;
-    }),
-    andWhere: jest.fn((clause: string, params: any) => {
-      Object.assign(conditions, params ?? {});
-      conditions[clause] = true;
-      return builder;
-    }),
-    select: jest.fn(() => builder),
-    getMany: jest.fn().mockResolvedValue(doomed),
+type Row = {
+  id: string;
+  status: ShiftAssignmentStatus;
+  workDate: string;
+  slotStartTime: string | null;
+  shiftStartTime: string | null;
+};
+
+/** Flattens nested Brackets into the SQL fragments and parameters used. */
+function collect(sink: { clauses: string[]; params: Record<string, unknown> }) {
+  const qb: any = {};
+  const add = (clause: unknown, params?: Record<string, unknown>) => {
+    if (clause instanceof Brackets) {
+      clause.whereFactory(collect(sink));
+    } else {
+      sink.clauses.push(String(clause));
+    }
+    Object.assign(sink.params, params ?? {});
+    return qb;
   };
+  qb.where = jest.fn(add);
+  qb.andWhere = jest.fn(add);
+  qb.orWhere = jest.fn(add);
+  return qb;
+}
+
+function build(profile: unknown, rows: Row[] = []) {
+  const service = Object.create(StoresService.prototype) as any;
+  const sink = { clauses: [] as string[], params: {} as Record<string, unknown> };
+  const builder = collect(sink);
+  for (const m of ['innerJoin', 'leftJoin', 'select', 'addSelect']) {
+    builder[m] = jest.fn(() => builder);
+  }
+  builder.getRawMany = jest.fn().mockResolvedValue(rows);
+  service.logger = { error: jest.fn() };
   service.profileRepository = { findOne: jest.fn().mockResolvedValue(profile) };
   service.shiftAssignmentRepository = {
     createQueryBuilder: jest.fn(() => builder),
-    update: jest.fn().mockResolvedValue({ affected: doomed.length }),
+    update: jest.fn().mockResolvedValue({ affected: rows.length }),
   };
-  return { service, builder, conditions };
+  service.shiftReminderService = {
+    cancelAssignmentReminders: jest.fn().mockResolvedValue(undefined),
+  };
+  return { service, sink };
 }
 
+const row = (over: Partial<Row>): Row => ({
+  id: 'a1',
+  status: ShiftAssignmentStatus.PENDING,
+  workDate: '2026-09-23',
+  slotStartTime: null,
+  shiftStartTime: '08:00:00',
+  ...over,
+});
+
 describe('cancelUpcomingShiftRegistrations', () => {
-  it('cancels the caller’s upcoming approved shifts', async () => {
-    const { service } = build({ id: PROFILE }, [{ id: 'a1' }, { id: 'a2' }]);
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('cancels the caller’s pending and later-approved self-registrations', async () => {
+    const { service } = build({ id: PROFILE }, [
+      row({ id: 'pending' }),
+      row({ id: 'approved', status: ShiftAssignmentStatus.APPROVED }),
+    ]);
 
     const result = await service.cancelUpcomingShiftRegistrations(
       STORE,
@@ -50,29 +89,79 @@ describe('cancelUpcomingShiftRegistrations', () => {
     );
 
     expect(result).toEqual({ cancelled: 2 });
-    expect(service.shiftAssignmentRepository.update).toHaveBeenCalledWith(
-      expect.anything(),
-      { status: ShiftAssignmentStatus.CANCELLED },
-    );
+    const [criteria, changes] = service.shiftAssignmentRepository.update.mock.calls[0];
+    expect(criteria.id.value).toEqual(['pending', 'approved']);
+    // Guarded: rows checked in or decided meanwhile are not touched.
+    expect(criteria.status.value).toEqual([
+      ShiftAssignmentStatus.PENDING,
+      ShiftAssignmentStatus.APPROVED,
+    ]);
+    expect(criteria.checkInTime.type).toBe('isNull');
+    expect(changes).toEqual({ status: ShiftAssignmentStatus.CANCELLED });
+    // Only approved rows had reminders.
+    expect(service.shiftReminderService.cancelAssignmentReminders).toHaveBeenCalledWith([
+      'approved',
+    ]);
   });
 
-  // The whole point of the narrow scope: history stays intact.
-  it('only targets approved, not-checked-in shifts from today onward', async () => {
-    const { service, conditions } = build({ id: PROFILE }, [{ id: 'a1' }]);
+  it('selects only self-registrations: PENDING, or APPROVED after insert and not owner notes', async () => {
+    const { service, sink } = build({ id: PROFILE }, []);
 
     await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
 
-    expect(conditions['a.status = :status']).toBe(true);
-    expect(conditions.status).toBe(ShiftAssignmentStatus.APPROVED);
-    expect(conditions['a.checkInTime IS NULL']).toBe(true);
-    expect(conditions['slot.workDate >= :today']).toBe(true);
-    // A local-date string, never a UTC one: at UTC+7 an ISO date is still
-    // yesterday for the first seven hours and would cancel today's shift.
-    expect(conditions.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(sink.clauses).toEqual(
+      expect.arrayContaining([
+        'a.employeeId = :employeeProfileId',
+        'cycle.storeId = :storeId',
+        'a.checkInTime IS NULL',
+        'slot.workDate >= :today',
+        'a.status = :pending',
+        'a.status = :approved',
+        "a.updated_at > a.created_at + interval '2 seconds'",
+        '(a.note IS NULL OR a.note NOT IN (:...ownerNotes))',
+      ]),
+    );
+    expect(sink.params).toMatchObject({
+      pending: ShiftAssignmentStatus.PENDING,
+      approved: ShiftAssignmentStatus.APPROVED,
+      ownerNotes: ['Owner assigned during shift creation', 'Auto-assigned from cycle'],
+      // Vietnam day, not the server's.
+      today: '2026-09-22',
+    });
+    // The old broad "every APPROVED row" filter is gone.
+    expect(sink.clauses).not.toContain('a.status = :status');
+  });
+
+  it('uses the Vietnam date just after midnight VN (still yesterday in UTC)', async () => {
+    jest.setSystemTime(new Date('2026-09-21T17:30:00Z')); // 00:30 VN on 22/09
+    const { service, sink } = build({ id: PROFILE }, []);
+
+    await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(sink.params.today).toBe('2026-09-22');
+  });
+
+  it('keeps shifts that already started today (VN time)', async () => {
+    const { service } = build({ id: PROFILE }, [
+      // 08:00 VN today: started at 10:00 VN.
+      row({ id: 'started', workDate: '2026-09-22', shiftStartTime: '08:00:00' }),
+      // Slot override 18:00 today: not started.
+      row({ id: 'tonight', workDate: '2026-09-22', slotStartTime: '18:00' }),
+    ]);
+
+    const result = await service.cancelUpcomingShiftRegistrations(
+      STORE,
+      PROFILE,
+      ACCOUNT,
+    );
+
+    expect(result).toEqual({ cancelled: 1 });
+    const [criteria] = service.shiftAssignmentRepository.update.mock.calls[0];
+    expect(criteria.id.value).toEqual(['tonight']);
   });
 
   it('narrows to one work shift when asked', async () => {
-    const { service, conditions } = build({ id: PROFILE }, [{ id: 'a1' }]);
+    const { service, sink } = build({ id: PROFILE }, []);
 
     await service.cancelUpcomingShiftRegistrations(
       STORE,
@@ -81,7 +170,7 @@ describe('cancelUpcomingShiftRegistrations', () => {
       'workshift-9',
     );
 
-    expect(conditions.workShiftId).toBe('workshift-9');
+    expect(sink.params.workShiftId).toBe('workshift-9');
   });
 
   it('writes nothing when there is nothing upcoming', async () => {

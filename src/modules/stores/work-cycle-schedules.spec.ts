@@ -330,3 +330,67 @@ describe('several active schedules per store', () => {
     });
   });
 });
+
+describe('createShiftSchedule announces open shifts to other staff', () => {
+  beforeEach(() => {
+    jest.useFakeTimers().setSystemTime(NOW);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  const run = async (maxStaff: number, employeeIds: string[]) => {
+    const service = Object.create(StoresService.prototype) as any;
+    service.storeRepository = {
+      findOne: jest
+        .fn()
+        .mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' }),
+    };
+    service.dataSource = {
+      transaction: jest.fn().mockResolvedValue({ id: 'cycle-1', assignmentIds: [] }),
+    };
+    service.notifyEmployeesOfCreatedShifts = jest.fn().mockResolvedValue(undefined);
+    await service.createShiftSchedule('store-1', 'owner-1', {
+      startDate: addDays(TODAY, 1),
+      recurrence: {
+        enabled: false,
+        frequency: ShiftRecurrenceFrequency.DAILY,
+        interval: 1,
+        endType: ShiftRecurrenceEndType.COUNT,
+        occurrenceCount: 1,
+      },
+      shifts: [
+        {
+          shiftName: 'Ca sáng',
+          startTime: '07:00',
+          endTime: '11:00',
+          maxStaff,
+          employeeIds,
+        },
+      ],
+    });
+    return service.notifyEmployeesOfCreatedShifts as jest.Mock;
+  };
+
+  it('excludes the people already picked for every open shift', async () => {
+    const notify = await run(2, ['p1']);
+    expect(notify).toHaveBeenCalledWith(
+      'store-1',
+      [
+        {
+          workDate: addDays(TODAY, 1),
+          startTime: '07:00',
+          endTime: '11:00',
+          shiftName: 'Ca sáng',
+          assignedProfileIds: ['p1'],
+        },
+      ],
+      ['p1'],
+    );
+  });
+
+  it('announces nothing when the shift is already full', async () => {
+    const notify = await run(1, ['p1']);
+    expect(notify).toHaveBeenCalledWith('store-1', [], []);
+  });
+});

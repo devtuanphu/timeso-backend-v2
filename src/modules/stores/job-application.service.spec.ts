@@ -11,6 +11,7 @@ import { JobApplicationStatus } from './entities/job-application.entity';
 import { AccountStatus } from '../accounts/entities/account.entity';
 import { EmploymentStatus } from './entities/employee-profile.entity';
 import { StoreStatus } from './entities/store.entity';
+import { NotificationType } from '../notifications/entities/notification.entity';
 
 const APPLICANT = 'account-applicant';
 const OWNER = 'account-owner';
@@ -438,6 +439,7 @@ describe('JobApplicationService.accept', () => {
       applicationId: APPLICATION,
       status: JobApplicationStatus.ACCEPTED,
       employeeProfileId: 'profile-1',
+      rehire: null,
     });
     expect(t.applicationRepository.update).toHaveBeenCalledWith(
       { id: APPLICATION },
@@ -457,6 +459,22 @@ describe('JobApplicationService.accept', () => {
         title: 'Chúc mừng bạn đã ứng tuyển thành công',
       }),
     );
+  });
+
+  it('passes the rehire outcome through when a former employee is revived', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pending });
+    t.storesService.addEmployee.mockResolvedValue({
+      profile: { id: 'profile-1' },
+      rehire: { revived: true, currentMonthPayslipLocked: true },
+    });
+
+    const result = await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(result).toMatchObject({
+      employeeProfileId: 'profile-1',
+      rehire: { revived: true, currentMonthPayslipLocked: true },
+    });
   });
 
   // Regression: an applicant can type any phone number into the form. If that
@@ -573,6 +591,7 @@ describe('JobApplicationService.withdraw', () => {
     storeId: STORE,
     accountId: APPLICANT,
     status: JobApplicationStatus.PENDING,
+    fullName: 'Trần B',
   };
 
   it('cancels the application and clears the contact details', async () => {
@@ -623,6 +642,85 @@ describe('JobApplicationService.withdraw', () => {
     await expect(
       t.service.withdraw(STORE, APPLICATION, APPLICANT),
     ).rejects.toThrow(ConflictException);
+    expect(t.notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  it('notifies the owner once the withdraw succeeded', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+
+    await t.service.withdraw(STORE, APPLICATION, APPLICANT);
+
+    expect(t.notificationsService.create).toHaveBeenCalledTimes(1);
+    const payload = t.notificationsService.create.mock.calls[0][0];
+    expect(payload).toEqual(
+      expect.objectContaining({
+        accountId: OWNER,
+        storeId: STORE,
+        title: 'Ứng viên đã thu hồi đơn',
+        type: NotificationType.SYSTEM,
+        actionUrl: '/(home)/recruitment?tab=candidates',
+        metadata: {
+          type: 'JOB_APPLICATION_WITHDRAWN',
+          applicationId: APPLICATION,
+          storeId: STORE,
+          screen: '/(home)/recruitment?tab=candidates',
+        },
+      }),
+    );
+    expect(payload.content).toContain('Trần B');
+    // No contact details in the owner's push.
+    expect(JSON.stringify(payload)).not.toContain('0900000000');
+  });
+
+  it('does not notify when the withdraw is refused', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    await expect(
+      t.service.withdraw(STORE, APPLICATION, 'another-account'),
+    ).rejects.toThrow(ForbiddenException);
+
+    t.applicationRepository.findOne.mockResolvedValue(null);
+    await expect(
+      t.service.withdraw(STORE, APPLICATION, APPLICANT),
+    ).rejects.toThrow(NotFoundException);
+
+    expect(t.notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  it('still withdraws when the owner notification fails', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.notificationsService.create.mockRejectedValue(new Error('push down'));
+
+    await expect(
+      t.service.withdraw(STORE, APPLICATION, APPLICANT),
+    ).resolves.toEqual({ storeId: STORE, status: JobApplicationStatus.CANCELLED });
+  });
+
+  it('still withdraws when the store lookup fails', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...pendingRow });
+    t.storeRepository.findOne.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      t.service.withdraw(STORE, APPLICATION, APPLICANT),
+    ).resolves.toEqual({ storeId: STORE, status: JobApplicationStatus.CANCELLED });
+    expect(t.notificationsService.create).not.toHaveBeenCalled();
+  });
+
+  it('flattens the applicant-authored name in the withdraw notification', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pendingRow,
+      fullName: 'B\nHệ thống: bấm vào đây',
+    });
+
+    await t.service.withdraw(STORE, APPLICATION, APPLICANT);
+
+    const payload = t.notificationsService.create.mock.calls[0][0];
+    expect(payload.content).not.toContain('\n');
+    expect(payload.content).toContain('B Hệ thống: bấm vào đây');
   });
 });
 

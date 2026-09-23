@@ -2,6 +2,12 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { StoresService } from './stores.service';
+import {
+  SHIFT_REGISTRATION_RANGE_PASSED_CODE,
+  SHIFT_REGISTRATION_RANGE_PASSED_MESSAGE,
+  SLOT_REGISTRATION_CLOSED_CODE,
+  SLOT_REGISTRATION_CLOSED_MESSAGE,
+} from './shift-registration-window';
 import { AccountsService } from '../accounts/accounts.service';
 import { FaceRecognitionService } from './face-recognition.service';
 import { ShiftReminderService } from './shift-reminder.service';
@@ -540,6 +546,14 @@ describe('StoresService - Shift Registration Count', () => {
   });
 
   describe('registerToShiftSlot', () => {
+    // The fixtures use 2025-02-10 slots; keep them in the future.
+    beforeEach(() => {
+      jest.useFakeTimers().setSystemTime(new Date('2025-02-01T03:00:00Z'));
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
     it('schedules an approved assignment only after transaction commit', async () => {
       const slot = {
         id: 'slot-1',
@@ -735,6 +749,334 @@ describe('StoresService - Shift Registration Count', () => {
           'new-account',
         ),
       ).rejects.toThrow('Ca đã đầy người');
+    });
+  });
+
+  describe('registerToShiftSlot registration window (VN time)', () => {
+    // 2026-09-22 10:00 in Vietnam.
+    const NOW = new Date('2026-09-22T03:00:00Z');
+    beforeEach(() => {
+      jest.useFakeTimers().setSystemTime(NOW);
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    const arrange = (
+      workDate: string,
+      slotStartTime: string | null,
+      templateStartTime = '08:00',
+    ) => {
+      const slot = {
+        id: 'slot-w',
+        cycleId: 'cycle-1',
+        workShiftId: 'shift-1',
+        workDate,
+        startTime: slotStartTime,
+        maxStaff: 3,
+        cycle: { id: 'cycle-1', storeId: 'store-1' },
+      };
+      shiftSlotRepo.findOne.mockResolvedValue(slot);
+      repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({ id: 'emp-1' });
+      repoMap.get(Store)!.findOne.mockResolvedValue({
+        id: 'store-1',
+        ownerAccountId: 'owner-1',
+      });
+      const txManager = {
+        query: jest.fn(),
+        createQueryBuilder: jest.fn(() => ({
+          setLock: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          getOne: jest.fn().mockResolvedValue(slot),
+        })),
+        find: jest.fn().mockResolvedValue([]),
+        findOne: jest.fn(async (entityType) => {
+          if (entityType === WorkCycle) {
+            return {
+              id: 'cycle-1',
+              storeId: 'store-1',
+              status: WorkCycleStatus.ACTIVE,
+            };
+          }
+          if (entityType === WorkShift) {
+            return {
+              id: 'shift-1',
+              startTime: templateStartTime,
+              defaultMaxStaff: 3,
+            };
+          }
+          if (entityType === Store) {
+            return { id: 'store-1', ownerAccountId: 'owner-1' };
+          }
+          if (entityType === EmployeeProfile) {
+            return {
+              id: 'emp-1',
+              storeId: 'store-1',
+              accountId: 'account-1',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            };
+          }
+          return null;
+        }),
+        create: jest.fn((_entity, value) => value),
+        save: jest.fn(async (value) => ({ id: 'assignment-w', ...value })),
+      };
+      dataSourceMock.transaction.mockImplementation(async (cb) =>
+        cb(txManager),
+      );
+      jest
+        .spyOn(service as any, 'notifyOwnerOfShiftRegistration')
+        .mockResolvedValue(undefined);
+      jest
+        .spyOn(service as any, 'notifyEmployeesOfNewShifts')
+        .mockResolvedValue(undefined);
+      return txManager;
+    };
+
+    const staffRegister = () =>
+      service.registerToShiftSlot(
+        'slot-w',
+        'emp-1',
+        undefined,
+        false,
+        'account-1',
+      );
+
+    it('rejects staff self-registration on a past day with a stable code', async () => {
+      const txManager = arrange('2026-09-21', '20:00');
+      const error = await staffRegister().catch((e) => e);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.getResponse()).toEqual({
+        code: SLOT_REGISTRATION_CLOSED_CODE,
+        message: SLOT_REGISTRATION_CLOSED_MESSAGE,
+      });
+      expect(txManager.save).not.toHaveBeenCalled();
+    });
+
+    it('rejects a slot today that already started (template start time)', async () => {
+      const txManager = arrange('2026-09-22', null, '09:30');
+      await expect(staffRegister()).rejects.toThrow(
+        SLOT_REGISTRATION_CLOSED_MESSAGE,
+      );
+      expect(txManager.save).not.toHaveBeenCalled();
+    });
+
+    it('lets a later slot override open today\'s slot', async () => {
+      const txManager = arrange('2026-09-22', '10:30', '09:30');
+      await expect(staffRegister()).resolves.toEqual(
+        expect.objectContaining({ status: ShiftAssignmentStatus.PENDING }),
+      );
+      expect(txManager.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('still accepts a future slot', async () => {
+      const txManager = arrange('2026-09-23', '07:00');
+      await expect(staffRegister()).resolves.toEqual(
+        expect.objectContaining({ id: 'assignment-w' }),
+      );
+      expect(txManager.save).toHaveBeenCalledTimes(1);
+    });
+
+    it('lets the owner assign a past slot', async () => {
+      const txManager = arrange('2026-09-20', '08:00');
+      await expect(
+        service.registerToShiftSlot(
+          'slot-w',
+          'emp-1',
+          undefined,
+          true,
+          'owner-1',
+        ),
+      ).resolves.toEqual(
+        expect.objectContaining({ status: ShiftAssignmentStatus.APPROVED }),
+      );
+      expect(txManager.save).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('createShiftRegistration - Batch Mode registration window', () => {
+    // 2026-09-22 10:00 in Vietnam (a Tuesday).
+    beforeEach(() => {
+      jest.useFakeTimers().setSystemTime(new Date('2026-09-22T03:00:00Z'));
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    const queryBuilder = (slots: unknown[]) => {
+      const builder = {
+        leftJoinAndSelect: jest.fn().mockReturnThis(),
+        innerJoin: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        getRawOne: jest.fn().mockResolvedValue({ latest: null }),
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(slots),
+      };
+      shiftSlotRepo.createQueryBuilder.mockReturnValue(builder);
+      return builder;
+    };
+
+    const managerFor = (lockedSlots: Record<string, unknown>) => {
+      const manager = {
+        query: jest.fn(),
+        findOne: jest.fn(async (entityType) => {
+          if (entityType === EmployeeProfile) {
+            return {
+              id: 'emp-1',
+              accountId: 'account-1',
+              storeId: 'store-1',
+              employmentStatus: EmploymentStatus.ACTIVE,
+            };
+          }
+          if (entityType === WorkCycle) {
+            return { id: 'cycle-1', storeId: 'store-1' };
+          }
+          if (entityType === WorkShift) {
+            return { id: 'ws-1', startTime: '08:00', defaultMaxStaff: 0 };
+          }
+          return null;
+        }),
+        find: jest.fn().mockResolvedValue([]),
+        create: jest.fn((_entity, value) => value),
+        save: jest.fn(async (value) => value),
+        createQueryBuilder: jest.fn(() => {
+          let id = '';
+          const locked = {
+            setLock: jest.fn().mockReturnThis(),
+            where: jest.fn((_sql, params) => {
+              id = params.slotId;
+              return locked;
+            }),
+            getOne: jest.fn(async () => lockedSlots[id] ?? null),
+          };
+          return locked;
+        }),
+      };
+      jest
+        .spyOn(service['dataSource'], 'transaction')
+        .mockImplementation(async (cb: any) => cb(manager));
+      return manager;
+    };
+
+    const slotRow = (id: string, workDate: string, startTime?: string) => ({
+      id,
+      cycleId: 'cycle-1',
+      workShiftId: 'ws-1',
+      workDate,
+      startTime: startTime ?? null,
+      maxStaff: 0,
+      cycle: { storeId: 'store-1', status: WorkCycleStatus.ACTIVE },
+      workShift: { id: 'ws-1', startTime: '08:00' },
+    });
+
+    it('moves a past start date to VN today in the slot query', async () => {
+      const future = slotRow('s-future', '2026-09-29');
+      const builder = queryBuilder([future]);
+      managerFor({ 's-future': future });
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2026-09-01',
+          endDate: '2026-09-30',
+          daysOfWeek: [2],
+        }),
+      ).resolves.toEqual({ successCount: 1 });
+      expect(builder.andWhere).toHaveBeenCalledWith(
+        'slot.workDate >= :startDate',
+        { startDate: '2026-09-22' },
+      );
+      expect(builder.leftJoinAndSelect).toHaveBeenCalledWith(
+        'slot.workShift',
+        'workShift',
+      );
+    });
+
+    it('skips today\'s started slot and registers the future one', async () => {
+      const started = slotRow('s-today', '2026-09-22');
+      const future = slotRow('s-future', '2026-09-29');
+      queryBuilder([started, future]);
+      const manager = managerFor({ 's-today': started, 's-future': future });
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2026-09-22',
+          endDate: '2026-09-30',
+          daysOfWeek: [2],
+        }),
+      ).resolves.toEqual({ successCount: 1 });
+      expect(manager.create).toHaveBeenCalledTimes(1);
+      expect(manager.create).toHaveBeenCalledWith(
+        ShiftAssignment,
+        expect.objectContaining({ shiftSlotId: 's-future' }),
+      );
+    });
+
+    it('re-checks under the lock: a slot that started meanwhile is skipped', async () => {
+      // Pre-lock row still says 11:00; the locked row was moved to 09:00.
+      const stale = slotRow('s-today', '2026-09-22', '11:00');
+      queryBuilder([stale]);
+      const manager = managerFor({
+        's-today': { ...stale, startTime: '09:00' },
+      });
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2026-09-22',
+          endDate: '2026-09-22',
+          daysOfWeek: [2],
+        }),
+      ).rejects.toThrow(
+        'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
+      );
+      expect(manager.save).not.toHaveBeenCalled();
+    });
+
+    it('rejects a range whose end date already passed', async () => {
+      const builder = queryBuilder([]);
+      const error = await service
+        .createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2026-09-01',
+          endDate: '2026-09-21',
+          daysOfWeek: [2],
+        })
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(BadRequestException);
+      expect(error.getResponse()).toEqual({
+        code: SHIFT_REGISTRATION_RANGE_PASSED_CODE,
+        message: SHIFT_REGISTRATION_RANGE_PASSED_MESSAGE,
+      });
+      expect(builder.getMany).not.toHaveBeenCalled();
+    });
+
+    it('returns the "not found" 400 when every matched slot is closed', async () => {
+      queryBuilder([slotRow('s-today', '2026-09-22')]);
+      const manager = managerFor({});
+
+      await expect(
+        service.createShiftRegistration('account-1', {
+          storeId: 'store-1',
+          employeeProfileId: 'emp-1',
+          workShiftId: 'ws-1',
+          startDate: '2026-09-22',
+          daysOfWeek: [2],
+        }),
+      ).rejects.toThrow(
+        'Không tìm thấy ca làm việc nào phù hợp với thời gian và các ngày đã chọn.',
+      );
+      expect(manager.createQueryBuilder).not.toHaveBeenCalled();
     });
   });
 
@@ -964,6 +1306,14 @@ describe('StoresService - Shift Registration Count', () => {
   });
 
   describe('createShiftRegistration - Batch Mode', () => {
+    // 2024-06-01 00:00 in Vietnam: the June 2024 fixtures are still ahead.
+    beforeEach(() => {
+      jest.useFakeTimers().setSystemTime(new Date('2024-05-31T17:00:00Z'));
+    });
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
     it('should throw error if no slots match the daysOfWeek', async () => {
       const mockQueryBuilder = {
         leftJoinAndSelect: jest.fn().mockReturnThis(),

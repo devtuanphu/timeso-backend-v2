@@ -767,3 +767,135 @@ describe('metricValue — KPI_COMPLETION tính từ nhiệm vụ KPI (D6)', () =
     expect(result.items[0]).toMatchObject({ current: 0, met: false });
   });
 });
+
+describe('CareerLadderService — current employment stint only', () => {
+  const build = (joinedAt: Date | null) => {
+    const service = Object.create(CareerLadderService.prototype) as any;
+    service.profileRepository = {
+      findOne: jest.fn().mockResolvedValue({ id: PROFILE, joinedAt }),
+    };
+    service.capabilityRepository = { find: jest.fn().mockResolvedValue([]) };
+    service.eventRepository = { find: jest.fn().mockResolvedValue([]) };
+    service.rungRepository = { find: jest.fn().mockResolvedValue([]) };
+    return service;
+  };
+
+  it('filters capability entries from the rehire onwards', async () => {
+    const service = build(new Date('2026-09-10T03:00:00.000Z'));
+
+    await service.getCapabilityEntries(PROFILE);
+
+    const where = service.capabilityRepository.find.mock.calls[0][0].where;
+    expect(where.employeeProfileId).toBe(PROFILE);
+    expect(where.awardedAt.type).toBe('moreThanOrEqual');
+    expect(where.awardedAt.value.toISOString()).toBe('2026-09-10T02:59:00.000Z');
+  });
+
+  it('filters career history from the rehire onwards', async () => {
+    const service = build(new Date('2026-09-10T03:00:00.000Z'));
+
+    await service.getCareerHistory(PROFILE);
+
+    const where = service.eventRepository.find.mock.calls[0][0].where;
+    expect(where.effectiveAt.type).toBe('moreThanOrEqual');
+    expect(where.effectiveAt.value.toISOString()).toBe('2026-09-10T02:59:00.000Z');
+  });
+
+  it('does not filter a legacy profile without joinedAt', async () => {
+    const service = build(null);
+
+    await service.getCapabilityEntries(PROFILE);
+    await service.getCareerHistory(PROFILE);
+
+    expect(service.capabilityRepository.find.mock.calls[0][0].where).toEqual({
+      employeeProfileId: PROFILE,
+    });
+    expect(service.eventRepository.find.mock.calls[0][0].where).toEqual({
+      employeeProfileId: PROFILE,
+    });
+  });
+});
+
+describe('CareerLadderService — rehire leaks A/B (current stint only)', () => {
+  const JOINED = new Date('2026-09-10T03:00:00.000Z');
+  const FLOOR = '2026-09-10T02:59:00.000Z';
+
+  const withKpiTasks = (joinedAt: Date | null) => {
+    const service = build({
+      criteria: [
+        criteria({ code: CriteriaCode.KPI_COMPLETION, value: 80, label: 'KPI' }),
+      ],
+    });
+    const qb: any = {};
+    for (const method of ['innerJoin', 'select', 'addSelect', 'where', 'andWhere']) {
+      qb[method] = jest.fn(() => qb);
+    }
+    qb.getRawOne = jest.fn().mockResolvedValue({ total: '2', done: '2' });
+    service.dataSource = { getRepository: jest.fn(() => ({ createQueryBuilder: () => qb })) };
+    return { service, qb, subject: profile({ joinedAt }) };
+  };
+
+  it('KPI completion counts only KPIs created in the current stint', async () => {
+    const { service, qb, subject } = withKpiTasks(JOINED);
+
+    await service.evaluateRung(subject, rung(), ladder());
+
+    const call = qb.andWhere.mock.calls.find(
+      ([sql]: [string]) => sql === 'kpi.created_at >= :stint',
+    );
+    expect(call).toBeDefined();
+    expect(call[1].stint.toISOString()).toBe(FLOOR);
+  });
+
+  it('KPI completion is not filtered for a legacy profile', async () => {
+    const { service, qb, subject } = withKpiTasks(null);
+
+    await service.evaluateRung(subject, rung(), ladder());
+
+    expect(qb.andWhere).not.toHaveBeenCalledWith(
+      'kpi.created_at >= :stint',
+      expect.anything(),
+    );
+  });
+
+  const progression = (joinedAt: Date | null, events: any[]) => {
+    const service = build();
+    service.profileRepository = {
+      findOne: jest.fn().mockResolvedValue(profile({ joinedAt })),
+    };
+    service.ladderRepository = { find: jest.fn().mockResolvedValue([ladder()]) };
+    service.rungRepository.find = jest.fn().mockResolvedValue([
+      rung({ id: 'rung-1', level: 1, targetId: 'role-1' }),
+      rung({ id: 'rung-2', level: 2, targetId: 'role-2' }),
+    ]);
+    service.edgeRepository = { find: jest.fn().mockResolvedValue([]) };
+    service.currentRung = jest.fn().mockResolvedValue(null);
+    service.targetNames = jest.fn().mockResolvedValue(new Map());
+    service.eventRepository.find = jest.fn().mockResolvedValue(events);
+    return service;
+  };
+
+  it('progression timeline ignores rungs traversed in the previous stint', async () => {
+    const service = progression(JOINED, []);
+
+    const stages = await service.getProgressionStages(PROFILE);
+
+    const where = service.eventRepository.find.mock.calls[0][0].where;
+    expect(where).toMatchObject({ employeeProfileId: PROFILE, ladderId: 'ladder-1' });
+    expect(where.effectiveAt.type).toBe('moreThanOrEqual');
+    expect(where.effectiveAt.value.toISOString()).toBe(FLOOR);
+    expect(stages.map((s: any) => s.progress)).toEqual([0, 0]);
+  });
+
+  it('progression timeline is not filtered for a legacy profile', async () => {
+    const service = progression(null, [{ fromRungId: null, toRungId: 'rung-1' }]);
+
+    const stages = await service.getProgressionStages(PROFILE);
+
+    expect(service.eventRepository.find.mock.calls[0][0].where).toEqual({
+      employeeProfileId: PROFILE,
+      ladderId: 'ladder-1',
+    });
+    expect(stages[0].progress).toBe(100);
+  });
+});
