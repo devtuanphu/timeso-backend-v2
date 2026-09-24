@@ -76,6 +76,18 @@ export class JobApplication extends BaseEntity {
   @Column({ name: 'birthday', type: 'date', nullable: true })
   birthday: string | null;
 
+  /** Applicant-typed single-line address. Cleared with the contact fields. */
+  @Column({ name: 'address', type: 'varchar', length: 255, nullable: true })
+  address: string | null;
+
+  /**
+   * Bare filename (never a path) of the optional selfie stored under
+   * `JOB_APPLICATION_SELFIE_DIR`. Served only through the authenticated
+   * selfie route; cleared and the file deleted on withdrawal or retention.
+   */
+  @Column({ name: 'selfie_path', type: 'varchar', length: 255, nullable: true })
+  selfiePath: string | null;
+
   @Column({
     type: 'enum',
     enum: JobApplicationStatus,

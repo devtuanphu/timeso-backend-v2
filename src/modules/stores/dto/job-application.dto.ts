@@ -22,6 +22,9 @@ import { JobApplicationStatus } from '../entities/job-application.entity';
 const trimmed = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
 
+/** Matches `store_job_applications.address varchar(255)`. */
+export const MAX_ADDRESS_LENGTH = 255;
+
 /** The values both apps already render for a person's gender. */
 export const GENDER_VALUES = ['Nam', 'Nữ', 'Khác'] as const;
 
@@ -93,6 +96,24 @@ export class CreateJobApplicationDto {
   @IsOptional()
   @Matches(/^\d{4}-\d{2}-\d{2}$/, { message: 'Ngày sinh không hợp lệ' })
   birthday?: string;
+
+  /**
+   * Optional so builds released before the field existed keep working. Folded
+   * to one safe line; a blank value is treated as absent rather than refused,
+   * because a multipart form sends an empty string for an untouched input.
+   * Not truncated here: an over-long address is refused by `MaxLength`
+   * instead of being silently cut.
+   */
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string'
+      ? sanitizeSingleLine(value, Number.MAX_SAFE_INTEGER) || undefined
+      : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(MAX_ADDRESS_LENGTH)
+  address?: string;
 }
 
 /** Owner inbox filter. */
@@ -147,6 +168,14 @@ export interface JobApplicationItemDto {
   reviewedAt: string | null;
   rejectionReason: string | null;
   avatarUrl: string | null;
+  /** Null when not given or once redacted. */
+  address: string | null;
+  /**
+   * `/api/stores/:storeId/job-applications/:id/selfie` when a selfie is on
+   * file, else null. Authenticated route; readable by the store owner and the
+   * applicant only.
+   */
+  selfieUrl: string | null;
   /**
    * Set when this applicant already has a profile at this store that has ended
    * — terminated, or soft-deleted when the owner removed them from the list.

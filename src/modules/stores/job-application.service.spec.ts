@@ -104,6 +104,19 @@ function build() {
     }),
   };
 
+  // Filesystem access is its own provider; the real one is covered by
+  // job-application-selfie.spec.ts.
+  const selfieStorage: any = {
+    verify: jest.fn().mockResolvedValue(true),
+    remove: jest.fn().mockResolvedValue(true),
+    exists: jest.fn().mockResolvedValue(true),
+    resolve: jest.fn((name: unknown) =>
+      typeof name === 'string' && !name.includes('/') && !name.includes('..')
+        ? `/private/selfies/${name}`
+        : null,
+    ),
+  };
+
   const service = new JobApplicationService(
     applicationRepository,
     storeRepository,
@@ -111,9 +124,11 @@ function build() {
     accountsService,
     notificationsService,
     storesService,
+    selfieStorage,
   );
   return {
     service,
+    selfieStorage,
     applicationRepository,
     storeRepository,
     profileRepository,
@@ -961,5 +976,338 @@ describe('JobApplicationService.listMine', () => {
       expect.objectContaining({ storeId: STORE, status: JobApplicationStatus.PENDING }),
       expect.objectContaining({ storeId: 'store-2' }),
     ]);
+  });
+});
+
+// ─── address + selfie ─────────────────────────────────────────────────────────
+
+const SELFIE = '0b7c6a52-6a0e-4c47-9d3e-3f1c2b8e5a11.jpg';
+const selfieFile = {
+  filename: SELFIE,
+  path: `uploads-private/job-application-selfies/${SELFIE}`,
+  mimetype: 'image/jpeg',
+  size: 1234,
+};
+
+describe('JobApplicationService.apply — address and selfie', () => {
+  it('JSON apply still works: no selfie, address optional', async () => {
+    const t = build();
+    const item = await t.service.apply(APPLICANT, STORE, { ...form } as any);
+
+    const created = t.applicationRepository.create.mock.calls[0][0];
+    expect(created.selfiePath).toBeNull();
+    expect(created.address).toBeNull();
+    expect(item.selfieUrl).toBeNull();
+    expect(item.address).toBeNull();
+    expect(t.selfieStorage.verify).not.toHaveBeenCalled();
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+
+  it('persists the address and the selfie filename with the application', async () => {
+    const t = build();
+    const item = await t.service.apply(
+      APPLICANT,
+      STORE,
+      { ...form, address: '12 Lê Lợi, Q1' } as any,
+      selfieFile,
+    );
+
+    expect(t.selfieStorage.verify).toHaveBeenCalledWith(selfieFile);
+    const created = t.applicationRepository.create.mock.calls[0][0];
+    expect(created.selfiePath).toBe(SELFIE);
+    expect(created.address).toBe('12 Lê Lợi, Q1');
+    expect(item.address).toBe('12 Lê Lợi, Q1');
+    expect(item.selfieUrl).toBe(
+      `/api/stores/${STORE}/job-applications/${APPLICATION}/selfie`,
+    );
+    expect(item.avatarUrl).toBeNull();
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+
+  it('never puts the address or selfie into the owner notification', async () => {
+    const t = build();
+    await t.service.apply(
+      APPLICANT,
+      STORE,
+      { ...form, address: '12 Lê Lợi, Q1' } as any,
+      selfieFile,
+    );
+    const payload = JSON.stringify(t.notificationsService.create.mock.calls);
+    expect(payload).not.toContain('Lê Lợi');
+    expect(payload).not.toContain(SELFIE);
+    expect(payload).not.toContain('selfie');
+  });
+
+  it('rejects content that fails the magic-byte check and deletes the file', async () => {
+    const t = build();
+    t.selfieStorage.verify.mockResolvedValue(false);
+
+    await expect(
+      t.service.apply(APPLICANT, STORE, { ...form } as any, selfieFile),
+    ).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'JOB_APPLICATION_SELFIE_INVALID' }),
+    });
+    expect(t.applicationRepository.save).not.toHaveBeenCalled();
+    expect(t.selfieStorage.remove).toHaveBeenCalledWith(SELFIE);
+  });
+
+  it('deletes the uploaded selfie when a business rule refuses the application', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      id: 'existing',
+      status: JobApplicationStatus.PENDING,
+    });
+
+    await expect(
+      t.service.apply(APPLICANT, STORE, { ...form } as any, selfieFile),
+    ).rejects.toThrow(ConflictException);
+    expect(t.selfieStorage.remove).toHaveBeenCalledWith(SELFIE);
+  });
+
+  it('deletes the uploaded selfie when the insert loses the duplicate race', async () => {
+    const t = build();
+    t.applicationRepository.save.mockRejectedValue({ code: '23505' });
+
+    await expect(
+      t.service.apply(APPLICANT, STORE, { ...form } as any, selfieFile),
+    ).rejects.toThrow(ConflictException);
+    expect(t.selfieStorage.remove).toHaveBeenCalledWith(SELFIE);
+  });
+
+  it('keeps the selfie once saved even if post-save bookkeeping fails', async () => {
+    const t = build();
+    t.profileRepository.save.mockRejectedValue(new Error('db down'));
+    t.accountsService.findById
+      .mockResolvedValueOnce({ id: APPLICANT, status: AccountStatus.ACTIVE })
+      .mockRejectedValue(new Error('db down'));
+
+    const item = await t.service.apply(APPLICANT, STORE, { ...form } as any, selfieFile);
+    expect(item.selfieUrl).not.toBeNull();
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('JobApplicationService — selfie retention on withdraw and reject', () => {
+  const rowWithSelfie = {
+    id: APPLICATION,
+    storeId: STORE,
+    accountId: APPLICANT,
+    status: JobApplicationStatus.PENDING,
+    fullName: 'Trần B',
+    address: '12 Lê Lợi',
+    selfiePath: SELFIE,
+    createdAt: new Date('2026-05-05T00:00:00Z'),
+    reviewedAt: null,
+    rejectionReason: null,
+  };
+
+  it('withdraw nulls address and selfie_path, then deletes the file', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...rowWithSelfie });
+    const order: string[] = [];
+    t.applicationRepository.update.mockImplementation(async () => {
+      order.push('update');
+      return { affected: 1 };
+    });
+    t.selfieStorage.remove.mockImplementation(async () => {
+      order.push('remove');
+      return true;
+    });
+
+    await t.service.withdraw(STORE, APPLICATION, APPLICANT);
+
+    const [, changes] = t.applicationRepository.update.mock.calls[0];
+    expect(changes).toEqual(
+      expect.objectContaining({ address: null, selfiePath: null }),
+    );
+    expect(t.selfieStorage.remove).toHaveBeenCalledWith(SELFIE);
+    expect(order).toEqual(['update', 'remove']);
+  });
+
+  it('a refused withdraw keeps the file', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...rowWithSelfie });
+    t.applicationRepository.update.mockResolvedValue({ affected: 0 });
+
+    await expect(
+      t.service.withdraw(STORE, APPLICATION, APPLICANT),
+    ).rejects.toThrow(ConflictException);
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+
+  it('reject clears the address but keeps the selfie until retention', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...rowWithSelfie });
+
+    await t.service.reject(STORE, APPLICATION, OWNER, {});
+
+    const [, changes] = t.applicationRepository.update.mock.calls[0];
+    expect(changes.address).toBeNull();
+    expect('selfiePath' in changes).toBe(false);
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('JobApplicationService.redactStaleContactDetails — selfies', () => {
+  it('clears each stale selfie with a conditional update, then deletes its file', async () => {
+    const t = build();
+    const other = '9d1f2e3a-1111-4222-8333-444455556666.png';
+    t.applicationRepository.find.mockResolvedValueOnce([
+      { id: 'a-1', selfiePath: SELFIE, reviewedAt: new Date('2026-01-01T00:00:00Z') },
+      { id: 'a-2', selfiePath: other, reviewedAt: null },
+    ]);
+    t.applicationRepository.update
+      .mockResolvedValueOnce({ affected: 1 }) // a-1 selfie
+      .mockResolvedValueOnce({ affected: 1 }) // a-2 selfie
+      .mockResolvedValueOnce({ affected: 3 }) // reviewed
+      .mockResolvedValueOnce({ affected: 2 }); // abandoned
+
+    await expect(t.service.redactStaleContactDetails()).resolves.toBe(5);
+
+    const [firstCriteria, firstChanges] = t.applicationRepository.update.mock.calls[0];
+    expect(firstCriteria).toEqual(
+      expect.objectContaining({ id: 'a-1', selfiePath: SELFIE, reviewedAt: expect.anything() }),
+    );
+    expect(firstChanges).toEqual({ selfiePath: null, address: null });
+    const [secondCriteria] = t.applicationRepository.update.mock.calls[1];
+    // Never reviewed: keyed on creation time, and still unreviewed at write time.
+    expect(secondCriteria).toEqual(
+      expect.objectContaining({ id: 'a-2', selfiePath: other, createdAt: expect.anything() }),
+    );
+    expect(t.selfieStorage.remove.mock.calls).toEqual([[SELFIE], [other]]);
+
+    // Bulk redaction clears the address but leaves selfie_path to the pass above.
+    for (const call of t.applicationRepository.update.mock.calls.slice(2)) {
+      expect(call[1].address).toBeNull();
+      expect('selfiePath' in call[1]).toBe(false);
+    }
+  });
+
+  it('keeps the file when the row changed between read and write', async () => {
+    const t = build();
+    t.applicationRepository.find.mockResolvedValueOnce([
+      { id: 'a-1', selfiePath: SELFIE, reviewedAt: null },
+    ]);
+    t.applicationRepository.update.mockResolvedValue({ affected: 0 });
+
+    await t.service.redactStaleContactDetails();
+    expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('JobApplicationService.getSelfie', () => {
+  const row = {
+    id: APPLICATION,
+    storeId: STORE,
+    accountId: APPLICANT,
+    selfiePath: SELFIE,
+  };
+  const notFound = { status: 404 };
+
+  it('lets the store owner read it', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...row });
+    await expect(t.service.getSelfie(STORE, APPLICATION, OWNER)).resolves.toEqual({
+      absolutePath: `/private/selfies/${SELFIE}`,
+      contentType: 'image/jpeg',
+    });
+  });
+
+  it('lets the applicant read their own without an owner lookup', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...row });
+    await expect(t.service.getSelfie(STORE, APPLICATION, APPLICANT)).resolves.toEqual(
+      expect.objectContaining({ contentType: 'image/jpeg' }),
+    );
+    expect(t.storeRepository.findOne).not.toHaveBeenCalled();
+  });
+
+  it('refuses an employee/member of the store with a 404', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...row });
+    await expect(
+      t.service.getSelfie(STORE, APPLICATION, 'store-employee'),
+    ).rejects.toMatchObject(notFound);
+  });
+
+  it('refuses the owner of another store, even via their own store id', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({ ...row });
+    t.storeRepository.findOne.mockResolvedValue({ id: STORE, ownerAccountId: OWNER });
+    await expect(
+      t.service.getSelfie(STORE, APPLICATION, 'other-owner'),
+    ).rejects.toMatchObject(notFound);
+    // Addressing the application through a store it does not belong to.
+    await expect(
+      t.service.getSelfie('store-2', APPLICATION, OWNER),
+    ).rejects.toMatchObject(notFound);
+  });
+
+  it('is 404 for an unknown application, no selfie, or a missing file', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValueOnce(null);
+    await expect(t.service.getSelfie(STORE, APPLICATION, OWNER)).rejects.toMatchObject(notFound);
+
+    t.applicationRepository.findOne.mockResolvedValueOnce({ ...row, selfiePath: null });
+    await expect(t.service.getSelfie(STORE, APPLICATION, OWNER)).rejects.toMatchObject(notFound);
+
+    t.applicationRepository.findOne.mockResolvedValueOnce({ ...row });
+    t.selfieStorage.exists.mockResolvedValueOnce(false);
+    await expect(t.service.getSelfie(STORE, APPLICATION, OWNER)).rejects.toMatchObject(notFound);
+  });
+
+  it('rejects a stored value that tries to traverse out of the directory', async () => {
+    const t = build();
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...row,
+      selfiePath: '../../.env',
+    });
+    await expect(t.service.getSelfie(STORE, APPLICATION, APPLICANT)).rejects.toMatchObject(
+      notFound,
+    );
+    expect(t.selfieStorage.exists).not.toHaveBeenCalled();
+  });
+});
+
+describe('CreateJobApplicationDto.address', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { plainToInstance } = require('class-transformer');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { validateSync } = require('class-validator');
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { CreateJobApplicationDto } = require('./dto/job-application.dto');
+
+  const check = (address: unknown) => {
+    const dto = plainToInstance(CreateJobApplicationDto, { ...form, address });
+    return { dto, errors: validateSync(dto).filter((e: any) => e.property === 'address') };
+  };
+
+  it('is optional for older builds', () => {
+    const dto = plainToInstance(CreateJobApplicationDto, { ...form });
+    expect(validateSync(dto)).toEqual([]);
+    expect(dto.address).toBeUndefined();
+  });
+
+  it('folds to one trimmed line', () => {
+    const { dto, errors } = check('  12 Lê Lợi,\n  Quận 1\t ');
+    expect(errors).toEqual([]);
+    expect(dto.address).toBe('12 Lê Lợi, Quận 1');
+  });
+
+  it('treats a blank value as absent', () => {
+    const { dto, errors } = check('   ');
+    expect(errors).toEqual([]);
+    expect(dto.address).toBeUndefined();
+  });
+
+  it('enforces 2..255 characters when present', () => {
+    expect(check('A').errors).toHaveLength(1);
+    expect(check('AB').errors).toEqual([]);
+    expect(check('x'.repeat(255)).errors).toEqual([]);
+    expect(check('x'.repeat(256)).errors).toHaveLength(1);
+  });
+
+  it('refuses a non-string', () => {
+    expect(check(12345).errors).toHaveLength(1);
   });
 });

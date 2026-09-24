@@ -32,6 +32,13 @@ import { Store, StoreStatus } from './entities/store.entity';
 import { StoresService } from './stores.service';
 import { sanitizeDisplayName } from './job-application.text';
 import {
+  JobApplicationSelfieStorage,
+  UploadedSelfie,
+  jobApplicationSelfieUrl,
+  selfieContentType,
+  selfieInvalid,
+} from './job-application-selfie.storage';
+import {
   FormerEmployment,
   FormerEmploymentRecord,
   AcceptJobApplicationDto,
@@ -69,6 +76,7 @@ export class JobApplicationService {
     private readonly accountsService: AccountsService,
     private readonly notificationsService: NotificationsService,
     private readonly storesService: StoresService,
+    private readonly selfieStorage: JobApplicationSelfieStorage,
   ) {}
 
   // ─── shared guards ────────────────────────────────────────────────────────
@@ -116,11 +124,64 @@ export class JobApplicationService {
 
   // ─── staff: submit ────────────────────────────────────────────────────────
 
+  /**
+   * Submits an application, optionally with a selfie multer has already
+   * written to the private selfie directory.
+   *
+   * File lifecycle: until the row is saved, every failure (bad content,
+   * eligibility, rate limit, duplicate) deletes the uploaded file. The
+   * filename is persisted in the same INSERT as the application, so a saved
+   * row and its file appear together. Nothing after the save throws — the
+   * remaining steps are best-effort — which is what lets
+   * `JobApplicationSelfieCleanupInterceptor` treat any error as "file
+   * unreferenced".
+   */
   async apply(
     accountId: string,
     storeId: string,
     dto: CreateJobApplicationDto,
+    selfie?: UploadedSelfie,
   ): Promise<JobApplicationItemDto> {
+    let saved: JobApplication;
+    let storeName: string;
+    let ownerAccountId: string;
+    try {
+      if (selfie && !(await this.selfieStorage.verify(selfie))) {
+        throw selfieInvalid();
+      }
+      ({ saved, storeName, ownerAccountId } = await this.insertApplication(
+        accountId,
+        storeId,
+        dto,
+        selfie?.filename ?? null,
+      ));
+    } catch (error) {
+      if (selfie) await this.selfieStorage.remove(selfie.filename);
+      throw error;
+    }
+
+    try {
+      await this.openPendingProfile(saved);
+      await this.notifyOwnerOfApplication(ownerAccountId, storeName, saved);
+    } catch (error) {
+      // Both steps already contain their own failures; this only guarantees
+      // the documented "no throw after save" contract.
+      this.logger.warn(
+        `[JobApplication] ${saved.id}: post-submit bookkeeping failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    return this.toItem(saved, null);
+  }
+
+  /** Every business rule of `apply`, ending in the INSERT. */
+  private async insertApplication(
+    accountId: string,
+    storeId: string,
+    dto: CreateJobApplicationDto,
+    selfiePath: string | null,
+  ): Promise<{ saved: JobApplication; storeName: string; ownerAccountId: string }> {
     await this.assertEligibleApplicant(accountId);
 
     const store = await this.storeRepository.findOne({
@@ -190,6 +251,8 @@ export class JobApplicationService {
           introduction: dto.introduction ?? null,
           gender: dto.gender ?? null,
           birthday: dto.birthday ?? null,
+          address: dto.address ?? null,
+          selfiePath,
           status: JobApplicationStatus.PENDING,
         }),
       );
@@ -204,9 +267,7 @@ export class JobApplicationService {
       throw error;
     }
 
-    await this.openPendingProfile(saved);
-    await this.notifyOwnerOfApplication(store.ownerAccountId, store.name, saved);
-    return this.toItem(saved, null);
+    return { saved, storeName: store.name, ownerAccountId: store.ownerAccountId };
   }
 
   /** Bounds how many owners one account can reach in a window. */
@@ -472,8 +533,9 @@ export class JobApplicationService {
         reviewedAt: new Date(),
         rejectionReason: dto.reason ?? null,
         // The decision is final, so the applicant's contact details serve no
-        // further purpose for this store.
-        ...redactedContact(),
+        // further purpose for this store. The selfie is kept until the
+        // retention sweep (policy unchanged), which deletes it with the file.
+        ...redactedContact({ keepSelfie: true }),
       },
     );
     if (!claimed.affected) {
@@ -525,6 +587,10 @@ export class JobApplicationService {
         message: 'Đơn ứng tuyển đã được xử lý.',
       });
     }
+    // After the DB no longer references it; best-effort, never throws.
+    if (application.selfiePath) {
+      await this.selfieStorage.remove(application.selfiePath);
+    }
     await this.closePendingProfile(application);
     // Reached only after the conditional claim succeeded, so a repeated
     // withdraw (Conflict above) never notifies the owner twice.
@@ -544,6 +610,12 @@ export class JobApplicationService {
       now.getTime() - CONTACT_RETENTION_DAYS * 24 * 60 * 60 * 1000,
     );
 
+    // Selfies first, row by row, because each file must be deleted and the
+    // bulk updates below cannot report which rows they touched. The bulk
+    // updates keep `selfie_path`, so a row this pass has not reached yet
+    // (batch cap) is picked up tomorrow instead of losing its file reference.
+    const selfies = await this.purgeStaleSelfies(cutoff);
+
     // Reviewed applications: keyed on when the decision was made.
     const reviewed = await this.applicationRepository.update(
       {
@@ -551,7 +623,7 @@ export class JobApplicationService {
         reviewedAt: LessThan(cutoff),
         contactRedactedAt: IsNull(),
       },
-      redactedContact(),
+      redactedContact({ keepSelfie: true }),
     );
 
     // Applications nobody ever acted on. These matched neither condition above
@@ -571,7 +643,7 @@ export class JobApplicationService {
       },
       {
         status: JobApplicationStatus.CANCELLED,
-        ...redactedContact(),
+        ...redactedContact({ keepSelfie: true }),
       },
     );
 
@@ -583,7 +655,113 @@ export class JobApplicationService {
         } abandoned application(s)`,
       );
     }
+    if (selfies) {
+      this.logger.log(`[JobApplication] deleted ${selfies} stale selfie(s)`);
+    }
     return affected;
+  }
+
+  /**
+   * Clears `selfie_path` and deletes the file for every application past the
+   * retention window: reviewed before the cutoff, or never reviewed and
+   * created before it (abandoned PENDING, and the CANCELLED rows the sweep
+   * expired, which have no `reviewed_at`).
+   *
+   * Each row is cleared with a conditional UPDATE repeating the eligibility
+   * test and the exact filename, so a row accepted or withdrawn between the
+   * read and the write is left alone, and the file is deleted only after its
+   * reference is gone. Returns the number of rows cleared.
+   */
+  private async purgeStaleSelfies(cutoff: Date): Promise<number> {
+    let cleared = 0;
+    for (let batch = 0; batch < SELFIE_PURGE_MAX_BATCHES; batch += 1) {
+      const rows = await this.applicationRepository.find({
+        where: [
+          { selfiePath: Not(IsNull()), reviewedAt: LessThan(cutoff) },
+          {
+            selfiePath: Not(IsNull()),
+            reviewedAt: IsNull(),
+            createdAt: LessThan(cutoff),
+          },
+        ],
+        select: ['id', 'selfiePath', 'reviewedAt'],
+        order: { id: 'ASC' },
+        take: SELFIE_PURGE_BATCH_SIZE,
+      });
+      if (!rows?.length) break;
+
+      let progressed = 0;
+      for (const row of rows) {
+        const result = await this.applicationRepository.update(
+          row.reviewedAt
+            ? { id: row.id, selfiePath: row.selfiePath as string, reviewedAt: LessThan(cutoff) }
+            : {
+                id: row.id,
+                selfiePath: row.selfiePath as string,
+                reviewedAt: IsNull(),
+                createdAt: LessThan(cutoff),
+              },
+          { selfiePath: null, address: null },
+        );
+        if (!result.affected) continue;
+        progressed += 1;
+        await this.selfieStorage.remove(row.selfiePath);
+      }
+      cleared += progressed;
+      // A full batch that changed nothing would be re-read forever.
+      if (!progressed || rows.length < SELFIE_PURGE_BATCH_SIZE) break;
+    }
+    return cleared;
+  }
+
+  // ─── selfie read ──────────────────────────────────────────────────────────
+
+  /**
+   * Resolves the selfie file of one application for `accountId`.
+   *
+   * Readers: the owner of the application's store, or the applicant. This is
+   * authorized here and not by `StoreOwnerOnlyGuard` — the route is left
+   * undecorated so the guard passes it through, because the applicant is not
+   * an owner. Every refusal (unknown id, wrong store, not a reader, no selfie,
+   * unsafe name, missing file) is the same 404, so a non-reader learns nothing
+   * about whether the application or its selfie exists.
+   */
+  async getSelfie(
+    storeId: string,
+    applicationId: string,
+    accountId: string,
+  ): Promise<{ absolutePath: string; contentType: string }> {
+    const notFound = () =>
+      new NotFoundException({
+        code: 'JOB_APPLICATION_SELFIE_NOT_FOUND',
+        message: 'Không tìm thấy ảnh chân dung',
+      });
+    if (!accountId) throw notFound();
+
+    const application = await this.applicationRepository.findOne({
+      where: { id: applicationId },
+      select: ['id', 'storeId', 'accountId', 'selfiePath'],
+    });
+    if (!application || application.storeId !== storeId) throw notFound();
+
+    let allowed = application.accountId === accountId;
+    if (!allowed) {
+      const store = await this.storeRepository.findOne({
+        where: { id: application.storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      allowed = !!store && store.ownerAccountId === accountId;
+    }
+    if (!allowed) throw notFound();
+
+    const absolutePath = this.selfieStorage.resolve(application.selfiePath);
+    if (!absolutePath || !(await this.selfieStorage.exists(application.selfiePath))) {
+      throw notFound();
+    }
+    return {
+      absolutePath,
+      contentType: selfieContentType(application.selfiePath as string),
+    };
   }
 
   private async loadPending(storeId: string, applicationId: string) {
@@ -915,6 +1093,10 @@ export class JobApplicationService {
       reviewedAt: row.reviewedAt ? row.reviewedAt.toISOString() : null,
       rejectionReason: row.rejectionReason,
       avatarUrl,
+      address: row.address ?? null,
+      selfieUrl: row.selfiePath
+        ? jobApplicationSelfieUrl(row.storeId, row.id)
+        : null,
       formerEmployment,
     };
   }
@@ -949,7 +1131,7 @@ const CONTACT_RETENTION_DAYS = 90;
  * `contact_redacted_at` predated their own `created_at`, and making the column
  * useless as evidence that the retention policy ran.
  */
-const redactedContact = () => ({
+const redactedContact = ({ keepSelfie = false }: { keepSelfie?: boolean } = {}) => ({
   phone: null,
   email: null,
   introduction: null,
@@ -957,8 +1139,17 @@ const redactedContact = () => ({
   // decision is final, so they are cleared on the same schedule as the rest.
   gender: null,
   birthday: null,
+  address: null,
+  // Clearing `selfie_path` orphans a file unless the caller deletes it after
+  // the update. `withdraw` does; rejection keeps the selfie until retention,
+  // and the retention sweep clears selfies itself in `purgeStaleSelfies`.
+  ...(keepSelfie ? {} : { selfiePath: null }),
   contactRedactedAt: new Date(),
 });
+
+/** Rows cleared per selfie purge query, and the per-run cap on queries. */
+const SELFIE_PURGE_BATCH_SIZE = 200;
+const SELFIE_PURGE_MAX_BATCHES = 50;
 
 /**
  * Owner app route showing the applications inbox.
