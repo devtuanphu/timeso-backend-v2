@@ -298,3 +298,56 @@ describe('G. employee ranking report — current stint only', () => {
     expect(report.employees[0]).toMatchObject({ employeeId: 'e-1', hours: 3 });
   });
 });
+
+describe('D. Attendance logs — current stint only', () => {
+  const build = () => {
+    const service = Object.create(StoresService.prototype) as any;
+    const qb = chain([{ id: 'log-1' }]);
+    qb.take = jest.fn(() => qb);
+    service.attendanceLogRepository = { createQueryBuilder: jest.fn(() => qb) };
+    return { service, qb };
+  };
+
+  it('drops logs from before the profile joined_at (owner, whole store)', async () => {
+    const { service, qb } = build();
+
+    const rows = await service.getAttendanceLogs('store-1');
+
+    expect(rows).toEqual([{ id: 'log-1' }]);
+    expect(qb.leftJoinAndSelect).toHaveBeenCalledWith('log.shiftAssignment', 'sa');
+    expect(qb.leftJoinAndSelect).toHaveBeenCalledWith('log.employeeProfile', 'ep');
+    expect(qb.where).toHaveBeenCalledWith('log.storeId = :storeId', { storeId: 'store-1' });
+    expect(qb.andWhere).toHaveBeenCalledWith(STINT_SQL('ep', 'log.timestamp'));
+    expect(qb.orderBy).toHaveBeenCalledWith('log.timestamp', 'DESC');
+    expect(qb.take).toHaveBeenCalledWith(100);
+  });
+
+  it('keeps the profile and date filters (staff caller, own profile)', async () => {
+    const { service, qb } = build();
+
+    await service.getAttendanceLogs('store-1', {
+      employeeProfileId: PROFILE,
+      dateFrom: '2026-09-01',
+      dateTo: '2026-09-30',
+    });
+
+    expect(qb.andWhere).toHaveBeenCalledWith(
+      'log.employeeProfileId = :employeeProfileId',
+      { employeeProfileId: PROFILE },
+    );
+    const dateCall = qb.andWhere.mock.calls.find(
+      ([clause]: any[]) => clause === 'log.timestamp BETWEEN :from AND :to',
+    );
+    expect(dateCall[1].from).toEqual(new Date('2026-09-01'));
+    expect(dateCall[1].to).toEqual(new Date('2026-09-30T23:59:59'));
+    expect(qb.andWhere).toHaveBeenCalledWith(STINT_SQL('ep', 'log.timestamp'));
+  });
+
+  it('a date range alone (without both ends) is ignored, as before', async () => {
+    const { service, qb } = build();
+    await service.getAttendanceLogs('store-1', { dateFrom: '2026-09-01' });
+    expect(
+      qb.andWhere.mock.calls.some(([clause]: any[]) => String(clause).includes('BETWEEN')),
+    ).toBe(false);
+  });
+});

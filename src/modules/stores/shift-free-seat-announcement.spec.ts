@@ -305,3 +305,83 @@ describe('owner triggers', () => {
     expect(service.announceFreeSeatsOfSlot).not.toHaveBeenCalled();
   });
 });
+
+describe('announceFreeSeatsOfSlots — seats a staff member gave back', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  const slot = (id: string, over: Record<string, unknown> = {}) => ({
+    id,
+    workDate: '2026-09-23',
+    startTime: '08:00',
+    endTime: '12:00',
+    maxStaff: 2,
+    cycle: { storeId: 'store-1', status: WorkCycleStatus.ACTIVE },
+    workShift: { shiftName: 'Ca sáng', startTime: '08:00', endTime: '12:00', defaultMaxStaff: 1 },
+    assignments: [
+      { employeeId: 'p1', status: ShiftAssignmentStatus.APPROVED },
+      { employeeId: 'p9', status: ShiftAssignmentStatus.CANCELLED },
+    ],
+    ...over,
+  });
+  const build = (slots: any[]) => {
+    const service = Object.create(StoresService.prototype) as any;
+    service.logger = { warn: jest.fn(), log: jest.fn(), debug: jest.fn() };
+    service.shiftSlotRepository = { find: jest.fn().mockResolvedValue(slots) };
+    service.notifyEmployeesOfCreatedShifts = jest.fn().mockResolvedValue(undefined);
+    return service;
+  };
+
+  it('one aggregated announcement per store, holders per shift, the canceller excluded, throttled', async () => {
+    const service = build([
+      slot('s1'),
+      slot('s2', { workDate: '2026-09-24' }),
+      // full again (someone took it): not announced
+      slot('s3', {
+        assignments: [
+          { employeeId: 'p1', status: ShiftAssignmentStatus.APPROVED },
+          { employeeId: 'p2', status: ShiftAssignmentStatus.PENDING },
+        ],
+      }),
+      // started today 08:00 VN
+      slot('s4', { workDate: '2026-09-22' }),
+      // stopped schedule
+      slot('s5', { cycle: { storeId: 'store-1', status: WorkCycleStatus.STOPPED } }),
+    ]);
+
+    await service.announceFreeSeatsOfSlots(['s1', 's2', 's3', 's4', 's5'], 'self_cancelled', ['p9']);
+
+    expect(service.notifyEmployeesOfCreatedShifts).toHaveBeenCalledTimes(1);
+    const [storeId, shifts, exclude] = service.notifyEmployeesOfCreatedShifts.mock.calls[0];
+    expect(storeId).toBe('store-1');
+    expect(shifts).toEqual([
+      expect.objectContaining({ workDate: '2026-09-23', assignedProfileIds: ['p1'] }),
+      expect.objectContaining({ workDate: '2026-09-24', assignedProfileIds: ['p1'] }),
+    ]);
+    expect(exclude).toEqual(['p9']);
+
+    // Same slots again inside the 15-minute window: nothing.
+    await service.announceFreeSeatsOfSlots(['s1', 's2'], 'self_cancelled', ['p9']);
+    expect(service.notifyEmployeesOfCreatedShifts).toHaveBeenCalledTimes(1);
+  });
+
+  it('shares the throttle with the single-slot path', async () => {
+    const service = build([slot('s1')]);
+    service.shiftSlotRepository.findOne = jest.fn().mockResolvedValue(slot('s1'));
+
+    await service.announceFreeSeatsOfSlot('s1', 'assignment_cancelled', ['p9']);
+    await service.announceFreeSeatsOfSlots(['s1'], 'self_cancelled', ['p9']);
+
+    expect(service.notifyEmployeesOfCreatedShifts).toHaveBeenCalledTimes(1);
+  });
+
+  it('never throws', async () => {
+    const service = build([]);
+    service.shiftSlotRepository.find.mockRejectedValue(new Error('db'));
+    await expect(
+      service.announceFreeSeatsOfSlots(['s1'], 'self_cancelled'),
+    ).resolves.toBeUndefined();
+    await expect(service.announceFreeSeatsOfSlots([], 'self_cancelled')).resolves.toBeUndefined();
+    expect(service.shiftSlotRepository.find).toHaveBeenCalledTimes(1);
+  });
+});

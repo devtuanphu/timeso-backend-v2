@@ -125,6 +125,14 @@ import {
 import { EmployeeFace } from './entities/employee-face.entity';
 import { ChatGroupMember } from '../chat-groups/entities/chat-group-member.entity';
 import {
+  JobApplication,
+  JobApplicationStatus,
+} from './entities/job-application.entity';
+import {
+  isSafeSelfieFilename,
+  jobApplicationSelfieUrl,
+} from './job-application-selfie.storage';
+import {
   currentStintContracts,
   currentStintSql,
   stintFloor,
@@ -279,6 +287,8 @@ import {
   buildShiftNotification,
   selectCreatedShiftAnnouncement,
   selectFreeSeatAnnouncement,
+  selectGeneratedSlotAnnouncements,
+  GeneratedSlotSeatState,
   shiftsOpenTo,
   SlotAnnouncementThrottle,
   AnnouncedShift,
@@ -391,6 +401,9 @@ const escapeLikeToken = (value: string): string =>
 // currently allows at most 50 drafts, so 10,000 keeps normal long schedules
 // available while preventing an unbounded transaction when no employees are set.
 const MAX_GENERATED_SHIFT_SLOTS = 10000;
+/** Bounds for announcing seats freed by one staff withdrawal. */
+const FREE_SEAT_ANNOUNCE_MAX_SLOTS = 1000;
+const FREE_SEAT_ANNOUNCE_CHUNK = 200;
 
 type NormalizedShiftDraft = Omit<ShiftDraftDto, 'employeeIds' | 'note'> & {
   employeeIds: string[];
@@ -1682,6 +1695,10 @@ export class StoresService {
       return { eligible: false as const };
     }
     const leftAt = former ? (former.leftAt ?? former.deletedAt ?? null) : null;
+    const selfieUrl = await this.findCandidateApplicationSelfieUrl(
+      storeId,
+      account.id,
+    );
     return {
       eligible: true as const,
       account: {
@@ -1695,7 +1712,53 @@ export class StoresService {
       formerEmployee: former
         ? { leftAt: leftAt ? new Date(leftAt).toISOString() : null }
         : null,
+      // Additive, nullable: the authenticated selfie route of this account's
+      // most recent PENDING or ACCEPTED application *to this store* that
+      // still has a selfie (not withdrawn, rejected or redacted). The route
+      // itself re-checks that the reader owns the store.
+      selfieUrl,
     };
+  }
+
+  /**
+   * Selfie route of `accountId`'s latest live application at `storeId`, or
+   * null. Only called after the caller was verified as the store owner.
+   * Best effort: a lookup failure yields null rather than failing the
+   * candidate lookup.
+   */
+  private async findCandidateApplicationSelfieUrl(
+    storeId: string,
+    accountId: string,
+  ): Promise<string | null> {
+    try {
+      const application = await this.dataSource
+        .getRepository(JobApplication)
+        .findOne({
+          where: {
+            storeId,
+            accountId,
+            status: In([
+              JobApplicationStatus.PENDING,
+              JobApplicationStatus.ACCEPTED,
+            ]),
+            selfiePath: Not(IsNull()),
+            contactRedactedAt: IsNull(),
+          },
+          select: ['id', 'storeId', 'selfiePath'],
+          order: { createdAt: 'DESC' },
+        });
+      if (!application || !isSafeSelfieFilename(application.selfiePath)) {
+        return null;
+      }
+      return jobApplicationSelfieUrl(application.storeId, application.id);
+    } catch (error) {
+      this.logger.warn(
+        `[findExistingEmployeeCandidate] selfie lookup failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return null;
+    }
   }
 
   async assertOwnerStoreAccess(storeId: string, ownerAccountId: string) {
@@ -5553,6 +5616,136 @@ export class StoresService {
     }
   }
 
+  /**
+   * `announceFreeSeatsOfSlot` for several slots of one withdrawal (a staff
+   * member cancelling their upcoming self-registrations, which can span many
+   * dates): same seat/start rules and the same per-slot throttle, but one
+   * aggregated notice per recipient account per store instead of one per
+   * slot. Holders of each slot are excluded per shift; `excludeProfileIds`
+   * (the person who cancelled) are excluded altogether. After commit, best
+   * effort, never throws, logs counts only.
+   */
+  private async announceFreeSeatsOfSlots(
+    slotIds: string[],
+    trigger: 'self_cancelled',
+    excludeProfileIds: string[] = [],
+  ): Promise<void> {
+    try {
+      const ids = [...new Set(slotIds.filter(Boolean))].slice(
+        0,
+        FREE_SEAT_ANNOUNCE_MAX_SLOTS,
+      );
+      if (!ids.length) return;
+      const slots: ShiftSlot[] = [];
+      for (let i = 0; i < ids.length; i += FREE_SEAT_ANNOUNCE_CHUNK) {
+        slots.push(
+          ...(await this.shiftSlotRepository.find({
+            where: { id: In(ids.slice(i, i + FREE_SEAT_ANNOUNCE_CHUNK)) },
+            relations: ['cycle', 'workShift', 'assignments'],
+          })),
+        );
+      }
+      const now = new Date();
+      const byStore = new Map<string, AnnouncedShift[]>();
+      let skipped = 0;
+      for (const slot of slots) {
+        const storeId = slot.cycle?.storeId;
+        if (!storeId || slot.cycle.status !== WorkCycleStatus.ACTIVE) {
+          skipped++;
+          continue;
+        }
+        const shift = selectFreeSeatAnnouncement(
+          {
+            workDate: slot.workDate,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            maxStaff: slot.maxStaff ?? slot.workShift?.defaultMaxStaff ?? null,
+            shiftName: slot.workShift?.shiftName ?? null,
+            templateStartTime: slot.workShift?.startTime ?? null,
+            templateEndTime: slot.workShift?.endTime ?? null,
+            holderProfileIds: (slot.assignments || [])
+              .filter((a) => a.status !== ShiftAssignmentStatus.CANCELLED)
+              .map((a) => a.employeeId),
+          },
+          now,
+        );
+        this.freeSeatThrottle ??= new SlotAnnouncementThrottle();
+        if (!shift || !this.freeSeatThrottle.claim(slot.id)) {
+          skipped++;
+          continue;
+        }
+        const list = byStore.get(storeId) ?? [];
+        list.push(shift);
+        byStore.set(storeId, list);
+      }
+      this.logger.debug(
+        `[announceFreeSeatsOfSlots] trigger=${trigger} slots=${slots.length} announced=${slots.length - skipped} stores=${byStore.size}`,
+      );
+      for (const [storeId, shifts] of byStore) {
+        await this.notifyEmployeesOfCreatedShifts(
+          storeId,
+          shifts,
+          excludeProfileIds,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[announceFreeSeatsOfSlots] trigger=${trigger} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Announces "Có ca mới để đăng ký" for slots the daily generation job just
+   * created. Only slots created in this run are passed in (a retry or second
+   * run finds them existing and creates nothing, so nothing is announced
+   * twice). One aggregated notice per recipient account per store, same
+   * recipient rules as a new schedule (`notifyEmployeesOfCreatedShifts`).
+   * Best effort: never throws, so slot generation is never affected; logs
+   * counts only.
+   *
+   * Known and accepted: "one notice per account per store" holds per cron
+   * run. A store that has both an old-style daily cycle
+   * (`generateDailySlotsForAllCycles`, 00:20 VN) and a legacy indefinite
+   * template cycle (`generateDailySlotsForIndefiniteCycles`, 00:25 VN) can
+   * therefore get two notices about 5 minutes apart. The two jobs are kept
+   * separate on purpose (own locks, own failure domains); do not merge them
+   * just to deduplicate this notice.
+   */
+  private async announceGeneratedSlots(
+    slots: GeneratedSlotSeatState[],
+    source: string,
+  ): Promise<void> {
+    if (!slots.length) return;
+    try {
+      const byStore = selectGeneratedSlotAnnouncements(slots);
+      let open = 0;
+      for (const [storeId, shifts] of byStore) {
+        open += shifts.length;
+        try {
+          await this.notifyEmployeesOfCreatedShifts(storeId, shifts);
+        } catch (error) {
+          this.logger.warn(
+            `[announceGeneratedSlots] source=${source} store=${storeId} failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
+      this.logger.log(
+        `[announceGeneratedSlots] source=${source} created=${slots.length} open=${open} stores=${byStore.size}`,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `[announceGeneratedSlots] source=${source} failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
   async updateWorkShift(
     storeId: string,
     shiftId: string,
@@ -5901,11 +6094,12 @@ export class StoresService {
   ) {
     const cycle = await this.workCycleRepository.findOne({
       where: { id: cycleId },
-      relations: ['templates'],
+      relations: ['templates', 'templates.workShift'],
     });
-    if (!cycle || !cycle.templates?.length) return;
+    if (!cycle || !cycle.templates?.length) return [];
 
     const slots: Partial<ShiftSlot>[] = [];
+    const sources: CycleShiftTemplate[] = [];
     const start = new Date(fromDate);
 
     for (let i = 0; i < daysAhead; i++) {
@@ -5935,14 +6129,19 @@ export class StoresService {
             maxStaff: template.maxStaff,
             dayOfWeek: this.getDayOfWeek(dateStr),
           });
+          sources.push(template);
         }
       }
     }
 
-    if (slots.length > 0) {
-      const slotEntities = slots.map((s) => this.shiftSlotRepository.create(s));
-      await this.shiftSlotRepository.save(slotEntities);
-    }
+    if (!slots.length) return [];
+    const slotEntities = slots.map((s) => this.shiftSlotRepository.create(s));
+    const saved = await this.shiftSlotRepository.save(slotEntities);
+    // The slots this call created, each with the template it came from.
+    return (saved ?? slotEntities).map((slot, index) => ({
+      slot,
+      template: sources[index],
+    }));
   }
 
   async getWorkCycles(storeId: string, ownerAccountId?: string) {
@@ -6250,70 +6449,99 @@ export class StoresService {
       .getMany();
 
     let createdCount = 0;
+    // Slots created by this run only, announced after generation.
+    const createdSlots: GeneratedSlotSeatState[] = [];
+    const nothing = () => ({
+      slotCount: 0,
+      assignmentIds: [] as string[],
+      created: [] as GeneratedSlotSeatState[],
+    });
 
-    for (const cycle of activeCycles) {
-      const generated = await this.dataSource.transaction(async (manager) => {
-        await lockStoreShiftAvailability(manager, cycle.storeId);
-        const lockedCycle = await manager.findOne(WorkCycle, {
-          where: { id: cycle.id, status: WorkCycleStatus.ACTIVE },
+    // Announce what was committed even when a later cycle throws: each
+    // cycle commits on its own, so earlier slots exist. The error is still
+    // rethrown (unchanged cron semantics); announcing never throws.
+    try {
+      for (const cycle of activeCycles) {
+        const generated = await this.dataSource.transaction(async (manager) => {
+          await lockStoreShiftAvailability(manager, cycle.storeId);
+          const lockedCycle = await manager.findOne(WorkCycle, {
+            where: { id: cycle.id, status: WorkCycleStatus.ACTIVE },
+          });
+          if (!lockedCycle) return nothing();
+          const existingSlots = await manager.find(ShiftSlot, {
+            where: { cycleId: cycle.id, workDate: tomorrowStr },
+          });
+          if (existingSlots.length) return nothing();
+          const firstDaySlots = await manager.find(ShiftSlot, {
+            where: { cycleId: cycle.id, workDate: cycle.startDate },
+            relations: ['assignments', 'workShift'],
+          });
+          if (!firstDaySlots.length) return nothing();
+          const newSlots = firstDaySlots.map((slot) =>
+            manager.create(ShiftSlot, {
+              cycleId: cycle.id,
+              workShiftId: slot.workShiftId,
+              workDate: tomorrowStr,
+              startTime: slot.startTime,
+              endTime: slot.endTime,
+              maxStaff: slot.maxStaff,
+              note: slot.note,
+              dayOfWeek: this.getDayOfWeek(tomorrowStr),
+            }),
+          );
+          const savedSlots = await manager.save(ShiftSlot, newSlots);
+          const newAssignments = firstDaySlots.flatMap((templateSlot, index) =>
+            (templateSlot.assignments || [])
+              .filter(
+                (assignment) =>
+                  assignment.status === ShiftAssignmentStatus.APPROVED,
+              )
+              .map((assignment) =>
+                manager.create(ShiftAssignment, {
+                  shiftSlotId: savedSlots[index].id,
+                  employeeId: assignment.employeeId,
+                  status: ShiftAssignmentStatus.APPROVED,
+                  note: 'Auto-assigned from cycle',
+                }),
+              ),
+          );
+          const savedAssignments = newAssignments.length
+            ? await manager.save(ShiftAssignment, newAssignments)
+            : [];
+          return {
+            slotCount: savedSlots.length,
+            assignmentIds: savedAssignments.map((assignment) => assignment.id),
+            created: savedSlots.map((slot, index) => {
+              const template = firstDaySlots[index];
+              return {
+                storeId: cycle.storeId,
+                workDate: slot.workDate,
+                startTime: slot.startTime ?? null,
+                endTime: slot.endTime ?? null,
+                maxStaff:
+                  slot.maxStaff ?? template.workShift?.defaultMaxStaff ?? null,
+                shiftName: template.workShift?.shiftName ?? null,
+                templateStartTime: template.workShift?.startTime ?? null,
+                templateEndTime: template.workShift?.endTime ?? null,
+                holderProfileIds: newAssignments
+                  .filter((assignment) => assignment.shiftSlotId === slot.id)
+                  .map((assignment) => assignment.employeeId),
+              };
+            }),
+          };
         });
-        if (!lockedCycle)
-          return { slotCount: 0, assignmentIds: [] as string[] };
-        const existingSlots = await manager.find(ShiftSlot, {
-          where: { cycleId: cycle.id, workDate: tomorrowStr },
-        });
-        if (existingSlots.length) {
-          return { slotCount: 0, assignmentIds: [] as string[] };
+        createdCount += generated.slotCount;
+        createdSlots.push(...generated.created);
+        for (const assignmentId of generated.assignmentIds) {
+          this.scheduleReminderForAssignment(assignmentId).catch(() => {
+            this.logger.error(
+              'Failed to schedule automatic assignment reminder',
+            );
+          });
         }
-        const firstDaySlots = await manager.find(ShiftSlot, {
-          where: { cycleId: cycle.id, workDate: cycle.startDate },
-          relations: ['assignments'],
-        });
-        if (!firstDaySlots.length) {
-          return { slotCount: 0, assignmentIds: [] as string[] };
-        }
-        const newSlots = firstDaySlots.map((slot) =>
-          manager.create(ShiftSlot, {
-            cycleId: cycle.id,
-            workShiftId: slot.workShiftId,
-            workDate: tomorrowStr,
-            startTime: slot.startTime,
-            endTime: slot.endTime,
-            maxStaff: slot.maxStaff,
-            note: slot.note,
-            dayOfWeek: this.getDayOfWeek(tomorrowStr),
-          }),
-        );
-        const savedSlots = await manager.save(ShiftSlot, newSlots);
-        const newAssignments = firstDaySlots.flatMap((templateSlot, index) =>
-          (templateSlot.assignments || [])
-            .filter(
-              (assignment) =>
-                assignment.status === ShiftAssignmentStatus.APPROVED,
-            )
-            .map((assignment) =>
-              manager.create(ShiftAssignment, {
-                shiftSlotId: savedSlots[index].id,
-                employeeId: assignment.employeeId,
-                status: ShiftAssignmentStatus.APPROVED,
-                note: 'Auto-assigned from cycle',
-              }),
-            ),
-        );
-        const savedAssignments = newAssignments.length
-          ? await manager.save(ShiftAssignment, newAssignments)
-          : [];
-        return {
-          slotCount: savedSlots.length,
-          assignmentIds: savedAssignments.map((assignment) => assignment.id),
-        };
-      });
-      createdCount += generated.slotCount;
-      for (const assignmentId of generated.assignmentIds) {
-        this.scheduleReminderForAssignment(assignmentId).catch(() => {
-          this.logger.error('Failed to schedule automatic assignment reminder');
-        });
       }
+    } finally {
+      await this.announceGeneratedSlots(createdSlots, 'daily');
     }
 
     return { processedCycles: activeCycles.length, createdSlots: createdCount };
@@ -6338,79 +6566,116 @@ export class StoresService {
     const today = getTodayDateString();
     const horizonDate = addDays(today, SHIFT_SCHEDULE_HORIZON_DAYS - 1);
     let createdCount = 0;
+    // Slots created by this run only, announced after generation.
+    const createdSlots: GeneratedSlotSeatState[] = [];
 
-    for (const cycle of unifiedSchedules) {
-      const rule = cycle.recurrenceRule as ShiftRecurrenceRule;
-      if (
-        horizonDate < cycle.startDate ||
-        rule.endType !== ShiftRecurrenceEndType.NEVER ||
-        !matchesShiftRecurrence(horizonDate, cycle.startDate, rule)
-      ) {
-        continue;
-      }
+    // Announce what was committed even when a later cycle throws: each
+    // cycle commits on its own, so earlier slots exist. The error is still
+    // rethrown (unchanged cron semantics); announcing never throws.
+    try {
+      for (const cycle of unifiedSchedules) {
+        const rule = cycle.recurrenceRule as ShiftRecurrenceRule;
+        if (
+          horizonDate < cycle.startDate ||
+          rule.endType !== ShiftRecurrenceEndType.NEVER ||
+          !matchesShiftRecurrence(horizonDate, cycle.startDate, rule)
+        ) {
+          continue;
+        }
 
-      const cycleSlots = await this.shiftSlotRepository.find({
-        where: { cycleId: cycle.id },
-        select: ['workShiftId'],
-      });
-      const shiftIds = [
-        ...new Set([
-          cycle.workShiftId as string,
-          ...cycleSlots.map((slot) => slot.workShiftId).filter(Boolean),
-        ]),
-      ];
-      for (const workShiftId of shiftIds) {
-        const existing = await this.shiftSlotRepository.findOne({
-          where: { cycleId: cycle.id, workShiftId, workDate: horizonDate },
+        const cycleSlots = await this.shiftSlotRepository.find({
+          where: { cycleId: cycle.id },
+          select: ['workShiftId'],
         });
-        if (existing) continue;
-        const workShift = await this.workShiftRepository.findOne({
-          where: { id: workShiftId, storeId: cycle.storeId, isActive: true },
-        });
-        if (!workShift) continue;
-        await this.shiftSlotRepository.save(
-          this.shiftSlotRepository.create({
-            cycleId: cycle.id,
-            workShiftId: workShift.id,
+        const shiftIds = [
+          ...new Set([
+            cycle.workShiftId as string,
+            ...cycleSlots.map((slot) => slot.workShiftId).filter(Boolean),
+          ]),
+        ];
+        for (const workShiftId of shiftIds) {
+          const existing = await this.shiftSlotRepository.findOne({
+            where: { cycleId: cycle.id, workShiftId, workDate: horizonDate },
+          });
+          if (existing) continue;
+          const workShift = await this.workShiftRepository.findOne({
+            where: { id: workShiftId, storeId: cycle.storeId, isActive: true },
+          });
+          if (!workShift) continue;
+          await this.shiftSlotRepository.save(
+            this.shiftSlotRepository.create({
+              cycleId: cycle.id,
+              workShiftId: workShift.id,
+              workDate: horizonDate,
+              startTime: workShift.startTime,
+              endTime: workShift.endTime,
+              maxStaff: workShift.defaultMaxStaff,
+              note: workShift.note || null,
+              dayOfWeek: getWeekDayForDate(horizonDate),
+            }),
+          );
+          createdCount += 1;
+          // A generated day carries no assignments: every seat is free.
+          createdSlots.push({
+            storeId: cycle.storeId,
             workDate: horizonDate,
-            startTime: workShift.startTime,
-            endTime: workShift.endTime,
-            maxStaff: workShift.defaultMaxStaff,
-            note: workShift.note || null,
-            dayOfWeek: getWeekDayForDate(horizonDate),
-          }),
-        );
-        createdCount += 1;
+            startTime: workShift.startTime ?? null,
+            endTime: workShift.endTime ?? null,
+            maxStaff: workShift.defaultMaxStaff ?? null,
+            shiftName: workShift.shiftName ?? null,
+            holderProfileIds: [],
+          });
+        }
       }
-    }
 
-    const tomorrowStr = addDays(today, 1);
+      const tomorrowStr = addDays(today, 1);
 
-    // Bug 5.1 fix: Check if slots already exist for tomorrow before generating
-    const existingTomorrowSlots = await this.shiftSlotRepository.find({
-      where: { workDate: tomorrowStr },
-    });
+      // Bug 5.1 fix: Check if slots already exist for tomorrow before generating
+      const existingTomorrowSlots = await this.shiftSlotRepository.find({
+        where: { workDate: tomorrowStr },
+      });
 
-    if (existingTomorrowSlots.length > 0) {
-      // Filter to only count INDEFINITE cycle slots
-      const existingCycleIds = new Set(
-        existingTomorrowSlots.map((s) => s.cycleId),
-      );
-      const indefiniteWithSlots = legacyCycles.filter((c) =>
-        existingCycleIds.has(c.id),
-      );
+      if (existingTomorrowSlots.length > 0) {
+        // Filter to only count INDEFINITE cycle slots
+        const existingCycleIds = new Set(
+          existingTomorrowSlots.map((s) => s.cycleId),
+        );
+        const indefiniteWithSlots = legacyCycles.filter((c) =>
+          existingCycleIds.has(c.id),
+        );
 
-      // Remove cycles that already have slots for tomorrow
-      legacyCycles = legacyCycles.filter((c) => !existingCycleIds.has(c.id));
+        // Remove cycles that already have slots for tomorrow
+        legacyCycles = legacyCycles.filter((c) => !existingCycleIds.has(c.id));
 
-      this.logger.debug(
-        `Skipped ${indefiniteWithSlots.length} indefinite cycles - slots already exist for tomorrow`,
-      );
-    }
+        this.logger.debug(
+          `Skipped ${indefiniteWithSlots.length} indefinite cycles - slots already exist for tomorrow`,
+        );
+      }
 
-    for (const cycle of legacyCycles) {
-      // Tạo slots cho ngày mai dựa trên template
-      await this.generateSlotsFromTemplate(cycle.id, tomorrowStr, 1);
+      for (const cycle of legacyCycles) {
+        // Tạo slots cho ngày mai dựa trên template
+        const generated = await this.generateSlotsFromTemplate(
+          cycle.id,
+          tomorrowStr,
+          1,
+        );
+        for (const { slot, template } of generated ?? []) {
+          createdSlots.push({
+            storeId: cycle.storeId,
+            workDate: slot.workDate,
+            startTime: slot.startTime ?? null,
+            endTime: slot.endTime ?? null,
+            maxStaff:
+              slot.maxStaff ?? template.workShift?.defaultMaxStaff ?? null,
+            shiftName: template.workShift?.shiftName ?? null,
+            templateStartTime: template.workShift?.startTime ?? null,
+            templateEndTime: template.workShift?.endTime ?? null,
+            holderProfileIds: [],
+          });
+        }
+      }
+    } finally {
+      await this.announceGeneratedSlots(createdSlots, 'indefinite');
     }
 
     return {
@@ -18679,22 +18944,28 @@ export class StoresService {
       dateTo?: string;
     },
   ) {
-    const where: any = { storeId };
-    if (filters?.employeeProfileId)
-      where.employeeProfileId = filters.employeeProfileId;
-    if (filters?.dateFrom && filters?.dateTo) {
-      where.timestamp = Between(
-        new Date(filters.dateFrom),
-        new Date(filters.dateTo + 'T23:59:59'),
-      );
+    const query = this.attendanceLogRepository
+      .createQueryBuilder('log')
+      .leftJoinAndSelect('log.shiftAssignment', 'sa')
+      .leftJoinAndSelect('log.employeeProfile', 'ep')
+      .where('log.storeId = :storeId', { storeId });
+    if (filters?.employeeProfileId) {
+      query.andWhere('log.employeeProfileId = :employeeProfileId', {
+        employeeProfileId: filters.employeeProfileId,
+      });
     }
+    if (filters?.dateFrom && filters?.dateTo) {
+      query.andWhere('log.timestamp BETWEEN :from AND :to', {
+        from: new Date(filters.dateFrom),
+        to: new Date(filters.dateTo + 'T23:59:59'),
+      });
+    }
+    // Current stint only: a rehired employee keeps one profile row, so logs
+    // from before `joined_at` belong to the former stint. Legacy profiles
+    // (no joined_at) and soft-deleted former employees are not filtered.
+    query.andWhere(currentStintSql('ep', 'log.timestamp'));
 
-    return this.attendanceLogRepository.find({
-      where,
-      relations: ['shiftAssignment', 'employeeProfile'],
-      order: { timestamp: 'DESC' },
-      take: 100,
-    });
+    return query.orderBy('log.timestamp', 'DESC').take(100).getMany();
   }
 
   /**
@@ -19264,6 +19535,7 @@ export class StoresService {
       .leftJoin('slot.workShift', 'ws')
       .select('a.id', 'id')
       .addSelect('a.status', 'status')
+      .addSelect('slot.id', 'slotId')
       .addSelect('slot.workDate', 'workDate')
       .addSelect('slot.startTime', 'slotStartTime')
       .addSelect('ws.startTime', 'shiftStartTime')
@@ -19307,6 +19579,7 @@ export class StoresService {
     const rows = await query.getRawMany<{
       id: string;
       status: ShiftAssignmentStatus;
+      slotId?: string;
       workDate: string | Date;
       slotStartTime: string | null;
       shiftStartTime: string | null;
@@ -19343,6 +19616,19 @@ export class StoresService {
       } catch {
         this.logger.error('Failed to cancel reminders of withdrawn shifts');
       }
+    }
+    // The withdrawn seats are free again: tell the store's other eligible
+    // staff (not the person who withdrew), with the free-seat throttle, one
+    // aggregated notice per account. Only not-yet-started slots were
+    // withdrawn, and the announcement re-checks seats and start time.
+    // After the write, best effort, never awaited by the caller.
+    const freedSlotIds = doomed
+      .map((row) => row.slotId)
+      .filter((slotId): slotId is string => !!slotId);
+    if (freedSlotIds.length) {
+      void this.announceFreeSeatsOfSlots(freedSlotIds, 'self_cancelled', [
+        employeeProfileId,
+      ]).catch(() => undefined);
     }
     return { cancelled: doomed.length };
   }

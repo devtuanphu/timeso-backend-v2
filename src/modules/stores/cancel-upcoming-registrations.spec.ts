@@ -196,3 +196,83 @@ describe('cancelUpcomingShiftRegistrations', () => {
     expect(service.shiftAssignmentRepository.update).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * A seat a staff member gives back by withdrawing their own upcoming
+ * registrations is announced to the store's other staff (free-seat path,
+ * throttled, one aggregated notice); termination and owner rejections are not.
+ */
+describe('cancelUpcomingShiftRegistrations — announces the freed seats', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('announces the withdrawn, not-started slots, excluding the person who withdrew', async () => {
+    const { service } = build({ id: PROFILE }, [
+      { ...row({ id: 'a1' }), slotId: 'slot-1' } as Row,
+      { ...row({ id: 'a2', status: ShiftAssignmentStatus.APPROVED }), slotId: 'slot-2' } as Row,
+      // Already started: not withdrawn, so not announced.
+      {
+        ...row({ id: 'a3', workDate: '2026-09-22', shiftStartTime: '08:00:00' }),
+        slotId: 'slot-3',
+      } as Row,
+    ]);
+    service.announceFreeSeatsOfSlots = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(result).toEqual({ cancelled: 2 });
+    expect(service.announceFreeSeatsOfSlots).toHaveBeenCalledTimes(1);
+    expect(service.announceFreeSeatsOfSlots).toHaveBeenCalledWith(
+      ['slot-1', 'slot-2'],
+      'self_cancelled',
+      [PROFILE],
+    );
+  });
+
+  it('announces nothing when nothing was withdrawn', async () => {
+    const { service } = build({ id: PROFILE }, []);
+    service.announceFreeSeatsOfSlots = jest.fn().mockResolvedValue(undefined);
+
+    await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(service.announceFreeSeatsOfSlots).not.toHaveBeenCalled();
+  });
+
+  it('an announcement failure never fails the withdrawal', async () => {
+    const { service } = build({ id: PROFILE }, [
+      { ...row({ id: 'a1' }), slotId: 'slot-1' } as Row,
+    ]);
+    service.announceFreeSeatsOfSlots = jest.fn().mockRejectedValue(new Error('x'));
+
+    await expect(
+      service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT),
+    ).resolves.toEqual({ cancelled: 1 });
+  });
+});
+
+describe('termination / rehire cancellation does not announce', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('cancelFutureShiftAssignments cancels without any free-seat notice', async () => {
+    const service = Object.create(StoresService.prototype) as any;
+    service.announceFreeSeatsOfSlot = jest.fn();
+    service.announceFreeSeatsOfSlots = jest.fn();
+    const builder: any = {};
+    for (const m of ['innerJoin', 'leftJoin', 'select', 'addSelect', 'where', 'andWhere']) {
+      builder[m] = jest.fn(() => builder);
+    }
+    builder.getRawMany = jest.fn().mockResolvedValue([
+      { id: 'a1', workDate: '2026-09-23', slotStartTime: null, shiftStartTime: '08:00:00' },
+    ]);
+    const repo = { createQueryBuilder: jest.fn(() => builder), update: jest.fn() };
+    const manager = { getRepository: jest.fn(() => repo) };
+
+    const ids = await service.cancelFutureShiftAssignments(manager, PROFILE, NOW);
+
+    expect(ids).toEqual(['a1']);
+    expect(repo.update).toHaveBeenCalled();
+    expect(service.announceFreeSeatsOfSlot).not.toHaveBeenCalled();
+    expect(service.announceFreeSeatsOfSlots).not.toHaveBeenCalled();
+  });
+});

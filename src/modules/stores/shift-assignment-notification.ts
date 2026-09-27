@@ -14,6 +14,8 @@ import {
   isSlotRegistrationClosed,
   normalizeWorkDate,
 } from './shift-registration-window';
+import { vnDateString } from '../../common/utils/vn-calendar';
+import { addDays } from './shift-schedule.utils';
 
 /**
  * - assigned: chủ xếp ca cho nhân viên;
@@ -216,6 +218,55 @@ export function selectFreeSeatAnnouncement(
     shiftName: slot.shiftName ?? null,
     assignedProfileIds: holders,
   };
+}
+
+/** A slot the daily generation job just created, with its seat state. */
+export interface GeneratedSlotSeatState extends SlotSeatState {
+  storeId: string;
+}
+
+/**
+ * How far ahead the nightly slot-generation job announces the days it
+ * creates: VN today .. today + (N - 1). An open-ended schedule is created
+ * with its whole horizon (~90 days) already generated and announced by the
+ * owner's create call, and the nightly job then only extends that horizon by
+ * one day ~89 days ahead. Announcing those far days would ping every
+ * eligible staff member of the store once per night for a date three months
+ * away that the owner already announced. Near days (the legacy daily cycles
+ * that generate "tomorrow") are the ones staff can act on.
+ */
+export const GENERATED_SLOT_ANNOUNCE_WINDOW_DAYS = 7;
+
+/**
+ * What the daily slot-generation job announces as "Có ca mới để đăng ký":
+ * of the slots *this run created*, those with a free seat that have not
+ * started yet (VN time) and fall within `GENERATED_SLOT_ANNOUNCE_WINDOW_DAYS`
+ * VN calendar days, grouped by store so each store's staff get one
+ * aggregated notice per run. Same seat/start rules as
+ * `selectFreeSeatAnnouncement`; holders ride along per shift so nobody is told
+ * about a shift they already hold.
+ */
+export function selectGeneratedSlotAnnouncements(
+  slots: GeneratedSlotSeatState[],
+  now: Date = new Date(),
+): Map<string, AnnouncedShift[]> {
+  const byStore = new Map<string, AnnouncedShift[]>();
+  // Exclusive upper bound: today + 7 is outside a 7-day window.
+  const windowEnd = addDays(
+    vnDateString(now),
+    GENERATED_SLOT_ANNOUNCE_WINDOW_DAYS,
+  );
+  for (const slot of slots) {
+    if (!slot.storeId) continue;
+    const workDate = normalizeWorkDate(slot.workDate);
+    if (!workDate || workDate >= windowEnd) continue;
+    const shift = selectFreeSeatAnnouncement(slot, now);
+    if (!shift) continue;
+    const list = byStore.get(slot.storeId) ?? [];
+    list.push(shift);
+    byStore.set(slot.storeId, list);
+  }
+  return byStore;
 }
 
 /**
