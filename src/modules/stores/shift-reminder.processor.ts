@@ -228,7 +228,13 @@ export class ShiftReminderProcessor extends WorkerHost {
 
       this.logger.log(`Shift reminder sent successfully ${tag}`);
     } catch (error) {
-      this.logger.error(`Shift reminder processing failed ${tag}`);
+      // The reason, not only the tag: without it a date-parsing bug stopped
+      // every pre-shift reminder for two months with nothing in the logs.
+      this.logger.error(
+        `Shift reminder processing failed ${tag}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
       throw error;
     }
   }

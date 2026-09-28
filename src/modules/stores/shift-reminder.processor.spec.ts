@@ -10,6 +10,68 @@ import {
 } from './shift-reminder.utils';
 
 describe('ShiftReminderProcessor identity checks', () => {
+  // Prod regression: raw `manager.query()` returns the `date` column as a JS
+  // Date (VN midnight), not 'YYYY-MM-DD'. That Date made every pre-shift
+  // reminder throw "Invalid shift reminder date or time" from 24/07/2026.
+  it('sends the reminder when the DB returns work_date as a Date', async () => {
+    const currentStart = parseVietnamShiftStart('2030-01-01', '09:00');
+    const query = jest.fn(async (sql: string) =>
+      sql.includes('employee_leave_requests')
+        ? [{ covered: false }]
+        : [
+            {
+              id: 'assignment-1',
+              status: 'APPROVED',
+              shiftSlotId: 'slot-1',
+              // What node-postgres yields for DATE '2030-01-01' on a VN host.
+              workDate: new Date('2030-01-01T00:00:00+07:00'),
+              startTime: '09:00:00',
+              shiftId: 'shift-1',
+            },
+          ],
+    );
+    const notificationsService = { create: jest.fn().mockResolvedValue(undefined) };
+    const processor = new ShiftReminderProcessor(
+      notificationsService as any,
+      {
+        findOne: jest.fn().mockResolvedValue({
+          id: 'employee-1',
+          storeId: 'store-1',
+          accountId: 'account-1',
+          account: {},
+          reminderSettings: { type: '15m' },
+        }),
+        manager: { query },
+      } as any,
+      { getJob: jest.fn() } as any,
+    );
+
+    await processor.process({
+      data: {
+        employeeId: 'employee-1',
+        storeId: 'store-1',
+        shiftId: 'shift-1',
+        shiftSlotId: 'slot-1',
+        assignmentId: 'assignment-1',
+        startTime: currentStart,
+        scheduleFingerprint: buildShiftReminderFingerprint(
+          { assignmentId: 'assignment-1', shiftSlotId: 'slot-1' },
+          'shift-1',
+          currentStart,
+          { type: '15m' },
+        ),
+      },
+    } as any);
+
+    expect(notificationsService.create).toHaveBeenCalledTimes(1);
+    expect(notificationsService.create.mock.calls[0][0]).toEqual(
+      expect.objectContaining({
+        type: NotificationType.SHIFT_REMINDER,
+        metadata: expect.objectContaining({ workDate: '2030-01-01' }),
+      }),
+    );
+  });
+
   it('notifies an exact assignment that passes the active/future-stop DB gate', async () => {
     const currentStart = parseVietnamShiftStart('2030-01-01', '09:00');
     const query = jest.fn().mockResolvedValue([

@@ -22,6 +22,22 @@ describe('shift reminder Vietnam time parsing', () => {
     );
   });
 
+  it('accepts a work date that the DB driver returned as a Date', () => {
+    // VN-midnight Date (VN host) and UTC-midnight Date (UTC host) of 2030-01-01.
+    for (const workDate of [
+      new Date('2030-01-01T00:00:00+07:00'),
+      new Date('2030-01-01T00:00:00Z'),
+    ]) {
+      expect(parseVietnamShiftStart(workDate, '09:00').toISOString()).toBe(
+        '2030-01-01T02:00:00.000Z',
+      );
+    }
+    // ISO strings with a time part keep their date.
+    expect(
+      parseVietnamShiftStart('2030-01-01T00:00:00.000Z', '09:00').toISOString(),
+    ).toBe('2030-01-01T02:00:00.000Z');
+  });
+
   it('keeps the next local date explicit for a cross-midnight occurrence', () => {
     const start = parseVietnamShiftStart('2030-01-01', '23:00');
     const end = parseVietnamShiftStart('2030-01-02', '01:00');

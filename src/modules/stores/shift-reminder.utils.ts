@@ -1,5 +1,7 @@
 import moment from 'moment-timezone';
 
+import { vnDateString } from '../../common/utils/vn-calendar';
+
 export const SHIFT_REMINDER_TIMEZONE = 'Asia/Ho_Chi_Minh';
 export const SHIFT_REMINDER_JOB_VERSION = 2;
 
@@ -122,14 +124,27 @@ export const getShiftReminderPreferenceFingerprint = (settings: any) => {
   return `${type}|${mode.minutes}`;
 };
 
+/**
+ * `YYYY-MM-DD` of a work date as it arrives from the database. Raw
+ * `manager.query()` rows hand `date` columns back as a JS `Date` (midnight of
+ * the process time zone), not a string; interpolating that Date produced
+ * "Sun Sep 27 2026 …", which failed the strict parse below, so every
+ * pre-shift reminder threw from 24/07/2026 on. A Date is read on the VN
+ * calendar; an ISO string keeps its first 10 characters.
+ */
+export const toWorkDateString = (workDate: string | Date): string =>
+  workDate instanceof Date
+    ? vnDateString(workDate)
+    : String(workDate).slice(0, 10);
+
 export const parseVietnamShiftStart = (
-  workDate: string,
+  workDate: string | Date,
   time: string,
 ): Date => {
   const normalizedTime =
     time.slice(0, 5) + (time.length >= 8 ? time.slice(5, 8) : ':00');
   const parsed = moment.tz(
-    `${workDate} ${normalizedTime}`,
+    `${toWorkDateString(workDate)} ${normalizedTime}`,
     'YYYY-MM-DD HH:mm:ss',
     true,
     SHIFT_REMINDER_TIMEZONE,
