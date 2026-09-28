@@ -319,6 +319,9 @@ import {
   pickDayOwnerAssignmentIds,
   summarizeMonthlyAttendance,
   computeStintSplitEarnedBase,
+  describeEarnedBase,
+  describePayslipTotals,
+  EarnedBreakdown,
 } from './payroll-calculation.utils';
 import {
   parseVnMonthInput,
@@ -1799,6 +1802,7 @@ export class StoresService {
     profileId: string,
     accountId: string,
     expectedStoreId?: string,
+    forbiddenMessage = 'Bạn chỉ có thể xem lịch của chính mình',
   ) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -1820,9 +1824,26 @@ export class StoresService {
       profile.accountId !== accountId ||
       !isEmployedStatus(profile.employmentStatus)
     ) {
-      throw new ForbiddenException('Bạn chỉ có thể xem lịch của chính mình');
+      throw new ForbiddenException(forbiddenMessage);
     }
     return profile;
+  }
+
+  /**
+   * Salary data (payslips, live estimate) is readable by the owner of the
+   * employee's store or by the employee's own account — never a coworker.
+   */
+  async assertEmployeeSalaryAccess(
+    profileId: string,
+    accountId: string,
+    expectedStoreId?: string,
+  ) {
+    return this.assertEmployeeCalendarAccess(
+      profileId,
+      accountId,
+      expectedStoreId,
+      'Bạn chỉ có thể xem lương của chính mình',
+    );
   }
 
   /**
@@ -9999,6 +10020,10 @@ export class StoresService {
       isFinalized: boolean;
       allowancesTotal: number;
       adjustmentBreakdown: PayslipAdjustmentLine[] | null;
+      earnedBreakdown: EarnedBreakdown | null;
+      incomeAfterAdvance: number;
+      deductionsExcludingAdvance: number;
+      isNetClamped: boolean;
     }
   > {
     const isFinalized = this.isProtectedPayslip(row);
@@ -10009,6 +10034,9 @@ export class StoresService {
         isFinalized,
         allowancesTotal: sumAllowances(row.allowances),
         adjustmentBreakdown: null,
+        // No store: the attendance behind the stored amount cannot be read.
+        earnedBreakdown: this.storedEarnedBreakdown(row, month, null),
+        ...describePayslipTotals(row),
       });
     }
     const live = await this.composeLivePayslip(
@@ -10035,6 +10063,8 @@ export class StoresService {
         isFinalized,
         allowancesTotal: sumAllowances(row.allowances),
         adjustmentBreakdown: consistent ? lines : null,
+        earnedBreakdown: this.storedEarnedBreakdown(row, month, live),
+        ...describePayslipTotals(row),
       });
     }
     const payslip = live.payslip;
@@ -10042,6 +10072,61 @@ export class StoresService {
       isEstimate: true,
       isFinalized: false,
       allowancesTotal: payslip.allowancesTotal,
+    });
+  }
+
+  /**
+   * `earnedBreakdown` of a stored payslip (finalized, or a past month): its
+   * stored earnedBaseSalary, baseSalary and paymentType described with the
+   * live attendance facts. When those facts no longer give back the stored
+   * amount (rate or attendance changed since, store unknown) `reproducible`
+   * is false and `quantity`/`workedMinutes` are null: today's attendance is
+   * never shown next to an amount it did not produce. Null when the stored
+   * payment type is missing or unknown, or nothing was priced (no rate and
+   * no amount).
+   */
+  private storedEarnedBreakdown(
+    row: EmployeeSalary,
+    month: VnMonth,
+    live: Awaited<ReturnType<StoresService['composeLivePayslip']>> | null,
+  ): EarnedBreakdown | null {
+    const knownTypes = Object.values(PaymentType) as string[];
+    if (!row.paymentType || !knownTypes.includes(row.paymentType)) return null;
+    const rate = Number(row.baseSalary);
+    const amount = Number(row.earnedBaseSalary);
+    // Nothing priced: no rate and no earned amount.
+    if (!(rate > 0) && !(amount > 0)) return null;
+    const breakdown = describeEarnedBase({
+      paymentType: row.paymentType,
+      rate: row.baseSalary,
+      facts: live?.facts ?? null,
+      standardWorkingDays: live?.standardWorkingDays ?? 0,
+      calendarDays: month.calendarDays,
+      amount: row.earnedBaseSalary,
+      mixedRates: live?.mixedRates ?? false,
+    });
+    return breakdown.reproducible
+      ? breakdown
+      : { ...breakdown, quantity: null, workedMinutes: null };
+  }
+
+  /** `earnedBreakdown` of a live payslip; null with no contract or no rate. */
+  private liveEarnedBreakdown(
+    live: Awaited<ReturnType<StoresService['composeLivePayslip']>>,
+  ): EarnedBreakdown | null {
+    const payslip = live.payslip;
+    if (!live.contract) return null;
+    if (!(payslip.baseSalary > 0) && payslip.earnedBaseSalary === 0) {
+      return null;
+    }
+    return describeEarnedBase({
+      paymentType: payslip.paymentType,
+      rate: payslip.baseSalary,
+      facts: live.facts,
+      standardWorkingDays: live.standardWorkingDays,
+      calendarDays: live.calendarDays,
+      amount: payslip.earnedBaseSalary,
+      mixedRates: live.mixedRates,
     });
   }
 
@@ -10072,6 +10157,8 @@ export class StoresService {
         live.facts,
         payslip.earnedBaseSalary,
       ),
+      earnedBreakdown: this.liveEarnedBreakdown(live),
+      ...describePayslipTotals(payslip),
     };
   }
 
@@ -10142,23 +10229,27 @@ export class StoresService {
           where: { storeId, isActive: true },
         })
       : [];
-    const { facts, payslip } = await this.computeEmployeePayslip({
-      employeeProfileId,
-      storeId,
-      month,
-      contract: activeContract,
-      rate,
-      rules,
-      standardWorkingDays,
-      existingSalaryId: existing?.id ?? null,
-      otherDeductions: existing?.otherDeductions,
-      stint: profile ?? undefined,
-    });
+    const { facts, payslip, currentStintEarned } =
+      await this.computeEmployeePayslip({
+        employeeProfileId,
+        storeId,
+        month,
+        contract: activeContract,
+        rate,
+        rules,
+        standardWorkingDays,
+        existingSalaryId: existing?.id ?? null,
+        otherDeductions: existing?.otherDeductions,
+        stint: profile ?? undefined,
+      });
     return {
       facts,
       payslip,
       rules,
       standardWorkingDays,
+      calendarDays: month.calendarDays,
+      // Same-month rehire: the earned base was priced per stint.
+      mixedRates: currentStintEarned != null,
       contract: activeContract,
     };
   }
@@ -10168,6 +10259,17 @@ export class StoresService {
       where: { id },
       relations: ['employeeProfile', 'monthlyPayroll'],
     });
+  }
+
+  /**
+   * One payslip for a viewer: 404 when it does not exist, then the same
+   * owner-or-self check as the other salary reads.
+   */
+  async getEmployeeSalaryByIdForViewer(id: string, accountId: string) {
+    const row = await this.getEmployeeSalaryById(id);
+    if (!row) throw new NotFoundException('Không tìm thấy phiếu lương');
+    await this.assertEmployeeSalaryAccess(row.employeeProfileId, accountId);
+    return row;
   }
 
   /**

@@ -14,6 +14,8 @@ import {
   computePayslipTotals,
   computeRuleAdjustments,
   computeStintSplitEarnedBase,
+  describeEarnedBase,
+  describePayslipTotals,
   MonthlyAttendanceFacts,
   PayrollAssignmentFact,
   pickDayOwnerAssignmentIds,
@@ -627,6 +629,250 @@ describe('computeStintSplitEarnedBase (same-month rehire)', () => {
       workingDays: 3,
       baseSalary: 30_000,
       paymentType: PaymentType.HOUR,
+    });
+  });
+});
+
+describe('describeEarnedBase', () => {
+  const base = {
+    standardWorkingDays: 26,
+    calendarDays: 31,
+  };
+
+  it('HOUR: unrounded hours, minutes kept, reproducible with the same rounding', () => {
+    const f = facts({ workedMinutes: 487, completedShifts: 1, daysWorked: 1 });
+    const amount = computeEarnedBase({
+      paymentType: PaymentType.HOUR,
+      rate: 25_000,
+      facts: f,
+      ...base,
+    });
+    expect(amount).toBe(202_917);
+    const b = describeEarnedBase({
+      paymentType: PaymentType.HOUR,
+      rate: 25_000,
+      facts: f,
+      ...base,
+      amount,
+    });
+    expect(b).toEqual({
+      paymentType: 'Giờ',
+      rate: 25_000,
+      rateLabel: 'Lương giờ',
+      rateUnitLabel: 'giờ',
+      quantity: 487 / 60,
+      quantityUnit: 'HOUR',
+      quantityLabel: 'Tổng giờ làm',
+      workedMinutes: 487,
+      divisor: null,
+      divisorLabel: null,
+      amount: 202_917,
+      reproducible: true,
+      mixedRates: false,
+    });
+    expect(b.quantity).toBeCloseTo(8.1166667, 6);
+  });
+
+  it('SHIFT: two shifts on one day count as two', () => {
+    const f = facts({ completedShifts: 2, daysWorked: 1, workedMinutes: 480 });
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 150_000,
+      facts: f,
+      ...base,
+      amount: computeEarnedBase({ paymentType: PaymentType.SHIFT, rate: 150_000, facts: f, ...base }),
+    });
+    expect(b).toMatchObject({
+      paymentType: 'Ca',
+      rateLabel: 'Lương ca',
+      rateUnitLabel: 'ca',
+      quantity: 2,
+      quantityUnit: 'SHIFT',
+      quantityLabel: 'Số ca làm',
+      workedMinutes: null,
+      divisor: null,
+      amount: 300_000,
+      reproducible: true,
+    });
+  });
+
+  it('DAY: completed shifts, no divisor', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.DAY,
+      rate: 300_000,
+      facts: facts({ completedShifts: 3, daysWorked: 3 }),
+      ...base,
+      amount: 900_000,
+    });
+    expect(b).toMatchObject({
+      paymentType: 'Ngày',
+      rateLabel: 'Lương ngày',
+      rateUnitLabel: 'ngày',
+      quantity: 3,
+      quantityUnit: 'SHIFT',
+      divisor: null,
+      reproducible: true,
+    });
+  });
+
+  it('WEEK: divided by 6 working days per week', () => {
+    const f = facts({ completedShifts: 5, daysWorked: 5 });
+    const amount = computeEarnedBase({ paymentType: PaymentType.WEEK, rate: 1_000_000, facts: f, ...base });
+    expect(amount).toBe(833_333);
+    expect(
+      describeEarnedBase({ paymentType: PaymentType.WEEK, rate: 1_000_000, facts: f, ...base, amount }),
+    ).toMatchObject({
+      paymentType: 'Tuần',
+      rateLabel: 'Lương tuần',
+      rateUnitLabel: 'tuần',
+      quantity: 5,
+      quantityUnit: 'SHIFT',
+      divisor: 6,
+      divisorLabel: 'ngày/tuần',
+      amount: 833_333,
+      reproducible: true,
+    });
+  });
+
+  it('MONTH: days worked over the standard working days', () => {
+    const f = facts({ completedShifts: 14, daysWorked: 12 });
+    const amount = computeEarnedBase({
+      paymentType: PaymentType.MONTH,
+      rate: 10_000_000,
+      facts: f,
+      standardWorkingDays: 27,
+      calendarDays: 31,
+    });
+    expect(
+      describeEarnedBase({
+        paymentType: PaymentType.MONTH,
+        rate: 10_000_000,
+        facts: f,
+        standardWorkingDays: 27,
+        calendarDays: 31,
+        amount,
+      }),
+    ).toMatchObject({
+      paymentType: 'Tháng',
+      rateLabel: 'Lương tháng',
+      rateUnitLabel: 'tháng',
+      quantity: 12,
+      quantityUnit: 'DAY',
+      quantityLabel: 'Ngày công',
+      divisor: 27,
+      divisorLabel: 'ngày công chuẩn',
+      amount: Math.round((10_000_000 * 12) / 27),
+      reproducible: true,
+    });
+  });
+
+  it('MONTH: falls back to calendar days when there is no standard', () => {
+    const f = facts({ daysWorked: 10 });
+    const input = { paymentType: PaymentType.MONTH, rate: 9_300_000, facts: f, standardWorkingDays: 0, calendarDays: 31 };
+    const amount = computeEarnedBase(input);
+    expect(amount).toBe(3_000_000);
+    expect(describeEarnedBase({ ...input, amount })).toMatchObject({
+      divisor: 31,
+      quantity: 10,
+      reproducible: true,
+    });
+  });
+
+  it('mixed rates (same-month stint split) are flagged and never reproducible', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 100_000,
+      facts: facts({ completedShifts: 3 }),
+      ...base,
+      amount: 300_000,
+      mixedRates: true,
+    });
+    expect(b.mixedRates).toBe(true);
+    expect(b.reproducible).toBe(false);
+  });
+
+  it('a stored amount priced at another rate is not reproducible; decimal strings become numbers', () => {
+    const b = describeEarnedBase({
+      paymentType: 'Giờ',
+      rate: '30000.00',
+      facts: facts({ workedMinutes: 600 }),
+      ...base,
+      amount: '250000.00',
+    });
+    expect(b.rate).toBe(30_000);
+    expect(b.amount).toBe(250_000);
+    expect(b.reproducible).toBe(false);
+    expect(
+      describeEarnedBase({
+        paymentType: 'Giờ',
+        rate: '25000.00',
+        facts: facts({ workedMinutes: 600 }),
+        ...base,
+        amount: '250000.00',
+      }).reproducible,
+    ).toBe(true);
+  });
+
+  it('missing facts: kept, but not reproducible', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 100_000,
+      facts: null,
+      ...base,
+      amount: 0,
+    });
+    expect(b).toMatchObject({ quantity: 0, amount: 0, reproducible: false });
+  });
+});
+
+describe('describePayslipTotals', () => {
+  it('derives the design totals from the returned figures', () => {
+    expect(
+      describePayslipTotals({
+        totalIncome: 2_000_000,
+        advancePayment: 500_000,
+        penalty: 100_000,
+        otherDeductions: 50_000,
+        netSalary: 1_350_000,
+      }),
+    ).toEqual({
+      incomeAfterAdvance: 1_500_000,
+      deductionsExcludingAdvance: 150_000,
+      isNetClamped: false,
+    });
+  });
+
+  it('flags a net clamped to zero', () => {
+    const totals = computePayslipTotals({
+      earnedBase: 100_000,
+      allowancesTotal: 0,
+      bonus: 0,
+      penalty: 150_000,
+      advancePayment: 20_000,
+    });
+    expect(totals.netSalary).toBe(0);
+    expect(
+      describePayslipTotals({ ...totals, penalty: 150_000, advancePayment: 20_000, otherDeductions: 0 }),
+    ).toEqual({
+      incomeAfterAdvance: 80_000,
+      deductionsExcludingAdvance: 150_000,
+      isNetClamped: true,
+    });
+  });
+
+  it('converts stored decimal strings to numbers', () => {
+    expect(
+      describePayslipTotals({
+        totalIncome: '1600000.00',
+        advancePayment: '100000.00',
+        penalty: '0.00',
+        otherDeductions: null,
+        netSalary: '1500000.00',
+      }),
+    ).toEqual({
+      incomeAfterAdvance: 1_500_000,
+      deductionsExcludingAdvance: 0,
+      isNetClamped: false,
     });
   });
 });

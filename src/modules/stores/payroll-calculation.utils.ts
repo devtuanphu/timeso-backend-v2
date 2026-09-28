@@ -147,6 +147,43 @@ export function resolvePayrollPaymentType(
   return type && known.includes(type) ? (type as PaymentType) : PaymentType.MONTH;
 }
 
+type EarnedBaseFacts = Pick<
+  MonthlyAttendanceFacts,
+  'completedShifts' | 'workedMinutes' | 'daysWorked'
+>;
+
+/**
+ * The terms of the earned-base formula, shared by computeEarnedBase and
+ * describeEarnedBase so the two cannot drift:
+ * earned = round(rate × units ÷ per). `per` is null when the month cannot
+ * be priced (MONTH with no standard and no calendar days).
+ */
+function earnedBaseTerms(input: {
+  paymentType: PaymentType;
+  facts: EarnedBaseFacts;
+  standardWorkingDays: number;
+  calendarDays: number;
+}): { units: number; per: number | null } {
+  const { facts } = input;
+  switch (input.paymentType) {
+    case PaymentType.HOUR:
+      return { units: Math.max(0, facts.workedMinutes), per: 60 };
+    case PaymentType.SHIFT:
+    case PaymentType.DAY:
+      return { units: facts.completedShifts, per: 1 };
+    case PaymentType.WEEK:
+      return { units: facts.completedShifts, per: WORKING_DAYS_PER_WEEK };
+    case PaymentType.MONTH:
+    default: {
+      const days =
+        input.standardWorkingDays > 0
+          ? input.standardWorkingDays
+          : input.calendarDays;
+      return { units: facts.daysWorked, per: days > 0 ? days : null };
+    }
+  }
+}
+
 /**
  * Earned base pay for the month.
  * - HOUR: rate × hours worked.
@@ -158,35 +195,156 @@ export function resolvePayrollPaymentType(
 export function computeEarnedBase(input: {
   paymentType: PaymentType;
   rate: number;
-  facts: Pick<
-    MonthlyAttendanceFacts,
-    'completedShifts' | 'workedMinutes' | 'daysWorked'
-  >;
+  facts: EarnedBaseFacts;
   standardWorkingDays: number;
   calendarDays: number;
 }): number {
   const rate = Number(input.rate);
   if (!Number.isFinite(rate) || rate <= 0) return 0;
-  const { facts } = input;
+  const { units, per } = earnedBaseTerms(input);
+  if (per == null) return 0;
+  return Math.round((rate * units) / per);
+}
 
-  switch (input.paymentType) {
-    case PaymentType.HOUR:
-      return Math.round((rate * Math.max(0, facts.workedMinutes)) / 60);
-    case PaymentType.SHIFT:
-    case PaymentType.DAY:
-      return Math.round(rate * facts.completedShifts);
-    case PaymentType.WEEK:
-      return Math.round((rate * facts.completedShifts) / WORKING_DAYS_PER_WEEK);
-    case PaymentType.MONTH:
-    default: {
-      const days =
-        input.standardWorkingDays > 0
-          ? input.standardWorkingDays
-          : input.calendarDays;
-      if (!(days > 0)) return 0;
-      return Math.round((rate * facts.daysWorked) / days);
-    }
-  }
+/** How a payslip's earned base was obtained, for the salary screen. */
+export interface EarnedBreakdown {
+  paymentType: 'Giờ' | 'Ca' | 'Ngày' | 'Tuần' | 'Tháng';
+  /** The rate the earned base is priced with (VND per rate unit). */
+  rate: number;
+  rateLabel:
+    | 'Lương giờ'
+    | 'Lương ca'
+    | 'Lương ngày'
+    | 'Lương tuần'
+    | 'Lương tháng';
+  rateUnitLabel: 'giờ' | 'ca' | 'ngày' | 'tuần' | 'tháng';
+  /**
+   * HOUR: hours worked (workedMinutes / 60, not rounded); SHIFT/DAY/WEEK:
+   * completed shifts; MONTH: distinct days worked. Null on a stored payslip
+   * whose amount the current attendance no longer reproduces.
+   */
+  quantity: number | null;
+  quantityUnit: 'HOUR' | 'SHIFT' | 'DAY';
+  quantityLabel: 'Tổng giờ làm' | 'Số ca làm' | 'Ngày công';
+  /** HOUR only: minutes worked; null otherwise (and when `quantity` is null). */
+  workedMinutes: number | null;
+  /** WEEK: 6; MONTH: working days the rate is divided by; null otherwise. */
+  divisor: number | null;
+  divisorLabel: string | null;
+  /** The payslip's earnedBaseSalary. */
+  amount: number;
+  /** round(rate × quantity ÷ (divisor ?? 1)) === amount, as computeEarnedBase rounds. */
+  reproducible: boolean;
+  /** The month holds shifts of two employment stints priced separately. */
+  mixedRates: boolean;
+}
+
+const EARNED_BREAKDOWN_LABELS: Record<
+  PaymentType,
+  Pick<
+    EarnedBreakdown,
+    'rateLabel' | 'rateUnitLabel' | 'quantityUnit' | 'quantityLabel'
+  > & { divisorLabel: string | null }
+> = {
+  [PaymentType.HOUR]: {
+    rateLabel: 'Lương giờ',
+    rateUnitLabel: 'giờ',
+    quantityUnit: 'HOUR',
+    quantityLabel: 'Tổng giờ làm',
+    divisorLabel: null,
+  },
+  [PaymentType.SHIFT]: {
+    rateLabel: 'Lương ca',
+    rateUnitLabel: 'ca',
+    quantityUnit: 'SHIFT',
+    quantityLabel: 'Số ca làm',
+    divisorLabel: null,
+  },
+  [PaymentType.DAY]: {
+    rateLabel: 'Lương ngày',
+    rateUnitLabel: 'ngày',
+    quantityUnit: 'SHIFT',
+    quantityLabel: 'Số ca làm',
+    divisorLabel: null,
+  },
+  [PaymentType.WEEK]: {
+    rateLabel: 'Lương tuần',
+    rateUnitLabel: 'tuần',
+    quantityUnit: 'SHIFT',
+    quantityLabel: 'Số ca làm',
+    divisorLabel: 'ngày/tuần',
+  },
+  [PaymentType.MONTH]: {
+    rateLabel: 'Lương tháng',
+    rateUnitLabel: 'tháng',
+    quantityUnit: 'DAY',
+    quantityLabel: 'Ngày công',
+    divisorLabel: 'ngày công chuẩn',
+  },
+};
+
+/**
+ * Describes an earned base (`amount`) with the terms computeEarnedBase uses.
+ * Pure and display-only: it never changes the amount. `reproducible` is
+ * true only when pricing `facts` at `rate` gives back exactly `amount`; it
+ * is false when `facts` is missing, when the amount was priced with other
+ * inputs (a stored payslip whose rate changed since) or when `mixedRates`
+ * is set (two stints priced with different contracts).
+ */
+export function describeEarnedBase(input: {
+  paymentType: PaymentType | string | null | undefined;
+  rate: unknown;
+  facts: EarnedBaseFacts | null | undefined;
+  standardWorkingDays: number;
+  calendarDays: number;
+  amount: unknown;
+  mixedRates?: boolean;
+}): EarnedBreakdown {
+  const paymentType = resolvePayrollPaymentType(input.paymentType);
+  const rate = toFiniteNumber(input.rate);
+  const amount = toFiniteNumber(input.amount);
+  const mixedRates = input.mixedRates === true;
+  const facts: EarnedBaseFacts = input.facts ?? {
+    completedShifts: 0,
+    workedMinutes: 0,
+    daysWorked: 0,
+  };
+  const { units, per } = earnedBaseTerms({
+    paymentType,
+    facts,
+    standardWorkingDays: toFiniteNumber(input.standardWorkingDays),
+    calendarDays: toFiniteNumber(input.calendarDays),
+  });
+  const isHour = paymentType === PaymentType.HOUR;
+  const divided =
+    paymentType === PaymentType.WEEK || paymentType === PaymentType.MONTH;
+  const labels = EARNED_BREAKDOWN_LABELS[paymentType];
+  const recomputed = computeEarnedBase({
+    paymentType,
+    rate,
+    facts,
+    standardWorkingDays: toFiniteNumber(input.standardWorkingDays),
+    calendarDays: toFiniteNumber(input.calendarDays),
+  });
+  return {
+    paymentType: paymentType as EarnedBreakdown['paymentType'],
+    rate,
+    rateLabel: labels.rateLabel,
+    rateUnitLabel: labels.rateUnitLabel,
+    quantity: isHour ? units / 60 : units,
+    quantityUnit: labels.quantityUnit,
+    quantityLabel: labels.quantityLabel,
+    workedMinutes: isHour ? units : null,
+    divisor: divided ? per : null,
+    divisorLabel: divided && per != null ? labels.divisorLabel : null,
+    amount,
+    reproducible:
+      input.facts != null &&
+      !mixedRates &&
+      (!divided || per != null) &&
+      recomputed === amount,
+    mixedRates,
+  };
 }
 
 /** Facts the bonus/fine rules read. */
@@ -425,6 +583,37 @@ export function computePayslipTotals(input: {
     advancePayment: input.advancePayment,
     otherDeductions: input.otherDeductions,
   });
+}
+
+/**
+ * Display figures derived from a payslip's returned totals, so they always
+ * reconcile with totalIncome / totalDeductions / netSalary of that payslip.
+ * - incomeAfterAdvance = totalIncome − advancePayment (TỔNG THU NHẬP).
+ * - deductionsExcludingAdvance = penalty + otherDeductions (Khấu trừ).
+ * - isNetClamped: the difference is negative and netSalary was clamped to 0.
+ */
+export function describePayslipTotals(input: {
+  totalIncome: unknown;
+  advancePayment: unknown;
+  penalty: unknown;
+  otherDeductions: unknown;
+  netSalary: unknown;
+}): {
+  incomeAfterAdvance: number;
+  deductionsExcludingAdvance: number;
+  isNetClamped: boolean;
+} {
+  const incomeAfterAdvance =
+    toFiniteNumber(input.totalIncome) - toFiniteNumber(input.advancePayment);
+  const deductionsExcludingAdvance =
+    toFiniteNumber(input.penalty) + toFiniteNumber(input.otherDeductions);
+  return {
+    incomeAfterAdvance,
+    deductionsExcludingAdvance,
+    isNetClamped:
+      incomeAfterAdvance - deductionsExcludingAdvance < 0 &&
+      toFiniteNumber(input.netSalary) === 0,
+  };
 }
 
 export interface PayslipComputation {

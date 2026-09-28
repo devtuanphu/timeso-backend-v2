@@ -3431,8 +3431,11 @@ export class StoresController {
   @ApiResponse({ status: 200, description: 'Danh sách lương' })
   async getEmployeeSalaries(
     @Param('profileId') profileId: string,
+    @GetUser() user: any,
     @Query('month') month?: string,
   ) {
+    // Owner of the employee's store, or the employee — never a coworker.
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.getEmployeeSalaries(profileId, month);
   }
 
@@ -3446,16 +3449,29 @@ export class StoresController {
   async getEstimatedSalary(
     @Param('profileId') profileId: string,
     @Query('storeId') storeId: string,
+    @GetUser() user: any,
     @Query('month') month?: string,
   ) {
+    // Owner-or-self, and the profile must belong to the queried store.
+    await this.storesService.assertEmployeeSalaryAccess(
+      profileId,
+      user.userId,
+      storeId,
+    );
     return this.storesService.getEstimatedSalary(profileId, storeId, month);
   }
 
   @Get('employee-salaries/:salaryId')
   @ApiOperation({ summary: 'Chi tiết phiếu lương' })
   @ApiResponse({ status: 200, description: 'Chi tiết phiếu lương' })
-  async getEmployeeSalaryById(@Param('salaryId') salaryId: string) {
-    return this.storesService.getEmployeeSalaryById(salaryId);
+  async getEmployeeSalaryById(
+    @Param('salaryId') salaryId: string,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.getEmployeeSalaryByIdForViewer(
+      salaryId,
+      user.userId,
+    );
   }
 
   @StoreOwnerOnly({ bodyResources: [{ field: 'employeeProfileId', resource: 'employees' }] })

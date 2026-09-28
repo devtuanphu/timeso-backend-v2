@@ -36,6 +36,10 @@ describe('StoresController authorization hand-off', () => {
     assertOwnsAnyStore: jest.fn(),
     extractPlaceholdersFromDocx: jest.fn(),
     getInventoryReports: jest.fn(),
+    assertEmployeeSalaryAccess: jest.fn(),
+    getEmployeeSalaries: jest.fn(),
+    getEstimatedSalary: jest.fn(),
+    getEmployeeSalaryByIdForViewer: jest.fn(),
   };
   const accountsService = { verifyPassword: jest.fn() };
   const shiftEndWorkflowService = {
@@ -210,6 +214,58 @@ describe('StoresController authorization hand-off', () => {
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    });
+  });
+
+  describe('salary reads check owner-or-self before reading', () => {
+    it('GET employees/:profileId/salaries', async () => {
+      storesService.assertEmployeeSalaryAccess.mockRejectedValueOnce(
+        new ForbiddenException('Bạn chỉ có thể xem lương của chính mình'),
+      );
+      await expect(
+        controller.getEmployeeSalaries('emp-1', STAFF, '2026-09'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(storesService.getEmployeeSalaries).not.toHaveBeenCalled();
+
+      await controller.getEmployeeSalaries('emp-1', OWNER, '2026-09');
+      expect(storesService.assertEmployeeSalaryAccess).toHaveBeenLastCalledWith(
+        'emp-1',
+        'owner-1',
+      );
+      expect(storesService.getEmployeeSalaries).toHaveBeenCalledWith(
+        'emp-1',
+        '2026-09',
+      );
+    });
+
+    it('GET employees/:profileId/estimated-salary scopes the profile to storeId', async () => {
+      storesService.assertEmployeeSalaryAccess.mockRejectedValueOnce(
+        new ForbiddenException('Nhân viên không thuộc cửa hàng này'),
+      );
+      await expect(
+        controller.getEstimatedSalary('emp-1', 'store-x', STAFF, '2026-09'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(storesService.getEstimatedSalary).not.toHaveBeenCalled();
+
+      await controller.getEstimatedSalary('emp-1', 'store-1', STAFF, '2026-09');
+      expect(storesService.assertEmployeeSalaryAccess).toHaveBeenLastCalledWith(
+        'emp-1',
+        'staff-1',
+        'store-1',
+      );
+      expect(storesService.getEstimatedSalary).toHaveBeenCalledWith(
+        'emp-1',
+        'store-1',
+        '2026-09',
+      );
+    });
+
+    it('GET employee-salaries/:salaryId passes the caller account', async () => {
+      await controller.getEmployeeSalaryById('s-1', STAFF);
+      expect(storesService.getEmployeeSalaryByIdForViewer).toHaveBeenCalledWith(
+        's-1',
+        'staff-1',
+      );
     });
   });
 });

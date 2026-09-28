@@ -2337,6 +2337,170 @@ describe('StoresService - salary screen: current month live, past months stored 
     expect(row).toMatchObject({ bonus: 0, earnedBaseSalary: 0, netSalary: 800_000 });
     expect(row.adjustmentBreakdown).toEqual([]);
   });
+
+  it('current month: earnedBreakdown explains the live earned base; design totals reconcile', async () => {
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(['2026-09-01', '2026-09-02']).map((row, i) => ({
+        ...row,
+        workedMinutes: i === 0 ? 487 : 240,
+      })),
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      { ...storedPending, advancePayment: 0, otherDeductions: '50000.00' },
+    ]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-09');
+    expect(slip.isEstimate).toBe(true);
+    expect(slip.earnedBreakdown).toEqual({
+      paymentType: 'Giờ',
+      rate: 25_000,
+      rateLabel: 'Lương giờ',
+      rateUnitLabel: 'giờ',
+      quantity: 727 / 60,
+      quantityUnit: 'HOUR',
+      quantityLabel: 'Tổng giờ làm',
+      workedMinutes: 727,
+      divisor: null,
+      divisorLabel: null,
+      amount: slip.earnedBaseSalary,
+      reproducible: true,
+      mixedRates: false,
+    });
+    expect(slip.earnedBaseSalary).toBe(Math.round((25_000 * 727) / 60));
+    expect(slip.incomeAfterAdvance).toBe(slip.totalIncome - slip.advancePayment);
+    expect(slip.deductionsExcludingAdvance).toBe(50_000);
+    expect(slip.deductionsExcludingAdvance).toBe(slip.penalty + slip.otherDeductions);
+    expect(slip.incomeAfterAdvance - slip.deductionsExcludingAdvance).toBe(slip.netSalary);
+    expect(slip.isNetClamped).toBe(false);
+  });
+
+  it('past month stored: rate changed since → not reproducible; decimal strings are numbers; clamped net flagged', async () => {
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(['2026-08-03', '2026-08-04']), // 2 × 480 min = 16 h
+    );
+    const stored = {
+      ...storedPending,
+      paymentType: 'Giờ',
+      // Priced at 25 000/h (400 000), then the stored rate was raised.
+      baseSalary: '30000.00',
+      earnedBaseSalary: '400000.00',
+      allowances: {},
+      bonus: '0.00',
+      penalty: '300000.00',
+      advancePayment: '200000.00',
+      otherDeductions: '0.00',
+      totalIncome: '400000.00',
+      totalDeductions: '500000.00',
+      netSalary: '0.00',
+    };
+    h.repo(EmployeeSalary).find.mockResolvedValue([{ ...stored }]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-08');
+    expect(slip.isEstimate).toBe(false);
+    // Today's 16 h would contradict the stored amount: no quantity is sent.
+    expect(slip.earnedBreakdown).toMatchObject({
+      paymentType: 'Giờ',
+      rateLabel: 'Lương giờ',
+      rate: 30_000,
+      quantity: null,
+      workedMinutes: null,
+      amount: 400_000,
+      reproducible: false,
+      mixedRates: false,
+    });
+    expect(slip).toMatchObject({
+      incomeAfterAdvance: 200_000,
+      deductionsExcludingAdvance: 300_000,
+      isNetClamped: true,
+    });
+
+    // Same stored figures at the rate they were priced with: reproducible.
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      { ...stored, baseSalary: '25000.00' },
+    ]);
+    const [again]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-08');
+    expect(again.earnedBreakdown).toMatchObject({
+      rate: 25_000,
+      quantity: 16,
+      workedMinutes: 960,
+      amount: 400_000,
+      reproducible: true,
+    });
+  });
+
+  it('stored payslip without a (known) payment type: earnedBreakdown is null, never Tháng', async () => {
+    const h = await harness('2026-09-22T03:00:00Z', completedOn(['2026-08-03']));
+    for (const paymentType of [null, '', 'Khác']) {
+      h.repo(EmployeeSalary).find.mockResolvedValue([
+        { ...storedPending, baseSalary: '25000.00', paymentType },
+      ]);
+      const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-08');
+      expect(slip.earnedBreakdown).toBeNull();
+      expect(slip.earnedBaseSalary).toBe(900_000);
+    }
+  });
+
+  it('approved payslip whose attendance changed afterwards: not reproducible, no quantity', async () => {
+    // Approved at 3 × 8 h (600 000 at 25 000/h); one shift was later removed.
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(['2026-09-01', '2026-09-02']),
+    );
+    h.repo(EmployeeSalary).find.mockResolvedValue([
+      {
+        ...storedPending,
+        paymentStatus: PaymentStatus.APPROVED,
+        paymentType: 'Giờ',
+        baseSalary: '25000.00',
+        earnedBaseSalary: '600000.00',
+      },
+    ]);
+    const [slip]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-09');
+    expect(slip.isEstimate).toBe(false);
+    expect(slip.earnedBreakdown).toMatchObject({
+      paymentType: 'Giờ',
+      rate: 25_000,
+      amount: 600_000,
+      quantity: null,
+      workedMinutes: null,
+      reproducible: false,
+    });
+  });
+
+  it('estimate with no active contract: earnedBreakdown is null', async () => {
+    const h = await harness('2026-09-02T03:00:00Z', completedOn(['2026-09-01']));
+    h.repo(EmployeeProfile).findOne.mockResolvedValue({ ...employee, contracts: [] });
+    h.repo(EmployeeSalary).find.mockResolvedValue([]);
+    const [row]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-09');
+    expect(row.earnedBreakdown).toBeNull();
+    expect(row).toMatchObject({
+      incomeAfterAdvance: 0,
+      deductionsExcludingAdvance: 0,
+      isNetClamped: false,
+    });
+  });
+
+  it('same-month rehire: earnedBreakdown flags mixed rates', async () => {
+    const h = await harness(
+      '2026-09-22T03:00:00Z',
+      completedOn(['2026-09-01', '2026-09-15']).map((row) => ({
+        ...row,
+        workedMinutes: 240,
+        shiftEarnings: row.shiftSlot.workDate === '2026-09-01' ? 80_000 : null,
+      })),
+    );
+    h.repo(EmployeeProfile).findOne.mockResolvedValue({
+      ...employee,
+      joinedAt: new Date('2026-09-10T03:00:00Z'),
+    });
+    h.repo(EmployeeSalary).find.mockResolvedValue([]);
+    const [row]: any[] = await h.service.getEmployeeSalaries('emp-1', '2026-09');
+    expect(row.earnedBreakdown).toMatchObject({
+      mixedRates: true,
+      reproducible: false,
+      amount: row.earnedBaseSalary,
+    });
+  });
 });
 
 describe('StoresService - new stores get no default bonus/fine rules (R5)', () => {
