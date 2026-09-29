@@ -192,6 +192,7 @@ describe('ChatGroupsService.getGroupDetails for direct chats', () => {
       requireGroupAccess: jest.fn().mockResolvedValue({
         group: { store: { ownerAccountId: 'owner' } },
       }),
+      getEmployedAccountIds: jest.fn().mockResolvedValue(new Set()),
     };
     service.chatGroupRepository = { findOne: jest.fn().mockResolvedValue(group) };
     service.chatGroupMemberRepository = {

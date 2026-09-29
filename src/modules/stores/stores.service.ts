@@ -5,6 +5,7 @@ import {
   ForbiddenException,
   ConflictException,
   Logger,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import {
@@ -303,6 +304,13 @@ import {
 
 import { MailService } from '../mail/mail.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { ActivityLogService, ActivityLogEntry } from './activity-log.service';
+import {
+  ACTIVITY_ACTIONS,
+  toActivityDate,
+  toActivityHHmm,
+} from './activity-log.summary';
+import { OwnerNotificationService } from './owner-notification.service';
 import { calculateShiftEarnings } from './shift-earnings.utils';
 import { countWorkingDaysInMonth } from './working-days.utils';
 import { validateStoreReportDate } from './store-report-date.utils';
@@ -435,6 +443,21 @@ const toShiftInterval = (
 
 const intervalsOverlap = (left: ShiftInterval, right: ShiftInterval) =>
   left.start < right.end && right.start < left.end;
+
+/** `HH:mm:ss` / `H:mm` → `HH:mm` for client-facing shift times. */
+const toHHmm = (time: string): string => {
+  const match = /^(\d{1,2}):(\d{2})/.exec(time);
+  return match ? `${match[1].padStart(2, '0')}:${match[2]}` : time;
+};
+
+/** One saved assignment shown next to an employee option (O4a). */
+export interface ShiftEmployeeOtherShift {
+  shiftName: string;
+  workDate: string;
+  startTime: string;
+  endTime: string;
+  overlaps: boolean;
+}
 
 const sortIntervals = (intervals: ShiftInterval[]) =>
   intervals.sort(
@@ -1192,7 +1215,58 @@ export class StoresService {
     // Appended deliberately: this constructor is positional and long, so a new
     // dependency goes on the end where it cannot shift any existing argument.
     private readonly notificationsService: NotificationsService,
+    // X1 activity log / X6 owner notifications. Optional so the many tests
+    // that build this service by hand keep working; hooks no-op without them.
+    @Optional()
+    private readonly activityLogService?: ActivityLogService,
+    @Optional()
+    private readonly ownerNotificationService?: OwnerNotificationService,
   ) {}
+
+  /**
+   * Writes one activity-log entry (inside `manager`'s transaction when given).
+   * Never throws: a log failure must not fail the business action.
+   */
+  private async logActivity(
+    manager: EntityManager | null,
+    entry: ActivityLogEntry,
+  ): Promise<void> {
+    if (!this.activityLogService) return;
+    try {
+      await this.activityLogService.record(manager, entry);
+    } catch {
+      // record() already swallows and logs; this is belt and braces.
+    }
+  }
+
+  /** Non-sensitive shift description for activity params. */
+  private activityShiftParams(slot?: {
+    workDate?: string | Date | null;
+    startTime?: string | null;
+    endTime?: string | null;
+    workShift?: { shiftName?: string | null; startTime?: string | null; endTime?: string | null } | null;
+  } | null): Record<string, unknown> {
+    if (!slot) return {};
+    return {
+      shiftName: slot.workShift?.shiftName ?? undefined,
+      startTime: toActivityHHmm(slot.startTime || slot.workShift?.startTime),
+      endTime: toActivityHHmm(slot.endTime || slot.workShift?.endTime),
+      workDate: toActivityDate(slot.workDate ?? null),
+    };
+  }
+
+  /** Type and dates of a leave / late / early request — never its reason. */
+  private activityLeaveParams(leave: {
+    type?: string | null;
+    startDate?: string | Date | null;
+    endDate?: string | Date | null;
+  }): Record<string, unknown> {
+    return {
+      leaveType: leave.type ?? undefined,
+      fromDate: toActivityDate(leave.startDate ?? null),
+      toDate: toActivityDate(leave.endDate ?? null),
+    };
+  }
 
   // Store management
   async create(data: Partial<Store>) {
@@ -1804,6 +1878,42 @@ export class StoresService {
     expectedStoreId?: string,
     forbiddenMessage = 'Bạn chỉ có thể xem lịch của chính mình',
   ) {
+    const { profile } = await this.resolveEmployeeOwnerOrSelf(
+      profileId,
+      accountId,
+      expectedStoreId,
+      forbiddenMessage,
+    );
+    return profile;
+  }
+
+  /**
+   * Employee record reads (profile detail, performance, assets, contracts…)
+   * are owner-or-self: the owner of the employee's store, or the employee's
+   * own account while employed. A coworker, the owner of another store, or a
+   * terminated / pending self is refused. `isOwner` lets callers strip
+   * owner-private fields from a self read.
+   */
+  async assertEmployeeRecordAccess(
+    profileId: string,
+    accountId: string,
+    expectedStoreId?: string,
+    forbiddenMessage = 'Bạn chỉ có thể xem hồ sơ của chính mình',
+  ) {
+    return this.resolveEmployeeOwnerOrSelf(
+      profileId,
+      accountId,
+      expectedStoreId,
+      forbiddenMessage,
+    );
+  }
+
+  private async resolveEmployeeOwnerOrSelf(
+    profileId: string,
+    accountId: string,
+    expectedStoreId: string | undefined,
+    forbiddenMessage: string,
+  ): Promise<{ profile: EmployeeProfile; isOwner: boolean }> {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
       select: ['id', 'storeId', 'accountId', 'employmentStatus'],
@@ -1818,7 +1928,7 @@ export class StoresService {
       select: ['id', 'ownerAccountId'],
     });
     if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
-    if (store.ownerAccountId === accountId) return profile;
+    if (store.ownerAccountId === accountId) return { profile, isOwner: true };
     // Any employed member (probation and on-leave included) reads their own.
     if (
       profile.accountId !== accountId ||
@@ -1826,7 +1936,7 @@ export class StoresService {
     ) {
       throw new ForbiddenException(forbiddenMessage);
     }
-    return profile;
+    return { profile, isOwner: false };
   }
 
   /**
@@ -2795,6 +2905,26 @@ export class StoresService {
         reusableId,
         { revivesFormerStint },
       );
+      // Promoting the applicant's own PENDING profile = accepting a job
+      // application; reviving a former stint = rehire; otherwise a new hire.
+      const hiredProfile = initialized.profile;
+      const hireAction = revivesFormerStint
+        ? ACTIVITY_ACTIONS.EMPLOYEE_REHIRED
+        : ACTIVITY_ACTIONS.EMPLOYEE_ADDED;
+      await this.logActivity(manager, {
+        storeId,
+        actorAccountId: ownerAccountId,
+        subjectEmployeeProfileId: hiredProfile.id,
+        action: hireAction,
+        resourceType: 'employee',
+        resourceId: hiredProfile.id,
+        params: revivesFormerStint
+          ? { mode: 'rehire' }
+          : { source: pendingAtStore ? 'application' : 'account' },
+        idempotencyKey: `${hireAction}:${hiredProfile.id}:${new Date(
+          hiredProfile.joinedAt ?? Date.now(),
+        ).getTime()}`,
+      });
       return {
         profileId: initialized.profile.id,
         rehire: {
@@ -3158,18 +3288,11 @@ export class StoresService {
       { isActive: false },
     );
 
-    const chats = await manager
-      .createQueryBuilder()
-      .update(ChatGroupMember)
-      .set({ status: 'removed' })
-      .where('account_id = :accountId', { accountId: p.accountId })
-      .andWhere("status = 'active'")
-      .andWhere('deleted_at IS NULL')
-      .andWhere(
-        'group_id IN (SELECT g.id FROM chat_groups g WHERE g.store_id = :storeId AND g.direct_key IS NULL AND g.created_by <> :accountId AND g.deleted_at IS NULL)',
-        { storeId: p.storeId, accountId: p.accountId },
-      )
-      .execute();
+    const chats = await this.removeStoreGroupChatMemberships(
+      manager,
+      p.storeId,
+      p.accountId,
+    );
 
     const shifts = await this.cancelFutureShiftAssignments(manager, p.id, now);
     // Backstop for people terminated before termination closed these: old
@@ -3179,6 +3302,31 @@ export class StoresService {
     this.logger.log(
       `[Rehire] profile=${p.id} contracts=${contracts?.affected ?? 0} assets=${held.length} faces=${faces?.affected ?? 0} chats=${chats?.affected ?? 0} shifts=${shifts.length}`,
     );
+  }
+
+  /**
+   * Marks the account's active memberships in the store's group chats as
+   * `removed` (direct chats and groups the account created are kept). Runs in
+   * the caller's transaction: at termination, and again at a rehire as a
+   * backstop for people terminated before termination did this.
+   */
+  private removeStoreGroupChatMemberships(
+    manager: EntityManager,
+    storeId: string,
+    accountId: string,
+  ) {
+    return manager
+      .createQueryBuilder()
+      .update(ChatGroupMember)
+      .set({ status: 'removed' })
+      .where('account_id = :accountId', { accountId })
+      .andWhere("status = 'active'")
+      .andWhere('deleted_at IS NULL')
+      .andWhere(
+        'group_id IN (SELECT g.id FROM chat_groups g WHERE g.store_id = :storeId AND g.direct_key IS NULL AND g.created_by <> :accountId AND g.deleted_at IS NULL)',
+        { storeId, accountId },
+      )
+      .execute();
   }
 
   private async assignInitialAssets(
@@ -3919,7 +4067,7 @@ export class StoresService {
     if (type === 'REGISTER') {
       const assignment = await this.shiftAssignmentRepository.findOne({
         where: { id: requestId },
-        relations: ['shiftSlot', 'shiftSlot.cycle'],
+        relations: ['shiftSlot', 'shiftSlot.cycle', 'shiftSlot.workShift'],
       });
       if (!assignment)
         throw new NotFoundException('Không tìm thấy yêu cầu đăng ký');
@@ -3961,6 +4109,20 @@ export class StoresService {
               'Yêu cầu đã được cập nhật, vui lòng tải lại',
             );
           }
+          const registrationAction =
+            status === 'APPROVED'
+              ? ACTIVITY_ACTIONS.SHIFT_REGISTRATION_APPROVED
+              : ACTIVITY_ACTIONS.SHIFT_REGISTRATION_REJECTED;
+          await this.logActivity(manager, {
+            storeId,
+            actorAccountId: accountId,
+            subjectEmployeeProfileId: assignment.employeeId,
+            action: registrationAction,
+            resourceType: 'shift_assignment',
+            resourceId: requestId,
+            params: this.activityShiftParams(assignment.shiftSlot),
+            idempotencyKey: `${registrationAction}:${requestId}`,
+          });
           return {
             ...assignment,
             status: nextStatus,
@@ -4051,6 +4213,22 @@ export class StoresService {
           throw new BadRequestException(
             'Yêu cầu đổi ca đã được cập nhật, vui lòng tải lại',
           );
+        const swapAction =
+          status === 'APPROVED'
+            ? ACTIVITY_ACTIONS.SHIFT_SWAP_APPROVED
+            : ACTIVITY_ACTIONS.SHIFT_SWAP_REJECTED;
+        await this.logActivity(manager, {
+          storeId: sourceStoreId,
+          actorAccountId: accountId,
+          subjectEmployeeProfileId: swap.requestedByEmployeeId,
+          action: swapAction,
+          resourceType: 'shift_swap',
+          resourceId: swap.id,
+          params: {
+            workDate: toActivityDate(swap.fromAssignment?.shiftSlot?.workDate),
+          },
+          idempotencyKey: `${swapAction}:${swap.id}`,
+        });
         return { ...swap, status: nextStatus, note: reason };
       });
     } else if (type === 'LEAVE') {
@@ -4095,6 +4273,20 @@ export class StoresService {
             'Yêu cầu đã được cập nhật, vui lòng tải lại',
           );
         }
+        const leaveAction =
+          status === 'APPROVED'
+            ? ACTIVITY_ACTIONS.LEAVE_REQUEST_APPROVED
+            : ACTIVITY_ACTIONS.LEAVE_REQUEST_REJECTED;
+        await this.logActivity(manager, {
+          storeId: leave.storeId,
+          actorAccountId: accountId,
+          subjectEmployeeProfileId: leave.employeeProfileId,
+          action: leaveAction,
+          resourceType: 'leave_request',
+          resourceId: leave.id,
+          params: this.activityLeaveParams(leave),
+          idempotencyKey: `${leaveAction}:${leave.id}`,
+        });
         return {
           ...leave,
           status: nextStatus,
@@ -4383,10 +4575,28 @@ export class StoresService {
       // they never resurface in the approval tab after a rehire.
       await this.closePendingRequestsOfLeaver(manager, profile.id);
 
+      // The leaver is no longer listed in, nor receives, the store's group
+      // chats. Same transaction, so a failed termination keeps them.
+      await this.removeStoreGroupChatMemberships(
+        manager,
+        profile.storeId,
+        profile.accountId,
+      );
+
       profile.employmentStatus = EmploymentStatus.TERMINATED;
       profile.terminationReasonId = reasonId;
       profile.leftAt = now;
       await manager.save(EmployeeProfile, profile);
+      // The termination reason is not logged (it can be personal).
+      await this.logActivity(manager, {
+        storeId: profile.storeId,
+        actorAccountId: ownerAccountId,
+        subjectEmployeeProfileId: profile.id,
+        action: ACTIVITY_ACTIONS.EMPLOYEE_REMOVED,
+        resourceType: 'employee',
+        resourceId: profile.id,
+        idempotencyKey: `${ACTIVITY_ACTIONS.EMPLOYEE_REMOVED}:${profile.id}:${now.getTime()}`,
+      });
       return manager.softDelete(EmployeeProfile, {
         id: profileId,
         storeId: profile.storeId,
@@ -4593,11 +4803,25 @@ export class StoresService {
         .getExists();
       if (otherActiveProfile) throw this.employeeAttachConflict();
 
+      const previousLeftAt = profile.leftAt;
       profile.employmentStatus = EmploymentStatus.ACTIVE;
       profile.terminationReasonId = null;
       profile.leftAt = null;
       profile.deletedAt = null;
       await manager.save(EmployeeProfile, profile);
+      await this.logActivity(manager, {
+        storeId: profile.storeId,
+        actorAccountId: ownerAccountId,
+        subjectEmployeeProfileId: profile.id,
+        action: ACTIVITY_ACTIONS.EMPLOYEE_REHIRED,
+        resourceType: 'employee',
+        resourceId: profile.id,
+        params: { mode: 'restore' },
+        // One entry per termination being undone.
+        idempotencyKey: `${ACTIVITY_ACTIONS.EMPLOYEE_REHIRED}:${profile.id}:restore:${
+          previousLeftAt ? new Date(previousLeftAt).getTime() : 'none'
+        }`,
+      });
       return manager.restore(EmployeeProfile, profileId);
     });
   }
@@ -5024,6 +5248,9 @@ export class StoresService {
 
     const assignmentIntervalsByEmployee = new Map<string, ShiftInterval[]>();
     const assignmentDatesByEmployee = new Map<string, Set<string>>();
+    // Additive (O4a): the saved shifts behind OTHER_SHIFT / CONFLICT, so the
+    // owner app can say which shift an employee is already booked for.
+    const otherShiftsByEmployee = new Map<string, ShiftEmployeeOtherShift[]>();
     for (const assignment of assignments) {
       const slot = assignment.shiftSlot;
       if (slot?.workDate) {
@@ -5035,12 +5262,31 @@ export class StoresService {
       const assignmentStart = slot?.startTime || slot?.workShift?.startTime;
       const assignmentEnd = slot?.endTime || slot?.workShift?.endTime;
       if (!slot?.workDate || !assignmentStart || !assignmentEnd) continue;
+      const interval = toShiftInterval(
+        slot.workDate,
+        assignmentStart,
+        assignmentEnd,
+      );
       const intervals =
         assignmentIntervalsByEmployee.get(assignment.employeeId) || [];
-      intervals.push(
-        toShiftInterval(slot.workDate, assignmentStart, assignmentEnd),
-      );
+      intervals.push(interval);
       assignmentIntervalsByEmployee.set(assignment.employeeId, intervals);
+
+      // Same-day shifts are listed; an adjacent-day (±1) shift only when it
+      // actually overlaps, i.e. an overnight shift crossing into the date.
+      const overlaps = proposedIntervals.some((proposed) =>
+        intervalsOverlap(proposed, interval),
+      );
+      if (!overlaps && !workDateSet.has(slot.workDate)) continue;
+      const others = otherShiftsByEmployee.get(assignment.employeeId) || [];
+      others.push({
+        shiftName: slot.workShift?.shiftName || 'Ca làm',
+        workDate: slot.workDate,
+        startTime: toHHmm(assignmentStart),
+        endTime: toHHmm(assignmentEnd),
+        overlaps,
+      });
+      otherShiftsByEmployee.set(assignment.employeeId, others);
     }
     const leaveIntervalsByEmployee = groupBlockingLeaveIntervals(
       leaveRequests,
@@ -5087,6 +5333,11 @@ export class StoresService {
           statusLabel: statusLabels[availability],
           selectable:
             availability === 'AVAILABLE' || availability === 'OTHER_SHIFT',
+          otherShifts: (otherShiftsByEmployee.get(employee.id) || []).sort(
+            (left, right) =>
+              left.workDate.localeCompare(right.workDate) ||
+              left.startTime.localeCompare(right.startTime),
+          ),
         };
       })
       .sort((left, right) => left.name.localeCompare(right.name, 'vi'));
@@ -5224,13 +5475,92 @@ export class StoresService {
     }
   }
 
-  async createShiftSchedule(
+  /**
+   * Per-date conflicts of one employee against a proposed `startTime`–`endTime`
+   * on each of `workDates` (end <= start = overnight): a non-cancelled
+   * assignment in an active cycle of the store, or approved blocking leave.
+   * Same data and interval rules as `assertShiftScheduleAvailabilityAtCommit`,
+   * but reports which dates conflict so the caller can answer 409 with
+   * details. Run it inside the transaction that holds the store's shift
+   * availability lock.
+   */
+  async findEmployeeShiftConflicts(
+    manager: EntityManager,
     storeId: string,
-    ownerAccountId: string,
-    data: CreateShiftScheduleDto,
-  ) {
-    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    employeeId: string,
+    workDates: string[],
+    startTime: string,
+    endTime: string,
+  ): Promise<Array<{ date: string; reason: 'SHIFT' | 'LEAVE' }>> {
+    if (!workDates.length) return [];
+    const sorted = [...workDates].sort();
+    const rangeStart = addDays(sorted[0], -1);
+    const rangeEnd = addDays(sorted[sorted.length - 1], 1);
+    const assignments = await manager
+      .createQueryBuilder(ShiftAssignment, 'assignment')
+      .leftJoinAndSelect('assignment.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'workShift')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('assignment.employeeId = :employeeId', { employeeId })
+      .andWhere('assignment.status != :cancelledStatus', {
+        cancelledStatus: ShiftAssignmentStatus.CANCELLED,
+      })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status = :activeCycleStatus', {
+        activeCycleStatus: WorkCycleStatus.ACTIVE,
+      })
+      .andWhere('slot.workDate BETWEEN :rangeStart AND :rangeEnd', {
+        rangeStart,
+        rangeEnd,
+      })
+      .getMany();
+    const leaveRequests = await manager
+      .createQueryBuilder(EmployeeLeaveRequest, 'leave')
+      .where('leave.storeId = :storeId', { storeId })
+      .andWhere('leave.employeeProfileId = :employeeId', { employeeId })
+      .andWhere('leave.status = :approvedStatus', {
+        approvedStatus: LeaveRequestStatus.APPROVED,
+      })
+      .andWhere('leave.type IN (:...blockingLeaveTypes)', {
+        blockingLeaveTypes: BLOCKING_LEAVE_TYPE_VALUES,
+      })
+      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
+      .andWhere('leave.endDate >= :rangeStart', { rangeStart })
+      .take(MAX_BLOCKING_LEAVE_ROWS + 1)
+      .getMany();
 
+    const shiftIntervals: ShiftInterval[] = [];
+    for (const assignment of assignments) {
+      const slot = assignment.shiftSlot;
+      const slotStart = slot?.startTime || slot?.workShift?.startTime;
+      const slotEnd = slot?.endTime || slot?.workShift?.endTime;
+      if (!slot?.workDate || !slotStart || !slotEnd) continue;
+      shiftIntervals.push(toShiftInterval(slot.workDate, slotStart, slotEnd));
+    }
+    const leaveIntervals =
+      groupBlockingLeaveIntervals(leaveRequests, rangeStart, rangeEnd).get(
+        employeeId,
+      ) || [];
+
+    const conflicts: Array<{ date: string; reason: 'SHIFT' | 'LEAVE' }> = [];
+    for (const date of sorted) {
+      const proposed = toShiftInterval(date, startTime, endTime);
+      if (shiftIntervals.some((interval) => intervalsOverlap(proposed, interval))) {
+        conflicts.push({ date, reason: 'SHIFT' });
+      } else if (
+        leaveIntervals.some((interval) => intervalsOverlap(proposed, interval))
+      ) {
+        conflicts.push({ date, reason: 'LEAVE' });
+      }
+    }
+    return conflicts;
+  }
+
+  /**
+   * Validation and date expansion of a unified shift schedule (no I/O).
+   * Shared by `createShiftSchedule` and `createShiftScheduleWithin`.
+   */
+  private planShiftSchedule(data: CreateShiftScheduleDto) {
     const drafts = data.shifts?.length
       ? data.shifts.map((draft) => ({
           ...draft,
@@ -5330,123 +5660,157 @@ export class StoresService {
           ? (recurrenceRule.endDate as string)
           : workDates[workDates.length - 1];
 
-    let result: any;
+    return {
+      drafts,
+      recurrenceRule,
+      workDates,
+      cycleType,
+      cycleEndDate,
+    };
+  }
+
+  /**
+   * Persist a planned schedule inside `manager`'s transaction: store lock,
+   * owner check, same-name rule, availability at commit, then cycle, shifts,
+   * slots and assignments. No post-commit side effects.
+   */
+  private async persistShiftSchedule(
+    manager: EntityManager,
+    storeId: string,
+    ownerAccountId: string,
+    data: CreateShiftScheduleDto,
+    plan: ReturnType<StoresService['planShiftSchedule']>,
+  ) {
+    const { drafts, recurrenceRule, workDates, cycleType, cycleEndDate } = plan;
+    await lockStoreShiftAvailability(manager, storeId);
+
+    const store = await manager.findOne(Store, {
+      where: { id: storeId },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (!store) {
+      throw new NotFoundException('Không tìm thấy cửa hàng');
+    }
+    if (store.ownerAccountId !== ownerAccountId) {
+      throw new ForbiddenException(
+        'Bạn không có quyền tạo lịch làm việc cho cửa hàng này',
+      );
+    }
+
+    const sameNameHit = await findSameNameShiftOnDates(
+      manager,
+      storeId,
+      drafts.map((draft) => draft.shiftName),
+      workDates,
+    );
+    if (sameNameHit) {
+      throw new BadRequestException(sameNameShiftMessage(sameNameHit));
+    }
+
+    if (drafts.some((draft) => draft.employeeIds.length > 0)) {
+      await this.assertShiftScheduleAvailabilityAtCommit(
+        manager,
+        storeId,
+        drafts,
+        workDates,
+      );
+    }
+
+    const cycle = manager.create(WorkCycle, {
+      storeId,
+      name: drafts[0].shiftName,
+      cycleType,
+      startDate: data.startDate,
+      endDate: cycleEndDate,
+      status: WorkCycleStatus.ACTIVE,
+      workShiftId: null,
+      recurrenceRule,
+    });
+    const savedCycle = await manager.save(WorkCycle, cycle);
+    const savedShifts: WorkShift[] = [];
+    const allSlots: ShiftSlot[] = [];
+    const allAssignments: ShiftAssignment[] = [];
+    for (const draft of drafts) {
+      const savedShift = await manager.save(
+        WorkShift,
+        manager.create(WorkShift, {
+          storeId,
+          shiftName: draft.shiftName,
+          startTime: draft.startTime,
+          endTime: draft.endTime,
+          defaultMaxStaff: draft.maxStaff,
+          colorCode: '#21D4D4',
+          note: draft.note,
+          isActive: true,
+        }),
+      );
+      savedShifts.push(savedShift);
+      const slots = workDates.map((workDate) =>
+        manager.create(ShiftSlot, {
+          cycleId: savedCycle.id,
+          workShiftId: savedShift.id,
+          workDate,
+          startTime: draft.startTime,
+          endTime: draft.endTime,
+          maxStaff: draft.maxStaff,
+          note: draft.note,
+          dayOfWeek: getWeekDayForDate(workDate),
+        }),
+      );
+      await manager.save(ShiftSlot, slots, { chunk: 500 });
+      allSlots.push(...slots);
+      const assignments = draft.employeeIds.flatMap((employeeId) =>
+        slots.map((slot) =>
+          manager.create(ShiftAssignment, {
+            shiftSlotId: slot.id,
+            employeeId,
+            status: ShiftAssignmentStatus.APPROVED,
+            note: 'Owner assigned during shift creation',
+          }),
+        ),
+      );
+      if (assignments.length)
+        await manager.save(ShiftAssignment, assignments, { chunk: 500 });
+      allAssignments.push(...assignments);
+    }
+    await manager.update(WorkCycle, savedCycle.id, {
+      workShiftId: savedShifts[0].id,
+    });
+
+    return {
+      id: savedCycle.id,
+      storeId,
+      status: savedCycle.status,
+      shift: savedShifts[0],
+      shifts: savedShifts,
+      recurrence: recurrenceRule,
+      generatedSlotCount: allSlots.length,
+      assignedEmployeeCount: drafts.reduce(
+        (sum, draft) => sum + draft.employeeIds.length,
+        0,
+      ),
+      generatedAssignmentCount: allAssignments.length,
+      assignmentIds: allAssignments.map((assignment) => assignment.id),
+      firstWorkDate: workDates[0],
+      lastGeneratedWorkDate: workDates[workDates.length - 1],
+    };
+  }
+
+  async createShiftSchedule(
+    storeId: string,
+    ownerAccountId: string,
+    data: CreateShiftScheduleDto,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const plan = this.planShiftSchedule(data);
+    const { drafts, workDates } = plan;
+
+    let result: Awaited<ReturnType<StoresService['persistShiftSchedule']>>;
     try {
-      result = await this.dataSource.transaction(async (manager) => {
-        await lockStoreShiftAvailability(manager, storeId);
-
-        const store = await manager.findOne(Store, {
-          where: { id: storeId },
-          lock: { mode: 'pessimistic_write' },
-        });
-
-        if (!store) {
-          throw new NotFoundException('Không tìm thấy cửa hàng');
-        }
-        if (store.ownerAccountId !== ownerAccountId) {
-          throw new ForbiddenException(
-            'Bạn không có quyền tạo lịch làm việc cho cửa hàng này',
-          );
-        }
-
-        const sameNameHit = await findSameNameShiftOnDates(
-          manager,
-          storeId,
-          drafts.map((draft) => draft.shiftName),
-          workDates,
-        );
-        if (sameNameHit) {
-          throw new BadRequestException(sameNameShiftMessage(sameNameHit));
-        }
-
-        if (drafts.some((draft) => draft.employeeIds.length > 0)) {
-          await this.assertShiftScheduleAvailabilityAtCommit(
-            manager,
-            storeId,
-            drafts,
-            workDates,
-          );
-        }
-
-        const cycle = manager.create(WorkCycle, {
-          storeId,
-          name: drafts[0].shiftName,
-          cycleType,
-          startDate: data.startDate,
-          endDate: cycleEndDate,
-          status: WorkCycleStatus.ACTIVE,
-          workShiftId: null,
-          recurrenceRule,
-        });
-        const savedCycle = await manager.save(WorkCycle, cycle);
-        const savedShifts: WorkShift[] = [];
-        const allSlots: ShiftSlot[] = [];
-        const allAssignments: ShiftAssignment[] = [];
-        for (const draft of drafts) {
-          const savedShift = await manager.save(
-            WorkShift,
-            manager.create(WorkShift, {
-              storeId,
-              shiftName: draft.shiftName,
-              startTime: draft.startTime,
-              endTime: draft.endTime,
-              defaultMaxStaff: draft.maxStaff,
-              colorCode: '#21D4D4',
-              note: draft.note,
-              isActive: true,
-            }),
-          );
-          savedShifts.push(savedShift);
-          const slots = workDates.map((workDate) =>
-            manager.create(ShiftSlot, {
-              cycleId: savedCycle.id,
-              workShiftId: savedShift.id,
-              workDate,
-              startTime: draft.startTime,
-              endTime: draft.endTime,
-              maxStaff: draft.maxStaff,
-              note: draft.note,
-              dayOfWeek: getWeekDayForDate(workDate),
-            }),
-          );
-          await manager.save(ShiftSlot, slots, { chunk: 500 });
-          allSlots.push(...slots);
-          const assignments = draft.employeeIds.flatMap((employeeId) =>
-            slots.map((slot) =>
-              manager.create(ShiftAssignment, {
-                shiftSlotId: slot.id,
-                employeeId,
-                status: ShiftAssignmentStatus.APPROVED,
-                note: 'Owner assigned during shift creation',
-              }),
-            ),
-          );
-          if (assignments.length)
-            await manager.save(ShiftAssignment, assignments, { chunk: 500 });
-          allAssignments.push(...assignments);
-        }
-        await manager.update(WorkCycle, savedCycle.id, {
-          workShiftId: savedShifts[0].id,
-        });
-
-        return {
-          id: savedCycle.id,
-          storeId,
-          status: savedCycle.status,
-          shift: savedShifts[0],
-          shifts: savedShifts,
-          recurrence: recurrenceRule,
-          generatedSlotCount: allSlots.length,
-          assignedEmployeeCount: drafts.reduce(
-            (sum, draft) => sum + draft.employeeIds.length,
-            0,
-          ),
-          generatedAssignmentCount: allAssignments.length,
-          assignmentIds: allAssignments.map((assignment) => assignment.id),
-          firstWorkDate: workDates[0],
-          lastGeneratedWorkDate: workDates[workDates.length - 1],
-        };
-      });
+      result = await this.dataSource.transaction((manager) =>
+        this.persistShiftSchedule(manager, storeId, ownerAccountId, data, plan),
+      );
     } catch (error: any) {
       // Only the one-active-cycle index means "already has an active cycle";
       // any other unique violation is a real error and is rethrown.
@@ -5475,6 +5839,36 @@ export class StoresService {
     );
 
     return publicResult;
+  }
+
+  /**
+   * `createShiftSchedule` inside the caller's transaction (X5 custom shift
+   * request approval): the same validation, locks, same-name rule,
+   * availability-at-commit check and writes, so every invariant of the
+   * unified path holds. The caller owns the transaction and must call
+   * `scheduleRemindersForNewAssignments` for the returned assignments once
+   * committed.
+   */
+  async createShiftScheduleWithin(
+    manager: EntityManager,
+    storeId: string,
+    ownerAccountId: string,
+    data: CreateShiftScheduleDto,
+  ) {
+    const plan = this.planShiftSchedule(data);
+    return this.persistShiftSchedule(manager, storeId, ownerAccountId, data, plan);
+  }
+
+  /** Post-commit reminders for assignments created by `createShiftScheduleWithin`. */
+  scheduleRemindersForNewAssignments(assignmentIds: string[]): void {
+    if (!assignmentIds.length) return;
+    void this.shiftReminderService
+      .scheduleAssignmentReminders(assignmentIds)
+      .catch(() => {
+        this.logger.error(
+          'Failed to schedule reminders for newly created shift schedule',
+        );
+      });
   }
 
   /**
@@ -7296,6 +7690,20 @@ export class StoresService {
       console.log(
         `[registerToShiftSlot] saved assignmentId=${saved.id}, slotId=${slotId}, cycleId=${slot.cycleId}, employeeId=${employeeId}, status=${saved.status}`,
       );
+      await this.logActivity(manager, {
+        storeId,
+        actorAccountId: ownerAccountId ?? null,
+        subjectEmployeeProfileId: employeeId,
+        action: ACTIVITY_ACTIONS.SHIFT_REGISTRATION_CREATED,
+        resourceType: 'shift_assignment',
+        resourceId: saved.id,
+        params: {
+          ...this.activityShiftParams({ ...slot, workShift }),
+          status: saved.status,
+          byOwner: authorizedOwnerAssign,
+        },
+        idempotencyKey: `${ACTIVITY_ACTIONS.SHIFT_REGISTRATION_CREATED}:${saved.id}`,
+      });
 
       return saved;
     });
@@ -7503,7 +7911,7 @@ export class StoresService {
   ) {
     const assignment = await this.shiftAssignmentRepository.findOne({
       where: { id: assignmentId },
-      relations: ['shiftSlot', 'shiftSlot.cycle'],
+      relations: ['shiftSlot', 'shiftSlot.cycle', 'shiftSlot.workShift'],
     });
     if (!assignment) throw new NotFoundException('Assignment not found');
     const storeId = assignment.shiftSlot?.cycle?.storeId;
@@ -7575,6 +7983,28 @@ export class StoresService {
       current.status = nextStatus;
       if (note !== undefined) current.note = note;
       const saved = await manager.save(ShiftAssignment, current);
+      const statusAction =
+        previousStatus === ShiftAssignmentStatus.PENDING
+          ? nextStatus === ShiftAssignmentStatus.APPROVED
+            ? ACTIVITY_ACTIONS.SHIFT_REGISTRATION_APPROVED
+            : nextStatus === ShiftAssignmentStatus.CANCELLED
+              ? ACTIVITY_ACTIONS.SHIFT_REGISTRATION_REJECTED
+              : null
+          : nextStatus === ShiftAssignmentStatus.CANCELLED
+            ? ACTIVITY_ACTIONS.SHIFT_REGISTRATION_CANCELLED
+            : null;
+      if (statusAction) {
+        await this.logActivity(manager, {
+          storeId,
+          actorAccountId: ownerAccountId,
+          subjectEmployeeProfileId: current.employeeId,
+          action: statusAction,
+          resourceType: 'shift_assignment',
+          resourceId: assignmentId,
+          params: this.activityShiftParams(assignment.shiftSlot),
+          idempotencyKey: `${statusAction}:${assignmentId}`,
+        });
+      }
       return { saved, previousStatus };
     }).then(async ({ saved, previousStatus }) => {
       // Transaction đã kiểm lại chuyển trạng thái dưới khoá, nên trạng thái
@@ -8566,6 +8996,16 @@ export class StoresService {
         newAccount.id,
         data,
       );
+      await this.logActivity(manager, {
+        storeId: data.storeId,
+        actorAccountId: ownerAccountId,
+        subjectEmployeeProfileId: profile.id,
+        action: ACTIVITY_ACTIONS.EMPLOYEE_ADDED,
+        resourceType: 'employee',
+        resourceId: profile.id,
+        params: { source: 'manual' },
+        idempotencyKey: `${ACTIVITY_ACTIONS.EMPLOYEE_ADDED}:${profile.id}`,
+      });
       return { account: newAccount, profileId: profile.id };
     });
 
@@ -13726,6 +14166,7 @@ export class StoresService {
     note?: string,
     assignedById?: string,
     dueDate?: Date,
+    actorAccountId?: string,
   ) {
     const asset = await this.assetRepository.findOne({
       where: { id: assetId },
@@ -13771,6 +14212,15 @@ export class StoresService {
     asset.currentStock -= quantity;
     await this.assetRepository.save(asset);
 
+    await this.logActivity(null, {
+      actorAccountId: actorAccountId ?? null,
+      subjectEmployeeProfileId: profileId,
+      action: ACTIVITY_ACTIONS.ASSET_ASSIGNED,
+      resourceType: 'asset_assignment',
+      resourceId: assignment.id,
+      params: { assetName: asset.name, quantity },
+    });
+
     return this.getEmployeeAssets(profileId);
   }
 
@@ -13781,6 +14231,7 @@ export class StoresService {
     note?: string,
     changedById?: string,
     dueDate?: Date,
+    actorAccountId?: string,
   ) {
     // 1. Get old assignment
     const oldAssignment = await this.assetAssignmentRepository.findOne({
@@ -13863,6 +14314,29 @@ export class StoresService {
         quantity,
       );
 
+      // An exchange is a return of A and an assignment of B.
+      await this.logActivity(manager, {
+        actorAccountId: actorAccountId ?? null,
+        subjectEmployeeProfileId: oldAssignment.employeeProfileId,
+        action: ACTIVITY_ACTIONS.ASSET_RETURNED,
+        resourceType: 'asset_assignment',
+        resourceId: oldAssignment.id,
+        params: {
+          assetName: oldAssignment.asset?.name,
+          quantity: oldAssignment.quantity,
+          assetStatus: AssetAssignmentStatus.RETURNED,
+        },
+        idempotencyKey: `${ACTIVITY_ACTIONS.ASSET_RETURNED}:${oldAssignment.id}`,
+      });
+      await this.logActivity(manager, {
+        actorAccountId: actorAccountId ?? null,
+        subjectEmployeeProfileId: oldAssignment.employeeProfileId,
+        action: ACTIVITY_ACTIONS.ASSET_ASSIGNED,
+        resourceType: 'asset_assignment',
+        resourceId: assignment.id,
+        params: { assetName: newAsset.name, quantity },
+      });
+
       return this.getEmployeeAssets(oldAssignment.employeeProfileId);
     });
   }
@@ -13871,6 +14345,7 @@ export class StoresService {
     assignmentId: string,
     status: AssetAssignmentStatus,
     returnNote?: string,
+    actorAccountId?: string,
   ) {
     // One transaction with the same lock order as the rehire restock
     // (assignment row, then asset row), and a conditional status update, so
@@ -13918,6 +14393,26 @@ export class StoresService {
           await manager.save(Asset, asset);
         }
       }
+
+      if (this.activityLogService) {
+        const assetName = await manager
+          .findOne(Asset, { where: { id: assignment.assetId }, select: ['id', 'name'] })
+          .then((row) => row?.name)
+          .catch(() => undefined);
+        await this.logActivity(manager, {
+          actorAccountId: actorAccountId ?? null,
+          subjectEmployeeProfileId: assignment.employeeProfileId,
+          action: ACTIVITY_ACTIONS.ASSET_RETURNED,
+          resourceType: 'asset_assignment',
+          resourceId: assignment.id,
+          params: {
+            assetName,
+            quantity: Number(assignment.quantity || 0),
+            assetStatus: status,
+          },
+          idempotencyKey: `${ACTIVITY_ACTIONS.ASSET_RETURNED}:${assignment.id}`,
+        });
+      }
     });
 
     return { message: 'Đã thu hồi tài sản thành công' };
@@ -13929,6 +14424,7 @@ export class StoresService {
     note?: string,
     assignedById?: string,
     dueDate?: Date,
+    actorAccountId?: string,
   ) {
     const oldAssignment = await this.assetAssignmentRepository.findOne({
       where: { id: assignmentId },
@@ -13944,6 +14440,7 @@ export class StoresService {
       note || `Cấp lại từ bản ghi cũ. ${oldAssignment.note || ''}`,
       assignedById,
       dueDate || (oldAssignment.dueDate ?? undefined),
+      actorAccountId,
     );
   }
 
@@ -13955,6 +14452,7 @@ export class StoresService {
       requestedAmount: number;
       requestReason?: string;
     },
+    actorAccountId?: string,
   ) {
     // 1. Lấy thông tin phiếu lương
     const employeeSalary = await this.employeeSalaryRepository.findOne({
@@ -14008,7 +14506,24 @@ export class StoresService {
       requestedAt: new Date(),
     });
 
-    return this.salaryAdvanceRequestRepository.save(request);
+    const saved = await this.salaryAdvanceRequestRepository.save(request);
+    // Month only: amounts and the reason never go into the activity log.
+    await this.logActivity(null, {
+      storeId: employeeSalary.employeeProfile?.storeId ?? null,
+      actorAccountId: actorAccountId ?? null,
+      subjectEmployeeProfileId: employeeProfileId,
+      action: ACTIVITY_ACTIONS.SALARY_ADVANCE_CREATED,
+      resourceType: 'salary_advance',
+      resourceId: saved.id,
+      params: { month: this.activityMonth(employeeSalary.month) },
+      idempotencyKey: `${ACTIVITY_ACTIONS.SALARY_ADVANCE_CREATED}:${saved.id}`,
+    });
+    return saved;
+  }
+
+  /** A payslip month marker → `YYYY-MM` (VN calendar). */
+  private activityMonth(month: Date | string | null | undefined) {
+    return toActivityDate(month ?? null)?.slice(0, 7);
   }
 
   async getSalaryAdvanceRequests(filters: {
@@ -14191,6 +14706,24 @@ export class StoresService {
       }
       const saved = await requestRepository.save(request);
 
+      const reviewAction =
+        data.status === AdvanceRequestStatus.APPROVED
+          ? ACTIVITY_ACTIONS.SALARY_ADVANCE_APPROVED
+          : data.status === AdvanceRequestStatus.REJECTED
+            ? ACTIVITY_ACTIONS.SALARY_ADVANCE_REJECTED
+            : null;
+      if (reviewAction) {
+        await this.logActivity(manager, {
+          actorAccountId: reviewerId,
+          subjectEmployeeProfileId: request.employeeProfileId,
+          action: reviewAction,
+          resourceType: 'salary_advance',
+          resourceId: requestId,
+          params: { month: this.activityMonth(payslip?.month) },
+          idempotencyKey: `${reviewAction}:${requestId}`,
+        });
+      }
+
       if (data.status === AdvanceRequestStatus.APPROVED && payslip) {
         const advancePayment = await this.sumApprovedAdvances(
           request.employeeSalaryId,
@@ -14257,6 +14790,14 @@ export class StoresService {
       throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
     }
     request.status = AdvanceRequestStatus.CANCELLED;
+    await this.logActivity(null, {
+      actorAccountId: accountId,
+      subjectEmployeeProfileId: requester.id,
+      action: ACTIVITY_ACTIONS.SALARY_ADVANCE_CANCELLED,
+      resourceType: 'salary_advance',
+      resourceId: request.id,
+      idempotencyKey: `${ACTIVITY_ACTIONS.SALARY_ADVANCE_CANCELLED}:${request.id}`,
+    });
     return request;
   }
 
@@ -14403,6 +14944,27 @@ export class StoresService {
 
     const savedAdjustment =
       await this.salaryAdjustmentRepository.save(adjustment);
+    // Direction and month only — never the amounts or the reason.
+    const savedAdjustmentId = (savedAdjustment as unknown as { id?: string })
+      ?.id;
+    await this.logActivity(null, {
+      storeId: profile.storeId,
+      actorAccountId: createdByAccountId,
+      subjectEmployeeProfileId: profile.id,
+      action: ACTIVITY_ACTIONS.SALARY_ADJUSTMENT_CREATED,
+      resourceType: 'salary_adjustment',
+      resourceId: savedAdjustmentId ?? null,
+      params: {
+        direction:
+          data.adjustmentType === AdjustmentType.INCREASE
+            ? 'increase'
+            : 'decrease',
+        month: effective.label,
+      },
+      idempotencyKey: savedAdjustmentId
+        ? `${ACTIVITY_ACTIONS.SALARY_ADJUSTMENT_CREATED}:${savedAdjustmentId}`
+        : null,
+    });
 
     // 2. Nếu hiệu lực ngay tháng hiện tại -> Cập nhật Hợp đồng và Phiếu lương
     if (effective.key === current.key) {
@@ -14663,6 +15225,7 @@ export class StoresService {
       referenceNumber?: string;
       notes?: string;
     },
+    actorAccountId?: string,
   ) {
     const salary = await this.employeeSalaryRepository.findOne({
       where: { id: salaryId },
@@ -14719,6 +15282,17 @@ export class StoresService {
     });
 
     await this.employeePaymentHistoryRepository.save(paymentHistory);
+
+    await this.logActivity(null, {
+      storeId: store.id,
+      actorAccountId: actorAccountId ?? null,
+      subjectEmployeeProfileId: salary.employeeProfileId,
+      action: ACTIVITY_ACTIONS.PAYSLIP_PAID,
+      resourceType: 'payslip',
+      resourceId: salary.id,
+      params: { month: this.activityMonth(salary.month) },
+      idempotencyKey: `${ACTIVITY_ACTIONS.PAYSLIP_PAID}:${salary.id}`,
+    });
 
     return {
       message: 'Thanh toán lương thành công',
@@ -17020,7 +17594,18 @@ export class StoresService {
         attachments,
         status: LeaveRequestStatus.PENDING,
       } as Partial<EmployeeLeaveRequest>);
-      return manager.save(EmployeeLeaveRequest, leaveRequest);
+      const saved = await manager.save(EmployeeLeaveRequest, leaveRequest);
+      await this.logActivity(manager, {
+        storeId,
+        actorAccountId: accountId,
+        subjectEmployeeProfileId: data.employeeProfileId,
+        action: ACTIVITY_ACTIONS.LEAVE_REQUEST_CREATED,
+        resourceType: 'leave_request',
+        resourceId: saved.id,
+        params: this.activityLeaveParams(saved),
+        idempotencyKey: `${ACTIVITY_ACTIONS.LEAVE_REQUEST_CREATED}:${saved.id}`,
+      });
+      return saved;
     });
   }
 
@@ -17156,7 +17741,18 @@ export class StoresService {
       throw new BadRequestException('Chỉ có thể hủy đơn đang chờ duyệt');
     }
     request.status = LeaveRequestStatus.CANCELLED;
-    return this.leaveRequestRepository.save(request);
+    const saved = await this.leaveRequestRepository.save(request);
+    await this.logActivity(null, {
+      storeId: request.storeId,
+      actorAccountId: accountId,
+      subjectEmployeeProfileId: request.employeeProfileId,
+      action: ACTIVITY_ACTIONS.LEAVE_REQUEST_CANCELLED,
+      resourceType: 'leave_request',
+      resourceId: request.id,
+      params: this.activityLeaveParams(request),
+      idempotencyKey: `${ACTIVITY_ACTIONS.LEAVE_REQUEST_CANCELLED}:${request.id}`,
+    });
+    return saved;
   }
 
   // ===== Shift Change Request Management =====
@@ -17333,7 +17929,18 @@ export class StoresService {
         attachments: data.attachments ? JSON.stringify(data.attachments) : null,
         status: ShiftChangeRequestStatus.PENDING,
       });
-      return manager.save(ShiftChangeRequest, request);
+      const saved = await manager.save(ShiftChangeRequest, request);
+      await this.logActivity(manager, {
+        storeId: data.storeId,
+        actorAccountId: accountId,
+        subjectEmployeeProfileId: data.employeeProfileId,
+        action: ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_CREATED,
+        resourceType: 'shift_change_request',
+        resourceId: saved.id,
+        params: { requestDate: toActivityDate(data.requestDate) },
+        idempotencyKey: `${ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_CREATED}:${saved.id}`,
+      });
+      return saved;
     });
   }
 
@@ -17481,8 +18088,8 @@ export class StoresService {
       where: { accountId: ownerAccountId, storeId: request.storeId },
       select: ['id'],
     });
-    const result = await this.dataSource.transaction((manager) =>
-      manager.update(
+    const result = await this.dataSource.transaction(async (manager) => {
+      const updated = await manager.update(
         ShiftChangeRequest,
         {
           id,
@@ -17497,8 +18104,25 @@ export class StoresService {
               ? (rejectionReason ?? null)
               : null,
         },
-      ),
-    );
+      );
+      if (updated.affected) {
+        const reviewAction =
+          status === ShiftChangeRequestStatus.APPROVED
+            ? ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_APPROVED
+            : ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_REJECTED;
+        await this.logActivity(manager, {
+          storeId: request.storeId,
+          actorAccountId: ownerAccountId,
+          subjectEmployeeProfileId: request.employeeProfileId,
+          action: reviewAction,
+          resourceType: 'shift_change_request',
+          resourceId: id,
+          params: { requestDate: toActivityDate(request.requestDate) },
+          idempotencyKey: `${reviewAction}:${id}`,
+        });
+      }
+      return updated;
+    });
     if (!result.affected) {
       throw new BadRequestException('Yêu cầu không còn chờ duyệt');
     }
@@ -17540,6 +18164,7 @@ export class StoresService {
   async cancelShiftChangeRequest(
     id: string,
     employeeProfileId: string | undefined,
+    actorAccountId?: string,
   ) {
     if (!employeeProfileId)
       throw new BadRequestException('Không xác định được nhân viên');
@@ -17554,21 +18179,35 @@ export class StoresService {
       throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
     }
     request.status = ShiftChangeRequestStatus.CANCELLED;
-    return this.shiftChangeRequestRepository.save(request);
+    const saved = await this.shiftChangeRequestRepository.save(request);
+    await this.logActivity(null, {
+      storeId: request.storeId,
+      actorAccountId: actorAccountId ?? null,
+      subjectEmployeeProfileId: request.employeeProfileId,
+      action: ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_CANCELLED,
+      resourceType: 'shift_change_request',
+      resourceId: request.id,
+      params: { requestDate: toActivityDate(request.requestDate) },
+      idempotencyKey: `${ACTIVITY_ACTIONS.SHIFT_CHANGE_REQUEST_CANCELLED}:${request.id}`,
+    });
+    return saved;
   }
 
   // ===== Bonus Work Request Management =====
-  async createBonusWorkRequest(data: {
-    storeId: string;
-    employeeProfileId: string;
-    shiftSlotId?: string | null;
-    shiftAssignmentId?: string | null;
-    requestDate: string;
-    startTime?: string;
-    endTime?: string;
-    reason?: string;
-    attachments?: string[];
-  }) {
+  async createBonusWorkRequest(
+    data: {
+      storeId: string;
+      employeeProfileId: string;
+      shiftSlotId?: string | null;
+      shiftAssignmentId?: string | null;
+      requestDate: string;
+      startTime?: string;
+      endTime?: string;
+      reason?: string;
+      attachments?: string[];
+    },
+    actorAccountId?: string,
+  ) {
     if (data.shiftAssignmentId) {
       const assignment = await this.shiftAssignmentRepository.findOne({
         where: {
@@ -17610,7 +18249,34 @@ export class StoresService {
       attachments: data.attachments ? JSON.stringify(data.attachments) : null,
       status: BonusWorkRequestStatus.PENDING,
     });
-    return this.bonusWorkRequestRepository.save(request);
+    const saved = await this.bonusWorkRequestRepository.save(request);
+    await this.logBonusWorkActivity(
+      ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_CREATED,
+      saved,
+      actorAccountId ?? null,
+    );
+    return saved;
+  }
+
+  private async logBonusWorkActivity(
+    action: string,
+    request: BonusWorkRequest,
+    actorAccountId: string | null,
+  ) {
+    await this.logActivity(null, {
+      storeId: request.storeId,
+      actorAccountId,
+      subjectEmployeeProfileId: request.employeeProfileId,
+      action,
+      resourceType: 'bonus_work_request',
+      resourceId: request.id,
+      params: {
+        requestDate: toActivityDate(request.requestDate),
+        startTime: toActivityHHmm(request.startTime),
+        endTime: toActivityHHmm(request.endTime),
+      },
+      idempotencyKey: `${action}:${request.id}`,
+    });
   }
 
   async getBonusWorkRequestsByEmployee(employeeProfileId: string) {
@@ -17693,7 +18359,13 @@ export class StoresService {
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
     request.status = BonusWorkRequestStatus.APPROVED;
     request.approvedById = approverProfileId;
-    return this.bonusWorkRequestRepository.save(request);
+    const saved = await this.bonusWorkRequestRepository.save(request);
+    await this.logBonusWorkActivity(
+      ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_APPROVED,
+      request,
+      ownerAccountId ?? null,
+    );
+    return saved;
   }
 
   async rejectBonusWorkRequest(
@@ -17706,10 +18378,90 @@ export class StoresService {
     request.status = BonusWorkRequestStatus.REJECTED;
     request.approvedById = approverProfileId;
     request.rejectionReason = reason ?? null;
-    return this.bonusWorkRequestRepository.save(request);
+    const saved = await this.bonusWorkRequestRepository.save(request);
+    await this.logBonusWorkActivity(
+      ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_REJECTED,
+      request,
+      ownerAccountId ?? null,
+    );
+    return saved;
   }
 
   // Lấy thống kê duyệt
+  /** Best effort: a missing table (migration not yet applied) counts 0. */
+  private async countPendingCustomShiftRequests(
+    storeId: string,
+    urgentBefore: Date,
+  ): Promise<{ pending: number; urgent: number }> {
+    try {
+      const rows: Array<{ pending: number; urgent: number }> =
+        await this.dataSource.query(
+          `SELECT COUNT(*)::int AS pending,
+                  COUNT(*) FILTER (WHERE created_at < $2)::int AS urgent
+           FROM custom_shift_requests
+           WHERE store_id = $1 AND status = 'PENDING'`,
+          [storeId, urgentBefore],
+        );
+      return {
+        pending: Number(rows?.[0]?.pending || 0),
+        urgent: Number(rows?.[0]?.urgent || 0),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `[getApprovalStats] custom shift requests not counted: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return { pending: 0, urgent: 0 };
+    }
+  }
+
+  /**
+   * Which bonus-work requests `GET bonus-work-requests` may return.
+   * The owner of the store sees the store (or the requested employee);
+   * anyone else only ever sees their own requests at that store, whatever
+   * `employeeProfileId` they sent. Null = nothing visible.
+   */
+  async resolveBonusWorkRequestScope(
+    accountId: string,
+    query: { storeId?: string; employeeProfileId?: string },
+  ): Promise<
+    | { kind: 'store'; storeId: string }
+    | { kind: 'employee'; employeeProfileId: string }
+    | null
+  > {
+    let storeId = query.storeId || null;
+    if (query.employeeProfileId) {
+      const target = await this.profileRepository.findOne({
+        where: { id: query.employeeProfileId },
+        select: ['id', 'storeId'],
+      });
+      if (!target) return null;
+      if (storeId && storeId !== target.storeId) return null;
+      storeId = target.storeId;
+    }
+    if (!storeId) return null;
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store) return null;
+    if (store.ownerAccountId === accountId) {
+      return query.employeeProfileId
+        ? { kind: 'employee', employeeProfileId: query.employeeProfileId }
+        : { kind: 'store', storeId };
+    }
+    const own = await this.profileRepository.findOne({
+      where: {
+        storeId,
+        accountId,
+        employmentStatus: In([...EMPLOYED_STATUSES]),
+      },
+      select: ['id'],
+    });
+    return own ? { kind: 'employee', employeeProfileId: own.id } : null;
+  }
+
   async getApprovalStats(storeId: string, ownerAccountId?: string) {
     if (!ownerAccountId) {
       throw new ForbiddenException('Không xác định được tài khoản');
@@ -17745,14 +18497,28 @@ export class StoresService {
 
     const allRequests = [...registrations, ...changeRequests, ...leaveRequests];
 
-    const total = allRequests.length;
-    const pending = allRequests.filter((r) => r.status === 'PENDING').length;
-    const approved = allRequests.filter((r) => r.status === 'APPROVED').length;
-    const urgent = allRequests.filter(
-      (r) => r.status === 'PENDING' && new Date(r.createdAt) < oneDayAgo,
-    ).length;
+    // X5 custom-time requests: only the PENDING ones matter to the badge.
+    const custom = await this.countPendingCustomShiftRequests(
+      storeId,
+      oneDayAgo,
+    );
 
-    return { total, pending, approved, urgent };
+    const total = allRequests.length + custom.pending;
+    const pending =
+      allRequests.filter((r) => r.status === 'PENDING').length + custom.pending;
+    const approved = allRequests.filter((r) => r.status === 'APPROVED').length;
+    const urgent =
+      allRequests.filter(
+        (r) => r.status === 'PENDING' && new Date(r.createdAt) < oneDayAgo,
+      ).length + custom.urgent;
+
+    return {
+      total,
+      pending,
+      approved,
+      urgent,
+      customShiftPending: custom.pending,
+    };
   }
 
   /** Only the employee who filed the request may cancel it. */
@@ -17776,7 +18542,13 @@ export class StoresService {
       throw new BadRequestException('Chỉ có thể hủy yêu cầu đang chờ duyệt');
     }
     request.status = BonusWorkRequestStatus.CANCELLED;
-    return this.bonusWorkRequestRepository.save(request);
+    const saved = await this.bonusWorkRequestRepository.save(request);
+    await this.logBonusWorkActivity(
+      ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_CANCELLED,
+      request,
+      accountId,
+    );
+    return saved;
   }
 
   // Feedback Management
@@ -18199,6 +18971,21 @@ export class StoresService {
         checkinDistance: checkinDistance ?? undefined,
       });
       await manager.save(AttendanceLog, checkInLog);
+      // Shift and minutes only — never location or face data.
+      await this.logActivity(manager, {
+        storeId: storeId ?? null,
+        actorAccountId: accountId,
+        subjectEmployeeProfileId: assignment.employeeId,
+        action: ACTIVITY_ACTIONS.CHECK_IN,
+        resourceType: 'shift_assignment',
+        resourceId: assignmentId,
+        params: {
+          ...this.activityShiftParams(slot),
+          checkInAt: vnClockHHmm(now),
+          lateMinutes,
+        },
+        idempotencyKey: `${ACTIVITY_ACTIONS.CHECK_IN}:${assignmentId}`,
+      });
       return { recorded: true, assignment: null };
     });
 
@@ -18234,6 +19021,18 @@ export class StoresService {
     // Ghi nhận đi trễ vào DailyEmployeeReport
     if (lateMinutes > 0 && storeId) {
       this.appendToDailyReport(storeId, 'lateArrivals', assignment.employeeId);
+    }
+
+    // X6: tell the owner after commit. Not awaited; never fails the check-in.
+    if (this.ownerNotificationService) {
+      void this.ownerNotificationService
+        .afterAttendance({
+          kind: 'check_in',
+          assignmentId,
+          at: now,
+          lateMinutes,
+        })
+        .catch(() => undefined);
     }
 
     this.logger.log(
@@ -18410,6 +19209,20 @@ export class StoresService {
         checkinDistance: checkinDistance ?? undefined,
       });
       await manager.save(AttendanceLog, checkOutLog);
+      await this.logActivity(manager, {
+        storeId: storeId ?? null,
+        actorAccountId: accountId,
+        subjectEmployeeProfileId: assignment.employeeId,
+        action: ACTIVITY_ACTIONS.CHECK_OUT,
+        resourceType: 'shift_assignment',
+        resourceId: assignmentId,
+        params: {
+          ...this.activityShiftParams(slot),
+          checkOutAt: vnClockHHmm(now),
+          earlyMinutes,
+        },
+        idempotencyKey: `${ACTIVITY_ACTIONS.CHECK_OUT}:${assignmentId}`,
+      });
       return { recorded: true, assignment: null };
     });
 
@@ -18447,6 +19260,18 @@ export class StoresService {
         'earlyDepartures',
         assignment.employeeId,
       );
+    }
+
+    // X6: tell the owner after commit. Not awaited; never fails the check-out.
+    if (this.ownerNotificationService) {
+      void this.ownerNotificationService
+        .afterAttendance({
+          kind: 'check_out',
+          assignmentId,
+          at: now,
+          earlyMinutes,
+        })
+        .catch(() => undefined);
     }
 
     // ===== Fix 2: Sync workingStatus → IDLE =====
@@ -19709,6 +20534,15 @@ export class StoresService {
       },
       { status: ShiftAssignmentStatus.CANCELLED },
     );
+    // No transaction here: the entry is written right after the guarded write.
+    await this.logActivity(null, {
+      storeId,
+      actorAccountId: callerAccountId,
+      subjectEmployeeProfileId: employeeProfileId,
+      action: ACTIVITY_ACTIONS.SHIFT_REGISTRATION_UPCOMING_CANCELLED,
+      resourceType: 'shift_assignment',
+      params: { count: doomed.length },
+    });
     const approvedIds = doomed
       .filter((a) => a.status === ShiftAssignmentStatus.APPROVED)
       .map((a) => a.id);
@@ -19994,6 +20828,22 @@ export class StoresService {
             'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
           );
         }
+
+        // One entry for the whole fixed-shift registration, not one per slot.
+        const firstSlot = matchedSlots[0];
+        await this.logActivity(manager, {
+          storeId: data.storeId,
+          actorAccountId: accountId,
+          subjectEmployeeProfileId: data.employeeProfileId,
+          action: ACTIVITY_ACTIONS.SHIFT_REGISTRATION_BATCH_CREATED,
+          resourceType: 'shift_assignment',
+          params: {
+            shiftName: firstSlot?.workShift?.shiftName,
+            fromDate: toActivityDate(startDate),
+            toDate: toActivityDate(rangeEnd),
+            count: successCount,
+          },
+        });
 
         return { successCount };
       });

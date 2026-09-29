@@ -1,4 +1,7 @@
-import { ShiftAggregationService } from './shift-aggregation.service';
+import {
+  activityHHmm,
+  ShiftAggregationService,
+} from './shift-aggregation.service';
 import { PaymentType } from './entities/employee-contract.entity';
 
 const queryBuilder = (rows: unknown = []) => {
@@ -647,5 +650,74 @@ describe('ShiftAggregationService — current stint only (rehire)', () => {
     });
 
     expect(fromBound(qbs.logs).toISOString()).toBe('2026-09-14T17:00:00.000Z');
+  });
+
+  it('activity timeRange / currentShift / requestedShift use HH:mm (S7c)', async () => {
+    const { service, qbs } = activitiesService(null);
+    const assignment = {
+      id: 'sa-1',
+      status: 'APPROVED',
+      createdAt: new Date('2026-09-12T01:00:00Z'),
+      note: null,
+      shiftSlot: {
+        workDate: '2026-09-12',
+        startTime: '08:00:00',
+        endTime: '17:30:00',
+        workShift: { shiftName: 'Ca sáng', startTime: '08:00:00', endTime: '17:30:00' },
+      },
+      employee: { account: { fullName: 'A' } },
+    };
+    qbs.assignments.getMany.mockResolvedValue([assignment]);
+    qbs.changes.getMany.mockResolvedValue([
+      {
+        id: 'scr-1',
+        status: 'PENDING',
+        createdAt: new Date('2026-09-12T02:00:00Z'),
+        requestDate: '2026-09-13',
+        reason: '',
+        currentShiftId: 'sa-1',
+        requestedShiftId: 'slot-2',
+      },
+    ]);
+    service.shiftSlotRepo = {
+      createQueryBuilder: jest.fn(() =>
+        queryBuilder([
+          {
+            id: 'slot-2',
+            startTime: null,
+            endTime: null,
+            workShift: { shiftName: 'Ca chiều', startTime: '12:00:00', endTime: '21:00:00' },
+          },
+        ]),
+      ),
+    };
+
+    const result = await service.getEmployeeActivities({
+      storeId: 'store-1',
+      employeeId: 'employee-1',
+      from: '2026-09-01',
+      to: '2026-09-30',
+      ownerAccountId: 'owner-1',
+    });
+
+    const register = result.find((row: any) => row.id === 'sa-1');
+    expect(register.details.timeRange).toBe('08:00 - 17:30');
+    const change = result.find((row: any) => row.id === 'scr-1');
+    expect(change.details.currentShift).toBe('Ca sáng (08:00 - 17:30)');
+    expect(change.details.requestedShift).toBe('Ca chiều (12:00 - 21:00)');
+    expect(JSON.stringify(result)).not.toMatch(/\d{2}:\d{2}:\d{2} -/);
+  });
+});
+
+describe('activityHHmm', () => {
+  it.each([
+    ['08:00:00', '08:00'],
+    ['8:05:00', '08:05'],
+    ['21:00', '21:00'],
+    ['', ''],
+    [null, ''],
+    [undefined, ''],
+  ])('%p -> %p', (input, expected) => {
+    expect(activityHHmm(input)).toBe(expected);
   });
 });

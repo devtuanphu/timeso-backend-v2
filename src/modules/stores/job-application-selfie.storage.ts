@@ -7,7 +7,7 @@ import {
   NestInterceptor,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
-import { mkdirSync, promises as fsp } from 'fs';
+import { constants as fsConstants, mkdirSync, promises as fsp } from 'fs';
 import { diskStorage } from 'multer';
 import { join, resolve as resolvePath, sep } from 'path';
 import { Observable, catchError, from, mergeMap, throwError } from 'rxjs';
@@ -27,6 +27,15 @@ import { Observable, catchError, from, mergeMap, throwError } from 'rxjs';
  * stored value can never point outside it.
  */
 export const JOB_APPLICATION_SELFIE_DIR = './uploads-private/job-application-selfies';
+
+/**
+ * Public upload directory served at `/uploads` (account avatars live here as
+ * `/uploads/<uuid>.<ext>`, see `POST /accounts/avatar`).
+ */
+export const PUBLIC_UPLOAD_DIR = './uploads';
+
+/** URL of a file in PUBLIC_UPLOAD_DIR, in the format account avatars use. */
+export const publicUploadUrl = (filename: string): string => `/uploads/${filename}`;
 
 /** Multipart file field carrying the selfie. */
 export const JOB_APPLICATION_SELFIE_FIELD = 'selfie';
@@ -173,6 +182,51 @@ export class JobApplicationSelfieStorage {
       return false;
     } finally {
       await handle?.close().catch(() => undefined);
+    }
+  }
+
+  /** Absolute public upload directory; overridable in tests. */
+  publicDirectory = resolvePath(PUBLIC_UPLOAD_DIR);
+
+  /**
+   * Copies a stored selfie into the public upload directory under a NEW uuid
+   * filename and returns that filename, or null when the selfie name is not
+   * one we wrote or the copy fails. The private file is never moved or linked:
+   * it keeps its own retention and deletion lifecycle.
+   *
+   * Only used when an accepted applicant has no avatar; the caller owns the
+   * decision to publish, this only performs the copy.
+   */
+  async copyToPublicUpload(filename: unknown): Promise<string | null> {
+    const source = this.resolve(filename);
+    if (!source) return null;
+    const extension = (filename as string).endsWith('.png') ? '.png' : '.jpg';
+    const target = `${randomUUID()}${extension}`;
+    try {
+      await fsp.mkdir(this.publicDirectory, { recursive: true });
+      // COPYFILE_EXCL: never overwrite an existing public file.
+      await fsp.copyFile(
+        source,
+        join(this.publicDirectory, target),
+        fsConstants.COPYFILE_EXCL,
+      );
+      return target;
+    } catch (error: any) {
+      this.logger.warn(
+        `[JobApplicationSelfie] could not copy a selfie to the public uploads (${error?.code ?? 'unknown'})`,
+      );
+      return null;
+    }
+  }
+
+  /** Best-effort delete of a file `copyToPublicUpload` wrote. Never throws. */
+  async removePublicUpload(filename: unknown): Promise<boolean> {
+    if (!isSafeSelfieFilename(filename)) return false;
+    try {
+      await fsp.unlink(join(this.publicDirectory, filename));
+      return true;
+    } catch {
+      return false;
     }
   }
 

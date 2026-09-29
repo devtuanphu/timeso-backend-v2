@@ -47,6 +47,22 @@ export class ChatGroupMember extends BaseEntity {
   @Column({ type: 'bigint', nullable: true, name: 'last_read_sequence' })
   lastReadSequence: string | null;
 
+  /**
+   * Highest message sequence known to have reached one of this member's
+   * devices (fetched over HTTP or acknowledged via PATCH :id/delivered).
+   * Monotonic, never above the group's max sequence, and kept >= the read
+   * cursor. Drives the sender's "delivered" (2 grey ticks) receipt.
+   */
+  @Column({
+    type: 'bigint',
+    default: 0,
+    name: 'last_delivered_sequence',
+  })
+  lastDeliveredSequence: string;
+
+  @Column({ type: 'timestamp', nullable: true, name: 'last_delivered_at' })
+  lastDeliveredAt: Date | null;
+
   @Column({ type: 'boolean', default: true, name: 'notifications_enabled' })
   notificationsEnabled: boolean;
 

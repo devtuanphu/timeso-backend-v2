@@ -4,7 +4,15 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync, existsSync } from 'fs';
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import request from 'supertest';
@@ -441,5 +449,43 @@ describe('JobApplicationSelfieStorage', () => {
     await expect(storage.remove(NAME)).resolves.toBe(true);
     await expect(storage.remove(NAME)).resolves.toBe(false);
     await expect(storage.remove('../../etc/passwd')).resolves.toBe(false);
+  });
+
+  describe('copyToPublicUpload (O3: avatar from selfie)', () => {
+    let publicDir: string;
+    beforeEach(() => {
+      publicDir = mkdtempSync(join(tmpdir(), 'selfie-public-'));
+      storage.publicDirectory = publicDir;
+    });
+    afterEach(() => rmSync(publicDir, { recursive: true, force: true }));
+
+    it('copies under a new uuid name and leaves the private file in place', async () => {
+      writeFileSync(join(dir, PNG_NAME), PNG);
+
+      const copied = await storage.copyToPublicUpload(PNG_NAME);
+
+      expect(copied).toMatch(/^[0-9a-f-]{36}\.png$/);
+      expect(copied).not.toBe(PNG_NAME);
+      expect(readFileSync(join(publicDir, copied as string))).toEqual(PNG);
+      // Copy, not move or link: the private selfie still exists on its own.
+      expect(existsSync(join(dir, PNG_NAME))).toBe(true);
+      expect(lstatSync(join(publicDir, copied as string)).isSymbolicLink()).toBe(false);
+      await storage.remove(PNG_NAME);
+      expect(existsSync(join(publicDir, copied as string))).toBe(true);
+    });
+
+    it('returns null for unsafe names or a missing source, writing nothing', async () => {
+      await expect(storage.copyToPublicUpload('../x.jpg')).resolves.toBeNull();
+      await expect(storage.copyToPublicUpload(NAME)).resolves.toBeNull();
+      expect(readdirSync(publicDir)).toEqual([]);
+    });
+
+    it('removePublicUpload deletes only a safe name in the public directory', async () => {
+      writeFileSync(join(dir, NAME), JPEG);
+      const copied = (await storage.copyToPublicUpload(NAME)) as string;
+      await expect(storage.removePublicUpload('../x.jpg')).resolves.toBe(false);
+      await expect(storage.removePublicUpload(copied)).resolves.toBe(true);
+      expect(readdirSync(publicDir)).toEqual([]);
+    });
   });
 });

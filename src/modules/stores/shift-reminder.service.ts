@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -20,6 +20,7 @@ import {
   SHIFT_REMINDER_JOB_VERSION,
   ShiftReminderIdentity,
 } from './shift-reminder.utils';
+import { OwnerNotificationService } from './owner-notification.service';
 
 const REMINDER_DB_BATCH_SIZE = 500;
 const REMINDER_MUTATION_CONCURRENCY = 10;
@@ -83,7 +84,30 @@ export class ShiftReminderService {
     @InjectQueue('shift-reminders') private readonly reminderQueue: Queue,
     @InjectRepository(ShiftAssignment)
     private readonly assignmentRepository: Repository<ShiftAssignment>,
+    // X6: the owner's per-employee pre-shift / ending-soon alerts follow the
+    // same schedule / cancel / reconcile calls as the staff reminders.
+    @Optional()
+    private readonly ownerNotificationService?: OwnerNotificationService,
   ) {}
+
+  /** Best effort: owner alerts never fail or delay-fail staff reminders. */
+  private async syncOwnerAlerts(assignmentIds: string[]) {
+    if (!this.ownerNotificationService || !assignmentIds.length) return;
+    try {
+      await this.ownerNotificationService.syncAssignments(assignmentIds);
+    } catch {
+      this.logger.warn('Owner shift alerts could not be synced');
+    }
+  }
+
+  private async cancelOwnerAlerts(assignmentIds: string[]) {
+    if (!this.ownerNotificationService || !assignmentIds.length) return;
+    try {
+      await this.ownerNotificationService.cancelAssignments(assignmentIds);
+    } catch {
+      this.logger.warn('Owner shift alerts could not be cancelled');
+    }
+  }
 
   private async acquireReminderMutationLock(
     shiftId: string,
@@ -365,6 +389,14 @@ export class ShiftReminderService {
   }
 
   async scheduleAssignmentReminder(assignmentId: string) {
+    try {
+      return await this.scheduleStaffAssignmentReminder(assignmentId);
+    } finally {
+      await this.syncOwnerAlerts([assignmentId]);
+    }
+  }
+
+  private async scheduleStaffAssignmentReminder(assignmentId: string) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const lease = await this.acquireReminderMutationLock('', '', {
         assignmentId,
@@ -390,6 +422,14 @@ export class ShiftReminderService {
   }
 
   async scheduleAssignmentReminders(assignmentIds: string[]) {
+    try {
+      return await this.scheduleStaffAssignmentReminders(assignmentIds);
+    } finally {
+      await this.syncOwnerAlerts([...new Set(assignmentIds.filter(Boolean))]);
+    }
+  }
+
+  private async scheduleStaffAssignmentReminders(assignmentIds: string[]) {
     const uniqueIds = [...new Set(assignmentIds.filter(Boolean))];
     let loaded = 0;
     let enqueued = 0;
@@ -606,6 +646,7 @@ export class ShiftReminderService {
    */
   async cancelAssignmentReminders(assignmentIds: string[]) {
     const uniqueIds = [...new Set(assignmentIds.filter(Boolean))];
+    await this.cancelOwnerAlerts(uniqueIds);
     let loaded = 0;
     let cancelled = 0;
 
@@ -693,7 +734,20 @@ export class ShiftReminderService {
       .limit(limit)
       .getRawMany();
     const ids = rows.map((row) => row.id);
-    if (ids.length) await this.scheduleAssignmentReminders(ids);
+    // Staff jobs only here: owner alerts are synced once below, for the
+    // union of both candidate sets (staff 'off' does not matter to the
+    // owner, and ending-soon also covers checked-in shifts).
+    if (ids.length) await this.scheduleStaffAssignmentReminders(ids);
+    if (this.ownerNotificationService) {
+      try {
+        await this.ownerNotificationService.reconcileUpcoming(now, {
+          ...options,
+          extraAssignmentIds: ids,
+        });
+      } catch {
+        this.logger.warn('Owner shift alert reconcile failed');
+      }
+    }
     this.logger.log(
       `Upcoming reminder reconcile: candidates=${ids.length}${
         ids.length >= limit ? ' (limit reached)' : ''

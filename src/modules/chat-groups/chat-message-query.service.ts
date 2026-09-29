@@ -1,7 +1,10 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { DataSource, EntityManager } from 'typeorm';
 
-import { ChatAuthorizationService } from './chat-authorization.service';
+import {
+  ChatAuthorizationService,
+  EMPLOYED_STATUS_SQL_LIST,
+} from './chat-authorization.service';
 import { mapChatMessage } from './chat-message.mapper';
 import {
   escapeIlikePattern,
@@ -14,6 +17,7 @@ import {
   ChatMessageCursorPageDto,
   HistoryMessagesQueryDto,
   LegacyChatPaginationQueryDto,
+  MarkChatGroupDeliveredDto,
   MarkChatGroupReadDto,
   SearchChatMessagesQueryDto,
 } from './dto/chat-v2.dto';
@@ -32,8 +36,12 @@ interface GroupListCursor {
   groupId: string;
 }
 
+const maxBigInt = (left: bigint, right: bigint) => (left > right ? left : right);
+
 @Injectable()
 export class ChatMessageQueryService {
+  private readonly logger = new Logger(ChatMessageQueryService.name);
+
   constructor(
     private readonly dataSource: DataSource,
     private readonly authorization: ChatAuthorizationService,
@@ -45,7 +53,10 @@ export class ChatMessageQueryService {
     query: HistoryMessagesQueryDto,
   ): Promise<ChatMessageCursorPageDto> {
     this.assertPageSize(query.limit, 100);
-    await this.authorization.requireGroupAccess(groupId, accountId);
+    const context = await this.authorization.requireGroupAccess(
+      groupId,
+      accountId,
+    );
     if (query.beforeSequence) {
       parseChatSequence(query.beforeSequence, 'beforeSequence', false);
     }
@@ -68,6 +79,12 @@ export class ChatMessageQueryService {
       .getMany();
     const hasMore = rows.length > query.limit;
     const selected = rows.slice(0, query.limit).reverse();
+    await this.markFetchedAsDelivered(
+      groupId,
+      accountId,
+      context?.member?.lastDeliveredSequence,
+      selected,
+    );
 
     return {
       data: selected.map(mapChatMessage),
@@ -83,7 +100,10 @@ export class ChatMessageQueryService {
     query: CatchUpMessagesQueryDto,
   ): Promise<ChatMessageCursorPageDto> {
     this.assertPageSize(query.limit, 100);
-    await this.authorization.requireGroupAccess(groupId, accountId);
+    const context = await this.authorization.requireGroupAccess(
+      groupId,
+      accountId,
+    );
     parseChatSequence(query.afterSequence, 'afterSequence', true);
 
     const rows = await this.dataSource
@@ -99,6 +119,12 @@ export class ChatMessageQueryService {
       .getMany();
     const hasMore = rows.length > query.limit;
     const selected = rows.slice(0, query.limit);
+    await this.markFetchedAsDelivered(
+      groupId,
+      accountId,
+      context?.member?.lastDeliveredSequence,
+      selected,
+    );
 
     return {
       data: selected.map(mapChatMessage),
@@ -195,48 +221,48 @@ export class ChatMessageQueryService {
   ): Promise<{ groupId: string; lastReadSequence: string; updatedAt: string }> {
     return this.dataSource.transaction(async (manager) => {
       await this.authorization.requireGroupAccess(groupId, accountId, manager);
-      const maximumRow = await manager
-        .getRepository(ChatMessage)
-        .createQueryBuilder('message')
-        .select('COALESCE(MAX(message.sequence), 0)', 'maximum')
-        .where('message.groupId = :groupId', { groupId })
-        .andWhere('message.sequence IS NOT NULL')
-        .getRawOne<{ maximum: string }>();
-      const maximum = BigInt(maximumRow?.maximum || '0');
+      const maximum = await this.getMaximumSequence(manager, groupId);
       const requested = dto.sequence
         ? parseChatSequence(dto.sequence, 'sequence', true)
         : maximum;
       const target = requested > maximum ? maximum : requested;
 
       const members = manager.getRepository(ChatGroupMember);
-      const member = await members.findOne({
-        where: { groupId, accountId, status: 'active' },
-        lock: { mode: 'pessimistic_write' },
-      });
-      if (!member) {
-        await this.authorization.requireGroupAccess(groupId, accountId, manager);
-        throw new Error('CHAT_MEMBER_STATE_CHANGED');
-      }
+      const member = await this.lockActiveMember(manager, groupId, accountId);
       const current = BigInt(member.lastReadSequence || '0');
-      const next = target > current ? target : current;
+      const next = maxBigInt(target, current);
       const updatedAt = new Date();
 
       if (next > current || member.lastReadSequence === null) {
         member.lastReadSequence = next.toString();
         member.lastReadAt = updatedAt;
+        // Read implies delivered: keep delivered >= read so a sender never
+        // sees "read" without "delivered".
+        const deliveredBefore = BigInt(member.lastDeliveredSequence || '0');
+        const deliveredChanged = next > deliveredBefore;
+        if (deliveredChanged) {
+          member.lastDeliveredSequence = next.toString();
+          member.lastDeliveredAt = updatedAt;
+        }
         await members.save(member);
-        await manager.getRepository(ChatOutboxEvent).save(
-          manager.getRepository(ChatOutboxEvent).create({
-            eventType: ChatOutboxEventType.READ_UPDATED_V1,
-            groupId,
-            messageId: null,
-            actorAccountId: accountId,
-            sequence: next.toString(),
-            status: ChatOutboxStatus.PENDING,
-            attemptCount: 0,
-            availableAt: updatedAt,
-          }),
+        await this.enqueueCursorEvent(
+          manager,
+          ChatOutboxEventType.READ_UPDATED_V1,
+          groupId,
+          accountId,
+          next,
+          updatedAt,
         );
+        if (deliveredChanged) {
+          await this.enqueueDeliveredEvent(
+            manager,
+            groupId,
+            accountId,
+            deliveredBefore,
+            next,
+            updatedAt,
+          );
+        }
       }
 
       return {
@@ -245,6 +271,224 @@ export class ChatMessageQueryService {
         updatedAt: updatedAt.toISOString(),
       };
     });
+  }
+
+  /**
+   * Advance the caller's delivered cursor (Zalo-style "đã nhận"). Monotonic:
+   * a lower sequence is a no-op, a higher one is clamped to the group's
+   * current maximum. Only a change writes and emits DELIVERED_UPDATED_V1.
+   */
+  async advanceDeliveredCursor(
+    groupId: string,
+    accountId: string,
+    dto: MarkChatGroupDeliveredDto,
+  ): Promise<{
+    groupId: string;
+    lastDeliveredSequence: string;
+    updatedAt: string;
+  }> {
+    const requested = parseChatSequence(dto.sequence, 'sequence', true);
+    return this.dataSource.transaction(async (manager) => {
+      await this.authorization.requireGroupAccess(groupId, accountId, manager);
+      return this.advanceDeliveredWithin(manager, groupId, accountId, requested);
+    });
+  }
+
+  private async advanceDeliveredWithin(
+    manager: EntityManager,
+    groupId: string,
+    accountId: string,
+    requested: bigint,
+  ) {
+    const maximum = await this.getMaximumSequence(manager, groupId);
+    const target = requested > maximum ? maximum : requested;
+    const member = await this.lockActiveMember(manager, groupId, accountId);
+    const current = maxBigInt(
+      BigInt(member.lastDeliveredSequence || '0'),
+      BigInt(member.lastReadSequence || '0'),
+    );
+    const next = maxBigInt(target, current);
+    const updatedAt = new Date();
+    const before = BigInt(member.lastDeliveredSequence || '0');
+    if (next > before) {
+      member.lastDeliveredSequence = next.toString();
+      member.lastDeliveredAt = updatedAt;
+      await manager.getRepository(ChatGroupMember).save(member);
+      await this.enqueueDeliveredEvent(
+        manager,
+        groupId,
+        accountId,
+        before,
+        next,
+        updatedAt,
+      );
+    }
+    return {
+      groupId,
+      lastDeliveredSequence: next.toString(),
+      updatedAt: updatedAt.toISOString(),
+    };
+  }
+
+  /**
+   * Messages returned to a member's own client have reached that device:
+   * advance their delivered cursor to the highest sequence in the page.
+   * Best effort — a receipt failure must never fail the read itself — and
+   * skipped without a write when the cursor is already there.
+   */
+  private async markFetchedAsDelivered(
+    groupId: string,
+    accountId: string,
+    knownDelivered: string | null | undefined,
+    messages: Array<Pick<ChatMessage, 'sequence'>>,
+  ): Promise<void> {
+    let highest = 0n;
+    for (const message of messages) {
+      if (message.sequence) highest = maxBigInt(highest, BigInt(message.sequence));
+    }
+    if (highest === 0n) return;
+    if (knownDelivered && BigInt(knownDelivered) >= highest) return;
+    await this.markDeliveredUpTo(groupId, accountId, highest);
+  }
+
+  /** Best-effort delivered advance for fetch paths (also used by the legacy list). */
+  async markDeliveredUpTo(
+    groupId: string,
+    accountId: string,
+    sequence: bigint,
+  ): Promise<void> {
+    try {
+      await this.dataSource.transaction((manager) =>
+        this.advanceDeliveredWithin(manager, groupId, accountId, sequence),
+      );
+    } catch {
+      this.logger.warn('Chat delivered cursor advance after fetch failed');
+    }
+  }
+
+  private async getMaximumSequence(
+    manager: EntityManager,
+    groupId: string,
+  ): Promise<bigint> {
+    const maximumRow = await manager
+      .getRepository(ChatMessage)
+      .createQueryBuilder('message')
+      .select('COALESCE(MAX(message.sequence), 0)', 'maximum')
+      .where('message.groupId = :groupId', { groupId })
+      .andWhere('message.sequence IS NOT NULL')
+      .getRawOne<{ maximum: string }>();
+    return BigInt(maximumRow?.maximum || '0');
+  }
+
+  private async lockActiveMember(
+    manager: EntityManager,
+    groupId: string,
+    accountId: string,
+  ): Promise<ChatGroupMember> {
+    const member = await manager.getRepository(ChatGroupMember).findOne({
+      where: { groupId, accountId, status: 'active' },
+      lock: { mode: 'pessimistic_write' },
+    });
+    if (!member) {
+      await this.authorization.requireGroupAccess(groupId, accountId, manager);
+      throw new Error('CHAT_MEMBER_STATE_CHANGED');
+    }
+    return member;
+  }
+
+  /**
+   * DELIVERED_UPDATED_V1 is coalesced to keep the fan-out linear:
+   *  (a) nothing is queued unless (previous, next] holds at least one live
+   *      message sent by someone else — the only messages whose ticks change;
+   *  (b) the row records the range start, so the dispatcher sends the event
+   *      only to the senders of messages in that range (the only accounts
+   *      that render ticks for them);
+   *  (c) an undispatched (pending) row of the same member and group is
+   *      extended in place instead of queueing another one.
+   * GET /chat-groups/:id/receipts stays the source of truth.
+   */
+  private async enqueueDeliveredEvent(
+    manager: EntityManager,
+    groupId: string,
+    accountId: string,
+    previous: bigint,
+    next: bigint,
+    at: Date,
+  ): Promise<void> {
+    if (next <= previous) return;
+    const othersInRange: unknown[] = await manager.query(
+      `SELECT 1
+       FROM chat_messages
+       WHERE group_id = $1
+         AND sequence > $2::bigint
+         AND sequence <= $3::bigint
+         AND sender_id <> $4
+         AND deleted_at IS NULL
+       LIMIT 1`,
+      [groupId, previous.toString(), next.toString(), accountId],
+    );
+    if (!othersInRange?.length) return;
+
+    const merged: unknown = await manager.query(
+      `UPDATE chat_outbox_events
+       SET sequence = GREATEST(sequence, $3::bigint),
+           range_start_sequence = LEAST(
+             COALESCE(range_start_sequence, $4::bigint),
+             $4::bigint
+           ),
+           updated_at = NOW()
+       WHERE group_id = $1
+         AND actor_account_id = $2
+         AND event_type = 'DELIVERED_UPDATED_V1'
+         AND status = 'pending'
+         AND deleted_at IS NULL
+       RETURNING id`,
+      [groupId, accountId, next.toString(), previous.toString()],
+    );
+    // UPDATE ... RETURNING comes back as [rows, count] from TypeORM's
+    // PostgreSQL runner; a plain array from other runners / mocks.
+    const mergedRows = Array.isArray(merged) && Array.isArray(merged[0])
+      ? (merged[0] as unknown[])
+      : (merged as unknown[]);
+    if (Array.isArray(mergedRows) && mergedRows.length > 0) return;
+
+    const outbox = manager.getRepository(ChatOutboxEvent);
+    await outbox.save(
+      outbox.create({
+        eventType: ChatOutboxEventType.DELIVERED_UPDATED_V1,
+        groupId,
+        messageId: null,
+        actorAccountId: accountId,
+        sequence: next.toString(),
+        rangeStartSequence: previous.toString(),
+        status: ChatOutboxStatus.PENDING,
+        attemptCount: 0,
+        availableAt: at,
+      }),
+    );
+  }
+
+  private async enqueueCursorEvent(
+    manager: EntityManager,
+    eventType: ChatOutboxEventType.READ_UPDATED_V1,
+    groupId: string,
+    accountId: string,
+    sequence: bigint,
+    at: Date,
+  ): Promise<void> {
+    const outbox = manager.getRepository(ChatOutboxEvent);
+    await outbox.save(
+      outbox.create({
+        eventType,
+        groupId,
+        messageId: null,
+        actorAccountId: accountId,
+        sequence: sequence.toString(),
+        status: ChatOutboxStatus.PENDING,
+        attemptCount: 0,
+        availableAt: at,
+      }),
+    );
   }
 
   async getAuthorizedGroupListV2(
@@ -346,7 +590,7 @@ export class ChatMessageQueryService {
        WHERE membership.account_id = $1
          AND membership.status = 'active'
          AND membership.deleted_at IS NULL
-         AND (store.owner_account_id = $1 OR employee.employment_status != 'terminated')
+         AND (store.owner_account_id = $1 OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))
          ${storeClause}
          ${cursorClause}
        ORDER BY "activityAt" DESC, chat_group.id DESC
@@ -461,7 +705,7 @@ export class ChatMessageQueryService {
        WHERE membership.account_id = $1
          AND membership.status = 'active'
          AND membership.deleted_at IS NULL
-         AND (store.owner_account_id = $1 OR employee.employment_status != 'terminated')`,
+         AND (store.owner_account_id = $1 OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))`,
       [accountId],
     );
     return { totalUnread: Number(rows[0]?.totalUnread || 0) };

@@ -139,6 +139,13 @@ export class MarkChatGroupReadDto {
   sequence?: string;
 }
 
+/** PATCH /chat-groups/:id/delivered — highest sequence that reached the device. */
+export class MarkChatGroupDeliveredDto {
+  @IsString()
+  @Matches(/^(0|[1-9]\d{0,18})$/)
+  sequence: string;
+}
+
 export class ChatSenderResponseDto {
   id: string;
   fullName: string | null;

@@ -15,6 +15,7 @@ import { ChatMessage } from './chat-message.entity';
 export enum ChatOutboxEventType {
   MESSAGE_CREATED_V1 = 'MESSAGE_CREATED_V1',
   READ_UPDATED_V1 = 'READ_UPDATED_V1',
+  DELIVERED_UPDATED_V1 = 'DELIVERED_UPDATED_V1',
 }
 
 export enum ChatOutboxStatus {
@@ -35,7 +36,7 @@ export enum ChatPushIntentStatus {
 @Check(
   'ck_chat_outbox_event_identity',
   `("event_type" = 'MESSAGE_CREATED_V1' AND "message_id" IS NOT NULL AND "actor_account_id" IS NOT NULL AND "sequence" IS NOT NULL)
-   OR ("event_type" = 'READ_UPDATED_V1' AND "message_id" IS NULL AND "actor_account_id" IS NOT NULL AND "sequence" IS NOT NULL)`,
+   OR ("event_type" IN ('READ_UPDATED_V1', 'DELIVERED_UPDATED_V1') AND "message_id" IS NULL AND "actor_account_id" IS NOT NULL AND "sequence" IS NOT NULL)`,
 )
 @Index('ux_chat_outbox_message_created', ['messageId', 'eventType'], {
   unique: true,
@@ -83,6 +84,14 @@ export class ChatOutboxEvent extends BaseEntity {
 
   @Column({ type: 'bigint', nullable: true })
   sequence: string | null;
+
+  /**
+   * DELIVERED_UPDATED_V1 only: the member's delivered cursor before the
+   * advance. The event goes to senders of messages in
+   * (range_start_sequence, sequence].
+   */
+  @Column({ type: 'bigint', nullable: true, name: 'range_start_sequence' })
+  rangeStartSequence: string | null;
 
   @Column({ type: 'enum', enum: ChatOutboxStatus, default: ChatOutboxStatus.PENDING })
   status: ChatOutboxStatus;

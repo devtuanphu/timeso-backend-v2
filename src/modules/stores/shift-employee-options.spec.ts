@@ -196,6 +196,94 @@ describe('Shift employee options', () => {
     );
   });
 
+  it('lists each option\'s saved shifts on the date as otherShifts (O4a)', async () => {
+    const service = createService('owner-1', [
+      {
+        employeeId: 'other-shift',
+        status: ShiftAssignmentStatus.APPROVED,
+        shiftSlot: {
+          workDate,
+          startTime: '12:00:00',
+          endTime: '21:00:00',
+          workShift: { shiftName: 'Ca chiều' },
+        } as any,
+      },
+      {
+        employeeId: 'conflict',
+        status: ShiftAssignmentStatus.APPROVED,
+        shiftSlot: { workDate, startTime: '08:00:00', endTime: '12:00:00' },
+      },
+      // Previous day, not overnight: not relevant to this date.
+      {
+        employeeId: 'available',
+        status: ShiftAssignmentStatus.APPROVED,
+        shiftSlot: {
+          workDate: addDays(workDate, -1),
+          startTime: '08:00',
+          endTime: '12:00',
+        },
+      },
+    ]);
+
+    const result = await service.getShiftEmployeeOptions('store-1', 'owner-1', payload);
+    const byId = Object.fromEntries(
+      result.employees.map((employee) => [employee.id, employee]),
+    );
+
+    expect(byId['other-shift'].availability).toBe('OTHER_SHIFT');
+    expect(byId['other-shift'].otherShifts).toEqual([
+      {
+        shiftName: 'Ca chiều',
+        workDate,
+        startTime: '12:00',
+        endTime: '21:00',
+        overlaps: false,
+      },
+    ]);
+    expect(byId.conflict.availability).toBe('CONFLICT');
+    expect(byId.conflict.otherShifts).toEqual([
+      {
+        shiftName: 'Ca làm',
+        workDate,
+        startTime: '08:00',
+        endTime: '12:00',
+        overlaps: true,
+      },
+    ]);
+    // Existing bucket semantics unchanged; no noise for unrelated days.
+    expect(byId.available.availability).toBe('AVAILABLE');
+    expect(byId.available.otherShifts).toEqual([]);
+    expect(byId['on-leave'].otherShifts).toEqual([]);
+  });
+
+  it('otherShifts includes an adjacent-day overnight shift only when it overlaps', async () => {
+    const service = createService('owner-1', [
+      {
+        employeeId: 'available',
+        status: ShiftAssignmentStatus.APPROVED,
+        shiftSlot: {
+          workDate: addDays(workDate, -1),
+          startTime: '22:00',
+          endTime: '08:00',
+        },
+      },
+    ]);
+
+    const result = await service.getShiftEmployeeOptions('store-1', 'owner-1', payload);
+    const option = result.employees.find((employee) => employee.id === 'available');
+
+    expect(option?.availability).toBe('CONFLICT');
+    expect(option?.otherShifts).toEqual([
+      {
+        shiftName: 'Ca làm',
+        workDate: addDays(workDate, -1),
+        startTime: '22:00',
+        endTime: '08:00',
+        overlaps: true,
+      },
+    ]);
+  });
+
   it('rejects access from a different owner', async () => {
     await expect(
       createService('owner-2').getShiftEmployeeOptions(

@@ -35,6 +35,7 @@ import {
   JobApplicationSelfieStorage,
   UploadedSelfie,
   jobApplicationSelfieUrl,
+  publicUploadUrl,
   selfieContentType,
   selfieInvalid,
 } from './job-application-selfie.storage';
@@ -442,6 +443,7 @@ export class JobApplicationService {
     const employeeProfileId: string | undefined = employee?.profile?.id;
 
     await this.backfillAccountIdentity(application);
+    await this.backfillAccountAvatarFromSelfie(application);
 
     // The durable outcome — employee hired, application ACCEPTED — is already
     // achieved. Recording the link and notifying are bookkeeping: a failure in
@@ -977,6 +979,46 @@ export class JobApplicationService {
       // hire has already committed and must not be reported as failed.
       this.logger.warn(
         `[JobApplication] ${application.id}: hired but could not backfill account identity: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * On acceptance, gives an account without an avatar a public copy of the
+   * application selfie as its avatar.
+   *
+   * The private selfie is COPIED (new uuid filename in the public uploads
+   * directory), never moved or linked, so its own retention/deletion is
+   * unaffected. The write is conditional (`setAvatarIfEmpty`), so an avatar
+   * the user set meanwhile is never replaced; the orphan copy is then removed.
+   * Best-effort: the hire has already committed and must not be reported as
+   * failed.
+   */
+  private async backfillAccountAvatarFromSelfie(application: JobApplication) {
+    if (!application.selfiePath) return;
+    let copied: string | null = null;
+    try {
+      const account = await this.accountsService.findById(application.accountId);
+      if (!account || account.avatar?.trim()) return;
+
+      copied = await this.selfieStorage.copyToPublicUpload(application.selfiePath);
+      if (!copied) return;
+
+      const written = await this.accountsService.setAvatarIfEmpty(
+        application.accountId,
+        publicUploadUrl(copied),
+      );
+      if (!written) {
+        await this.selfieStorage.removePublicUpload(copied);
+      }
+    } catch (error) {
+      if (copied) await this.selfieStorage.removePublicUpload(copied);
+      // No filename or account id in the log: it would tie a face photo to a
+      // person.
+      this.logger.warn(
+        `[JobApplication] ${application.id}: hired but could not set the avatar from the selfie: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );

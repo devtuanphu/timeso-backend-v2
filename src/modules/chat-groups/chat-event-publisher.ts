@@ -15,6 +15,14 @@ export interface ChatReadUpdatedEvent {
   updatedAt: string;
 }
 
+export interface ChatDeliveredUpdatedEvent {
+  version: 1;
+  groupId: string;
+  accountId: string;
+  lastDeliveredSequence: string;
+  updatedAt: string;
+}
+
 export interface ChatTypingEvent {
   version: 1;
   groupId: string;
@@ -30,6 +38,10 @@ export interface ChatEventPublisher {
   ): Promise<void>;
   publishReadUpdated(
     event: ChatReadUpdatedEvent,
+    recipientAccountIds: string[],
+  ): Promise<void>;
+  publishDeliveredUpdated(
+    event: ChatDeliveredUpdatedEvent,
     recipientAccountIds: string[],
   ): Promise<void>;
   publishTyping(

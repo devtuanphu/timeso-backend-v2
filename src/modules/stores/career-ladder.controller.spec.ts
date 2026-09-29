@@ -38,6 +38,14 @@ function build() {
         return { id: storeId, ownerAccountId: OWNER };
       },
     ),
+    // Owner-or-self on the profile (EMPLOYEE owns PROFILE).
+    assertEmployeeRecordAccess: jest.fn(
+      async (_profileId: string, accountId: string) => {
+        if (accountId === OWNER) return { profile: {}, isOwner: true };
+        if (accountId === EMPLOYEE) return { profile: {}, isOwner: false };
+        throw new ForbiddenException('Bạn chỉ có thể xem lộ trình của chính mình');
+      },
+    ),
   };
   const careerLadderService = {
     storeIdOfProfile: jest.fn().mockResolvedValue(STORE),
@@ -152,11 +160,6 @@ describe('lộ trình — chỉ chủ cửa hàng mới được thao tác', () 
       'setRungNextRungs',
       (c: any) => c.setRungNextRungs(STORE, 'rung-1', {}, asEmployee),
     ],
-    ['getCareerHistory', (c: any) => c.getCareerHistory(PROFILE, asEmployee)],
-    [
-      'getNextRungs',
-      (c: any) => c.getNextRungs(PROFILE, 'ladder-1', asEmployee),
-    ],
     ['advanceEmployee', (c: any) => c.advanceEmployee(PROFILE, {}, asEmployee)],
     [
       'getCapabilityEntries',
@@ -169,6 +172,20 @@ describe('lộ trình — chỉ chủ cửa hàng mới được thao tác', () 
   ])('%s từ chối nhân viên', async (_name, call) => {
     const { controller } = build();
     await expect(call(controller)).rejects.toThrow(ForbiddenException);
+  });
+
+  // Nhân viên được ĐỌC lịch sử và bậc kế tiếp của chính mình (chủ-hoặc-chính-
+  // mình); đồng nghiệp vẫn bị từ chối, và mọi thao tác ghi vẫn chỉ cho chủ.
+  it.each([
+    ['getCareerHistory', (c: any, u: any) => c.getCareerHistory(PROFILE, u)],
+    ['getNextRungs', (c: any, u: any) => c.getNextRungs(PROFILE, 'ladder-1', u)],
+  ])('%s: chính nhân viên đọc được, đồng nghiệp bị từ chối', async (_name, call) => {
+    const { controller } = build();
+    await expect(call(controller, asEmployee)).resolves.toBeDefined();
+    await expect(call(controller, asOwner)).resolves.toBeDefined();
+    await expect(
+      call(controller, { userId: 'account-coworker' }),
+    ).rejects.toThrow(ForbiddenException);
   });
 
   // Route tóm tắt dành cho app nhân viên: không dùng kiểm chủ, mà kiểm

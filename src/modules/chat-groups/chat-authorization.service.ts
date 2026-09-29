@@ -1,17 +1,28 @@
 import { Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { EntityManager, Not, Repository } from 'typeorm';
+import { EntityManager, In, Repository } from 'typeorm';
 
 import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import {
+  EMPLOYED_STATUSES,
   EmployeeProfile,
-  EmploymentStatus,
 } from '../stores/entities/employee-profile.entity';
 import { Store, StoreStatus } from '../stores/entities/store.entity';
 import { UserDevice } from '../devices/entities/user-device.entity';
 import { chatAccessDenied } from './chat-errors';
 import { ChatGroupMember } from './entities/chat-group-member.entity';
 import { ChatGroup } from './entities/chat-group.entity';
+
+/**
+ * SQL list literal of the employed statuses, for raw chat queries.
+ *
+ * Chat membership must follow the same whitelist as the rest of the store:
+ * a PENDING applicant and a TERMINATED ex-employee are not members. Built from
+ * the enum constants only (never user input), so inlining is injection-safe.
+ */
+export const EMPLOYED_STATUS_SQL_LIST = EMPLOYED_STATUSES.map(
+  (status) => `'${status}'`,
+).join(', ');
 
 export interface AuthorizedChatContext {
   group: ChatGroup;
@@ -84,7 +95,7 @@ export class ChatAuthorizationService {
         where: {
           storeId: group.storeId,
           accountId,
-          employmentStatus: Not(EmploymentStatus.TERMINATED),
+          employmentStatus: In([...EMPLOYED_STATUSES]),
         },
       });
       if (!employee) {
@@ -155,8 +166,8 @@ export class ChatAuthorizationService {
       .andWhere('employee.accountId IN (:...accountIds)', {
         accountIds: staffIds,
       })
-      .andWhere('employee.employmentStatus != :terminated', {
-        terminated: EmploymentStatus.TERMINATED,
+      .andWhere('employee.employmentStatus IN (:...employedStatuses)', {
+        employedStatuses: [...EMPLOYED_STATUSES],
       })
       .getRawMany<{ accountId: string }>();
 
@@ -175,6 +186,35 @@ export class ChatAuthorizationService {
     if (accountCount !== uniqueIds.length) {
       throw chatAccessDenied();
     }
+  }
+
+  /**
+   * Of `accountIds`, the staff accounts currently employed at `storeId`.
+   *
+   * Used to hide stale memberships (PENDING / TERMINATED profile) from member
+   * lists; the store owner is not an employee and must be handled by callers.
+   */
+  async getEmployedAccountIds(
+    storeId: string,
+    accountIds: string[],
+    manager?: EntityManager,
+  ): Promise<Set<string>> {
+    const uniqueIds = [...new Set(accountIds)];
+    if (uniqueIds.length === 0) return new Set();
+    const employees =
+      manager?.getRepository(EmployeeProfile) || this.employeeRepository;
+    const rows = await employees
+      .createQueryBuilder('employee')
+      .select('employee.accountId', 'accountId')
+      .where('employee.storeId = :storeId', { storeId })
+      .andWhere('employee.accountId IN (:...accountIds)', {
+        accountIds: uniqueIds,
+      })
+      .andWhere('employee.employmentStatus IN (:...employedStatuses)', {
+        employedStatuses: [...EMPLOYED_STATUSES],
+      })
+      .getRawMany<{ accountId: string }>();
+    return new Set(rows.map((row) => row.accountId));
   }
 
   async getEligibleRecipientAccountIds(
@@ -202,8 +242,8 @@ export class ChatAuthorizationService {
         storeStatus: StoreStatus.ACTIVE,
       })
       .andWhere(
-        '(store.owner_account_id = member.account_id OR employee.employment_status != :terminated)',
-        { terminated: EmploymentStatus.TERMINATED },
+        '(store.owner_account_id = member.account_id OR employee.employment_status IN (:...employedStatuses))',
+        { employedStatuses: [...EMPLOYED_STATUSES] },
       )
       .getRawMany<{ accountId: string }>();
 
@@ -246,7 +286,7 @@ export class ChatAuthorizationService {
          AND member.deleted_at IS NULL
          AND member.notifications_enabled = true
          AND (store.owner_account_id = member.account_id
-              OR employee.employment_status != 'terminated')`,
+              OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))`,
       [groupId, senderAccountId],
     );
     return rows as EligibleChatPushDevice[];
@@ -288,7 +328,7 @@ export class ChatAuthorizationService {
          AND member.deleted_at IS NULL
          AND member.notifications_enabled = true
          AND (store.owner_account_id = member.account_id
-              OR employee.employment_status != 'terminated')
+              OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))
          AND device.user_id = member.account_id::text
          AND device.device_id = $4
          AND device.push_token_fingerprint = $5

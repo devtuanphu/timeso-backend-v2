@@ -19,14 +19,21 @@ import { ChatMessage } from './entities/chat-message.entity';
 import { CreateChatGroupDto } from './dto/create-chat-group.dto';
 import { SendMessageDto } from './dto/send-message.dto';
 import { UpdateChatGroupDto } from './dto/update-chat-group.dto';
-import { ChatAuthorizationService } from './chat-authorization.service';
+import {
+  ChatAuthorizationService,
+  EMPLOYED_STATUS_SQL_LIST,
+} from './chat-authorization.service';
 import {
   chatAccessDenied,
   directChatImmutable,
   directChatInvalidTarget,
 } from './chat-errors';
 import { validateChatGroupName } from './chat-message.utils';
-import { mapActiveChatMember } from './chat-member.mapper';
+import {
+  ChatMemberReceipt,
+  mapActiveChatMember,
+  mapChatMemberReceipt,
+} from './chat-member.mapper';
 import { Store, StoreStatus } from '../stores/entities/store.entity';
 
 /** Số người tối đa trả về cho ô tìm kiếm người đã chat chung. */
@@ -245,7 +252,7 @@ export class ChatGroupsService {
                 AND mine.status = 'active'
                 AND mine.deleted_at IS NULL
                 AND (store.owner_account_id = other.account_id
-                     OR employee.employment_status <> 'terminated')
+                     OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))
            ) contact
           ORDER BY contact."fullName" ASC
           LIMIT ${CHAT_CONTACTS_LIMIT}`,
@@ -422,11 +429,15 @@ export class ChatGroupsService {
     });
 
     if (!group) throw new ForbiddenException('CHAT_ACCESS_DENIED');
-    const members = await this.chatGroupMemberRepository.find({
-      where: { groupId, status: 'active' },
-      relations: ['account'],
-      order: { createdAt: 'ASC' },
-    });
+    const members = await this.filterEmployedMembers(
+      await this.chatGroupMemberRepository.find({
+        where: { groupId, status: 'active' },
+        relations: ['account'],
+        order: { createdAt: 'ASC' },
+      }),
+      context.group.storeId,
+      context.group.store.ownerAccountId,
+    );
 
     // Chat riêng: tên và ảnh là của người kia (kể cả khi người đó đã rời).
     let name = group.name;
@@ -694,8 +705,64 @@ export class ChatGroupsService {
       order: { createdAt: 'ASC' },
     });
 
-    return members.map((member) =>
-      mapActiveChatMember(member, context.group.store.ownerAccountId),
+    const ownerAccountId = context.group.store.ownerAccountId;
+    const visible = await this.filterEmployedMembers(
+      members,
+      context.group.storeId,
+      ownerAccountId,
+    );
+    return visible.map((member) => mapActiveChatMember(member, ownerAccountId));
+  }
+
+  /**
+   * Per-member delivered/read cursors for the sender's receipt ticks. Only
+   * the caller's own group (member-only) and only eligible members (owner or
+   * employed staff) — the same set a message is delivered to.
+   */
+  async getGroupReceipts(
+    groupId: string,
+    userId: string,
+  ): Promise<{ groupId: string; members: ChatMemberReceipt[] }> {
+    const context = await this.authorization.requireGroupAccess(groupId, userId);
+    const members = await this.chatGroupMemberRepository.find({
+      where: { groupId, status: 'active' },
+      select: {
+        id: true,
+        accountId: true,
+        lastReadSequence: true,
+        lastDeliveredSequence: true,
+        createdAt: true,
+      },
+      order: { createdAt: 'ASC' },
+    });
+    const visible = await this.filterEmployedMembers(
+      members,
+      context.group.storeId,
+      context.group.store.ownerAccountId,
+    );
+    return { groupId, members: visible.map(mapChatMemberReceipt) };
+  }
+
+  /**
+   * A membership row can outlive the employment it was granted for (legacy
+   * terminations did not clean chat rows). Only the owner and staff whose
+   * profile at the group's store is employed are listed as members.
+   */
+  private async filterEmployedMembers(
+    members: ChatGroupMember[],
+    storeId: string,
+    ownerAccountId: string,
+  ): Promise<ChatGroupMember[]> {
+    const staffIds = members
+      .map((member) => member.accountId)
+      .filter((accountId) => accountId !== ownerAccountId);
+    const employed = await this.authorization.getEmployedAccountIds(
+      storeId,
+      staffIds,
+    );
+    return members.filter(
+      (member) =>
+        member.accountId === ownerAccountId || employed.has(member.accountId),
     );
   }
 

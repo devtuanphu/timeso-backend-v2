@@ -1008,8 +1008,10 @@ describe('ShiftReminderService.reconcileUpcomingReminders (backfill)', () => {
     const service = new ShiftReminderService({} as any, {
       createQueryBuilder: jest.fn(() => qb),
     } as any);
+    // The reconcile schedules staff jobs only; owner alerts are synced once
+    // by OwnerNotificationService.reconcileUpcoming.
     const schedule = jest
-      .spyOn(service, 'scheduleAssignmentReminders')
+      .spyOn(service as any, 'scheduleStaffAssignmentReminders')
       .mockResolvedValue({} as any);
     return { service, qb, schedule };
   };

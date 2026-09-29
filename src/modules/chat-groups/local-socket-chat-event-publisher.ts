@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 
 import {
+  ChatDeliveredUpdatedEvent,
   ChatEventPublisher,
   ChatMessageCreatedEvent,
   ChatReadUpdatedEvent,
@@ -55,6 +56,23 @@ export class LocalSocketChatEventPublisher implements ChatEventPublisher {
           sequence: event.lastReadSequence,
         });
       }
+    }
+  }
+
+  /**
+   * V2 only: released legacy clients have no delivered receipt, so there is
+   * no legacy counterpart to emit.
+   */
+  async publishDeliveredUpdated(
+    event: ChatDeliveredUpdatedEvent,
+    recipientAccountIds: string[],
+  ): Promise<void> {
+    const v2 = this.readiness.getServer('v2');
+    if (!v2 || !this.readiness.isActive()) {
+      throw new Error('CHAT_REALTIME_NOT_READY');
+    }
+    for (const accountId of recipientAccountIds) {
+      v2.to(`account:${accountId}`).emit('chat.delivered.updated.v1', event);
     }
   }
 

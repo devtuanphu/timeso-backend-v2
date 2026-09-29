@@ -6,6 +6,8 @@ import { StoresController } from '../src/modules/stores/stores.controller';
 import { StoresService } from '../src/modules/stores/stores.service';
 import { StoreAccessGuard } from '../src/modules/stores/guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../src/modules/stores/guards/store-resource-access.guard';
+import { StoreOwnerOnlyGuard } from '../src/modules/stores/guards/store-owner-only.guard';
+import { CareerLadderService } from '../src/modules/stores/career-ladder.service';
 import { AccountsService } from '../src/modules/accounts/accounts.service';
 import { MailService } from '../src/modules/mail/mail.service';
 import { JwtAuthGuard } from '../src/modules/auth/guards/jwt-auth.guard';
@@ -142,6 +144,8 @@ describe('Attendance flow (e2e)', () => {
         { provide: AccountsService, useValue: {} },
         { provide: MailService, useValue: {} },
         { provide: ShiftEndWorkflowService, useValue: shiftEndWorkflowService },
+        // StoresController's career-ladder dependency; unused by this suite.
+        { provide: CareerLadderService, useValue: {} },
         { provide: getQueueToken('attendance-background'), useValue: queue },
       ],
     })
@@ -154,6 +158,12 @@ describe('Attendance flow (e2e)', () => {
       .overrideGuard(StoreAccessGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      // StoreOwnerOnlyGuard reads the store owner through DataSource; these
+      // suites have no database, so owner-only metadata is stubbed open here
+      // (the guard has its own unit tests; owner checks in the services
+      // still run).
+      .overrideGuard(StoreOwnerOnlyGuard)
       .useValue({ canActivate: () => true })
       .compile();
 
@@ -346,10 +356,25 @@ describe('Attendance flow (e2e)', () => {
     service.dataSource = {
       transaction: jest.fn((callback: any) =>
         callback({
-          getRepository: (entity: any) =>
-            entity?.name === 'EmployeeSalary'
-              ? salaryRepository
-              : payrollRepository,
+          // Payroll reads inside the transaction go through the manager;
+          // route them to the same stubs the service uses outside it
+          // (`Entity` -> `service.entityRepository`, plus the odd names).
+          getRepository: (entity: any) => {
+            const name = String(entity?.name ?? '');
+            const special: Record<string, unknown> = {
+              EmployeeSalary: salaryRepository,
+              MonthlyPayroll: payrollRepository,
+              StoreShiftConfig: service.shiftConfigRepository,
+              StorePayrollRule: service.payrollRuleRepository,
+              // No approved leave in this month.
+              EmployeeLeaveRequest: service.leaveRequestRepository ?? {
+                find: jest.fn().mockResolvedValue([]),
+              },
+            };
+            const byConvention =
+              service[`${name.charAt(0).toLowerCase()}${name.slice(1)}Repository`];
+            return special[name] ?? byConvention ?? payrollRepository;
+          },
         }),
       ),
     };

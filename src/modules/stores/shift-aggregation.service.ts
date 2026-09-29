@@ -295,6 +295,18 @@ export interface ShiftDetailResponse extends ShiftSlotResponse {
 
 // ── Service ───────────────────────────────────────────────────────────────────
 
+/**
+ * Activity feed times as `HH:mm`: Postgres `time` columns come back as
+ * `HH:mm:ss`, which the activity strings (timeRange / currentShift /
+ * requestedShift) used to show verbatim.
+ */
+export const activityHHmm = (value: unknown): string => {
+  if (value === null || value === undefined || value === '') return '';
+  const text = String(value);
+  const match = /^(\d{1,2}):(\d{2})/.exec(text);
+  return match ? `${match[1].padStart(2, '0')}:${match[2]}` : text;
+};
+
 @Injectable()
 export class ShiftAggregationService {
   constructor(
@@ -2042,7 +2054,7 @@ export class ShiftAggregationService {
       for (const a of assignments) {
         shiftLookupMap.set(a.id, {
           shiftName: a.shiftSlot?.workShift?.shiftName || 'Ca làm',
-          timeRange: `${a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || ''} - ${a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || ''}`,
+          timeRange: `${activityHHmm(a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '')} - ${activityHHmm(a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime || '')}`,
           employeeName: a.employee?.account?.fullName,
         });
       }
@@ -2062,7 +2074,7 @@ export class ShiftAggregationService {
       for (const s of slots) {
         shiftLookupMap.set(s.id, {
           shiftName: s.workShift?.shiftName || 'Ca làm',
-          timeRange: `${s.startTime || s.workShift?.startTime || ''} - ${s.endTime || s.workShift?.endTime || ''}`,
+          timeRange: `${activityHHmm(s.startTime || s.workShift?.startTime || '')} - ${activityHHmm(s.endTime || s.workShift?.endTime || '')}`,
         });
       }
     }
@@ -2096,7 +2108,7 @@ export class ShiftAggregationService {
         hasWarningIcon: false,
         details: {
           shiftName: ws?.shiftName || 'Ca làm việc',
-          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+          timeRange: slot ? `${activityHHmm(slot.startTime || ws?.startTime || '')} - ${activityHHmm(slot.endTime || ws?.endTime || '')}` : '',
           method: log.method,
         },
       });
@@ -2136,7 +2148,7 @@ export class ShiftAggregationService {
         details: {
           shiftName: ws?.shiftName || 'Ca làm việc',
           workDate: slot?.workDate || '',
-          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+          timeRange: slot ? `${activityHHmm(slot.startTime || ws?.startTime || '')} - ${activityHHmm(slot.endTime || ws?.endTime || '')}` : '',
           note: sa.note || '',
         },
       });
@@ -2238,7 +2250,7 @@ export class ShiftAggregationService {
           startTime: lr.startTime,
           endTime: lr.endTime,
           shiftName: ws?.shiftName,
-          timeRange: slot ? `${slot.startTime || ws?.startTime || ''} - ${slot.endTime || ws?.endTime || ''}` : '',
+          timeRange: slot ? `${activityHHmm(slot.startTime || ws?.startTime || '')} - ${activityHHmm(slot.endTime || ws?.endTime || '')}` : '',
         },
       });
     }

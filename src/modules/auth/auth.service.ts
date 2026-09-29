@@ -17,6 +17,7 @@ import { AccountRefreshToken, AppType } from '../accounts/entities/account-refre
 import {
   DataSource,
   EntityManager,
+  In,
   IsNull,
   LessThan,
   MoreThan,
@@ -109,7 +110,10 @@ import { MailService } from '../mail/mail.service';
 import { AccountOtp } from '../accounts/entities/account-otp.entity';
 import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import { ZaloService } from '../zalo/zalo.service';
-import { EmployeeProfile } from '../stores/entities/employee-profile.entity';
+import {
+  EMPLOYED_STATUSES,
+  EmployeeProfile,
+} from '../stores/entities/employee-profile.entity';
 import { StoresService } from '../stores/stores.service';
 import { isAppReadOnlyMode } from '../../common/utils/app-read-only-mode';
 import {
@@ -424,9 +428,17 @@ export class AuthService {
     // For staff app: include employeeProfile data
     let employeeData: any = {};
     if (appType === AppType.EMPLOYEE_APP) {
+      // Only an employed profile makes the account a store member: a PENDING
+      // applicant or TERMINATED ex-employee gets no store. An account can hold
+      // several employed profiles, so pick deterministically (most recent hire).
       const profile = await this.employeeProfileRepository.findOne({
-        where: { accountId: user.id },
+        where: { accountId: user.id, employmentStatus: In([...EMPLOYED_STATUSES]) },
         relations: ['store'],
+        order: {
+          joinedAt: { direction: 'DESC', nulls: 'LAST' },
+          updatedAt: 'DESC',
+          id: 'ASC',
+        },
       });
       if (profile) {
         employeeData = {

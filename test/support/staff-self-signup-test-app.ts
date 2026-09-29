@@ -59,6 +59,8 @@ import { ShiftEndWorkflowService } from '../../src/modules/stores/shift-end-work
 import { StoresController } from '../../src/modules/stores/stores.controller';
 import { StoreAccessGuard } from '../../src/modules/stores/guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../../src/modules/stores/guards/store-resource-access.guard';
+import { StoreOwnerOnlyGuard } from '../../src/modules/stores/guards/store-owner-only.guard';
+import { CareerLadderService } from '../../src/modules/stores/career-ladder.service';
 import { StoresService } from '../../src/modules/stores/stores.service';
 
 export const STAFF_SIGNUP_STORE_ID = '11111111-1111-4111-8111-111111111111';
@@ -513,6 +515,8 @@ export async function createStaffSignupTestApp(
         { provide: MailService, useValue: {} },
         { provide: getQueueToken('attendance-background'), useValue: {} },
         { provide: ShiftEndWorkflowService, useValue: {} },
+        // StoresController's career-ladder dependency; unused by this suite.
+        { provide: CareerLadderService, useValue: {} },
         { provide: ConfigService, useValue: configService },
         { provide: getRepositoryToken(Account), useValue: accountRepository },
         JwtStrategy,
@@ -526,6 +530,12 @@ export async function createStaffSignupTestApp(
       .overrideGuard(StoreAccessGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      // StoreOwnerOnlyGuard reads the store owner through DataSource; these
+      // suites have no database, so owner-only metadata is stubbed open here
+      // (the guard has its own unit tests; owner checks in the services
+      // still run).
+      .overrideGuard(StoreOwnerOnlyGuard)
       .useValue({ canActivate: () => true })
       .compile();
     app = module.createNestApplication();

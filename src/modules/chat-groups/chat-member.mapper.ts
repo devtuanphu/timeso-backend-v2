@@ -11,7 +11,36 @@ export interface ChatMemberResponse {
   status: 'active';
   notificationsEnabled: boolean;
   chatColor: string | null;
+  /** Receipt cursors (additive): delivered is always >= read. */
+  lastDeliveredSequence: string;
+  lastReadSequence: string;
 }
+
+export interface ChatMemberReceipt {
+  accountId: string;
+  lastDeliveredSequence: string;
+  lastReadSequence: string;
+}
+
+/**
+ * Normalized receipt cursors of one membership. A null read cursor is "0";
+ * delivered never reports below read (rows written before the delivered
+ * column existed, or before the backfill ran).
+ */
+export const mapChatMemberReceipt = (
+  member: Pick<
+    ChatGroupMember,
+    'accountId' | 'lastReadSequence' | 'lastDeliveredSequence'
+  >,
+): ChatMemberReceipt => {
+  const read = BigInt(member.lastReadSequence || '0');
+  const delivered = BigInt(member.lastDeliveredSequence || '0');
+  return {
+    accountId: member.accountId,
+    lastDeliveredSequence: (delivered > read ? delivered : read).toString(),
+    lastReadSequence: read.toString(),
+  };
+};
 
 export const mapActiveChatMember = (
   member: ChatGroupMember,
@@ -19,6 +48,7 @@ export const mapActiveChatMember = (
 ): ChatMemberResponse => {
   const chatRole =
     member.accountId === ownerAccountId ? 'owner' : 'participant';
+  const receipt = mapChatMemberReceipt(member);
   return {
     id: member.id,
     accountId: member.accountId,
@@ -30,5 +60,7 @@ export const mapActiveChatMember = (
     status: 'active',
     notificationsEnabled: member.notificationsEnabled,
     chatColor: member.chatColor || null,
+    lastDeliveredSequence: receipt.lastDeliveredSequence,
+    lastReadSequence: receipt.lastReadSequence,
   };
 };

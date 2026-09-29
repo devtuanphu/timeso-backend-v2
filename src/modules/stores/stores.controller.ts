@@ -33,6 +33,10 @@ import {
 } from '@nestjs/swagger';
 import { StoresService } from './stores.service';
 import { CareerLadderService } from './career-ladder.service';
+import {
+  toSelfCareerHistory,
+  toSelfEmployeeDetail,
+} from './employee-detail-privacy';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { StoreAccessGuard } from './guards/store-access.guard';
 import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
@@ -757,7 +761,11 @@ export class StoresController {
   ) {
     const accountId = user?.userId ?? user?.id;
     const profile = await this.storesService.getEmployeeByAccountId(accountId);
-    return this.storesService.cancelShiftChangeRequest(id, profile?.id);
+    return this.storesService.cancelShiftChangeRequest(
+      id,
+      profile?.id,
+      accountId,
+    );
   }
 
   @Get('maps/geocode')
@@ -808,8 +816,24 @@ export class StoresController {
       reason?: string;
       attachments?: string[];
     },
+    @GetUser() user: any,
   ) {
-    const request = await this.storesService.createBonusWorkRequest(body);
+    // Owner-or-self on the target employee: without this any authenticated
+    // account could file an overtime request for someone else's profile.
+    if (!user?.userId) throw new UnauthorizedException();
+    if (!body?.employeeProfileId) {
+      throw new BadRequestException('employeeProfileId is required');
+    }
+    const { profile } = await this.storesService.assertEmployeeRecordAccess(
+      body.employeeProfileId,
+      user.userId,
+      body.storeId || undefined,
+      'Bạn chỉ có thể gửi yêu cầu tăng ca cho chính mình',
+    );
+    const request = await this.storesService.createBonusWorkRequest(
+      { ...body, storeId: profile.storeId },
+      user.userId,
+    );
     await this.shiftEndWorkflowService.markOvertimePending(request);
     return request;
   }
@@ -823,19 +847,30 @@ export class StoresController {
     @Query('storeId') storeId?: string,
     @Query('employeeProfileId') employeeProfileId?: string,
     @Query('status') status?: string,
+    @GetUser() user?: any,
   ) {
-    if (employeeProfileId) {
-      return this.storesService.getBonusWorkRequestsByEmployee(
-        employeeProfileId,
-      );
-    }
-    if (storeId) {
+    if (!user?.userId) throw new UnauthorizedException();
+    // Owner: the store (or the named employee). Anyone else: only their own
+    // requests at that store, whatever employeeProfileId was sent.
+    const scope = await this.storesService.resolveBonusWorkRequestScope(
+      user.userId,
+      { storeId, employeeProfileId },
+    );
+    if (!scope) return [];
+    if (scope.kind === 'store') {
       return this.storesService.getBonusWorkRequestsByStore(
-        storeId,
+        scope.storeId,
         status as BonusWorkRequestStatus | undefined,
       );
     }
-    return [];
+    const own = await this.storesService.getBonusWorkRequestsByEmployee(
+      scope.employeeProfileId,
+    );
+    // `?employeeProfileId=` never filtered by status (released clients);
+    // a store-scoped read narrowed to the caller keeps its ?status= filter.
+    return status && !employeeProfileId
+      ? own.filter((request) => String(request.status) === status)
+      : own;
   }
 
   @StoreOwnerOnly()
@@ -1150,7 +1185,11 @@ export class StoresController {
   @Get('employees/:profileId/skill')
   @ApiOperation({ summary: 'Lấy kỹ năng của một nhân viên' })
   @ApiResponse({ status: 200, type: StoreSkillResponseDto })
-  async getEmployeeSkill(@Param('profileId') profileId: string) {
+  async getEmployeeSkill(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(profileId, user.userId);
     return this.storesService.getEmployeeSkill(profileId);
   }
 
@@ -1420,12 +1459,20 @@ export class StoresController {
     description: 'Thông tin hồ sơ nhân viên chi tiết',
     type: EmployeeDetailResponseDto,
   })
-  async getEmployeeById(@Param('profileId') profileId: string) {
+  async getEmployeeById(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    // Owner-or-self: a coworker must not read identity, bank or contracts.
+    const { isOwner } = await this.storesService.assertEmployeeRecordAccess(
+      profileId,
+      user.userId,
+    );
     const result = await this.storesService.getEmployeeById(profileId);
     if (!result) {
       throw new NotFoundException('Không tìm thấy nhân viên');
     }
-    return result;
+    return isOwner ? result : toSelfEmployeeDetail(result);
   }
 
   @Get(':id/me/reminder-settings')
@@ -1639,7 +1686,11 @@ export class StoresController {
     description: 'Báo cáo hiệu suất chi tiết',
     type: EmployeePerformanceReportResponseDto,
   })
-  async getEmployeePerformance(@Param('profileId') profileId: string) {
+  async getEmployeePerformance(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(profileId, user.userId);
     // `progression` được ghép ở đây thay vì trong StoresService: nó cần lộ
     // trình, còn StoresService thì không nên nhận thêm phụ thuộc nào nữa.
     const report = await this.storesService.getEmployeePerformance(profileId);
@@ -1662,7 +1713,11 @@ export class StoresController {
     description: 'Chi tiết lộ trình thăng tiến',
     type: [ProgressionStageDto],
   })
-  async getEmployeeProgression(@Param('profileId') profileId: string) {
+  async getEmployeeProgression(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(profileId, user.userId);
     // Vẫn là một mảng trần đúng như app chủ đang đọc bằng `setStages(res)`;
     // chỉ nguồn tính đổi sang máy đánh giá của lộ trình.
     return this.careerLadderService.getProgressionStages(profileId);
@@ -1795,26 +1850,39 @@ export class StoresController {
     return this.careerLadderService.getCareerSummary(profileId);
   }
 
-  @StoreOwnerOnly()
   @Get('employees/:profileId/career-history')
-  @ApiOperation({ summary: 'Lịch sử nghề nghiệp của nhân viên' })
+  @ApiOperation({
+    summary: 'Lịch sử nghề nghiệp của nhân viên',
+    description:
+      'Chủ cửa hàng hoặc chính nhân viên đó (khi còn làm). Nhân viên tự xem thì `note` của chủ trả về null.',
+  })
   async getCareerHistory(
     @Param('profileId') profileId: string,
     @GetUser() user: any,
   ) {
-    await this.assertOwnerOfProfile(profileId, user.userId);
-    return this.careerLadderService.getCareerHistory(profileId);
+    // Same owner-or-employed-self rule as assertCanViewOwnCareer, but also
+    // tells us whether the reader is the owner (to hide the owner's notes).
+    const { isOwner } = await this.storesService.assertEmployeeRecordAccess(
+      profileId,
+      user.userId,
+      undefined,
+      'Bạn chỉ có thể xem lộ trình của chính mình',
+    );
+    const history = await this.careerLadderService.getCareerHistory(profileId);
+    return isOwner ? history : toSelfCareerHistory(history);
   }
 
-  @StoreOwnerOnly()
   @Get('employees/:profileId/next-rungs/:ladderId')
-  @ApiOperation({ summary: 'Các bậc kế tiếp và tiến độ trên một lộ trình' })
+  @ApiOperation({
+    summary: 'Các bậc kế tiếp và tiến độ trên một lộ trình',
+    description: 'Chủ cửa hàng hoặc chính nhân viên đó (khi còn làm).',
+  })
   async getNextRungs(
     @Param('profileId') profileId: string,
     @Param('ladderId') ladderId: string,
     @GetUser() user: any,
   ) {
-    await this.assertOwnerOfProfile(profileId, user.userId);
+    await this.careerLadderService.assertCanViewOwnCareer(profileId, user.userId);
     return this.careerLadderService.nextRungs(profileId, ladderId);
   }
 
@@ -1965,7 +2033,11 @@ export class StoresController {
     description:
       'Lấy các tài sản đang được cấp phát cho nhân viên theo profileId',
   })
-  async getEmployeeAssets(@Param('profileId') profileId: string) {
+  async getEmployeeAssets(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(profileId, user.userId);
     return this.storesService.getEmployeeAssets(profileId);
   }
 
@@ -1996,6 +2068,7 @@ export class StoresController {
       body.note,
       managerProfileId,
       body.dueDate,
+      req?.user?.userId,
     );
   }
 
@@ -2023,6 +2096,7 @@ export class StoresController {
       body.note,
       managerProfileId,
       body.dueDate,
+      req?.user?.userId,
     );
   }
 
@@ -2036,11 +2110,13 @@ export class StoresController {
   async returnAsset(
     @Param('assignmentId') assignmentId: string,
     @Body() body: ReturnAssetDto,
+    @GetUser() user?: any,
   ) {
     return this.storesService.returnAsset(
       assignmentId,
       body.status,
       body.returnNote,
+      user?.userId,
     );
   }
 
@@ -2067,6 +2143,7 @@ export class StoresController {
       body.note,
       managerProfileId,
       body.dueDate,
+      req?.user?.userId,
     );
   }
 
@@ -2159,7 +2236,11 @@ export class StoresController {
     description: 'Hợp đồng hiện tại',
     type: ContractResponseDto,
   })
-  async getLatestContract(@Param('profileId') profileId: string) {
+  async getLatestContract(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(profileId, user.userId);
     return this.storesService.getLatestContract(profileId);
   }
 
@@ -3503,9 +3584,11 @@ export class StoresController {
   @ApiResponse({ status: 200, description: 'Danh sách lịch sử thanh toán' })
   async getEmployeeSalaryHistory(
     @Param('profileId') profileId: string,
+    @GetUser() user: any,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.getEmployeeSalaryHistory(
       profileId,
       parseInt(page || '1', 10),
@@ -3525,8 +3608,16 @@ export class StoresController {
       requestedAmount: number;
       requestReason?: string;
     },
+    @GetUser() user: any,
   ) {
-    return this.storesService.createSalaryAdvanceRequest(profileId, body);
+    // Owner-or-self: a coworker must not file an advance on someone else's
+    // payslip (store membership alone is not enough).
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
+    return this.storesService.createSalaryAdvanceRequest(
+      profileId,
+      body,
+      user.userId,
+    );
   }
 
   @StoreOwnerOnly()
@@ -3550,8 +3641,10 @@ export class StoresController {
   @ApiResponse({ status: 200, description: 'Danh sách yêu cầu ứng lương' })
   async getEmployeeSalaryAdvanceRequests(
     @Param('profileId') profileId: string,
+    @GetUser() user: any,
     @Query('status') status?: string,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.getSalaryAdvanceRequests({
       employeeProfileId: profileId,
       status: status as any,
@@ -4256,7 +4349,12 @@ export class StoresController {
   })
   async getSalaryAdjustments(
     @Param('employeeProfileId') employeeProfileId: string,
+    @GetUser() user: any,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(
+      employeeProfileId,
+      user.userId,
+    );
     return this.storesService.getSalaryAdjustments(employeeProfileId);
   }
 
@@ -4284,7 +4382,12 @@ export class StoresController {
   })
   async getEmployeeSalaryOverview(
     @Param('employeeProfileId') employeeProfileId: string,
+    @GetUser() user: any,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(
+      employeeProfileId,
+      user.userId,
+    );
     return this.storesService.getEmployeeSalaryOverview(employeeProfileId);
   }
 
@@ -4293,7 +4396,12 @@ export class StoresController {
   async getEmployeeSalaryDetailByMonth(
     @Param('employeeProfileId') employeeProfileId: string,
     @Query('month') month: string,
+    @GetUser() user: any,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(
+      employeeProfileId,
+      user.userId,
+    );
     return this.storesService.getEmployeeSalaryDetailByMonth(
       employeeProfileId,
       month,
@@ -4312,8 +4420,9 @@ export class StoresController {
       referenceNumber?: string;
       notes?: string;
     },
+    @GetUser() user?: any,
   ) {
-    return this.storesService.payEmployeeSalary(id, body);
+    return this.storesService.payEmployeeSalary(id, body, user?.userId);
   }
 
   @StoreOwnerOnly()
@@ -4334,7 +4443,12 @@ export class StoresController {
   @ApiOperation({ summary: 'Lấy lịch sử thanh toán lương của MỘT nhân viên' })
   async getEmployeePaymentHistories(
     @Param('employeeProfileId') employeeProfileId: string,
+    @GetUser() user: any,
   ) {
+    await this.storesService.assertEmployeeSalaryAccess(
+      employeeProfileId,
+      user.userId,
+    );
     return this.storesService.getEmployeePaymentHistories(employeeProfileId);
   }
 
@@ -4777,7 +4891,11 @@ export class StoresController {
 
   @Get('employees/:employeeId/face-registration')
   @ApiOperation({ summary: 'Kiểm tra trạng thái đăng ký khuôn mặt' })
-  async getFaceRegistration(@Param('employeeId') employeeId: string) {
+  async getFaceRegistration(
+    @Param('employeeId') employeeId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeRecordAccess(employeeId, user.userId);
     return this.storesService.getFaceRegistration(employeeId);
   }
 
@@ -4845,7 +4963,14 @@ export class StoresController {
     // (22P02, `invalid input syntax for type uuid: ""`).
     @Query('storeId', new ParseUUIDPipe({ errorHttpStatusCode: 400 }))
     storeId: string,
+    @GetUser() user: any,
   ) {
+    // Owner-or-self, and the profile must belong to the queried store.
+    await this.storesService.assertEmployeeRecordAccess(
+      employeeId,
+      user.userId,
+      storeId,
+    );
     return this.storesService.getNextShiftAssignment(employeeId, storeId);
   }
 
@@ -4951,6 +5076,8 @@ export class StoresController {
     @GetUser() user: any,
     @Body() body: { question: string; month?: string },
   ) {
+    // Owner-or-self, like reading the inquiries.
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.createSalaryInquiry(
       profileId,
       body.question,
@@ -4960,7 +5087,11 @@ export class StoresController {
 
   @Get('employees/:profileId/salary-inquiries')
   @ApiOperation({ summary: 'Lấy danh sách câu hỏi lương của nhân viên' })
-  async getSalaryInquiries(@Param('profileId') profileId: string) {
+  async getSalaryInquiries(
+    @Param('profileId') profileId: string,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.getSalaryInquiries(profileId);
   }
 
@@ -4978,7 +5109,10 @@ export class StoresController {
   async createSalarySlip(
     @Param('profileId') profileId: string,
     @Body() body: { month: string },
+    @GetUser() user: any,
   ) {
+    // Returns payslip data: owner-or-self like every other salary read.
+    await this.storesService.assertEmployeeSalaryAccess(profileId, user.userId);
     return this.storesService.getSalarySlipData(profileId, body.month);
   }
 

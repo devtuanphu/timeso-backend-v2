@@ -31,6 +31,7 @@ import {
   LegacyChatPaginationQueryDto,
   LegacyChatPageQueryDto,
   LegacyChatMediaQueryDto,
+  MarkChatGroupDeliveredDto,
   MarkChatGroupReadDto,
   OpenDirectChatDto,
   SearchChatMessagesQueryDto,
@@ -289,6 +290,24 @@ export class ChatGroupsController {
     @Request() req,
   ) {
     return this.messageQueries.advanceReadCursor(id, req.user.userId, dto);
+  }
+
+  @Patch(':id/delivered')
+  @ApiOperation({
+    summary: 'Báo tin nhắn đã tới thiết bị (đã nhận) tới sequence',
+  })
+  async markAsDelivered(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: MarkChatGroupDeliveredDto,
+    @Request() req,
+  ) {
+    return this.messageQueries.advanceDeliveredCursor(id, req.user.userId, dto);
+  }
+
+  @Get(':id/receipts')
+  @ApiOperation({ summary: 'Trạng thái đã nhận / đã xem của các thành viên' })
+  async getReceipts(@Param('id', ParseUUIDPipe) id: string, @Request() req) {
+    return this.chatGroupsService.getGroupReceipts(id, req.user.userId);
   }
 
   // Settings

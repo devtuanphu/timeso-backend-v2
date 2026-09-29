@@ -42,6 +42,39 @@ describe('chat reliability migration artifacts', () => {
     expect(readme).toContain('does not backfill old chat messages');
   });
 
+  it('keeps chat receipts additive and outbox-constraint aware', () => {
+    const receipts = script('migration_chat_receipts.sql');
+    expect(receipts).toContain('\\set ON_ERROR_STOP on');
+    expect(receipts).toContain(
+      'ADD COLUMN IF NOT EXISTS last_delivered_sequence bigint NOT NULL DEFAULT 0',
+    );
+    expect(receipts).toContain('ADD COLUMN IF NOT EXISTS last_delivered_at');
+    expect(receipts).toContain("ADD VALUE IF NOT EXISTS %L");
+    expect(receipts).toMatch(
+      /ck_chat_outbox_event_type[\s\S]*DELIVERED_UPDATED_V1/,
+    );
+    expect(receipts).toMatch(
+      /ck_chat_outbox_event_identity[\s\S]*DELIVERED_UPDATED_V1/,
+    );
+    expect(receipts).not.toMatch(/DROP COLUMN/i);
+    expect(receipts).toContain(
+      'ADD COLUMN IF NOT EXISTS range_start_sequence bigint',
+    );
+    // Constraints are re-added NOT VALID and validated separately.
+    expect(receipts).toMatch(
+      /ADD CONSTRAINT ck_chat_outbox_event_type[\s\S]*?NOT VALID;/,
+    );
+    expect(receipts).toMatch(
+      /ADD CONSTRAINT ck_chat_outbox_event_identity[\s\S]*?\) NOT VALID;/,
+    );
+    expect(receipts).toContain(
+      'VALIDATE CONSTRAINT ck_chat_outbox_event_type',
+    );
+    expect(receipts).toContain(
+      'VALIDATE CONSTRAINT ck_chat_outbox_event_identity',
+    );
+  });
+
   it('keeps direct-chat expand additive and index-safe', () => {
     const expand = script('migration_chat_direct_expand.sql');
     const verify = script('verify_chat_direct.sql');

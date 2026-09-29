@@ -123,6 +123,8 @@ describe('StoresController owner report forwarding', () => {
     expect(storesService.cancelShiftChangeRequest).toHaveBeenCalledWith(
       'request-1',
       'employee-1',
+      // The acting account, recorded in the activity log.
+      'staff-1',
     );
   });
 

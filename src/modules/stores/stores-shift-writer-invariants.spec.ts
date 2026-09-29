@@ -39,6 +39,20 @@ const rawQb = (rows: any[], clauses: string[] = []) => {
   return qb;
 };
 
+/** Records the chat-membership UPDATE a termination issues on the manager. */
+const chatUpdateQb = () => {
+  const calls: { method: string; args: unknown[] }[] = [];
+  const qb: any = {};
+  for (const method of ['update', 'set', 'where', 'andWhere']) {
+    qb[method] = jest.fn((...args: unknown[]) => {
+      calls.push({ method, args });
+      return qb;
+    });
+  }
+  qb.execute = jest.fn(async () => ({ affected: 2 }));
+  return { qb, calls };
+};
+
 describe('StoresService shift predicate writers', () => {
   const createService = () => {
     const service = Object.create(StoresService.prototype) as StoresService;
@@ -62,6 +76,7 @@ describe('StoresService shift predicate writers', () => {
 
   it('locks the employee store before authoritative termination checks and writes', async () => {
     const service = createService();
+    const chat = chatUpdateQb();
     (service as any).profileRepository = {
       findOne: jest.fn(async () => ({ id: 'employee-1', storeId: 'store-1' })),
     };
@@ -72,6 +87,7 @@ describe('StoresService shift predicate writers', () => {
           return {
             id: 'employee-1',
             storeId: 'store-1',
+            accountId: 'staff-account-1',
             employmentStatus: EmploymentStatus.ACTIVE,
           };
         }
@@ -85,6 +101,7 @@ describe('StoresService shift predicate writers', () => {
       }),
       save: jest.fn(async (_entity: unknown, value: unknown) => value),
       softDelete: jest.fn(async () => ({ affected: 1 })),
+      createQueryBuilder: jest.fn(() => chat.qb),
       // Termination withdraws future shifts first; nothing to cancel here.
       getRepository: () => ({
         createQueryBuilder: () => rawQb([]),
@@ -117,6 +134,27 @@ describe('StoresService shift predicate writers', () => {
       id: 'employee-1',
       storeId: 'store-1',
     });
+
+    // X4: the leaver's store group-chat memberships are removed inside the
+    // same transaction, before the profile is soft-deleted.
+    expect(chat.qb.set).toHaveBeenCalledWith({ status: 'removed' });
+    expect(chat.qb.where).toHaveBeenCalledWith('account_id = :accountId', {
+      accountId: 'staff-account-1',
+    });
+    const chatSql = chat.calls
+      .filter((call) => call.method === 'andWhere')
+      .map((call) => call.args[0])
+      .join(' ');
+    expect(chatSql).toContain("status = 'active'");
+    expect(chatSql).toContain('g.store_id = :storeId');
+    expect(chatSql).toContain('g.direct_key IS NULL');
+    expect(
+      chat.calls.find((call) => call.args[1] && (call.args[1] as any).storeId)
+        ?.args[1],
+    ).toEqual({ storeId: 'store-1', accountId: 'staff-account-1' });
+    expect(chat.qb.execute.mock.invocationCallOrder[0]).toBeLessThan(
+      manager.softDelete.mock.invocationCallOrder[0],
+    );
   });
 
   it('rechecks owner and store-scoped termination reason after the lock', async () => {
@@ -189,6 +227,7 @@ describe('StoresService shift predicate writers', () => {
         }),
         save: jest.fn(async (_entity: unknown, value: unknown) => value),
         softDelete: jest.fn(async () => ({ affected: 1 })),
+        createQueryBuilder: jest.fn(() => chatUpdateQb().qb),
         getRepository: jest.fn((entity: unknown) => {
           if (entity === EmployeeLeaveRequest) return { update: leaveUpdate };
           if (entity === ShiftChangeRequest) return { update: changeUpdate };

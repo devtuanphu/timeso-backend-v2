@@ -92,6 +92,7 @@ function build() {
     // this the call threw and the service's own try/catch swallowed it, so the
     // backfill looked fine while doing nothing.
     update: jest.fn().mockResolvedValue({}),
+    setAvatarIfEmpty: jest.fn().mockResolvedValue(true),
   };
   const notificationsService: any = { create: jest.fn().mockResolvedValue({}) };
   const storesService: any = {
@@ -110,6 +111,8 @@ function build() {
     verify: jest.fn().mockResolvedValue(true),
     remove: jest.fn().mockResolvedValue(true),
     exists: jest.fn().mockResolvedValue(true),
+    copyToPublicUpload: jest.fn().mockResolvedValue('copied-avatar.jpg'),
+    removePublicUpload: jest.fn().mockResolvedValue(true),
     resolve: jest.fn((name: unknown) =>
       typeof name === 'string' && !name.includes('/') && !name.includes('..')
         ? `/private/selfies/${name}`
@@ -438,6 +441,106 @@ describe('JobApplicationService.accept', () => {
     await expect(
       t.service.accept(STORE, APPLICATION, OWNER, {} as any),
     ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+  });
+
+  describe('O3: avatar from the application selfie', () => {
+    const SELFIE_NAME = '0b7c6a52-6a0e-4c47-9d3e-3f1c2b8e5a11.jpg';
+
+    it('copies the selfie to a public avatar when the account has none', async () => {
+      const t = build();
+      t.applicationRepository.findOne.mockResolvedValue({
+        ...pending,
+        selfiePath: SELFIE_NAME,
+      });
+      t.accountsService.findById.mockResolvedValue({
+        id: APPLICANT,
+        status: AccountStatus.ACTIVE,
+        fullName: 'Có tên',
+        avatar: null,
+      });
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.selfieStorage.copyToPublicUpload).toHaveBeenCalledWith(SELFIE_NAME);
+      expect(t.accountsService.setAvatarIfEmpty).toHaveBeenCalledWith(
+        APPLICANT,
+        '/uploads/copied-avatar.jpg',
+      );
+      // The private selfie is kept (copy, not move).
+      expect(t.selfieStorage.remove).not.toHaveBeenCalled();
+      expect(t.selfieStorage.removePublicUpload).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when the account already has an avatar', async () => {
+      const t = build();
+      t.applicationRepository.findOne.mockResolvedValue({
+        ...pending,
+        selfiePath: SELFIE_NAME,
+      });
+      t.accountsService.findById.mockResolvedValue({
+        id: APPLICANT,
+        status: AccountStatus.ACTIVE,
+        fullName: 'Có tên',
+        avatar: '/uploads/mine.jpg',
+      });
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.selfieStorage.copyToPublicUpload).not.toHaveBeenCalled();
+      expect(t.accountsService.setAvatarIfEmpty).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when the application has no selfie', async () => {
+      const t = build();
+      t.applicationRepository.findOne.mockResolvedValue({ ...pending });
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.selfieStorage.copyToPublicUpload).not.toHaveBeenCalled();
+    });
+
+    it('removes the orphan copy when an avatar was set concurrently', async () => {
+      const t = build();
+      t.applicationRepository.findOne.mockResolvedValue({
+        ...pending,
+        selfiePath: SELFIE_NAME,
+      });
+      t.accountsService.setAvatarIfEmpty.mockResolvedValue(false);
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.selfieStorage.removePublicUpload).toHaveBeenCalledWith(
+        'copied-avatar.jpg',
+      );
+    });
+
+    it('a failed copy or write never fails the accept', async () => {
+      const copyFails = build();
+      copyFails.applicationRepository.findOne.mockResolvedValue({
+        ...pending,
+        selfiePath: SELFIE_NAME,
+      });
+      copyFails.selfieStorage.copyToPublicUpload.mockResolvedValue(null);
+      await expect(
+        copyFails.service.accept(STORE, APPLICATION, OWNER, {} as any),
+      ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+      expect(copyFails.accountsService.setAvatarIfEmpty).not.toHaveBeenCalled();
+
+      const writeFails = build();
+      writeFails.applicationRepository.findOne.mockResolvedValue({
+        ...pending,
+        selfiePath: SELFIE_NAME,
+      });
+      writeFails.accountsService.setAvatarIfEmpty.mockRejectedValue(
+        new Error('db down'),
+      );
+      await expect(
+        writeFails.service.accept(STORE, APPLICATION, OWNER, {} as any),
+      ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+      expect(writeFails.selfieStorage.removePublicUpload).toHaveBeenCalledWith(
+        'copied-avatar.jpg',
+      );
+    });
   });
 
   it('hires through the existing attach flow and notifies the applicant', async () => {

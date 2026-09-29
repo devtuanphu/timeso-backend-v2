@@ -20,6 +20,8 @@ import {
 const CLAIM_LIMIT = 100;
 const MAX_ATTEMPTS = 20;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+/** Newest sequences of a delivered range scanned for tick owners. */
+export const DELIVERED_RANGE_SCAN_LIMIT = 500;
 
 @Injectable()
 export class ChatOutboxDispatcherService {
@@ -147,7 +149,10 @@ export class ChatOutboxDispatcherService {
           { version: 1, message: mapChatMessage(message) },
           recipients,
         );
-      } else if (event.eventType === ChatOutboxEventType.READ_UPDATED_V1) {
+      } else if (
+        event.eventType === ChatOutboxEventType.READ_UPDATED_V1 ||
+        event.eventType === ChatOutboxEventType.DELIVERED_UPDATED_V1
+      ) {
         if (!event.actorAccountId || event.sequence === null) {
           throw new Error('CHAT_OUTBOX_IDENTITY_INVALID');
         }
@@ -161,16 +166,36 @@ export class ChatOutboxDispatcherService {
           await this.markPublished(event.id);
           return;
         }
-        await this.publisher.publishReadUpdated(
-          {
-            version: 1,
-            groupId: event.groupId,
-            accountId: event.actorAccountId,
-            lastReadSequence: event.sequence,
-            updatedAt: event.createdAt.toISOString(),
-          },
-          recipients,
-        );
+        if (event.eventType === ChatOutboxEventType.READ_UPDATED_V1) {
+          await this.publisher.publishReadUpdated(
+            {
+              version: 1,
+              groupId: event.groupId,
+              accountId: event.actorAccountId,
+              lastReadSequence: event.sequence,
+              updatedAt: event.createdAt.toISOString(),
+            },
+            recipients,
+          );
+        } else {
+          const senders = await this.sendersInDeliveredRange(event);
+          const targeted = recipients.filter(
+            (accountId) =>
+              accountId !== event.actorAccountId && senders.has(accountId),
+          );
+          if (targeted.length) {
+            await this.publisher.publishDeliveredUpdated(
+              {
+                version: 1,
+                groupId: event.groupId,
+                accountId: event.actorAccountId,
+                lastDeliveredSequence: event.sequence,
+                updatedAt: (event.updatedAt ?? event.createdAt).toISOString(),
+              },
+              targeted,
+            );
+          }
+        }
       } else {
         throw new Error('CHAT_OUTBOX_EVENT_UNSUPPORTED');
       }
@@ -179,6 +204,35 @@ export class ChatOutboxDispatcherService {
     } catch {
       await this.markFailed(event);
     }
+  }
+
+  /**
+   * Senders (other than the actor) of live messages in the delivered range
+   * (range_start_sequence, sequence]. Bounded: only the newest
+   * DELIVERED_RANGE_SCAN_LIMIT sequences of the range are scanned; a sender
+   * of an older message in a very long range relies on GET receipts.
+   */
+  private async sendersInDeliveredRange(
+    event: ChatOutboxEvent,
+  ): Promise<Set<string>> {
+    const upper = BigInt(event.sequence as string);
+    const floor = upper - BigInt(DELIVERED_RANGE_SCAN_LIMIT);
+    const start = event.rangeStartSequence
+      ? BigInt(event.rangeStartSequence)
+      : floor;
+    const lower = start > floor ? start : floor;
+    const rows: Array<{ senderId: string }> = await this.dataSource.query(
+      `SELECT DISTINCT sender_id AS "senderId"
+       FROM chat_messages
+       WHERE group_id = $1
+         AND sequence > $2::bigint
+         AND sequence <= $3::bigint
+         AND sender_id <> $4
+         AND deleted_at IS NULL
+       LIMIT 500`,
+      [event.groupId, lower.toString(), upper.toString(), event.actorAccountId],
+    );
+    return new Set((rows || []).map((row) => row.senderId));
   }
 
   private async markPublished(id: string): Promise<void> {

@@ -1,9 +1,10 @@
 import { InjectQueue } from '@nestjs/bullmq';
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
 import { DataSource, In, IsNull, Repository } from 'typeorm';
 import { NotificationsService } from '../notifications/notifications.service';
+import { OwnerNotificationService } from './owner-notification.service';
 import {
   NotificationPriority,
   NotificationType,
@@ -138,6 +139,10 @@ export class ShiftEndWorkflowService {
     @InjectQueue('shift-end-workflows') private readonly workflowQueue: Queue,
     @InjectQueue('attendance-background')
     private readonly attendanceQueue: Queue,
+    // X6: the owner's "ending soon" alert follows the effective end (shift
+    // end, or the approved overtime end).
+    @Optional()
+    private readonly ownerNotificationService?: OwnerNotificationService,
   ) {}
 
   calculateScheduledEnd(
@@ -217,6 +222,13 @@ export class ShiftEndWorkflowService {
           removeOnFail: 1000,
         },
       );
+    }
+    if (this.ownerNotificationService) {
+      try {
+        await this.ownerNotificationService.syncAssignments([assignmentId]);
+      } catch {
+        this.logger.warn('Owner shift-ending alert could not be rescheduled');
+      }
     }
   }
 

@@ -114,6 +114,19 @@ import { StoreAccessGuard } from './guards/store-access.guard';
 import { StoreAccessResolver } from './guards/store-access.resolver';
 import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
+import { ActivityLog } from './entities/activity-log.entity';
+import {
+  OwnerNotificationLog,
+  OwnerNotificationSetting,
+} from './entities/owner-notification-setting.entity';
+import { ActivityLogService } from './activity-log.service';
+import { OwnerNotificationService } from './owner-notification.service';
+import { OwnerShiftAlertProcessor } from './owner-notification.processor';
+import { OWNER_SHIFT_ALERTS_QUEUE } from './owner-notification.utils';
+import { StoreActivityController } from './store-activity.controller';
+import { CustomShiftRequestController } from './custom-shift-request.controller';
+import { CustomShiftRequestService } from './custom-shift-request.service';
+import { CustomShiftRequest } from './entities/custom-shift-request.entity';
 
 @Module({
   imports: [
@@ -195,6 +208,10 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
       CronLock,
       ShiftEndWorkflow,
       JobApplication,
+      ActivityLog,
+      OwnerNotificationSetting,
+      OwnerNotificationLog,
+      CustomShiftRequest,
     ]),
 
     AccountsModule,
@@ -210,12 +227,17 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     BullModule.registerQueue({
       name: 'shift-end-workflows',
     }),
+    BullModule.registerQueue({
+      name: OWNER_SHIFT_ALERTS_QUEUE,
+    }),
   ],
   controllers: [
     StoresController,
     StoresPublicController,
     ShiftAggregationController,
     JobApplicationController,
+    StoreActivityController,
+    CustomShiftRequestController,
   ],
   providers: [
     StoresService,
@@ -235,6 +257,10 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     StoreAccessGuard,
     StoreAccessResolver,
     StoreResourceAccessGuard,
+    ActivityLogService,
+    OwnerNotificationService,
+    OwnerShiftAlertProcessor,
+    CustomShiftRequestService,
   ],
   exports: [
     StoresService,
@@ -244,6 +270,8 @@ import { ShiftEndWorkflowProcessor } from './shift-end-workflow.processor';
     ShiftReminderService,
     ShiftEndWorkflowService,
     JobApplicationService,
+    ActivityLogService,
+    OwnerNotificationService,
   ],
 })
 export class StoresModule {}

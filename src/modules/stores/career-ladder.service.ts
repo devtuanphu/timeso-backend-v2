@@ -4,6 +4,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import {
@@ -15,6 +16,8 @@ import {
   Repository,
 } from 'typeorm';
 import { stintFloor } from './employment-stint.utils';
+import { ActivityLogService } from './activity-log.service';
+import { ACTIVITY_ACTIONS } from './activity-log.summary';
 
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import {
@@ -157,6 +160,9 @@ export class CareerLadderService {
     private readonly probationSettingRepository: Repository<StoreProbationSetting>,
     private readonly notificationsService: NotificationsService,
     private readonly dataSource: DataSource,
+    // X1 activity log; optional so hand-built test instances keep working.
+    @Optional()
+    private readonly activityLogService?: ActivityLogService,
   ) {}
 
   // ---------------------------------------------------------------------
@@ -1234,6 +1240,25 @@ export class CareerLadderService {
           note: options.note ?? null,
         }),
       );
+
+      // Same transaction as the career event. The owner's note is not logged.
+      if (this.activityLogService) {
+        const rungName = await this.targetNames(ladder.dimension, [
+          rung.targetId,
+        ])
+          .then((names) => names.get(rung.targetId))
+          .catch(() => undefined);
+        await this.activityLogService.record(manager, {
+          storeId: profile.storeId,
+          actorAccountId: decidedByAccountId,
+          subjectEmployeeProfileId: profile.id,
+          action: ACTIVITY_ACTIONS.CAREER_ADVANCED,
+          resourceType: 'career_event',
+          resourceId: event.id,
+          params: { ladderName: ladder.name, rungName },
+          idempotencyKey: `${ACTIVITY_ACTIONS.CAREER_ADVANCED}:${event.id}`,
+        });
+      }
 
       // Lên bậc này có thể đẩy một lộ trình khác về điểm xuất phát — dùng cho
       // "thăng vị trí thì phải thử việc lại".

@@ -4,11 +4,14 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { EntityManager, Repository } from 'typeorm';
+import { EntityManager, In, Repository } from 'typeorm';
 import { Account } from './entities/account.entity';
 import { AccountIdentityDocument } from './entities/account-identity-document.entity';
 import { AccountFinance } from './entities/account-finance.entity';
-import { EmployeeProfile, EmploymentStatus } from '../stores/entities/employee-profile.entity';
+import {
+  EMPLOYED_STATUSES,
+  EmployeeProfile,
+} from '../stores/entities/employee-profile.entity';
 import * as bcrypt from 'bcrypt';
 import {
   legacyNormalizedPhoneSql,
@@ -265,6 +268,22 @@ export class AccountsService {
     return repository.save(finance);
   }
 
+  /**
+   * Sets the avatar only when the account still has none. Conditional in SQL
+   * so a concurrent `POST /accounts/avatar` by the user always wins. Returns
+   * true when the avatar was written.
+   */
+  async setAvatarIfEmpty(accountId: string, avatar: string): Promise<boolean> {
+    const result = await this.accountRepository
+      .createQueryBuilder()
+      .update(Account)
+      .set({ avatar })
+      .where('id = :accountId', { accountId })
+      .andWhere("(avatar IS NULL OR btrim(avatar) = '')")
+      .execute();
+    return (result.affected ?? 0) > 0;
+  }
+
   async verifyPassword(accountId: string, password: string): Promise<boolean> {
     const account = await this.accountRepository
       .createQueryBuilder('account')
@@ -277,16 +296,18 @@ export class AccountsService {
   }
 
   /**
-   * Get all stores where user is an active employee
+   * Get all stores where user is currently employed.
+   *
+   * Only EMPLOYED_STATUSES count: a PENDING job applicant is not a store member
+   * yet, and a TERMINATED profile no longer is.
    */
   async getEmployeeStores(accountId: string) {
     const profiles = await this.employeeProfileRepository.find({
-      where: { accountId },
+      where: { accountId, employmentStatus: In([...EMPLOYED_STATUSES]) },
       relations: ['store'],
     });
 
     return profiles
-      .filter(p => p.employmentStatus !== EmploymentStatus.TERMINATED)
       .map(p => ({
         employeeProfileId: p.id,
         storeId: p.storeId,

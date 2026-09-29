@@ -31,6 +31,8 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Account } from '../src/modules/accounts/entities/account.entity';
 import { StoreAccessGuard } from '../src/modules/stores/guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../src/modules/stores/guards/store-resource-access.guard';
+import { StoreOwnerOnlyGuard } from '../src/modules/stores/guards/store-owner-only.guard';
+import { CareerLadderService } from '../src/modules/stores/career-ladder.service';
 import {
   ShiftRecurrenceEndType,
   ShiftRecurrenceFrequency,
@@ -107,7 +109,24 @@ class MemoryScheduleDatabase {
 
   private createManager(staged: MemoryState) {
     return {
-      query: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+      query: jest.fn(async (sql: string, params: any[] = []) => {
+        // findSameNameShiftOnDates: active shifts of the store on the dates.
+        if (sql.includes('FROM shift_slots')) {
+          const [storeId, workDates] = params;
+          return staged.slots
+            .filter((slot) => workDates.includes(slot.workDate))
+            .map((slot) => ({
+              shift: staged.shifts.find((item) => item.id === slot.workShiftId),
+              slot,
+            }))
+            .filter(({ shift }) => shift?.storeId === storeId && shift.isActive)
+            .map(({ shift, slot }) => ({
+              shift_name: shift.shiftName,
+              work_date: slot.workDate,
+            }));
+        }
+        return [{ pg_advisory_xact_lock: null }];
+      }),
       findOne: jest.fn(async (entity: any, options: any) => {
         const where = options?.where || {};
         const source =
@@ -183,7 +202,12 @@ describe('Unified shift schedule flow (e2e)', () => {
     database = new MemoryScheduleDatabase();
     storesService = Object.create(StoresService.prototype) as StoresService;
     loggerErrorMock = jest.fn();
-    (storesService as any).logger = { error: loggerErrorMock };
+    (storesService as any).logger = {
+      error: loggerErrorMock,
+      warn: jest.fn(),
+      log: jest.fn(),
+      debug: jest.fn(),
+    };
     (storesService as any).dataSource = database;
     (storesService as any).storeRepository = {
       findOne: jest.fn(async ({ where }: any) =>
@@ -251,6 +275,8 @@ describe('Unified shift schedule flow (e2e)', () => {
         { provide: AccountsService, useValue: {} },
         { provide: MailService, useValue: {} },
         { provide: ShiftEndWorkflowService, useValue: {} },
+        // StoresController's career-ladder dependency; unused by this suite.
+        { provide: CareerLadderService, useValue: {} },
         {
           provide: getQueueToken('attendance-background'),
           useValue: { add: jest.fn() },
@@ -267,6 +293,12 @@ describe('Unified shift schedule flow (e2e)', () => {
       .overrideGuard(StoreAccessGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      // StoreOwnerOnlyGuard reads the store owner through DataSource; these
+      // suites have no database, so owner-only metadata is stubbed open here
+      // (the guard has its own unit tests; owner checks in the services
+      // still run).
+      .overrideGuard(StoreOwnerOnlyGuard)
       .useValue({ canActivate: () => true })
       .compile();
 
@@ -719,6 +751,8 @@ describe('Unified shift schedule authentication boundary (e2e)', () => {
         { provide: AccountsService, useValue: {} },
         { provide: MailService, useValue: {} },
         { provide: ShiftEndWorkflowService, useValue: {} },
+        // StoresController's career-ladder dependency; unused by this suite.
+        { provide: CareerLadderService, useValue: {} },
         // JwtStrategy re-reads the account on every request, so it cannot be
         // constructed without this repository. Its absence is why this suite
         // failed to build its module before the tenancy guards existed.
@@ -737,6 +771,12 @@ describe('Unified shift schedule authentication boundary (e2e)', () => {
       .overrideGuard(StoreAccessGuard)
       .useValue({ canActivate: () => true })
       .overrideGuard(StoreResourceAccessGuard)
+      .useValue({ canActivate: () => true })
+      // StoreOwnerOnlyGuard reads the store owner through DataSource; these
+      // suites have no database, so owner-only metadata is stubbed open here
+      // (the guard has its own unit tests; owner checks in the services
+      // still run).
+      .overrideGuard(StoreOwnerOnlyGuard)
       .useValue({ canActivate: () => true })
       .compile();
     app = moduleRef.createNestApplication();

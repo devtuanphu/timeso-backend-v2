@@ -99,6 +99,9 @@ export class ChatMessageCommandService {
             lastReadSequence: () =>
               `GREATEST(COALESCE(last_read_sequence, 0), ${persisted.sequence})`,
             lastReadAt: () => 'CURRENT_TIMESTAMP',
+            // Keep delivered >= read for the sender's own cursor.
+            lastDeliveredSequence: () =>
+              `GREATEST(COALESCE(last_delivered_sequence, 0), ${persisted.sequence})`,
           })
           .where('group_id = :groupId', { groupId })
           .andWhere('account_id = :accountId', { accountId })
