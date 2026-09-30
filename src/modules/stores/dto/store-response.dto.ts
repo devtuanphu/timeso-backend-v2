@@ -824,6 +824,13 @@ export class ProgressionRequirementDto {
 
   @ApiProperty()
   isMet: boolean;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    example: 'Đã đạt 1/30 ca · còn 29 ca',
+  })
+  progressText?: string | null;
 }
 
 export class EmployeePerformanceReportResponseDto {
@@ -889,6 +896,13 @@ export class ProgressionStageRequirementDto {
 
   @ApiProperty()
   completed: boolean;
+
+  @ApiProperty({
+    required: false,
+    nullable: true,
+    example: 'Đã đạt 1/30 ca · còn 29 ca',
+  })
+  progressText?: string | null;
 }
 
 export class ProgressionStageDto {

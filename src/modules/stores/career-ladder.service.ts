@@ -15,7 +15,7 @@ import {
   MoreThanOrEqual,
   Repository,
 } from 'typeorm';
-import { stintFloor } from './employment-stint.utils';
+import { stintFloor, stintStartVnDate } from './employment-stint.utils';
 import { ActivityLogService } from './activity-log.service';
 import { ACTIVITY_ACTIONS } from './activity-log.summary';
 
@@ -51,6 +51,14 @@ import { computeProbationEndsAt } from './career-ladder.lifecycle';
 import { KpiTask } from './entities/kpi-task.entity';
 import { KpiStatus } from './entities/employee-kpi.entity';
 import { vnDateString } from '../../common/utils/vn-calendar';
+import {
+  buildCriteriaProgressText,
+  effectiveCriteriaUnit,
+} from './career-progress-text';
+import {
+  ShiftAssignment,
+  ShiftAssignmentStatus,
+} from './entities/shift-management.entity';
 import { NotificationType } from '../notifications/entities/notification.entity';
 
 /**
@@ -110,6 +118,11 @@ export interface EvaluatedCriteria {
   unit: string | null;
   met: boolean;
   isRequired: boolean;
+  /**
+   * Câu tiến độ dựng sẵn cho app, vd. "Đã đạt 1/30 ca · còn 29 ca". Null với
+   * checklist, điều kiện chéo lộ trình, hoặc khi chưa đo được.
+   */
+  progressText: string | null;
 }
 
 export interface RungEvaluation {
@@ -798,6 +811,11 @@ export class CareerLadderService {
           kind: string;
           met: boolean;
           isRequired: boolean;
+          current: number | null;
+          target: number | null;
+          unit: string | null;
+          operator: 'gte' | 'lte' | null;
+          progressText: string | null;
         }>;
       } | null;
     }> = [];
@@ -824,14 +842,32 @@ export class CareerLadderService {
               name: best.targetName,
               progress: best.progress,
               passed: best.passed,
-              // Chỉ nhãn và trạng thái: số đo thô của chỉ số không cần cho
-              // trang chủ, và bớt lộ dữ liệu không dùng.
-              items: best.items.map((item) => ({
-                label: item.label,
-                kind: item.kind,
-                met: item.met,
-                isRequired: item.isRequired,
-              })),
+              // Nhãn, trạng thái và số đo của chính nhân viên để trang chủ đếm
+              // ngược ("còn 29 ca"). Chỉ số lộ trình không có tiền lương; id và
+              // mã nội bộ vẫn không trả ra. Số đo chỉ có với metric/tenure —
+              // checklist và điều kiện chéo lộ trình là có/không.
+              items: best.items.map((item) => {
+                const measurable =
+                  item.kind === CriteriaKind.METRIC ||
+                  item.kind === CriteriaKind.TENURE;
+                return {
+                  label: item.label,
+                  kind: item.kind,
+                  met: item.met,
+                  isRequired: item.isRequired,
+                  current: measurable ? item.current : null,
+                  target: measurable ? item.target : null,
+                  unit: measurable
+                    ? effectiveCriteriaUnit(item.kind, item.code, item.unit)
+                    : null,
+                  operator: measurable
+                    ? item.operator === CriteriaOperator.LTE
+                      ? 'lte'
+                      : 'gte'
+                    : null,
+                  progressText: item.progressText ?? null,
+                };
+              }),
             }
           : null,
       });
@@ -908,7 +944,8 @@ export class CareerLadderService {
 
     const items: EvaluatedCriteria[] = [];
     for (const c of criteria) {
-      items.push(await this.measure(profile, ladder, c, checklistResults));
+      const measured = await this.measure(profile, ladder, c, checklistResults);
+      items.push({ ...measured, progressText: buildCriteriaProgressText(measured) });
     }
 
     const required = items.filter((i) => i.isRequired);
@@ -945,7 +982,7 @@ export class CareerLadderService {
     ladder: StoreLadder,
     c: StoreRungCriteria,
     checklistResults?: Record<string, boolean>,
-  ): Promise<EvaluatedCriteria> {
+  ): Promise<Omit<EvaluatedCriteria, 'progressText'>> {
     const target = c.value === null ? null : Number(c.value);
     const base = {
       id: c.id,
@@ -1014,33 +1051,37 @@ export class CareerLadderService {
       return Number(profile.capabilityPoints) || 0;
     }
 
-    // Chỉ số cộng dồn thì cộng từ lúc vào bậc, không phải từ đầu tháng: một
-    // người vào bậc giữa tháng không nên được tính công của bậc trước.
     // Computed from the KPI tasks themselves: nothing writes the monthly
     // summary's kpiTotalCount / kpiCompletedCount (deprecated), so it was 0.
     if (code === CriteriaCode.KPI_COMPLETION) {
       return this.kpiCompletionPercent(profile.id, stintFloor(profile.joinedAt));
     }
 
-    const cumulative: string[] = [
-      CriteriaCode.COMPLETED_SHIFTS,
-      CriteriaCode.WORK_HOURS,
-    ];
-    const enteredAt = await this.rungEnteredAt(profile.id, ladder.id);
-    const summaries = await this.monthlySummaries(
-      profile.id,
-      cumulative.includes(code ?? '') ? enteredAt : null,
-    );
+    // Chỉ số cộng dồn thì cộng từ lúc vào bậc, không phải từ đầu tháng: một
+    // người vào bậc giữa tháng không nên được tính công của bậc trước. Đếm
+    // thẳng từ ca đã hoàn thành (nguồn gốc) chứ không cộng các dòng
+    // employee_monthly_summaries: dòng đó được ghi lại bất đồng bộ sau mỗi
+    // lần chấm ra, chỉ có hạt tháng (nên tính cả nửa tháng trước khi vào bậc),
+    // và `totalWorkHours` của nó vốn đã là số cộng dồn, cộng nhiều tháng là
+    // đếm trùng.
+    if (
+      code === CriteriaCode.COMPLETED_SHIFTS ||
+      code === CriteriaCode.WORK_HOURS
+    ) {
+      const since = await this.cumulativeSinceVnDate(profile, ladder);
+      const done = await this.completedWorkSince(profile.id, since);
+      return code === CriteriaCode.COMPLETED_SHIFTS
+        ? done.shifts
+        : Math.round((done.minutes / 60) * 100) / 100;
+    }
+
+    const summaries = await this.monthlySummaries(profile.id);
     if (summaries.length === 0) return 0;
 
     const sum = (pick: (s: EmployeeMonthlySummary) => unknown) =>
       summaries.reduce((acc, s) => acc + (Number(pick(s)) || 0), 0);
 
     switch (code) {
-      case CriteriaCode.COMPLETED_SHIFTS:
-        return sum((s) => s.completedShifts);
-      case CriteriaCode.WORK_HOURS:
-        return sum((s) => s.totalWorkHours);
       case CriteriaCode.UNAUTHORIZED_LEAVES:
         return sum((s) => s.unauthorizedLeavesCount);
       case CriteriaCode.ON_TIME_PERCENT: {
@@ -1055,6 +1096,52 @@ export class CareerLadderService {
         // nhìn thấy có gì đó sai trong cấu hình.
         return null;
     }
+  }
+
+  /**
+   * Ngày (lịch Việt Nam, 'YYYY-MM-DD') bắt đầu cộng dồn chỉ số của bậc hiện
+   * tại: ngày vào bậc, nhưng không sớm hơn ngày bắt đầu đợt làm việc hiện tại
+   * (một mốc vào bậc của đợt trước khi nghỉ rồi quay lại không được tính).
+   * Chưa có mốc vào bậc thì đếm từ đầu đợt làm việc; hồ sơ cũ không có cả hai
+   * thì không giới hạn. Cùng quy ước "theo ngày" với stintStartVnDate: ca làm
+   * sớm hơn trong chính ngày vào bậc vẫn được tính.
+   */
+  private async cumulativeSinceVnDate(
+    profile: EmployeeProfile,
+    ladder: StoreLadder,
+  ): Promise<string | null> {
+    const enteredAt = await this.rungEnteredAt(profile.id, ladder.id);
+    const entryDate = enteredAt ? vnDateString(new Date(enteredAt)) : null;
+    const stintDate = stintStartVnDate(profile.joinedAt);
+    if (entryDate && stintDate) {
+      return entryDate > stintDate ? entryDate : stintDate;
+    }
+    return entryDate ?? stintDate;
+  }
+
+  /** Số ca COMPLETED và tổng phút làm của hồ sơ, từ một ngày làm (VN) trở đi. */
+  private async completedWorkSince(
+    profileId: string,
+    sinceVnDate: string | null,
+  ): Promise<{ shifts: number; minutes: number }> {
+    const query = this.dataSource
+      .getRepository(ShiftAssignment)
+      .createQueryBuilder('assignment')
+      .innerJoin('assignment.shiftSlot', 'slot')
+      .select('COUNT(assignment.id)', 'shifts')
+      .addSelect('COALESCE(SUM(assignment.workedMinutes), 0)', 'minutes')
+      .where('assignment.employeeId = :profileId', { profileId })
+      .andWhere('assignment.status = :status', {
+        status: ShiftAssignmentStatus.COMPLETED,
+      });
+    if (sinceVnDate) {
+      query.andWhere('slot.workDate >= :since', { since: sinceVnDate });
+    }
+    const row = await query.getRawOne<{ shifts: string; minutes: string }>();
+    return {
+      shifts: Number(row?.shifts) || 0,
+      minutes: Number(row?.minutes) || 0,
+    };
   }
 
   /**
@@ -1092,25 +1179,14 @@ export class CareerLadderService {
     return Math.round(((Number(row?.done) || 0) / total) * 100);
   }
 
-  /** Tháng hiện tại, hoặc từ lúc vào bậc tới nay với chỉ số cộng dồn. */
-  private async monthlySummaries(profileId: string, since: Date | null) {
+  /** Dòng thống kê của tháng hiện tại (chỉ số theo tháng). */
+  private async monthlySummaries(profileId: string) {
     const now = new Date();
     const thisMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-    if (!since) {
-      const one = await this.summaryRepository.findOne({
-        where: { employeeProfileId: profileId, month: thisMonth },
-      });
-      return one ? [one] : [];
-    }
-
-    const fromMonth = new Date(since.getFullYear(), since.getMonth(), 1);
-    return this.summaryRepository
-      .createQueryBuilder('summary')
-      .where('summary.employeeProfileId = :profileId', { profileId })
-      .andWhere('summary.month >= :fromMonth', { fromMonth })
-      .orderBy('summary.month', 'DESC')
-      .getMany();
+    const one = await this.summaryRepository.findOne({
+      where: { employeeProfileId: profileId, month: thisMonth },
+    });
+    return one ? [one] : [];
   }
 
   // ---------------------------------------------------------------------
@@ -1736,7 +1812,11 @@ export class CareerLadderService {
         const isPast = !isCurrent && traversed.has(rung.id);
 
         let progress = 0;
-        let requirements: { text: string; completed: boolean }[] = [];
+        let requirements: {
+          text: string;
+          completed: boolean;
+          progressText: string | null;
+        }[] = [];
 
         if (isPast || isCurrent) {
           progress = 100;
@@ -1746,6 +1826,8 @@ export class CareerLadderService {
           requirements = evaluation.items.map((i) => ({
             text: i.label,
             completed: i.met,
+            // Additive: older apps read only text/completed.
+            progressText: i.progressText ?? null,
           }));
         }
 
@@ -1827,6 +1909,7 @@ export class CareerLadderService {
         isMet: i.met,
         currentValue: i.current,
         requiredValue: i.target,
+        progressText: i.progressText ?? null,
       })),
       skills: 'N/A',
     };

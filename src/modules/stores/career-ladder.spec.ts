@@ -90,6 +90,8 @@ function build(
     latestEvent?: any;
     currentRung?: any;
     otherLadder?: any;
+    /** Kết quả truy vấn ca COMPLETED (shift_assignments). */
+    completed?: { shifts: string; minutes: string };
   } = {},
 ) {
   const service = Object.create(CareerLadderService.prototype) as any;
@@ -129,7 +131,17 @@ function build(
   service.probationSettingRepository = {
     findOne: jest.fn().mockResolvedValue(null),
   };
-  service.dataSource = { getRepository: jest.fn() };
+  const shiftQb: any = {};
+  for (const method of ['innerJoin', 'select', 'addSelect', 'where', 'andWhere']) {
+    shiftQb[method] = jest.fn(() => shiftQb);
+  }
+  shiftQb.getRawOne = jest
+    .fn()
+    .mockResolvedValue(opts.completed ?? { shifts: '0', minutes: '0' });
+  service.shiftQb = shiftQb;
+  service.dataSource = {
+    getRepository: jest.fn(() => ({ createQueryBuilder: () => shiftQb })),
+  };
   service.notificationsService = { create: jest.fn() };
 
   return service;
@@ -640,7 +652,7 @@ describe('assertCanViewOwnCareer — chỉ chủ hoặc chính nhân viên', () 
 });
 
 describe('getCareerSummary', () => {
-  it('mỗi lộ trình trả bậc đang giữ và bậc kế có tiến độ cao nhất, không lộ số đo thô', async () => {
+  it('mỗi lộ trình trả bậc đang giữ và bậc kế có tiến độ cao nhất, kèm số đo để đếm ngược', async () => {
     const service = Object.create(CareerLadderService.prototype) as any;
     service.profileRepository = {
       findOne: jest.fn().mockResolvedValue(profile({ employeeTypeId: 'type-probation' })),
@@ -661,7 +673,32 @@ describe('getCareerSummary', () => {
         progress: 80,
         passed: false,
         items: [
-          { label: 'Đủ 30 ngày', kind: 'tenure', met: true, isRequired: true, current: 45, target: 30 },
+          {
+            id: 'c-1',
+            code: 'days_in_rung',
+            label: 'Đủ 30 ngày',
+            kind: 'tenure',
+            operator: 'gte',
+            unit: null,
+            met: true,
+            isRequired: true,
+            current: 45,
+            target: 30,
+            progressText: 'Đã đạt 45/30 ngày',
+          },
+          {
+            id: 'c-2',
+            code: null,
+            label: 'Thái độ tốt',
+            kind: 'checklist',
+            operator: null,
+            unit: null,
+            met: false,
+            isRequired: true,
+            current: 0,
+            target: null,
+            progressText: null,
+          },
         ],
       },
     ]);
@@ -679,7 +716,31 @@ describe('getCareerSummary', () => {
           name: 'Chính thức',
           progress: 80,
           passed: false,
-          items: [{ label: 'Đủ 30 ngày', kind: 'tenure', met: true, isRequired: true }],
+          items: [
+            {
+              label: 'Đủ 30 ngày',
+              kind: 'tenure',
+              met: true,
+              isRequired: true,
+              current: 45,
+              target: 30,
+              unit: 'ngày',
+              operator: 'gte',
+              progressText: 'Đã đạt 45/30 ngày',
+            },
+            // Checklist là có/không: không trả số đo.
+            {
+              label: 'Thái độ tốt',
+              kind: 'checklist',
+              met: false,
+              isRequired: true,
+              current: null,
+              target: null,
+              unit: null,
+              operator: null,
+              progressText: null,
+            },
+          ],
         },
       },
     ]);
@@ -897,5 +958,233 @@ describe('CareerLadderService — rehire leaks A/B (current stint only)', () => 
       ladderId: 'ladder-1',
     });
     expect(stages[0].progress).toBe(100);
+  });
+});
+
+describe('metricValue — ca đã hoàn thành / giờ làm đếm từ ca thật', () => {
+  const shiftsCriteria = criteria({
+    code: CriteriaCode.COMPLETED_SHIFTS,
+    value: 30,
+    label: 'Số ca đã hoàn thành ≥ 30 ca',
+    unit: 'ca',
+  });
+
+  it('1 ca hoàn thành sau khi vào bậc → 1/30, còn 29 ca', async () => {
+    const service = build({
+      criteria: [shiftsCriteria],
+      // Bảng thống kê tháng còn chưa kịp cập nhật (job chấm ra bất đồng bộ).
+      summaries: [summary({ completedShifts: 0 })],
+      latestEvent: { effectiveAt: new Date('2026-09-20T08:00:00.000Z') },
+      completed: { shifts: '1', minutes: '480' },
+    });
+
+    const result = await service.evaluateRung(
+      profile({ joinedAt: new Date('2026-01-05T02:00:00.000Z') }),
+      rung(),
+      ladder(),
+    );
+
+    expect(result.items[0]).toMatchObject({
+      current: 1,
+      target: 30,
+      met: false,
+      progressText: 'Đã đạt 1/30 ca · còn 29 ca',
+    });
+    const qb = service.shiftQb;
+    expect(qb.where).toHaveBeenCalledWith('assignment.employeeId = :profileId', {
+      profileId: PROFILE,
+    });
+    expect(qb.andWhere).toHaveBeenCalledWith('assignment.status = :status', {
+      status: 'COMPLETED',
+    });
+    // Từ ngày vào bậc (lịch VN), không phải từ đầu tháng.
+    expect(qb.andWhere).toHaveBeenCalledWith('slot.workDate >= :since', {
+      since: '2026-09-20',
+    });
+    // Không còn cộng các dòng thống kê tháng.
+    expect(service.summaryRepository.createQueryBuilder).not.toHaveBeenCalled();
+  });
+
+  it('ngày vào bậc tính theo giờ Việt Nam (vào bậc 23:30 UTC = sáng hôm sau ở VN)', async () => {
+    const service = build({
+      criteria: [shiftsCriteria],
+      latestEvent: { effectiveAt: new Date('2026-09-19T23:30:00.000Z') },
+    });
+
+    await service.evaluateRung(profile({ joinedAt: null }), rung(), ladder());
+
+    expect(service.shiftQb.andWhere).toHaveBeenCalledWith('slot.workDate >= :since', {
+      since: '2026-09-20',
+    });
+  });
+
+  it('mốc vào bậc của đợt làm trước không được tính: lấy ngày quay lại làm', async () => {
+    const service = build({
+      criteria: [shiftsCriteria],
+      latestEvent: { effectiveAt: new Date('2025-03-01T03:00:00.000Z') },
+    });
+
+    await service.evaluateRung(
+      profile({ joinedAt: new Date('2026-09-10T03:00:00.000Z') }),
+      rung(),
+      ladder(),
+    );
+
+    expect(service.shiftQb.andWhere).toHaveBeenCalledWith('slot.workDate >= :since', {
+      since: '2026-09-10',
+    });
+  });
+
+  it('chưa có mốc vào bậc thì đếm từ đầu đợt làm việc, không reset theo tháng', async () => {
+    const service = build({
+      criteria: [shiftsCriteria],
+      latestEvent: null,
+      completed: { shifts: '31', minutes: '0' },
+    });
+
+    const result = await service.evaluateRung(
+      profile({ joinedAt: new Date('2026-06-01T01:00:00.000Z') }),
+      rung(),
+      ladder(),
+    );
+
+    expect(service.shiftQb.andWhere).toHaveBeenCalledWith('slot.workDate >= :since', {
+      since: '2026-06-01',
+    });
+    expect(result.items[0]).toMatchObject({
+      current: 31,
+      met: true,
+      progressText: 'Đã đạt 31/30 ca',
+    });
+  });
+
+  it('hồ sơ cũ không có mốc nào thì không giới hạn ngày', async () => {
+    const service = build({ criteria: [shiftsCriteria], latestEvent: null });
+
+    await service.evaluateRung(profile({ joinedAt: null }), rung(), ladder());
+
+    expect(service.shiftQb.andWhere).not.toHaveBeenCalledWith(
+      'slot.workDate >= :since',
+      expect.anything(),
+    );
+  });
+
+  it('giờ làm = tổng phút làm của ca hoàn thành, không cộng dồn số tích luỹ nhiều tháng', async () => {
+    const service = build({
+      criteria: [
+        criteria({
+          code: CriteriaCode.WORK_HOURS,
+          value: 40,
+          label: 'Số giờ làm ≥ 40',
+          unit: 'giờ',
+        }),
+      ],
+      // totalWorkHours đã là số tích luỹ; cộng hai tháng từng cho ra 160.
+      summaries: [summary({ totalWorkHours: 80 }), summary({ totalWorkHours: 80 })],
+      latestEvent: { effectiveAt: new Date('2026-09-01T03:00:00.000Z') },
+      completed: { shifts: '3', minutes: '741' },
+    });
+
+    const result = await service.evaluateRung(profile(), rung(), ladder());
+
+    expect(result.items[0]).toMatchObject({
+      current: 12.35,
+      met: false,
+      progressText: 'Đã đạt 12,3/40 giờ · còn 27,7 giờ',
+    });
+  });
+
+  it('checklist không có câu tiến độ', async () => {
+    const service = build({
+      criteria: [criteria({ kind: CriteriaKind.CHECKLIST, code: null, value: null })],
+    });
+
+    const result = await service.evaluateRung(profile(), rung(), ladder());
+
+    expect(result.items[0].progressText).toBeNull();
+  });
+});
+
+describe('getCareerSummary — đếm ngược đi hết đường từ phép đo tới trang chủ', () => {
+  it('1 ca đã làm với điều kiện 30 ca → "còn 29 ca"', async () => {
+    const service = build({
+      criteria: [
+        criteria({
+          code: CriteriaCode.COMPLETED_SHIFTS,
+          value: 30,
+          label: 'Số ca đã hoàn thành ≥ 30 ca',
+          unit: 'ca',
+        }),
+      ],
+      latestEvent: { effectiveAt: new Date('2026-09-20T08:00:00.000Z') },
+      completed: { shifts: '1', minutes: '480' },
+    });
+    service.profileRepository = {
+      findOne: jest.fn().mockResolvedValue(profile({ storeRoleId: null })),
+    };
+    service.ladderRepository = {
+      find: jest.fn().mockResolvedValue([ladder()]),
+      findOne: jest.fn().mockResolvedValue(ladder()),
+    };
+    service.edgeRepository = {
+      find: jest.fn().mockResolvedValue([{ fromRungId: null, toRungId: 'rung-2' }]),
+    };
+    service.rungRepository.find = jest.fn().mockResolvedValue([rung()]);
+    service.targetNames = jest.fn().mockResolvedValue(new Map([['role-2', 'Ca trưởng']]));
+
+    const result = await service.getCareerSummary(PROFILE);
+
+    expect(result.ladders[0].next.items).toEqual([
+      {
+        label: 'Số ca đã hoàn thành ≥ 30 ca',
+        kind: 'metric',
+        met: false,
+        isRequired: true,
+        current: 1,
+        target: 30,
+        unit: 'ca',
+        operator: 'gte',
+        progressText: 'Đã đạt 1/30 ca · còn 29 ca',
+      },
+    ]);
+
+    // Màn "bậc kế tiếp" nói cùng một câu.
+    const next = await service.nextRungs(PROFILE, 'ladder-1');
+    expect(next[0].items[0].progressText).toBe('Đã đạt 1/30 ca · còn 29 ca');
+  });
+});
+
+describe('getProgressionStages — yêu cầu của bậc đi tới được có câu tiến độ', () => {
+  it('trả progressText cạnh text/completed (app cũ bỏ qua trường mới)', async () => {
+    const service = build({
+      criteria: [
+        criteria({
+          code: CriteriaCode.COMPLETED_SHIFTS,
+          value: 30,
+          label: 'Số ca đã hoàn thành ≥ 30 ca',
+          unit: 'ca',
+        }),
+      ],
+      completed: { shifts: '1', minutes: '0' },
+    });
+    service.profileRepository = {
+      findOne: jest.fn().mockResolvedValue(profile({ storeRoleId: null })),
+    };
+    service.ladderRepository = { find: jest.fn().mockResolvedValue([ladder()]) };
+    service.rungRepository.find = jest.fn().mockResolvedValue([rung()]);
+    service.edgeRepository = {
+      find: jest.fn().mockResolvedValue([{ fromRungId: null, toRungId: 'rung-2' }]),
+    };
+    service.targetNames = jest.fn().mockResolvedValue(new Map([['role-2', 'Ca trưởng']]));
+
+    const stages = await service.getProgressionStages(PROFILE);
+
+    expect(stages[0].requirements).toEqual([
+      {
+        text: 'Số ca đã hoàn thành ≥ 30 ca',
+        completed: false,
+        progressText: 'Đã đạt 1/30 ca · còn 29 ca',
+      },
+    ]);
   });
 });
