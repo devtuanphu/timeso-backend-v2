@@ -364,6 +364,7 @@ import {
   creditedWorkedMinutes,
   resolveAttendanceRules,
 } from './attendance-rules';
+import { overtimeEndAt } from './shift-end-workflow.service';
 import { DEFAULT_ANDROID_CHANNEL } from '../push/push-capabilities';
 import {
   isSlotRegistrationClosed,
@@ -18754,6 +18755,7 @@ export class StoresService {
       request,
       ownerAccountId ?? null,
     );
+    await this.repriceCheckedOutOvertime(saved);
     return saved;
   }
 
@@ -18773,7 +18775,83 @@ export class StoresService {
       request,
       ownerAccountId ?? null,
     );
+    await this.repriceCheckedOutOvertime(saved);
     return saved;
+  }
+
+  /**
+   * End of the approved overtime of an assignment, as an instant, or null.
+   * Only this extends paid time past the shift end.
+   */
+  private async approvedOvertimeEnd(
+    assignmentId: string,
+    shiftEnd: Date | null,
+  ): Promise<Date | null> {
+    const request = await this.bonusWorkRequestRepository.findOne({
+      where: {
+        shiftAssignmentId: assignmentId,
+        status: BonusWorkRequestStatus.APPROVED,
+      },
+      order: { updatedAt: 'DESC' },
+    });
+    return request ? overtimeEndAt(request, shiftEnd ?? undefined) : null;
+  }
+
+  /**
+   * An overtime request decided after the employee already checked out
+   * (they left while it was pending): worked minutes were paid to the shift
+   * end, so approving pays the overtime and rejecting an earlier approval
+   * takes it back. The payslip is recomputed when the minutes change.
+   * Automatic check-outs are priced when they close and are left alone.
+   */
+  private async repriceCheckedOutOvertime(
+    request: BonusWorkRequest,
+  ): Promise<void> {
+    if (!request.shiftAssignmentId) return;
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      where: { id: request.shiftAssignmentId },
+      relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+    });
+    if (
+      !assignment ||
+      assignment.status !== ShiftAssignmentStatus.COMPLETED ||
+      !assignment.checkInTime ||
+      !assignment.checkOutTime ||
+      assignment.isAutoCheckout
+    ) {
+      return;
+    }
+    const slot = assignment.shiftSlot;
+    const { start, end } = resolveShiftBoundaries(
+      slot?.workDate,
+      slot?.startTime || slot?.workShift?.startTime,
+      slot?.endTime || slot?.workShift?.endTime,
+    );
+    const storeId = slot?.cycle?.storeId;
+    const setting = storeId
+      ? await this.timekeepingSettingRepository.findOne({ where: { storeId } })
+      : null;
+    const workedMinutes = creditedWorkedMinutes({
+      start,
+      end,
+      checkIn: new Date(assignment.checkInTime),
+      checkOut: new Date(assignment.checkOutTime),
+      rules: resolveAttendanceRules(setting),
+      storedLateMinutes: assignment.lateMinutes,
+      paidUntil: await this.approvedOvertimeEnd(assignment.id, end),
+    });
+    if (workedMinutes === Number(assignment.workedMinutes)) return;
+    await this.shiftAssignmentRepository.update(
+      { id: assignment.id, status: ShiftAssignmentStatus.COMPLETED },
+      { workedMinutes },
+    );
+    try {
+      await this.processCheckoutPayroll(assignment.id);
+    } catch {
+      this.logger.error(
+        `[Overtime] Payslip not recomputed after repricing ${assignment.id}`,
+      );
+    }
   }
 
   // Lấy thống kê duyệt
@@ -19635,8 +19713,10 @@ export class StoresService {
     // Leaving early within the store's allowed minutes counts as on time (0).
     const earlyMinutes = applyGrace(calculateEarlyMinutes(shiftEnd, now), rules);
 
-    // Check-in to check-out, with forgiven (or not deducted) late/early time
-    // counted. Whether the late arrival was forgiven is what check-in stored.
+    // Paid time inside the shift, with forgiven (or not deducted) late/early
+    // time counted; staying after the end is paid only up to an approved
+    // overtime end. Whether the late arrival was forgiven is what check-in
+    // stored.
     const workedMinutes = creditedWorkedMinutes({
       start: shiftStart,
       end: shiftEnd,
@@ -19644,6 +19724,7 @@ export class StoresService {
       checkOut: now,
       rules,
       storedLateMinutes: assignment.lateMinutes,
+      paidUntil: await this.approvedOvertimeEnd(assignmentId, shiftEnd),
     });
 
     // Determine final attendance status

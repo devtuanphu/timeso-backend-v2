@@ -90,10 +90,15 @@ export function checkInOpensAt(
 }
 
 /**
- * Worked minutes between check-in and check-out. A late arrival (or early
- * leave) is counted from the shift start (or to the shift end) when it fell
- * within the grace, or when the store does not deduct late/early time.
- * Arriving early or leaving late is counted as it happened, as before.
+ * Paid worked minutes of one attendance: only time inside the shift, plus
+ * approved overtime. Arriving before the start is not paid, and staying
+ * after the end is paid only up to `paidUntil` — the approved overtime end —
+ * so sitting on until 12:00 after a 10:00 shift adds nothing without an
+ * approved overtime request.
+ *
+ * Inside the shift, a late arrival (or early leave) is counted from the
+ * start (or to the end) when it fell within the grace, or when the store
+ * does not deduct late/early time.
  *
  * Pass `storedLateMinutes` (what check-in recorded) when known: whether the
  * late arrival was forgiven is then decided by that record, not re-decided
@@ -106,6 +111,8 @@ export function creditedWorkedMinutes(input: {
   checkOut: Date;
   rules: AttendanceRules;
   storedLateMinutes?: number | null;
+  /** End of approved overtime, when later than the shift end. */
+  paidUntil?: Date | null;
 }): number {
   const { start, end, checkIn, checkOut, rules, storedLateMinutes } = input;
   // Called only for a real gap (> 0 ms); whole minutes decide the grace, as
@@ -117,8 +124,14 @@ export function creditedWorkedMinutes(input: {
       : applyGrace(Math.floor(gapMs / 60_000), rules) === 0);
 
   let from = checkIn.getTime();
-  if (start && from > start.getTime()) {
-    if (credited(from - start.getTime(), storedLateMinutes)) {
+  if (start) {
+    if (from < start.getTime()) {
+      // Early arrival: paid from the shift start.
+      from = start.getTime();
+    } else if (
+      from > start.getTime() &&
+      credited(from - start.getTime(), storedLateMinutes)
+    ) {
       from = start.getTime();
     }
   }
@@ -126,5 +139,11 @@ export function creditedWorkedMinutes(input: {
   if (end && to < end.getTime()) {
     if (credited(end.getTime() - to)) to = end.getTime();
   }
+  // Staying late: paid to the shift end, or to the approved overtime end.
+  const paidEnd =
+    input.paidUntil && (!end || input.paidUntil.getTime() > end.getTime())
+      ? input.paidUntil
+      : end;
+  if (paidEnd && to > paidEnd.getTime()) to = paidEnd.getTime();
   return Math.max(0, Math.floor((to - from) / 60_000));
 }

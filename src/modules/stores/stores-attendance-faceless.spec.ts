@@ -98,6 +98,8 @@ function build(opts: {
   };
   service.dataSource = { transaction: jest.fn(async (cb: any) => cb(manager)) };
   service.profileRepository = { update: jest.fn().mockResolvedValue({}) };
+  // No approved overtime unless a test says so.
+  service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(null) };
   service.appendToDailyReport = jest.fn();
   service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
   service.ownerNotificationService = { afterAttendance: jest.fn().mockResolvedValue(undefined) };

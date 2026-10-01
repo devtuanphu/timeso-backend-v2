@@ -369,6 +369,32 @@ describe('auto-checkout worked time', () => {
     expect(written[0]).toMatchObject({ workedMinutes: 540 });
   });
 
+  it('pays to the shift end when overtime was rejected after it ended', async () => {
+    // Rejected after the end: the workflow moved the close to later, but
+    // nothing after 17:00 VN (END) is approved.
+    jest.setSystemTime(plus(40));
+    const { service, written } = build({ setting: null as any });
+
+    await service.autoCheckout('assignment-1', plus(20));
+
+    expect(written[0]).toMatchObject({ workedMinutes: 540 });
+  });
+
+  it('pays approved overtime up to its end', async () => {
+    jest.setSystemTime(new Date('2026-07-12T11:20:00.000Z')); // overtime end + 20
+    const overtime = {
+      id: 'overtime-1',
+      status: BonusWorkRequestStatus.APPROVED,
+      requestDate: '2026-07-12',
+      endTime: '18:00:00', // 11:00 UTC
+    };
+    const { service, written } = build({ setting: null as any, overtime });
+
+    await service.autoCheckout('assignment-1', new Date('2026-07-12T11:00:00.000Z'));
+
+    expect(written[0]).toMatchObject({ workedMinutes: 600 });
+  });
+
   it('counts from the check-in when the late arrival was recorded', async () => {
     const { service, written } = build({
       setting: null as any,

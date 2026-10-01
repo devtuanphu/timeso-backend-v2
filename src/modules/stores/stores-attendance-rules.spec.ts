@@ -58,6 +58,8 @@ function build(assignment: any, setting: Record<string, unknown> | null) {
   };
   service.dataSource = { transaction: jest.fn(async (cb: any) => cb(manager)) };
   service.profileRepository = { update: jest.fn().mockResolvedValue({}) };
+  // No approved overtime unless a test says so.
+  service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(null) };
   service.appendToDailyReport = jest.fn();
   // Check-out hands payroll and the shift-end workflow off after commit.
   service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
@@ -263,5 +265,139 @@ describe('check-out with the store attendance rules', () => {
       workedMinutes: 225,
       attendanceStatus: AttendanceStatus.LATE_AND_EARLY,
     });
+  });
+});
+
+describe('check-out pays only the shift and approved overtime', () => {
+  afterEach(() => jest.useRealTimers());
+  const at = (clock: string) =>
+    jest.useFakeTimers({
+      now: vn(clock),
+      doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
+    });
+
+  it('stops at the shift end without an approved overtime request', async () => {
+    // Shift 08:00-12:00, stayed until 14:00 with no overtime request.
+    at('14:00');
+    const { service, written } = build(checkedIn('08:00', 0), null);
+
+    await service.checkOutWithFace('as-1', Buffer.from('x'), 'staff-1');
+
+    expect(written()).toMatchObject({ earlyMinutes: 0, workedMinutes: 240 });
+  });
+
+  it('pays up to the approved overtime end', async () => {
+    at('14:00');
+    const { service, written } = build(checkedIn('08:00', 0), null);
+    service.bonusWorkRequestRepository.findOne.mockResolvedValue({
+      status: 'APPROVED',
+      requestDate: '2026-10-01',
+      endTime: '13:00:00',
+    });
+
+    await service.checkOutWithFace('as-1', Buffer.from('x'), 'staff-1');
+
+    expect(written()).toMatchObject({ workedMinutes: 300 });
+    expect(service.bonusWorkRequestRepository.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { shiftAssignmentId: 'as-1', status: 'APPROVED' },
+      }),
+    );
+  });
+
+  it('does not pay the time before the shift start', async () => {
+    at('12:00');
+    const { service, written } = build(checkedIn('07:45', 0), null);
+
+    await service.checkOutWithFace('as-1', Buffer.from('x'), 'staff-1');
+
+    expect(written()).toMatchObject({ workedMinutes: 240 });
+  });
+});
+
+describe('overtime decided after the employee checked out', () => {
+  const completed = (over: Record<string, unknown> = {}) => ({
+    id: 'as-1',
+    status: ShiftAssignmentStatus.COMPLETED,
+    employeeId: 'emp-1',
+    checkInTime: vn('08:00'),
+    checkOutTime: vn('14:00'),
+    lateMinutes: 0,
+    workedMinutes: 240,
+    isAutoCheckout: false,
+    shiftSlot: SLOT,
+    ...over,
+  });
+
+  const buildDecision = (
+    assignment: Record<string, unknown>,
+    approved: Record<string, unknown> | null,
+  ) => {
+    const service = Object.create(StoresService.prototype) as any;
+    service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
+    service.shiftAssignmentRepository = {
+      findOne: jest.fn().mockResolvedValue(assignment),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+    service.timekeepingSettingRepository = { findOne: jest.fn().mockResolvedValue(null) };
+    service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(approved) };
+    service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
+    return service;
+  };
+  const request = { id: 'ot-1', shiftAssignmentId: 'as-1' } as any;
+  const approvedTo13 = { status: 'APPROVED', requestDate: '2026-10-01', endTime: '13:00:00' };
+
+  it('approving pays the overtime and recomputes the payslip', async () => {
+    const service = buildDecision(completed(), approvedTo13);
+
+    await service.repriceCheckedOutOvertime(request);
+
+    expect(service.shiftAssignmentRepository.update).toHaveBeenCalledWith(
+      { id: 'as-1', status: ShiftAssignmentStatus.COMPLETED },
+      { workedMinutes: 300 },
+    );
+    expect(service.processCheckoutPayroll).toHaveBeenCalledWith('as-1');
+  });
+
+  it('rejecting an earlier approval takes the overtime back', async () => {
+    const service = buildDecision(completed({ workedMinutes: 300 }), null);
+
+    await service.repriceCheckedOutOvertime(request);
+
+    expect(service.shiftAssignmentRepository.update).toHaveBeenCalledWith(
+      expect.anything(),
+      { workedMinutes: 240 },
+    );
+    expect(service.processCheckoutPayroll).toHaveBeenCalledWith('as-1');
+  });
+
+  it('leaves unchanged minutes, open shifts and automatic check-outs alone', async () => {
+    for (const assignment of [
+      completed(),
+      completed({ status: ShiftAssignmentStatus.CONFIRMED, checkOutTime: null }),
+      completed({ isAutoCheckout: true, workedMinutes: 240 }),
+    ]) {
+      const service = buildDecision(assignment, null);
+      await service.repriceCheckedOutOvertime(request);
+      expect(service.shiftAssignmentRepository.update).not.toHaveBeenCalled();
+      expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
+    }
+  });
+
+  it('runs when the owner approves or rejects', async () => {
+    const service = Object.create(StoresService.prototype) as any;
+    const saved = { ...request, status: 'APPROVED' };
+    service.loadBonusWorkRequestForOwner = jest.fn().mockResolvedValue({
+      request: { ...request },
+      approverProfileId: 'owner-profile',
+    });
+    service.bonusWorkRequestRepository = { save: jest.fn().mockResolvedValue(saved) };
+    service.logBonusWorkActivity = jest.fn().mockResolvedValue(undefined);
+    service.repriceCheckedOutOvertime = jest.fn().mockResolvedValue(undefined);
+
+    await service.approveBonusWorkRequest('ot-1', 'owner-1');
+    await service.rejectBonusWorkRequest('ot-1', 'owner-1', 'Không cần');
+
+    expect(service.repriceCheckedOutOvertime).toHaveBeenCalledTimes(2);
   });
 });

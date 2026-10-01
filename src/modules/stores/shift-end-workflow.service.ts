@@ -547,6 +547,7 @@ export class ShiftEndWorkflowService {
       });
       const nowMs = (options.now ?? new Date()).getTime();
       const expiredPendingIds: string[] = [];
+      let approvedOvertimeEnd: Date | null = null;
       for (const request of overtimeRequests ?? []) {
         if (request.status === BonusWorkRequestStatus.PENDING) {
           if (!options.pendingOvertimeDue) return null;
@@ -562,24 +563,28 @@ export class ShiftEndWorkflowService {
         ) {
           return null;
         }
+        approvedOvertimeEnd = approvedEnd;
       }
 
       const autoCheckoutAt = new Date();
-      // Paid to the effective end; a late arrival forgiven at check-in (or
-      // not deducted by the store) counts from the shift start.
+      // Paid to the shift end, or to the approved overtime end — never to an
+      // end pushed later for another reason (overtime rejected after the
+      // shift ended moves the close to now + 5 min). A late arrival forgiven
+      // at check-in (or not deducted by the store) counts from the start.
       const slot = assignment.shiftSlot;
-      const { start } = resolveShiftBoundaries(
+      const { start, end } = resolveShiftBoundaries(
         slot?.workDate ? String(slot.workDate).slice(0, 10) : null,
         slot?.startTime || slot?.workShift?.startTime,
         slot?.endTime || slot?.workShift?.endTime,
       );
       const workedMinutes = creditedWorkedMinutes({
         start,
-        end: null,
+        end,
         checkIn: assignment.checkInTime,
         checkOut: effectiveEndAt,
         rules,
         storedLateMinutes: assignment.lateMinutes,
+        paidUntil: approvedOvertimeEnd,
       });
       const updated = await manager
         .createQueryBuilder()

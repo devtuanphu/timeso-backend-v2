@@ -151,7 +151,7 @@ describe('creditedWorkedMinutes', () => {
     ).toBe(240);
   });
 
-  it('keeps early arrival and late leave as worked', () => {
+  it('pays neither early arrival nor staying late without overtime', () => {
     expect(
       creditedWorkedMinutes({
         start,
@@ -160,7 +160,38 @@ describe('creditedWorkedMinutes', () => {
         checkOut: vn('2026-10-01T12:20'),
         rules: { ...DEFAULT_ATTENDANCE_RULES, creditLateEarly: true },
       }),
-    ).toBe(270);
+    ).toBe(240);
+  });
+
+  it('shift 05:00-10:00, checked out at 12:00 without overtime: 5 hours', () => {
+    const early = resolveShiftBoundaries('2026-10-01', '05:00', '10:00');
+    expect(
+      creditedWorkedMinutes({
+        start: early.start,
+        end: early.end,
+        checkIn: vn('2026-10-01T05:00'),
+        checkOut: vn('2026-10-01T12:00'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+      }),
+    ).toBe(300);
+  });
+
+  it('pays staying late up to the approved overtime end', () => {
+    const at = (checkOut: string, paidUntil: string) =>
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T08:00'),
+        checkOut: vn(checkOut),
+        rules: DEFAULT_ATTENDANCE_RULES,
+        paidUntil: vn(paidUntil),
+      });
+    // Approved to 13:00, left 12:20: the 20 minutes are paid.
+    expect(at('2026-10-01T12:20', '2026-10-01T13:00')).toBe(260);
+    // Approved to 12:10, left 12:20: paid to 12:10.
+    expect(at('2026-10-01T12:20', '2026-10-01T12:10')).toBe(250);
+    // An "overtime end" before the shift end never shortens the shift.
+    expect(at('2026-10-01T12:00', '2026-10-01T11:00')).toBe(240);
   });
 
   it('handles a cross-midnight shift', () => {
