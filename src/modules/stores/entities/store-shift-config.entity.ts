@@ -19,6 +19,12 @@ export enum TimekeepingRequirement {
   LOCATION_QR_GPS_FACEID = 'LOCATION_QR_GPS_FACEID', // Có vị trí (QR + GPS + FaceID)
   GPS_ONLY = 'GPS_ONLY', // Chỉ GPS
   QR_ONLY = 'QR_ONLY', // Chỉ QR
+  /**
+   * GPS + QR, không cần FaceID: nhân viên quét QR cửa hàng và có vị trí trong
+   * bán kính là chấm công được, không chụp mặt. Không có ảnh thì QR + GPS
+   * luôn bị kiểm tra chặt (attendance-enforcement.ts, evaluateFacelessAttendance).
+   */
+  GPS_QR = 'GPS_QR',
 }
 
 // --- ENTITY ---

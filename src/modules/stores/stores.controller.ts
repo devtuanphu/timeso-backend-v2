@@ -43,6 +43,7 @@ import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
 import { CreateWorkShiftDto, UpdateWorkShiftDto } from './dto/work-shift.dto';
+import { parseAttendanceCoordinate } from './attendance-enforcement';
 import { resolveUploadedDocxPath } from './contract-template-file.utils';
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
@@ -4752,7 +4753,11 @@ export class StoresController {
   // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   @Post('shift-assignments/:id/check-in')
-  @ApiOperation({ summary: 'Check-in ca làm việc (3 bước: QR → GPS → Face)' })
+  @ApiOperation({
+    summary: 'Check-in ca làm việc (QR → GPS → Face)',
+    description:
+      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR); khi đó QR và vị trí trong bán kính là bắt buộc.',
+  })
   @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkIn(
     @Param('id') id: string,
@@ -4766,16 +4771,18 @@ export class StoresController {
       orientationNormalized?: string;
     },
   ) {
-    if (!photo) throw new BadRequestException('Photo is required');
-    const imageBuffer = photo.buffer;
-    if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
+    // No photo is accepted only for a GPS_QR store (the service checks the
+    // store mode and then requires QR + GPS); other stores get 400
+    // ATTENDANCE_FACE_REQUIRED.
+    const imageBuffer = photo ? photo.buffer : null;
+    if (photo && !imageBuffer) throw new BadRequestException('Invalid photo upload');
     const result = await this.storesService.checkInWithFace(
       id,
       imageBuffer,
       user?.userId,
       {
-        latitude: body.latitude ? parseFloat(body.latitude) : undefined,
-        longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+        latitude: parseAttendanceCoordinate(body.latitude, 90),
+        longitude: parseAttendanceCoordinate(body.longitude, 180),
         qrStoreId: body.qrStoreId,
         orientationNormalized: body.orientationNormalized === 'true',
       },
@@ -4793,7 +4800,11 @@ export class StoresController {
   }
 
   @Post('shift-assignments/:id/check-out')
-  @ApiOperation({ summary: 'Check-out ca làm việc (3 bước: QR → GPS → Face)' })
+  @ApiOperation({
+    summary: 'Check-out ca làm việc (QR → GPS → Face)',
+    description:
+      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR); khi đó QR và vị trí trong bán kính là bắt buộc.',
+  })
   @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkOut(
     @Param('id') id: string,
@@ -4807,16 +4818,18 @@ export class StoresController {
       orientationNormalized?: string;
     },
   ) {
-    if (!photo) throw new BadRequestException('Photo is required');
-    const imageBuffer = photo.buffer;
-    if (!imageBuffer) throw new BadRequestException('Invalid photo upload');
+    // No photo is accepted only for a GPS_QR store (the service checks the
+    // store mode and then requires QR + GPS); other stores get 400
+    // ATTENDANCE_FACE_REQUIRED.
+    const imageBuffer = photo ? photo.buffer : null;
+    if (photo && !imageBuffer) throw new BadRequestException('Invalid photo upload');
     const result = await this.storesService.checkOutWithFace(
       id,
       imageBuffer,
       user?.userId,
       {
-        latitude: body.latitude ? parseFloat(body.latitude) : undefined,
-        longitude: body.longitude ? parseFloat(body.longitude) : undefined,
+        latitude: parseAttendanceCoordinate(body.latitude, 90),
+        longitude: parseAttendanceCoordinate(body.longitude, 180),
         qrStoreId: body.qrStoreId,
         orientationNormalized: body.orientationNormalized === 'true',
       },

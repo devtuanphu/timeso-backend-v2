@@ -375,6 +375,7 @@ import {
 import {
   describeAttendanceViolation,
   evaluateAttendanceRules,
+  evaluateFacelessAttendance,
   resolveAttendanceEnforcementMode,
 } from './attendance-enforcement';
 import * as ExcelJS from 'exceljs';
@@ -1019,6 +1020,9 @@ const requireWorkShiftName = (value: unknown): string => {
   }
   return name;
 };
+
+/** GPS_QR chosen for a store without saved coordinates. */
+export const STORE_LOCATION_REQUIRED_CODE = 'STORE_LOCATION_REQUIRED';
 
 /** Check-in before the store's early check-in window opens. */
 export const CHECK_IN_TOO_EARLY_CODE = 'CHECK_IN_TOO_EARLY';
@@ -17036,6 +17040,21 @@ export class StoresService {
   }
 
   async upsertShiftConfig(storeId: string, data: UpdateStoreShiftConfigDto) {
+    // GPS + QR without FaceID measures every check-in against the store's
+    // coordinates: without them nobody could check in.
+    if (data.timekeepingRequirement === TimekeepingRequirement.GPS_QR) {
+      const store = await this.storeRepository.findOne({
+        where: { id: storeId },
+        select: ['id', 'latitude', 'longitude'],
+      });
+      if (store?.latitude == null || store?.longitude == null) {
+        throw new BadRequestException({
+          code: STORE_LOCATION_REQUIRED_CODE,
+          message:
+            'Hãy thiết lập vị trí cửa hàng trước khi chọn chấm công GPS + QR.',
+        });
+      }
+    }
     let config = await this.shiftConfigRepository.findOne({
       where: { storeId },
     });
@@ -19109,6 +19128,8 @@ export class StoresService {
     storeId: string | undefined,
     employeeProfileId: string | undefined,
     options?: { latitude?: number; longitude?: number; qrStoreId?: string },
+    /** No face photo: allowed only for a GPS_QR store, and always enforced. */
+    faceless = false,
   ): Promise<{
     checkinDistance: number | null;
     checkinLatitude: number | null;
@@ -19119,8 +19140,9 @@ export class StoresService {
     let checkinLatitude: number | null = null;
     let checkinLongitude: number | null = null;
 
+    // Finite numbers only: NaN would make every distance comparison false.
     const hasLocationFix =
-      options?.latitude != null && options?.longitude != null;
+      Number.isFinite(options?.latitude) && Number.isFinite(options?.longitude);
 
     const [timekeeping, shiftConfig, store] = await Promise.all([
       storeId
@@ -19129,7 +19151,7 @@ export class StoresService {
       storeId
         ? this.shiftConfigRepository.findOne({ where: { storeId } })
         : null,
-      storeId && hasLocationFix
+      storeId && (hasLocationFix || faceless)
         ? this.storeRepository.findOne({ where: { id: storeId } })
         : null,
     ]);
@@ -19145,6 +19167,35 @@ export class StoresService {
           store.longitude,
         );
       }
+    }
+
+    if (faceless) {
+      // Nothing identifies the person, so QR + location are the evidence and
+      // are enforced regardless of ATTENDANCE_ENFORCEMENT_MODE.
+      const facelessViolations = evaluateFacelessAttendance({
+        requirement: shiftConfig?.timekeepingRequirement,
+        attendanceRadius: timekeeping?.attendanceRadius,
+        qrStoreId: options?.qrStoreId,
+        expectedStoreId: storeId,
+        hasLocationFix,
+        storeHasLocation: store?.latitude != null && store?.longitude != null,
+        distanceMeters: checkinDistance,
+      });
+      if (facelessViolations.length) {
+        this.logger.warn(
+          `[${label}] attendance without face refused: ${facelessViolations.join(',')}`,
+        );
+        throw new BadRequestException({
+          code: `ATTENDANCE_${facelessViolations[0]}`,
+          message: describeAttendanceViolation(facelessViolations[0]),
+        });
+      }
+      return {
+        checkinDistance,
+        checkinLatitude,
+        checkinLongitude,
+        rules: resolveAttendanceRules(timekeeping),
+      };
     }
 
     const violations = evaluateAttendanceRules({
@@ -19186,9 +19237,13 @@ export class StoresService {
     };
   }
 
+  /**
+   * Check-in. `imageBuffer` null = no face photo, accepted only for a store
+   * whose attendance mode is GPS_QR (QR + GPS then strictly required).
+   */
   async checkInWithFace(
     assignmentId: string,
-    imageBuffer: Buffer,
+    imageBuffer: Buffer | null,
     accountId: string,
     options?: {
       latitude?: number;
@@ -19258,6 +19313,7 @@ export class StoresService {
         storeId,
         assignment.employeeId,
         options,
+        !imageBuffer,
       );
 
     // Check-in opens the store's "Cho phép check-in trước giờ làm" minutes
@@ -19279,38 +19335,47 @@ export class StoresService {
     }
 
     // ===== Step 2: Face Verification =====
-    const employeeFace = await this.employeeFaceRepository.findOne({
-      where: { employeeProfileId: assignment.employeeId, isActive: true },
-    });
-    if (!employeeFace || employeeFace.faceDescriptors.length === 0) {
-      throw new BadRequestException(
-        'Face not registered. Please register your face first.',
+    // Skipped only without a photo, which the policy step accepted for a
+    // GPS_QR store after checking QR + location.
+    const faceStartedAt = Date.now();
+    const matchResult: { matched: true; distance: number | null } = {
+      matched: true,
+      distance: null,
+    };
+    if (imageBuffer) {
+      const employeeFace = await this.employeeFaceRepository.findOne({
+        where: { employeeProfileId: assignment.employeeId, isActive: true },
+      });
+      if (!employeeFace || employeeFace.faceDescriptors.length === 0) {
+        throw new BadRequestException(
+          'Face not registered. Please register your face first.',
+        );
+      }
+
+      const descriptor = await this.faceRecognitionService.extractDescriptor(
+        imageBuffer,
+        options?.orientationNormalized ? { rotations: [0] } : undefined,
+      );
+      if (!descriptor) {
+        return { matched: false, message: 'No face detected in image' };
+      }
+
+      const faceMatch = this.faceRecognitionService.compareFaces(
+        descriptor,
+        employeeFace.faceDescriptors,
+      );
+      if (!faceMatch.matched) {
+        return {
+          matched: false,
+          distance: faceMatch.distance,
+          message: 'Face does not match',
+        };
+      }
+      matchResult.distance = faceMatch.distance;
+      this.logger.debug(
+        `[CheckIn] Face verified — distance=${faceMatch.distance}`,
       );
     }
-
-    const faceStartedAt = Date.now();
-    const descriptor = await this.faceRecognitionService.extractDescriptor(
-      imageBuffer,
-      options?.orientationNormalized ? { rotations: [0] } : undefined,
-    );
-    if (!descriptor) {
-      return { matched: false, message: 'No face detected in image' };
-    }
-
-    const matchResult = this.faceRecognitionService.compareFaces(
-      descriptor,
-      employeeFace.faceDescriptors,
-    );
-    if (!matchResult.matched) {
-      return {
-        matched: false,
-        distance: matchResult.distance,
-        message: 'Face does not match',
-      };
-    }
-    this.logger.debug(
-      `[CheckIn] Face verified — distance=${matchResult.distance}`,
-    );
 
     // Calculate late minutes against the slot's work date in Vietnam time, so
     // the result does not depend on the server timezone and overnight shifts
@@ -19365,8 +19430,8 @@ export class StoresService {
         storeId: storeId ?? '',
         type: AttendanceLogType.CHECK_IN,
         timestamp: now,
-        method: AttendanceMethod.FACE,
-        faceMatchScore: matchResult.distance,
+        method: imageBuffer ? AttendanceMethod.FACE : AttendanceMethod.QR_GPS,
+        faceMatchScore: matchResult.distance ?? undefined,
         checkinLatitude: checkinLatitude ?? undefined,
         checkinLongitude: checkinLongitude ?? undefined,
         checkinDistance: checkinDistance ?? undefined,
@@ -19457,9 +19522,10 @@ export class StoresService {
     };
   }
 
+  /** Check-out; `imageBuffer` null as for checkInWithFace (GPS_QR stores). */
   async checkOutWithFace(
     assignmentId: string,
-    imageBuffer: Buffer,
+    imageBuffer: Buffer | null,
     accountId: string,
     options?: {
       latitude?: number;
@@ -19511,39 +19577,49 @@ export class StoresService {
         storeId,
         assignment.employeeId,
         options,
+        !imageBuffer,
       );
 
     // ===== Step 2: Face Verification =====
-    const employeeFace = await this.employeeFaceRepository.findOne({
-      where: { employeeProfileId: assignment.employeeId, isActive: true },
-    });
-    if (!employeeFace || employeeFace.faceDescriptors.length === 0) {
-      throw new BadRequestException('Face not registered');
-    }
-
+    // Skipped only without a photo, which the policy step accepted for a
+    // GPS_QR store after checking QR + location.
     const faceStartedAt = Date.now();
-    const descriptor = await this.faceRecognitionService.extractDescriptor(
-      imageBuffer,
-      options?.orientationNormalized ? { rotations: [0] } : undefined,
-    );
-    if (!descriptor) {
-      return { matched: false, message: 'No face detected in image' };
-    }
+    const matchResult: { matched: true; distance: number | null } = {
+      matched: true,
+      distance: null,
+    };
+    if (imageBuffer) {
+      const employeeFace = await this.employeeFaceRepository.findOne({
+        where: { employeeProfileId: assignment.employeeId, isActive: true },
+      });
+      if (!employeeFace || employeeFace.faceDescriptors.length === 0) {
+        throw new BadRequestException('Face not registered');
+      }
 
-    const matchResult = this.faceRecognitionService.compareFaces(
-      descriptor,
-      employeeFace.faceDescriptors,
-    );
-    if (!matchResult.matched) {
-      return {
-        matched: false,
-        distance: matchResult.distance,
-        message: 'Face does not match',
-      };
+      const descriptor = await this.faceRecognitionService.extractDescriptor(
+        imageBuffer,
+        options?.orientationNormalized ? { rotations: [0] } : undefined,
+      );
+      if (!descriptor) {
+        return { matched: false, message: 'No face detected in image' };
+      }
+
+      const faceMatch = this.faceRecognitionService.compareFaces(
+        descriptor,
+        employeeFace.faceDescriptors,
+      );
+      if (!faceMatch.matched) {
+        return {
+          matched: false,
+          distance: faceMatch.distance,
+          message: 'Face does not match',
+        };
+      }
+      matchResult.distance = faceMatch.distance;
+      this.logger.debug(
+        `[CheckOut] Face verified — distance=${faceMatch.distance}`,
+      );
     }
-    this.logger.debug(
-      `[CheckOut] Face verified — distance=${matchResult.distance}`,
-    );
 
     // Calculate early minutes and worked minutes. Same Vietnam-anchored
     // boundaries as check-in, so an overnight shift ending at 06:00 is compared
@@ -19611,8 +19687,8 @@ export class StoresService {
         storeId: storeId ?? '',
         type: AttendanceLogType.CHECK_OUT,
         timestamp: now,
-        method: AttendanceMethod.FACE,
-        faceMatchScore: matchResult.distance,
+        method: imageBuffer ? AttendanceMethod.FACE : AttendanceMethod.QR_GPS,
+        faceMatchScore: matchResult.distance ?? undefined,
         checkinLatitude: checkinLatitude ?? undefined,
         checkinLongitude: checkinLongitude ?? undefined,
         checkinDistance: checkinDistance ?? undefined,

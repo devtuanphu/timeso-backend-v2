@@ -1,3 +1,5 @@
+import { BadRequestException } from '@nestjs/common';
+
 import { TimekeepingRequirement } from './entities/store-shift-config.entity';
 
 /**
@@ -38,7 +40,9 @@ export type AttendanceViolation =
   | 'QR_REQUIRED'
   | 'QR_MISMATCH'
   | 'LOCATION_REQUIRED'
-  | 'OUT_OF_RANGE';
+  | 'OUT_OF_RANGE'
+  | 'STORE_LOCATION_MISSING'
+  | 'FACE_REQUIRED';
 
 export interface AttendanceRuleInput {
   /** Store-level policy; absent settings fall back to the entity defaults. */
@@ -61,18 +65,26 @@ export interface AttendanceRuleInput {
 const QR_REQUIREMENTS = new Set<TimekeepingRequirement>([
   TimekeepingRequirement.LOCATION_QR_GPS_FACEID,
   TimekeepingRequirement.QR_ONLY,
+  TimekeepingRequirement.GPS_QR,
 ]);
 
 const GPS_REQUIREMENTS = new Set<TimekeepingRequirement>([
   TimekeepingRequirement.LOCATION_QR_GPS_FACEID,
   TimekeepingRequirement.GPS_ONLY,
+  TimekeepingRequirement.GPS_QR,
 ]);
+
+/** Radius used when the store has none saved (entity default). */
+export const DEFAULT_ATTENDANCE_RADIUS_METERS = 50;
 
 const VIOLATION_MESSAGES: Record<AttendanceViolation, string> = {
   QR_REQUIRED: 'Cửa hàng yêu cầu quét mã QR khi chấm công.',
   QR_MISMATCH: 'Mã QR không khớp với cửa hàng của ca làm việc này',
   LOCATION_REQUIRED: 'Cửa hàng yêu cầu bật vị trí khi chấm công.',
   OUT_OF_RANGE: 'Bạn đang ở ngoài phạm vi chấm công của cửa hàng.',
+  STORE_LOCATION_MISSING:
+    'Cửa hàng chưa thiết lập vị trí nên chưa thể chấm công bằng GPS + QR. Vui lòng báo chủ cửa hàng.',
+  FACE_REQUIRED: 'Cửa hàng yêu cầu xác thực khuôn mặt khi chấm công.',
 };
 
 export function describeAttendanceViolation(
@@ -131,3 +143,74 @@ export function evaluateAttendanceRules(
 
   return violations;
 }
+
+export interface FacelessAttendanceInput {
+  requirement?: TimekeepingRequirement | null;
+  attendanceRadius?: number | null;
+  qrStoreId?: string | null;
+  expectedStoreId?: string | null;
+  hasLocationFix: boolean;
+  /** Whether the store has saved coordinates to measure against. */
+  storeHasLocation: boolean;
+  distanceMeters?: number | null;
+}
+
+/**
+ * Attendance without a face photo, allowed only for a GPS_QR store. With no
+ * face to identify the person, QR and location are the only evidence, so they
+ * are always checked — whatever ATTENDANCE_ENFORCEMENT_MODE says, whatever
+ * the requireQrScan / requireLocation toggles and the location exemption list
+ * (an exempt employee would be left with nothing to check). Returns every
+ * violation, the most decisive first; empty means accepted.
+ */
+export function evaluateFacelessAttendance(
+  input: FacelessAttendanceInput,
+): AttendanceViolation[] {
+  if (input.requirement !== TimekeepingRequirement.GPS_QR) {
+    return ['FACE_REQUIRED'];
+  }
+  const violations: AttendanceViolation[] = [];
+  if (!input.qrStoreId) {
+    violations.push('QR_REQUIRED');
+  } else if (!input.expectedStoreId || input.qrStoreId !== input.expectedStoreId) {
+    violations.push('QR_MISMATCH');
+  }
+  if (!input.storeHasLocation) {
+    violations.push('STORE_LOCATION_MISSING');
+  } else if (
+    !input.hasLocationFix ||
+    typeof input.distanceMeters !== 'number' ||
+    !Number.isFinite(input.distanceMeters)
+  ) {
+    violations.push('LOCATION_REQUIRED');
+  } else {
+    const radius =
+      typeof input.attendanceRadius === 'number' && input.attendanceRadius > 0
+        ? input.attendanceRadius
+        : DEFAULT_ATTENDANCE_RADIUS_METERS;
+    if (input.distanceMeters > radius) violations.push('OUT_OF_RANGE');
+  }
+  return violations;
+}
+
+/**
+ * Latitude/longitude of a check-in/out. Missing stays missing; anything that
+ * is not a finite number within ±max is refused, so `NaN`/`Infinity` cannot
+ * reach the distance check (NaN > radius is false: it would pass as inside).
+ */
+export const parseAttendanceCoordinate = (
+  value: string | undefined,
+  max: number,
+): number | undefined => {
+  if (value === undefined || value === null || String(value).trim() === '') {
+    return undefined;
+  }
+  const n = Number(value);
+  if (!Number.isFinite(n) || Math.abs(n) > max) {
+    throw new BadRequestException({
+      code: 'ATTENDANCE_INVALID_LOCATION',
+      message: 'Vị trí gửi lên không hợp lệ. Vui lòng thử lại.',
+    });
+  }
+  return n;
+};

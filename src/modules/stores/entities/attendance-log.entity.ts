@@ -13,6 +13,8 @@ export enum AttendanceMethod {
   FACE = 'FACE',
   MANUAL = 'MANUAL',
   SYSTEM = 'SYSTEM',
+  /** QR + GPS without a face photo (store mode GPS_QR). */
+  QR_GPS = 'QR_GPS',
 }
 
 @Entity('attendance_logs')
