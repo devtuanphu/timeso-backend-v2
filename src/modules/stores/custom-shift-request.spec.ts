@@ -440,7 +440,7 @@ describe('CustomShiftRequestService.approve (owner)', () => {
         employeeIds: ['emp-1'],
         recurrence: { enabled: false },
       });
-      expect(data.shiftName).toBe('Khung giờ khác 22:00-06:00 · Minh #req1');
+      expect(data.shiftName).toBe('Khung giờ khác');
     }
     expect(view).toMatchObject({
       status: 'APPROVED',
@@ -479,27 +479,45 @@ describe('CustomShiftRequestService.approve (owner)', () => {
     expect(STAFF_WORK_SHIFT_ROUTE).toBe('/(home)/workshift');
   });
 
-  it('shift name is unique per request (id suffix), so identical requests never collide', async () => {
-    const first = build({ row: pendingRow({ id: 'aaaaaaaa-1111-4111-8111-111111111111' }) });
-    await first.service.approve('store-a', 'aaaaaaaa-1111-4111-8111-111111111111', 'owner-a');
-    const second = build({ row: pendingRow({ id: 'bbbbbbbb-2222-4222-8222-222222222222' }) });
-    await second.service.approve('store-a', 'bbbbbbbb-2222-4222-8222-222222222222', 'owner-a');
-    const nameOf = (ctx: ReturnType<typeof build>) =>
-      (ctx.storesService.createShiftScheduleWithin.mock.calls[0] as any[])[3].shiftName;
-    expect(nameOf(first)).toBe('Khung giờ khác 22:00-06:00 · Minh #aaaaaa');
-    expect(nameOf(second)).toBe('Khung giờ khác 22:00-06:00 · Minh #bbbbbb');
-    expect(nameOf(first).length).toBeLessThanOrEqual(80);
+  it('names the shift plainly "Khung giờ khác" (no ids, names or times in it)', async () => {
+    const ctx = build();
+    await ctx.service.approve('store-a', 'req-1', 'owner-a');
+    for (const call of ctx.storesService.createShiftScheduleWithin.mock.calls as any[]) {
+      expect(call[3].shiftName).toBe('Khung giờ khác');
+      expect(call[3].shiftName).not.toMatch(/#|·|\d{2}:\d{2}/);
+    }
   });
 
-  it('a same-name shift on a date (data drift): coded 409, nothing created', async () => {
+  it('numbers the name only on a date that already has "Khung giờ khác"', async () => {
     const ctx = build({
+      row: pendingRow({ endDate: '2026-10-07' }),
       sameNameRows: [
-        { shift_name: 'Khung giờ khác 22:00-06:00 · Minh #req1', work_date: '2026-10-05' },
+        { shift_name: 'Khung giờ khác', work_date: '2026-10-05' },
+        { shift_name: 'Khung giờ khác 2', work_date: '2026-10-05' },
       ],
     });
+    // The shared mock returns every row regardless of the date filter, so
+    // both dates see the two existing names and get the next free number.
+    await ctx.service.approve('store-a', 'req-1', 'owner-a');
+    const names = (ctx.storesService.createShiftScheduleWithin.mock.calls as any[]).map(
+      (call) => call[3].shiftName,
+    );
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) expect(name).toBe('Khung giờ khác 3');
+  });
+
+  it('every numbered name taken on a date: coded 409, nothing created', async () => {
+    const taken = [
+      { shift_name: 'Khung giờ khác', work_date: '2026-10-05' },
+      ...Array.from({ length: 49 }, (_, index) => ({
+        shift_name: `Khung giờ khác ${index + 2}`,
+        work_date: '2026-10-05',
+      })),
+    ];
+    const ctx = build({ sameNameRows: taken });
     await expect(ctx.service.approve('store-a', 'req-1', 'owner-a')).rejects.toMatchObject({
       status: 409,
-      response: { code: 'CUSTOM_SHIFT_NAME_TAKEN', date: '2026-10-05' },
+      response: { code: 'CUSTOM_SHIFT_NAME_TAKEN' },
     });
     expect(ctx.storesService.createShiftScheduleWithin).not.toHaveBeenCalled();
   });

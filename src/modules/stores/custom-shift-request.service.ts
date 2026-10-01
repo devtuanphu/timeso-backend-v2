@@ -56,7 +56,9 @@ export const STAFF_WORK_SHIFT_ROUTE = '/(home)/workshift';
 export const CUSTOM_SHIFT_NOTIFICATION_TYPE = 'CUSTOM_SHIFT_REQUEST';
 const OWNER_LIST_LIMIT = 200;
 const STAFF_LIST_LIMIT = 100;
-const SHIFT_NAME_MAX = 80;
+/** Plain name of a shift created from an approved "Khung giờ khác" request. */
+export const CUSTOM_SHIFT_BASE_NAME = 'Khung giờ khác';
+const CUSTOM_SHIFT_NAME_MAX_SUFFIX = 50;
 
 export interface CustomShiftRequestView {
   id: string;
@@ -280,18 +282,6 @@ export class CustomShiftRequestService {
         });
       }
 
-      const shiftName = this.shiftNameFor(employee, startTime, endTime, row.id);
-      // The name is unique per request, so this only fires on data drift;
-      // answer it with a coded 409 instead of the generic 400.
-      const sameName = await findSameNameShiftOnDates(
-        manager,
-        storeId,
-        [shiftName],
-        dates,
-      );
-      if (sameName) {
-        throw this.shiftNameTaken(sameName.workDate);
-      }
       const ref: CustomShiftScheduleRef = {
         cycleIds: [],
         shiftIds: [],
@@ -300,6 +290,10 @@ export class CustomShiftRequestService {
         skippedPastDates,
       };
       for (const date of dates) {
+        // Staff see this name on Home and in their schedule, next to the real
+        // times, so it stays plain: "Khung giờ khác", numbered only when the
+        // store already has a shift of that name on the same date.
+        const shiftName = await this.shiftNameFor(manager, storeId, date);
         const created = await this.createShiftFor(
           manager,
           storeId,
@@ -426,20 +420,21 @@ export class CustomShiftRequestService {
   }
 
   /**
-   * "Khung giờ khác 22:00-06:00 · Minh #1a2b3c": the request-id suffix makes
-   * the name unique per request, so the same-name-on-date rule never blocks
-   * one employee's second request (or another employee's identical one).
+   * "Khung giờ khác", or "Khung giờ khác 2", "… 3" when the store already has
+   * a shift with that name on `date` (the same-name-on-date rule). Runs inside
+   * the approval transaction, which holds the store availability lock.
    */
-  private shiftNameFor(
-    employee: EmployeeProfile,
-    startTime: string,
-    endTime: string,
-    requestId: string,
-  ) {
-    const suffix = ` #${requestId.replace(/-/g, '').slice(0, 6)}`;
-    const who = employee.account?.fullName?.trim();
-    const base = `Khung giờ khác ${startTime}-${endTime}${who ? ` · ${who}` : ''}`;
-    return `${base.slice(0, SHIFT_NAME_MAX - suffix.length).trim()}${suffix}`;
+  private async shiftNameFor(
+    manager: EntityManager,
+    storeId: string,
+    date: string,
+  ): Promise<string> {
+    for (let n = 1; n <= CUSTOM_SHIFT_NAME_MAX_SUFFIX; n += 1) {
+      const candidate = n === 1 ? CUSTOM_SHIFT_BASE_NAME : `${CUSTOM_SHIFT_BASE_NAME} ${n}`;
+      const taken = await findSameNameShiftOnDates(manager, storeId, [candidate], [date]);
+      if (!taken) return candidate;
+    }
+    throw this.shiftNameTaken(date);
   }
 
   private shiftNameTaken(workDate?: string) {
