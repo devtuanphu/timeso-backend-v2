@@ -42,6 +42,7 @@ import { StoreAccessGuard } from './guards/store-access.guard';
 import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
+import { CreateWorkShiftDto, UpdateWorkShiftDto } from './dto/work-shift.dto';
 import { resolveUploadedDocxPath } from './contract-template-file.utils';
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
@@ -2410,7 +2411,11 @@ export class StoresController {
     description: 'Thành công',
     type: WorkShiftResponseDto,
   })
-  async createWorkShift(@Param('id') id: string, @Body() body: any, @GetUser() user: any) {
+  async createWorkShift(
+    @Param('id') id: string,
+    @Body() body: CreateWorkShiftDto,
+    @GetUser() user: any,
+  ) {
     return this.storesService.createWorkShift(id, body, user.userId);
   }
 
@@ -2440,10 +2445,33 @@ export class StoresController {
   async updateWorkShift(
     @Param('storeId') storeId: string,
     @Param('shiftId') shiftId: string,
-    @Body() body: any,
+    @Body() body: UpdateWorkShiftDto,
     @GetUser() user: any,
   ) {
     return this.storesService.updateWorkShift(storeId, shiftId, body, user.userId);
+  }
+
+  @StoreOwnerOnly()
+  @Delete(':storeId/work-shifts/:shiftId')
+  @ApiOperation({
+    summary: 'Xoá ca làm việc khỏi thiết lập',
+    description:
+      'Ẩn ca (is_active=false), giữ lịch sử. Xoá các lịch sắp tới chưa có nhân viên; ' +
+      'từ chối (409 WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS) khi còn lịch sắp tới đã có nhân viên. ' +
+      'Xoá ca đã ẩn là thao tác không đổi (200).',
+  })
+  @ApiResponse({ status: 200, description: 'Đã xoá (hoặc đã xoá trước đó)' })
+  @ApiResponse({
+    status: 409,
+    description:
+      '{ code: "WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS", count, message }',
+  })
+  async deleteWorkShift(
+    @Param('storeId') storeId: string,
+    @Param('shiftId', ParseUUIDPipe) shiftId: string,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.deleteWorkShift(storeId, shiftId, user.userId);
   }
 
   // ==================== WORK CYCLE MANAGEMENT ====================

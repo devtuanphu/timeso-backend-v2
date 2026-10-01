@@ -277,6 +277,9 @@ describe('fixed-shift registration range (B3)', () => {
     qb.getRawOne = jest.fn().mockResolvedValue({ latest: '2026-12-31' });
     qb.getMany = jest.fn().mockResolvedValue([]);
     service.shiftSlotRepository = { createQueryBuilder: jest.fn(() => qb) };
+    service.workShiftRepository = {
+      findOne: jest.fn().mockResolvedValue({ id: 'ws-1', isActive: true }),
+    };
 
     await expect(
       service.createShiftRegistration('acc-1', {

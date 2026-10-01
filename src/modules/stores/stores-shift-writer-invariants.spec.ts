@@ -70,6 +70,7 @@ describe('StoresService shift predicate writers', () => {
     };
     (service as any).workShiftRepository = {
       find: jest.fn(async () => []),
+      query: jest.fn(async () => []),
     };
     return service;
   };
@@ -323,9 +324,9 @@ describe('StoresService shift predicate writers', () => {
     }
   });
 
-  // Chủ cửa hàng cho phép trùng tên ca miễn khác ngày; ca mẫu trong cài đặt
-  // chấm công không gắn ngày nên không còn bị chặn vì trùng tên. Tên rỗng vẫn bị chặn.
-  it('allows reactivating a timekeeping shift that shares an active name, but not an empty name', async () => {
+  // Tên ca được trùng (ca mẫu không gắn ngày); tên rỗng vẫn bị chặn. Ca đã xoá
+  // (ẩn) không còn được "kích hoạt lại" hay sửa qua đường lưu thiết lập.
+  it('ignores entries for a deleted (hidden) shift and never writes isActive, but rejects an empty name', async () => {
     const service = createService();
     const manager = {
       query: jest.fn(async () => []),
@@ -369,39 +370,48 @@ describe('StoresService shift predicate writers', () => {
       ),
     };
 
+    // A hidden shift is neither revived nor renamed.
     await expect(
       service.upsertTimekeepingSetting(
         'store-1',
         {
           shifts: [
-            {
-              id: 'shift-2',
-              shiftName: '   ',
-              isActive: true,
-            },
-          ],
-        } as any,
-        'owner-1',
-      ),
-    ).rejects.toBeInstanceOf(BadRequestException);
-    expect(manager.update).not.toHaveBeenCalled();
-    expect(manager.save).not.toHaveBeenCalled();
-
-    await expect(
-      service.upsertTimekeepingSetting(
-        'store-1',
-        {
-          shifts: [
-            {
-              id: 'shift-2',
-              shiftName: '  ca   sáng ',
-              isActive: true,
-            },
+            { id: 'shift-2', shiftName: '  ca   sáng ', isActive: true },
           ],
         } as any,
         'owner-1',
       ),
     ).resolves.not.toThrow();
+    expect(manager.update).not.toHaveBeenCalled();
+
+    // isActive in the payload is ignored for a visible shift as well; a
+    // shared active name is allowed.
+    await service.upsertTimekeepingSetting(
+      'store-1',
+      {
+        shifts: [
+          { id: 'shift-1', shiftName: ' Ca sáng ', isActive: false },
+        ],
+      } as any,
+      'owner-1',
+    );
+    expect(manager.update).toHaveBeenCalledWith(
+      WorkShift,
+      { id: 'shift-1', storeId: 'store-1' },
+      { shiftName: 'Ca sáng' },
+    );
+
+    manager.update.mockClear();
+    manager.save.mockClear();
+    await expect(
+      service.upsertTimekeepingSetting(
+        'store-1',
+        { shifts: [{ id: 'shift-1', shiftName: '   ' }] } as any,
+        'owner-1',
+      ),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(manager.update).not.toHaveBeenCalled();
+    expect(manager.save).not.toHaveBeenCalled();
   });
 
   it('rejects a timekeeping shift id outside the authoritative store set', async () => {
@@ -621,6 +631,7 @@ describe('StoresService shift predicate writers', () => {
     };
     (service as any).workShiftRepository = {
       find: jest.fn(async () => [...shifts]),
+      query: jest.fn(async () => []),
     };
     const manager = {
       query: jest.fn(async () => []),
@@ -682,6 +693,7 @@ describe('StoresService shift predicate writers', () => {
     };
     (service as any).workShiftRepository = {
       find: jest.fn(async () => [...state.shifts]),
+      query: jest.fn(async () => []),
     };
     const transaction = jest.fn(async (callback: (manager: any) => unknown) => {
       const previous = transactionTail;
@@ -766,6 +778,7 @@ describe('StoresService shift predicate writers', () => {
     };
     (service as any).workShiftRepository = {
       find: jest.fn(async () => [{ id: 'shift-1', storeId: 'store-1' }]),
+      query: jest.fn(async () => []),
     };
     const transaction = jest.fn();
     (service as any).dataSource = { transaction };
@@ -874,6 +887,7 @@ describe('StoresService shift predicate writers', () => {
     };
     (service as any).workShiftRepository = {
       find: jest.fn(async () => [...state.shifts]),
+      query: jest.fn(async () => []),
     };
     (service as any).dataSource = {
       transaction: jest.fn(async (callback: (manager: any) => unknown) => {

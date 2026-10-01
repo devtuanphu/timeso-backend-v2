@@ -19,6 +19,7 @@ import { ACTIVITY_ACTIONS } from './activity-log.summary';
 import { StoresService } from './stores.service';
 import { CareerLadderService } from './career-ladder.service';
 import { BonusWorkRequestStatus } from './entities/bonus-work-request.entity';
+import { DEFAULT_ATTENDANCE_RULES } from './attendance-rules';
 
 const FORBIDDEN_PARAM_KEYS = [
   'amount',
@@ -92,6 +93,7 @@ function attendanceService(assignment: any) {
     checkinDistance: 12.3,
     checkinLatitude: 10.1,
     checkinLongitude: 106.2,
+    rules: DEFAULT_ATTENDANCE_RULES,
   });
   service.employeeFaceRepository = {
     findOne: jest.fn().mockResolvedValue({ faceDescriptors: [[0.1]] }),

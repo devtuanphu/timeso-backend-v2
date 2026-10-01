@@ -7,6 +7,11 @@ import { addDays, parseDateOnly } from './shift-schedule.utils';
 export const CUSTOM_SHIFT_MAX_RANGE_DAYS = 62;
 export const CUSTOM_SHIFT_MIN_MINUTES = 60;
 export const CUSTOM_SHIFT_MAX_MINUTES = 16 * 60;
+/**
+ * Note on every shift created from an approved "Khung giờ khác" request.
+ * Those per-date shifts are hidden from the store's shift settings list.
+ */
+export const CUSTOM_SHIFT_NOTE = 'Khung giờ khác (nhân viên đề xuất)';
 
 const TIME = /^([01]\d|2[0-3]):([0-5]\d)$/;
 

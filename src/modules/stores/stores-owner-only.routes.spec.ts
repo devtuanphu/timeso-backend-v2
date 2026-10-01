@@ -52,6 +52,9 @@ describe('owner-only route metadata', () => {
     'updateEmployeeKpiStatus', // PATCH employee-kpis/:id/status
     'updateKpiReminders', // PATCH employee-kpis/:id/reminders
     'updateKpiCompliments', // PATCH employee-kpis/:id/compliments
+    'createWorkShift', // POST :id/work-shifts
+    'updateWorkShift', // PUT :storeId/work-shifts/:shiftId
+    'deleteWorkShift', // DELETE :storeId/work-shifts/:shiftId
   ];
 
   it.each(CRITICAL_STORES_HANDLERS)('StoresController.%s is owner-only', (handler) => {

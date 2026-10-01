@@ -186,6 +186,7 @@ function mockRepo() {
     update: jest.fn().mockResolvedValue({ affected: 1 }),
     delete: jest.fn().mockResolvedValue({ affected: 1 }),
     count: jest.fn().mockResolvedValue(0),
+    query: jest.fn().mockResolvedValue([]),
     createQueryBuilder: jest.fn(() => ({
       where: jest.fn().mockReturnThis(),
       andWhere: jest.fn().mockReturnThis(),
@@ -466,10 +467,14 @@ describe('Work Shift & Cycle Management', () => {
 
       const result = await service.createWorkShift('store-1', data, 'owner-1');
 
+      // Times are stored normalized to the `time` column's HH:mm:ss.
       expect(workShiftRepo.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          ...data,
+          shiftName: 'Ca sáng',
+          startTime: '08:00:00',
+          endTime: '12:00:00',
           storeId: 'store-1',
+          isActive: true,
         }),
       );
       expect(workShiftRepo.save).toHaveBeenCalled();
@@ -535,6 +540,7 @@ describe('Work Shift & Cycle Management', () => {
 
       expect(workShiftRepo.find).toHaveBeenCalledWith({
         where: { storeId: 'store-1', isActive: true },
+        order: { startTime: 'ASC', shiftName: 'ASC' },
       });
       expect(result).toHaveLength(2);
     });

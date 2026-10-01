@@ -33,6 +33,12 @@ import {
   ShiftAssignmentStatus,
 } from './entities/shift-management.entity';
 import { resolveShiftBoundaries } from './attendance-time.utils';
+import {
+  AttendanceRules,
+  creditedWorkedMinutes,
+  resolveAttendanceRules,
+} from './attendance-rules';
+import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
 import { describeWorkDate } from '../../common/utils/relative-day';
 import {
   toDateMarker,
@@ -60,9 +66,20 @@ export const SHIFT_ATTENDANCE_ACTION_URL = '/';
 
 /**
  * Minutes after the effective end (shift end, or approved overtime end) at
- * which a shift that was never checked out is closed as FORGOT_CHECKOUT.
+ * which a shift that was never checked out is closed as FORGOT_CHECKOUT, for
+ * a store without its own "Cho phép check-out sau giờ làm" setting.
  */
 export const AUTO_CHECKOUT_GRACE_MINUTES = 15;
+
+/** Minutes after the end at which "check out or request overtime" is sent. */
+const END_REMINDER_MINUTES = [0, 5, 10] as const;
+
+/**
+ * `reminderMinute` of the auto-checkout step. Kept at 15 (its old fixed
+ * minute) so jobs queued before per-store windows still mean "auto-checkout";
+ * the actual time is the store's window, re-checked when the job runs.
+ */
+const AUTO_CHECKOUT_STEP = 15;
 
 /**
  * Note stored on a PENDING overtime request that timed out: the shift was
@@ -81,11 +98,12 @@ export const PENDING_OVERTIME_EXPIRED_NOTE =
 export const pendingOvertimeAutoCheckoutAt = (
   effectiveEndAt: Date,
   request?: Pick<BonusWorkRequest, 'requestDate' | 'endTime'> | null,
+  graceMinutes: number = AUTO_CHECKOUT_GRACE_MINUTES,
 ): Date => {
   let last = effectiveEndAt.getTime();
   const requestedEnd = overtimeEndAt(request, effectiveEndAt);
   if (requestedEnd && requestedEnd.getTime() > last) last = requestedEnd.getTime();
-  return new Date(last + AUTO_CHECKOUT_GRACE_MINUTES * 60_000);
+  return new Date(last + graceMinutes * 60_000);
 };
 
 /**
@@ -143,7 +161,28 @@ export class ShiftEndWorkflowService {
     // end, or the approved overtime end).
     @Optional()
     private readonly ownerNotificationService?: OwnerNotificationService,
+    // The store's attendance rules (auto-checkout window, worked-time
+    // credit). Optional so a missing row or repository means the defaults.
+    @Optional()
+    @InjectRepository(StoreTimekeepingSetting)
+    private readonly timekeepingSettingRepository?: Repository<StoreTimekeepingSetting>,
   ) {}
+
+  /** The store's attendance rules; the defaults when unknown. */
+  async rulesFor(storeId: string | null | undefined): Promise<AttendanceRules> {
+    if (!storeId || !this.timekeepingSettingRepository) {
+      return resolveAttendanceRules(null);
+    }
+    try {
+      const setting = await this.timekeepingSettingRepository.findOne({
+        where: { storeId },
+      });
+      return resolveAttendanceRules(setting);
+    } catch {
+      this.logger.warn('Attendance rules unavailable, using the defaults');
+      return resolveAttendanceRules(null);
+    }
+  }
 
   calculateScheduledEnd(
     workDate: string,
@@ -156,12 +195,18 @@ export class ShiftEndWorkflowService {
     return end;
   }
 
-  async scheduleForAssignment(assignmentId: string): Promise<void> {
+  async scheduleForAssignment(
+    assignmentId: string,
+    knownRules?: AttendanceRules,
+  ): Promise<void> {
     const assignment = await this.assignmentRepository.findOne({
       where: { id: assignmentId },
       relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
     });
     if (!assignment?.checkInTime || assignment.checkOutTime) return;
+    const graceMinutes = (
+      knownRules ?? (await this.rulesFor(assignment.shiftSlot?.cycle?.storeId))
+    ).lateCheckoutMinutes;
 
     const slot = assignment.shiftSlot;
     const startTime = slot?.startTime || slot?.workShift?.startTime;
@@ -177,7 +222,11 @@ export class ShiftEndWorkflowService {
       where: { shiftAssignmentId: assignmentId },
     });
     if (existing) {
-      await this.scheduleJobs(assignmentId, existing.effectiveEndAt);
+      await this.scheduleJobs(
+        assignmentId,
+        existing.effectiveEndAt,
+        graceMinutes,
+      );
       return;
     }
     try {
@@ -197,14 +246,20 @@ export class ShiftEndWorkflowService {
     } catch (error: any) {
       if (error?.code !== '23505') throw error;
     }
-    await this.scheduleJobs(assignmentId, scheduledEndAt);
+    await this.scheduleJobs(assignmentId, scheduledEndAt, graceMinutes);
   }
 
+  /**
+   * Reminders at end +0/+5/+10 (those before the store's check-out window
+   * closes) and the auto-checkout when it closes, at end + `graceMinutes`.
+   */
   private async scheduleJobs(
     assignmentId: string,
     effectiveEndAt: Date,
+    graceMinutes: number,
   ): Promise<void> {
-    for (const minute of [0, 5, 10, 15] as ReminderMinute[]) {
+    for (const minute of END_REMINDER_MINUTES) {
+      if (minute >= graceMinutes) continue;
       const runAt = effectiveEndAt.getTime() + minute * 60_000;
       await this.workflowQueue.add(
         'shift-end-action',
@@ -223,6 +278,11 @@ export class ShiftEndWorkflowService {
         },
       );
     }
+    await this.enqueueAutoCheckout(
+      assignmentId,
+      effectiveEndAt,
+      new Date(effectiveEndAt.getTime() + graceMinutes * 60_000),
+    );
     if (this.ownerNotificationService) {
       try {
         await this.ownerNotificationService.syncAssignments([assignmentId]);
@@ -230,6 +290,30 @@ export class ShiftEndWorkflowService {
         this.logger.warn('Owner shift-ending alert could not be rescheduled');
       }
     }
+  }
+
+  /** One auto-checkout job per (end, due time): the due time is in its id. */
+  private async enqueueAutoCheckout(
+    assignmentId: string,
+    effectiveEndAt: Date,
+    dueAt: Date,
+  ): Promise<void> {
+    await this.workflowQueue.add(
+      'shift-end-action',
+      {
+        assignmentId,
+        expectedEndAt: effectiveEndAt.toISOString(),
+        reminderMinute: AUTO_CHECKOUT_STEP,
+      },
+      {
+        jobId: `shift-end-${assignmentId}-${effectiveEndAt.getTime()}-auto-${dueAt.getTime()}`,
+        delay: Math.max(0, dueAt.getTime() - Date.now()),
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 1000 },
+        removeOnComplete: 1000,
+        removeOnFail: 1000,
+      },
+    );
   }
 
   async markCompletedByEmployee(assignmentId: string): Promise<void> {
@@ -293,10 +377,28 @@ export class ShiftEndWorkflowService {
       return;
     }
 
-    if (data.reminderMinute === 15) {
-      await this.autoCheckout(data.assignmentId, workflow.effectiveEndAt);
+    const rules = await this.rulesFor(assignment.shiftSlot?.cycle?.storeId);
+    if (data.reminderMinute === AUTO_CHECKOUT_STEP) {
+      // The window is the store's current setting: an owner who widened it
+      // after this job was queued gets the later time.
+      const dueAt = new Date(
+        workflow.effectiveEndAt.getTime() + rules.lateCheckoutMinutes * 60_000,
+      );
+      if (Date.now() < dueAt.getTime() - 1_000) {
+        await this.enqueueAutoCheckout(
+          data.assignmentId,
+          workflow.effectiveEndAt,
+          dueAt,
+        );
+        return;
+      }
+      await this.autoCheckout(data.assignmentId, workflow.effectiveEndAt, {
+        rules,
+      });
       return;
     }
+    // The window now closes before this reminder: the auto-checkout covers it.
+    if (data.reminderMinute >= rules.lateCheckoutMinutes) return;
 
     const marker =
       data.reminderMinute === 0
@@ -412,19 +514,27 @@ export class ShiftEndWorkflowService {
   async autoCheckout(
     assignmentId: string,
     effectiveEndAt: Date,
-    options: { pendingOvertimeDue?: boolean; now?: Date } = {},
+    options: {
+      pendingOvertimeDue?: boolean;
+      now?: Date;
+      rules?: AttendanceRules;
+    } = {},
   ): Promise<boolean> {
     const result = await this.dataSource.transaction(async (manager) => {
       const assignment = await manager.findOne(ShiftAssignment, {
         where: { id: assignmentId },
         relations: [
           'shiftSlot',
+          'shiftSlot.workShift',
           'shiftSlot.cycle',
           'employee',
           'employee.account',
         ],
       });
       if (!assignment?.checkInTime || assignment.checkOutTime) return null;
+      const rules =
+        options.rules ??
+        (await this.rulesFor(assignment.shiftSlot?.cycle?.storeId));
 
       const overtimeRequests = await manager.find(BonusWorkRequest, {
         where: {
@@ -448,21 +558,29 @@ export class ShiftEndWorkflowService {
         const approvedEnd = overtimeEndAt(request, effectiveEndAt);
         if (
           approvedEnd &&
-          nowMs <
-            approvedEnd.getTime() + AUTO_CHECKOUT_GRACE_MINUTES * 60_000
+          nowMs < approvedEnd.getTime() + rules.lateCheckoutMinutes * 60_000
         ) {
           return null;
         }
       }
 
       const autoCheckoutAt = new Date();
-      const workedMinutes = Math.max(
-        0,
-        Math.floor(
-          (effectiveEndAt.getTime() - assignment.checkInTime.getTime()) /
-            60_000,
-        ),
+      // Paid to the effective end; a late arrival forgiven at check-in (or
+      // not deducted by the store) counts from the shift start.
+      const slot = assignment.shiftSlot;
+      const { start } = resolveShiftBoundaries(
+        slot?.workDate ? String(slot.workDate).slice(0, 10) : null,
+        slot?.startTime || slot?.workShift?.startTime,
+        slot?.endTime || slot?.workShift?.endTime,
       );
+      const workedMinutes = creditedWorkedMinutes({
+        start,
+        end: null,
+        checkIn: assignment.checkInTime,
+        checkOut: effectiveEndAt,
+        rules,
+        storedLateMinutes: assignment.lateMinutes,
+      });
       const updated = await manager
         .createQueryBuilder()
         .update(ShiftAssignment)
@@ -627,7 +745,11 @@ export class ShiftEndWorkflowService {
       reminder5SentAt: null,
       reminder10SentAt: null,
     });
-    await this.scheduleJobs(request.shiftAssignmentId, effectiveEndAt);
+    await this.scheduleJobs(
+      request.shiftAssignmentId,
+      effectiveEndAt,
+      (await this.rulesFor(request.storeId)).lateCheckoutMinutes,
+    );
   }
 
   async resumeAfterOvertime(request: BonusWorkRequest): Promise<void> {
@@ -646,7 +768,11 @@ export class ShiftEndWorkflowService {
       effectiveEndAt,
       overtimeRequestId: null,
     });
-    await this.scheduleJobs(request.shiftAssignmentId, effectiveEndAt);
+    await this.scheduleJobs(
+      request.shiftAssignmentId,
+      effectiveEndAt,
+      (await this.rulesFor(request.storeId)).lateCheckoutMinutes,
+    );
   }
 
   /**
@@ -891,11 +1017,20 @@ export class ShiftEndWorkflowService {
         status: ShiftAssignmentStatus.CONFIRMED,
         checkOutTime: IsNull(),
       },
-      select: ['id'],
+      relations: ['shiftSlot', 'shiftSlot.cycle'],
     });
+    // One settings read per store per run.
+    const rulesByStore = new Map<string, Promise<AttendanceRules>>();
+    const rulesOf = (storeId: string | undefined) => {
+      const key = storeId ?? '';
+      if (!rulesByStore.has(key)) rulesByStore.set(key, this.rulesFor(storeId));
+      return rulesByStore.get(key)!;
+    };
     for (const assignment of assignments) {
       try {
-        await this.scheduleForAssignment(assignment.id);
+        const rules = await rulesOf(assignment.shiftSlot?.cycle?.storeId);
+        const graceMs = rules.lateCheckoutMinutes * 60_000;
+        await this.scheduleForAssignment(assignment.id, rules);
         const workflow = await this.workflowRepository.findOne({
           where: { shiftAssignmentId: assignment.id },
         });
@@ -904,11 +1039,11 @@ export class ShiftEndWorkflowService {
         if (
           (workflow.state === ShiftEndWorkflowState.ACTIVE ||
             workflow.state === ShiftEndWorkflowState.OVERTIME_APPROVED) &&
-          now >=
-            workflow.effectiveEndAt.getTime() +
-              AUTO_CHECKOUT_GRACE_MINUTES * 60_000
+          now >= workflow.effectiveEndAt.getTime() + graceMs
         ) {
-          await this.autoCheckout(assignment.id, workflow.effectiveEndAt);
+          await this.autoCheckout(assignment.id, workflow.effectiveEndAt, {
+            rules,
+          });
           continue;
         }
         if (workflow.state === ShiftEndWorkflowState.OVERTIME_PENDING) {
@@ -924,9 +1059,11 @@ export class ShiftEndWorkflowService {
             pendingOvertimeAutoCheckoutAt(
               workflow.effectiveEndAt,
               request,
+              rules.lateCheckoutMinutes,
             ).getTime()
           ) {
             await this.autoCheckout(assignment.id, workflow.effectiveEndAt, {
+              rules,
               pendingOvertimeDue: true,
             });
           }

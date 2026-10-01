@@ -58,6 +58,8 @@ export const ACTIVITY_ACTIONS = {
   ASSET_RETURNED: 'asset.returned',
 
   CAREER_ADVANCED: 'career.advanced',
+
+  WORK_SHIFT_DELETED: 'work_shift.deleted',
 } as const;
 
 export type ActivityAction =
@@ -78,7 +80,8 @@ export type ActivityResourceType =
   | 'salary_adjustment'
   | 'employee'
   | 'asset_assignment'
-  | 'career_event';
+  | 'career_event'
+  | 'work_shift';
 
 const HHMM = /^\d{2}:\d{2}$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -373,6 +376,8 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
       return `${actor} chuyển ${subject} lên bậc ${
         p.rungName ? String(p.rungName) : 'mới'
       }${p.ladderName ? ` (lộ trình ${String(p.ladderName)})` : ''}`;
+    case A.WORK_SHIFT_DELETED:
+      return `${actor} xoá ${describeShift(p)}`;
     default:
       return `${actor} thực hiện một thao tác`;
   }

@@ -33,6 +33,7 @@ import {
 } from './entities/employee-profile.entity';
 import { Store } from './entities/store.entity';
 import {
+  CUSTOM_SHIFT_NOTE,
   customShiftDurationMinutes,
   expandCustomShiftDates,
   isOvernight,
@@ -304,7 +305,7 @@ export class CustomShiftRequestService {
             startTime,
             endTime,
             maxStaff: 1,
-            note: 'Khung giờ khác (nhân viên đề xuất)',
+            note: CUSTOM_SHIFT_NOTE,
             employeeIds: [employee.id],
             recurrence: {
               enabled: false,

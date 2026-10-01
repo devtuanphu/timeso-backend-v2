@@ -116,7 +116,11 @@ describe('ShiftEndWorkflowService', () => {
       expectedEndAt: workflow.effectiveEndAt.toISOString(),
       reminderMinute: 15,
     });
-    expect(autoCheckout).toHaveBeenCalledWith('assignment-1', workflow.effectiveEndAt);
+    expect(autoCheckout).toHaveBeenCalledWith(
+      'assignment-1',
+      workflow.effectiveEndAt,
+      { rules: expect.objectContaining({ lateCheckoutMinutes: 15 }) },
+    );
   });
 });
 
@@ -325,7 +329,9 @@ describe('ShiftEndWorkflowService.reconcileActiveAssignments (R5)', () => {
       state: ShiftEndWorkflowState.OVERTIME_APPROVED,
     });
     await service.reconcileActiveAssignments();
-    expect(autoCheckout).toHaveBeenCalledWith('assignment-1', end);
+    expect(autoCheckout).toHaveBeenCalledWith('assignment-1', end, {
+      rules: expect.objectContaining({ lateCheckoutMinutes: 15 }),
+    });
   });
 
   it('waits for the pending overtime timeout, then closes with pendingOvertimeDue', async () => {
@@ -347,7 +353,10 @@ describe('ShiftEndWorkflowService.reconcileActiveAssignments (R5)', () => {
     expect(due.autoCheckout).toHaveBeenCalledWith(
       'assignment-1',
       workflow.effectiveEndAt,
-      { pendingOvertimeDue: true },
+      {
+        pendingOvertimeDue: true,
+        rules: expect.objectContaining({ lateCheckoutMinutes: 15 }),
+      },
     );
   });
 });

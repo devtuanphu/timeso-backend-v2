@@ -91,6 +91,7 @@ describe('renderActivitySummary', () => {
     [A.ASSET_ASSIGNED, { assetName: 'Áo', quantity: 2 }, 'Chủ A cấp 2 Áo cho Minh'],
     [A.ASSET_RETURNED, { assetName: 'Áo', assetStatus: 'LOST' }, 'Chủ A ghi nhận mất Áo của Minh'],
     [A.CAREER_ADVANCED, { ladderName: 'Vị trí', rungName: 'Trưởng ca' }, 'Chủ A chuyển Minh lên bậc Trưởng ca (lộ trình Vị trí)'],
+    [A.WORK_SHIFT_DELETED, { shiftName: 'Sáng', startTime: '08:00', endTime: '12:00', count: 2 }, 'Chủ A xoá ca Sáng (08:00–12:00)'],
   ])('owner action %s', (action, params, expected) => {
     expect(
       renderActivitySummary({

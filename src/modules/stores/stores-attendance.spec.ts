@@ -880,7 +880,17 @@ describe('StoresService - Check-in/Check-out Integration', () => {
       },
     };
 
+    // 10:00 VN on the open shift's day: inside the check-in window, so the
+    // request reaches the policy and face steps.
+    beforeEach(() => {
+      jest.useFakeTimers({
+        now: new Date('2099-05-05T03:00:00Z'),
+        doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
+      });
+    });
+
     afterEach(() => {
+      jest.useRealTimers();
       delete process.env.ATTENDANCE_ENFORCEMENT_MODE;
     });
 

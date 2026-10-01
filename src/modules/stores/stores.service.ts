@@ -203,6 +203,14 @@ import {
 
 import { StoreApprovalSettingDto } from './dto/store-approval-setting.dto';
 import { StoreTimekeepingSettingDto } from './dto/store-timekeeping-setting.dto';
+import {
+  CreateWorkShiftDto,
+  UpdateWorkShiftDto,
+  WORK_SHIFT_NAME_MAX_LENGTH,
+  WORK_SHIFT_TIME_MESSAGE,
+  WORK_SHIFT_TIME_PATTERN,
+} from './dto/work-shift.dto';
+import { CUSTOM_SHIFT_NOTE } from './custom-shift-request.utils';
 import { UpdatePayrollSettingDto } from './dto/store-payroll-setting.dto';
 import {
   CreateShiftScheduleDto,
@@ -349,6 +357,13 @@ import {
   computeAttendanceDeltas,
   resolveShiftBoundaries,
 } from './attendance-time.utils';
+import {
+  applyGrace,
+  AttendanceRules,
+  checkInOpensAt,
+  creditedWorkedMinutes,
+  resolveAttendanceRules,
+} from './attendance-rules';
 import { DEFAULT_ANDROID_CHANNEL } from '../push/push-capabilities';
 import {
   isSlotRegistrationClosed,
@@ -948,6 +963,86 @@ export const shouldNotifyNewShifts = (reminderSettings: unknown): boolean =>
 const normalizeActiveShiftName = (name: string) =>
   name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('vi-VN');
 
+/** "HH:mm" / "HH:mm:ss" → "HH:mm:ss"; null when malformed. */
+const normalizeWorkShiftTime = (value: unknown): string | null => {
+  if (typeof value !== 'string' || !WORK_SHIFT_TIME_PATTERN.test(value)) {
+    return null;
+  }
+  return value.length === 5 ? `${value}:00` : value;
+};
+
+const requireWorkShiftTime = (value: unknown): string => {
+  const time = normalizeWorkShiftTime(value);
+  if (!time) throw new BadRequestException(WORK_SHIFT_TIME_MESSAGE);
+  return time;
+};
+
+/**
+ * A time from the legacy bulk settings save (older owner builds sent
+ * free-typed text). An echo of the stored value, or a missing one, is "no
+ * change" (undefined). "H:mm", "HH:mm" and "HH:mm:ss" are padded to
+ * "HH:mm:ss" ("8:30" → "08:30:00"); anything else is a 400.
+ */
+const legacyBulkShiftTime = (
+  value: unknown,
+  stored: string,
+): string | undefined => {
+  if (value === undefined || value === null || value === stored) {
+    return undefined;
+  }
+  const match =
+    typeof value === 'string'
+      ? /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(value.trim())
+      : null;
+  const [hour, minute, second] = match
+    ? [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)]
+    : [NaN, NaN, NaN];
+  if (!(hour <= 23 && minute <= 59 && second <= 59)) {
+    throw new BadRequestException(WORK_SHIFT_TIME_MESSAGE);
+  }
+  const pad = (part: number) => String(part).padStart(2, '0');
+  const normalized = `${pad(hour)}:${pad(minute)}:${pad(second)}`;
+  const storedNormalized = normalizeWorkShiftTime(stored);
+  return normalized === storedNormalized ? undefined : normalized;
+};
+
+/** Trimmed shift name; 400 when blank or longer than the DTO limit. */
+const requireWorkShiftName = (value: unknown): string => {
+  const name = typeof value === 'string' ? value.trim() : '';
+  if (!name || !normalizeActiveShiftName(name)) {
+    throw new BadRequestException('Tên ca là bắt buộc');
+  }
+  if (name.length > WORK_SHIFT_NAME_MAX_LENGTH) {
+    throw new BadRequestException(
+      `Tên ca tối đa ${WORK_SHIFT_NAME_MAX_LENGTH} ký tự`,
+    );
+  }
+  return name;
+};
+
+/** Check-in before the store's early check-in window opens. */
+export const CHECK_IN_TOO_EARLY_CODE = 'CHECK_IN_TOO_EARLY';
+
+/** Registering to a deleted (hidden) shift. */
+export const WORK_SHIFT_INACTIVE_CODE = 'WORK_SHIFT_INACTIVE';
+export const WORK_SHIFT_INACTIVE_MESSAGE =
+  'Ca làm việc này đã bị xoá, vui lòng chọn ca khác';
+
+/** Stable 409 code of DELETE work-shifts when booked upcoming days remain. */
+export const WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS =
+  'WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS';
+
+/**
+ * Assignment states that hold a seat on a not-yet-started slot. A slot with
+ * one of these blocks deleting its shift; only CANCELLED rows do not.
+ */
+const SEAT_HOLDING_ASSIGNMENT_STATUSES: readonly ShiftAssignmentStatus[] = [
+  ShiftAssignmentStatus.PENDING,
+  ShiftAssignmentStatus.APPROVED,
+  ShiftAssignmentStatus.CONFIRMED,
+  ShiftAssignmentStatus.COMPLETED,
+];
+
 const assertShiftNamesPresent = (
   shifts: Array<{ shiftName: string; isActive?: boolean }>,
 ) => {
@@ -1040,6 +1135,9 @@ const defaultTimekeepingSettingData = (storeId: string) => ({
   storeId,
   enableFlexibleShift: false,
   requireLocation: true,
+  attendanceRadius: 50,
+  requireQrScan: true,
+  locationExceptionEmployeeIds: [] as string[],
   allowedLateMinutes: 0,
   deductWorkTimeIfLate: true,
   showLateAlert: true,
@@ -1854,20 +1952,33 @@ export class StoresService {
     return store;
   }
 
+  /**
+   * Shift ids an owner writes into cycles, templates or slots must belong to
+   * the store and still be in the settings list: a deleted (hidden) shift
+   * takes no new days. Pass `rejectInactive: false` for a reference kept
+   * unchanged from before the delete.
+   */
   private async assertWorkShiftsBelongToStore(
     storeId: string,
     workShiftIds: string[],
+    { rejectInactive = true }: { rejectInactive?: boolean } = {},
   ) {
     const uniqueIds = [...new Set(workShiftIds.filter(Boolean))];
     if (!uniqueIds.length) return;
     const shifts = await this.workShiftRepository.find({
       where: { id: In(uniqueIds), storeId },
-      select: ['id'],
+      select: ['id', 'isActive'],
     });
     if (shifts.length !== uniqueIds.length) {
       throw new ForbiddenException(
         'Một hoặc nhiều ca làm không thuộc cửa hàng này',
       );
+    }
+    if (rejectInactive && shifts.some((shift) => shift.isActive === false)) {
+      throw new BadRequestException({
+        code: WORK_SHIFT_INACTIVE_CODE,
+        message: WORK_SHIFT_INACTIVE_MESSAGE,
+      });
     }
   }
 
@@ -2367,14 +2478,16 @@ export class StoresService {
       storeId,
       accountId,
     );
-    const [existingSetting, existingShifts] = await Promise.all([
+    // `shifts` lists what the settings screen manages: active templates,
+    // without deleted (hidden) or "Khung giờ khác" request shifts.
+    const [existingSetting, visibleShifts] = await Promise.all([
       this.timekeepingSettingRepository.findOne({ where: { storeId } }),
-      this.workShiftRepository.find({ where: { storeId } }),
+      this.listSettingsWorkShifts(storeId),
     ]);
     if (existingSetting || access === 'STAFF') {
       return {
         ...(existingSetting || defaultTimekeepingSettingData(storeId)),
-        shifts: existingShifts,
+        shifts: visibleShifts,
       };
     }
 
@@ -2387,10 +2500,11 @@ export class StoresService {
           'Bạn không có quyền xem cấu hình chấm công',
         );
       }
-      const { setting, shifts } = await this.ensureDefaultTimekeepingSetting(
+      const { setting } = await this.ensureDefaultTimekeepingSetting(
         manager,
         storeId,
       );
+      const shifts = await this.listSettingsWorkShifts(storeId, manager);
       return { ...setting, shifts };
     });
   }
@@ -2437,27 +2551,57 @@ export class StoresService {
           throw new BadRequestException('Ca làm việc không thuộc cửa hàng này');
         }
       }
+      // Shifts are created, edited and deleted through the work-shifts
+      // routes; this bulk path (older apps) may only retouch the shifts the
+      // settings list shows. Entries for a deleted (hidden) or "Khung giờ
+      // khác" shift are ignored so a stale screen cannot revive or alter
+      // them, and `isActive` is never written here: hiding goes through
+      // DELETE and its upcoming-assignment check.
+      const customShiftIds = shiftUpdates.length
+        ? await this.findCustomRequestShiftIds(manager, storeId)
+        : new Set<string>();
+      const editableUpdates = shiftUpdates
+        .filter((shiftData) => {
+          const existing = existingById.get(shiftData.id!);
+          return existing?.isActive !== false && !customShiftIds.has(shiftData.id!);
+        })
+        .map((shiftData) => ({
+          id: shiftData.id as string,
+          shiftName:
+            shiftData.shiftName !== undefined && shiftData.shiftName !== null
+              ? String(shiftData.shiftName).trim()
+              : undefined,
+          startTime: legacyBulkShiftTime(
+            shiftData.startTime,
+            existingById.get(shiftData.id!)!.startTime,
+          ),
+          endTime: legacyBulkShiftTime(
+            shiftData.endTime,
+            existingById.get(shiftData.id!)!.endTime,
+          ),
+        }));
       const updatesById = new Map(
-        shiftUpdates.map((shift) => [shift.id as string, shift]),
+        editableUpdates.map((shift) => [shift.id, shift]),
       );
       const finalShifts = existingShifts.map((shift) => {
         const update = updatesById.get(shift.id);
         return {
           shiftName: (update?.shiftName ?? shift.shiftName).trim(),
-          isActive: update?.isActive ?? shift.isActive,
+          isActive: shift.isActive,
         };
       });
       assertShiftNamesPresent(finalShifts);
-      const reminderShiftIds = shiftUpdates
+      const reminderShiftIds = editableUpdates
         .filter((shiftData) => {
-          const existing = existingById.get(shiftData.id!);
+          const existing = existingById.get(shiftData.id)!;
           return (
             (shiftData.startTime !== undefined &&
-              shiftData.startTime !== existing?.startTime) ||
-            (shiftData.isActive === true && existing?.isActive === false)
+              !sameShiftTime(shiftData.startTime, existing.startTime)) ||
+            (shiftData.endTime !== undefined &&
+              !sameShiftTime(shiftData.endTime, existing.endTime))
           );
         })
-        .map((shiftData) => shiftData.id!);
+        .map((shiftData) => shiftData.id);
 
       let setting = await manager.findOne(StoreTimekeepingSetting, {
         where: { storeId },
@@ -2470,29 +2614,20 @@ export class StoresService {
         });
       }
 
-      for (const shiftData of shiftUpdates) {
+      for (const shiftData of editableUpdates) {
         const shift = existingById.get(shiftData.id)!;
         const finalStartTime = shiftData.startTime ?? shift.startTime;
         const finalEndTime = shiftData.endTime ?? shift.endTime;
-        if (finalStartTime === finalEndTime) {
+        if (sameShiftTime(finalStartTime, finalEndTime)) {
           throw new BadRequestException(
             'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
           );
         }
         const allowedUpdate: Partial<WorkShift> = {};
-        for (const key of [
-          'shiftName',
-          'startTime',
-          'endTime',
-          'isActive',
-        ] as const) {
-          if (shiftData[key] !== undefined) {
-            (allowedUpdate as any)[key] = shiftData[key];
-          }
+        for (const key of ['shiftName', 'startTime', 'endTime'] as const) {
+          if (shiftData[key] !== undefined) allowedUpdate[key] = shiftData[key];
         }
-        if (allowedUpdate.shiftName) {
-          allowedUpdate.shiftName = allowedUpdate.shiftName.trim();
-        }
+        if (!Object.keys(allowedUpdate).length) continue;
         await manager.update(
           WorkShift,
           { id: shift.id, storeId },
@@ -2963,6 +3098,19 @@ export class StoresService {
       if (!id) continue;
       const exists = await manager.exists(entity, { where: { id, storeId } });
       if (!exists) throw this.invalidStoreReference();
+    }
+    // A new hire's default shift comes from the settings list; a deleted
+    // (hidden) shift is no longer offered there.
+    if (
+      data.workShiftId &&
+      (await manager.exists(WorkShift, {
+        where: { id: data.workShiftId, storeId, isActive: false },
+      }))
+    ) {
+      throw new BadRequestException({
+        code: WORK_SHIFT_INACTIVE_CODE,
+        message: WORK_SHIFT_INACTIVE_MESSAGE,
+      });
     }
   }
 
@@ -5020,20 +5168,21 @@ export class StoresService {
   // Work Shift management
   async createWorkShift(
     storeId: string,
-    data: Partial<WorkShift>,
+    data: CreateWorkShiftDto | Partial<WorkShift>,
     ownerAccountId?: string,
   ) {
-    if (!data.shiftName?.trim() || !data.startTime || !data.endTime) {
+    if (!data?.shiftName?.trim() || !data.startTime || !data.endTime) {
       throw new BadRequestException('Tên ca và thời gian là bắt buộc');
     }
-    if (data.startTime === data.endTime) {
+    const shiftName = requireWorkShiftName(data.shiftName);
+    const shiftStartTime = requireWorkShiftTime(data.startTime);
+    const shiftEndTime = requireWorkShiftTime(data.endTime);
+    // A start after the end is an overnight shift; only equal times are wrong.
+    if (sameShiftTime(shiftStartTime, shiftEndTime)) {
       throw new BadRequestException(
         'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
       );
     }
-    const shiftName = data.shiftName.trim();
-    const shiftStartTime = data.startTime;
-    const shiftEndTime = data.endTime;
     if (!ownerAccountId) {
       throw new ForbiddenException('Không xác định được tài khoản');
     }
@@ -5047,9 +5196,8 @@ export class StoresService {
           'Bạn không có quyền tạo ca cho cửa hàng này',
         );
       }
-      if (!normalizeActiveShiftName(shiftName)) {
-        throw new BadRequestException('Tên ca là bắt buộc');
-      }
+      // The same-name rule ("same name only on different days") needs work
+      // dates; a new template has none, so no name can clash yet.
       const shift = manager.create(WorkShift, {
         storeId,
         shiftName,
@@ -5059,16 +5207,72 @@ export class StoresService {
         colorCode: data.colorCode ?? '#21D4D4',
         note: data.note ?? null,
         location: data.location ?? null,
-        isActive: data.isActive ?? true,
+        isActive: true,
       });
       return manager.save(WorkShift, shift);
     });
   }
 
+  /**
+   * The store's shift templates as the settings screen and the shift pickers
+   * list them: active only, without the per-date shifts an approved
+   * "Khung giờ khác" request created (those belong to one employee and day).
+   */
   async getWorkShifts(storeId: string) {
-    return this.workShiftRepository.find({
+    return this.listSettingsWorkShifts(storeId);
+  }
+
+  private async listSettingsWorkShifts(
+    storeId: string,
+    manager?: EntityManager,
+  ): Promise<WorkShift[]> {
+    const options = {
       where: { storeId, isActive: true },
-    });
+      order: { startTime: 'ASC' as const, shiftName: 'ASC' as const },
+    };
+    const shifts = manager
+      ? await manager.find(WorkShift, options)
+      : await this.workShiftRepository.find(options);
+    const active = (shifts ?? []).filter((shift) => shift.isActive !== false);
+    if (!active.length) return [];
+    const customIds = await this.findCustomRequestShiftIds(
+      manager ?? this.workShiftRepository,
+      storeId,
+    );
+    return active.filter((shift) => !customIds.has(shift.id));
+  }
+
+  /**
+   * Active shifts of the store created by an approved custom shift request:
+   * listed in a request's `created_schedule_ref.shiftIds`, or carrying the
+   * request note (rows created before the ref existed).
+   */
+  private async findCustomRequestShiftIds(
+    runner: Pick<EntityManager, 'query'>,
+    storeId: string,
+  ): Promise<Set<string>> {
+    const rows: Array<{ id?: unknown }> = await runner.query(
+      `SELECT ws.id
+         FROM work_shifts ws
+        WHERE ws.store_id = $1
+          AND ws.is_active = true
+          AND (
+            ws.note = $2
+            OR EXISTS (
+              SELECT 1
+                FROM custom_shift_requests csr
+               WHERE csr.store_id = ws.store_id
+                 AND csr.created_schedule_ref -> 'shiftIds'
+                     @> jsonb_build_array(ws.id::text)
+            )
+          )`,
+      [storeId, CUSTOM_SHIFT_NOTE],
+    );
+    return new Set(
+      (Array.isArray(rows) ? rows : [])
+        .map((row) => row?.id)
+        .filter((id): id is string => typeof id === 'string'),
+    );
   }
 
   private normalizeShiftRecurrence(
@@ -6164,12 +6368,23 @@ export class StoresService {
   async updateWorkShift(
     storeId: string,
     shiftId: string,
-    data: Partial<WorkShift>,
+    data: UpdateWorkShiftDto | Partial<WorkShift>,
     ownerAccountId?: string,
   ) {
     if (!ownerAccountId) {
       throw new ForbiddenException('Không xác định được tài khoản');
     }
+    const input = data ?? {};
+    const nextName =
+      input.shiftName !== undefined
+        ? requireWorkShiftName(input.shiftName)
+        : undefined;
+    const nextStartInput =
+      input.startTime !== undefined
+        ? requireWorkShiftTime(input.startTime)
+        : undefined;
+    const nextEndInput =
+      input.endTime !== undefined ? requireWorkShiftTime(input.endTime) : undefined;
     await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     const shiftBeforeLock = await this.workShiftRepository.findOne({
       where: { id: shiftId, storeId },
@@ -6178,6 +6393,7 @@ export class StoresService {
     if (!shiftBeforeLock) {
       throw new NotFoundException('Không tìm thấy ca làm việc');
     }
+    let timeChanged = false;
     const saved = await this.dataSource.transaction(async (manager) => {
       await lockStoreShiftAvailability(manager, storeId);
       const store = await manager.findOne(Store, { where: { id: storeId } });
@@ -6191,18 +6407,18 @@ export class StoresService {
         where: { id: shiftId, storeId },
         lock: { mode: 'pessimistic_write' },
       });
-      if (!shift) throw new NotFoundException('Không tìm thấy ca làm việc');
-      const nextStart = data.startTime ?? shift.startTime;
-      const nextEnd = data.endTime ?? shift.endTime;
-      if (nextStart === nextEnd) {
+      // A deleted (hidden) shift is not editable: it is kept only for history.
+      if (!shift || shift.isActive === false) {
+        throw new NotFoundException('Không tìm thấy ca làm việc');
+      }
+      const nextStart = nextStartInput ?? shift.startTime;
+      const nextEnd = nextEndInput ?? shift.endTime;
+      if (sameShiftTime(nextStart, nextEnd)) {
         throw new BadRequestException(
           'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
         );
       }
-      if (data.shiftName !== undefined) {
-        const normalizedName = normalizeActiveShiftName(data.shiftName);
-        if (!normalizedName)
-          throw new BadRequestException('Tên ca là bắt buộc');
+      if (nextName !== undefined) {
         const ownDates: Array<{ work_date: string }> = await manager.query(
           `SELECT DISTINCT to_char(ss.work_date, 'YYYY-MM-DD') AS work_date
              FROM shift_slots ss
@@ -6214,7 +6430,7 @@ export class StoresService {
         const sameNameHit = await findSameNameShiftOnDates(
           manager,
           storeId,
-          [data.shiftName],
+          [nextName],
           (Array.isArray(ownDates) ? ownDates : [])
             .map((row) => row?.work_date)
             .filter((date): date is string => typeof date === 'string'),
@@ -6224,32 +6440,157 @@ export class StoresService {
           throw new BadRequestException(sameNameShiftMessage(sameNameHit));
         }
       }
+      timeChanged =
+        (nextStartInput !== undefined &&
+          !sameShiftTime(nextStartInput, shift.startTime)) ||
+        (nextEndInput !== undefined &&
+          !sameShiftTime(nextEndInput, shift.endTime));
       const allowed: Partial<WorkShift> = {};
+      if (nextName !== undefined) allowed.shiftName = nextName;
+      if (nextStartInput !== undefined) allowed.startTime = nextStartInput;
+      if (nextEndInput !== undefined) allowed.endTime = nextEndInput;
       for (const key of [
-        'shiftName',
-        'startTime',
-        'endTime',
         'defaultMaxStaff',
         'colorCode',
         'note',
-        'isActive',
         'location',
       ] as const) {
-        if (data[key] !== undefined) (allowed as any)[key] = data[key];
+        if (input[key] !== undefined) (allowed as any)[key] = input[key];
       }
-      if (allowed.shiftName) allowed.shiftName = allowed.shiftName.trim();
-      await manager.update(WorkShift, { id: shiftId, storeId }, allowed);
+      if (Object.keys(allowed).length) {
+        await manager.update(WorkShift, { id: shiftId, storeId }, allowed);
+      }
       return manager.findOne(WorkShift, { where: { id: shiftId, storeId } });
     });
 
-    // Reschedule reminders since time might have changed
-    if (data.startTime) {
+    // Reminders and the owner's start/ending alerts follow the shift's times.
+    if (timeChanged) {
       this.rescheduleRemindersForShift(shiftId).catch(() => {
         this.logger.error('Failed to reschedule shift reminders');
       });
     }
 
     return saved;
+  }
+
+  /**
+   * Deletes a shift from the store's shift settings by hiding it
+   * (`is_active = false`); the row stays because past slots, attendance and
+   * payroll join it.
+   *
+   * Refused with 409 WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS (nothing changed)
+   * while a not-yet-started slot (VN time) of an active schedule still holds
+   * a seat. Upcoming slots without one are removed the way DELETE
+   * shift-slots/:slotId removes a slot; started and past slots are kept.
+   * Deleting an already hidden shift is a no-op.
+   */
+  async deleteWorkShift(
+    storeId: string,
+    shiftId: string,
+    ownerAccountId?: string,
+  ) {
+    if (!ownerAccountId) {
+      throw new ForbiddenException('Không xác định được tài khoản');
+    }
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const result = await this.dataSource.transaction(async (manager) => {
+      await lockStoreShiftAvailability(manager, storeId);
+      const store = await manager.findOne(Store, {
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (!store) throw new NotFoundException('Cửa hàng không tồn tại');
+      if (store.ownerAccountId !== ownerAccountId) {
+        throw new ForbiddenException(
+          'Bạn không có quyền xoá ca của cửa hàng này',
+        );
+      }
+      const shift = await manager.findOne(WorkShift, {
+        where: { id: shiftId, storeId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!shift) throw new NotFoundException('Không tìm thấy ca làm việc');
+      if (shift.isActive === false) {
+        return {
+          alreadyDeleted: true,
+          removedSlotIds: [] as string[],
+          removedAssignmentIds: [] as string[],
+        };
+      }
+
+      const now = new Date();
+      const candidates = await manager.find(ShiftSlot, {
+        where: {
+          workShiftId: shiftId,
+          workDate: MoreThanOrEqual(vnDateString(now)),
+          cycle: {
+            storeId,
+            status: In([WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED]),
+          },
+        },
+        relations: ['assignments'],
+      });
+      const upcoming = (candidates ?? []).filter(
+        (slot) => !isSlotRegistrationClosed(slot, shift, now),
+      );
+      const booked = upcoming.filter((slot) =>
+        (slot.assignments ?? []).some((assignment) =>
+          SEAT_HOLDING_ASSIGNMENT_STATUSES.includes(assignment.status),
+        ),
+      );
+      if (booked.length) {
+        throw new ConflictException({
+          code: WORK_SHIFT_HAS_UPCOMING_ASSIGNMENTS,
+          count: booked.length,
+          message: `Ca còn ${booked.length} lịch sắp tới đã có nhân viên, hãy huỷ các lịch đó trước`,
+        });
+      }
+
+      const removedSlotIds = upcoming.map((slot) => slot.id);
+      const removedAssignmentIds = upcoming.flatMap((slot) =>
+        (slot.assignments ?? []).map((assignment) => assignment.id),
+      );
+      await this.removeShiftSlotsWithin(manager, removedSlotIds);
+      await manager.update(
+        WorkShift,
+        { id: shiftId, storeId },
+        { isActive: false },
+      );
+      await this.logActivity(manager, {
+        storeId,
+        actorAccountId: ownerAccountId,
+        action: ACTIVITY_ACTIONS.WORK_SHIFT_DELETED,
+        resourceType: 'work_shift',
+        resourceId: shiftId,
+        params: {
+          shiftName: shift.shiftName,
+          startTime: String(shift.startTime ?? '').slice(0, 5),
+          endTime: String(shift.endTime ?? '').slice(0, 5),
+          count: removedSlotIds.length,
+        },
+        idempotencyKey: `${ACTIVITY_ACTIONS.WORK_SHIFT_DELETED}:${shiftId}`,
+      });
+      return { alreadyDeleted: false, removedSlotIds, removedAssignmentIds };
+    });
+
+    // Removed slots held only cancelled rows; clear any reminder or owner
+    // alert still queued for them. Best effort, after commit.
+    if (result.removedAssignmentIds.length) {
+      try {
+        await this.shiftReminderService.cancelAssignmentReminders(
+          result.removedAssignmentIds,
+        );
+      } catch {
+        this.logger.error('Failed to cancel reminders of removed shift slots');
+      }
+    }
+
+    return {
+      id: shiftId,
+      deleted: true,
+      alreadyDeleted: result.alreadyDeleted,
+      removedUpcomingSlots: result.removedSlotIds.length,
+    };
   }
 
   // Helper function to re-sync reminders for all employees assigned to a shift
@@ -6523,9 +6864,9 @@ export class StoresService {
       const dateStr = currentDate.toISOString().split('T')[0];
       const dayOfWeek = this.getDayOfWeek(dateStr);
 
-      // Tìm templates cho ngày này
+      // Tìm templates cho ngày này (bỏ qua ca đã bị xoá / ẩn)
       const dayTemplates = cycle.templates.filter(
-        (t) => t.dayOfWeek === dayOfWeek,
+        (t) => t.dayOfWeek === dayOfWeek && t.workShift?.isActive !== false,
       );
       for (const template of dayTemplates) {
         // Kiểm tra slot đã tồn tại chưa
@@ -6603,14 +6944,18 @@ export class StoresService {
     if (ownerAccountId) {
       const cycle = await this.workCycleRepository.findOne({
         where: { id: cycleId },
-        select: ['id', 'storeId'],
+        select: ['id', 'storeId', 'workShiftId'],
       });
       if (!cycle) throw new NotFoundException('Chu kỳ không tồn tại');
       await this.assertOwnerStoreAccess(cycle.storeId, ownerAccountId);
+      // Re-saving a cycle that still points at a since-deleted shift keeps
+      // working; switching to a deleted shift does not.
       if (data.workShiftId)
-        await this.assertWorkShiftsBelongToStore(cycle.storeId, [
-          data.workShiftId,
-        ]);
+        await this.assertWorkShiftsBelongToStore(
+          cycle.storeId,
+          [data.workShiftId],
+          { rejectInactive: data.workShiftId !== cycle.workShiftId },
+        );
     }
     const allowed: Partial<WorkCycle> = {};
     for (const key of [
@@ -6887,10 +7232,13 @@ export class StoresService {
             where: { cycleId: cycle.id, workDate: tomorrowStr },
           });
           if (existingSlots.length) return nothing();
-          const firstDaySlots = await manager.find(ShiftSlot, {
-            where: { cycleId: cycle.id, workDate: cycle.startDate },
-            relations: ['assignments', 'workShift'],
-          });
+          // A deleted (hidden) shift is not copied to new days.
+          const firstDaySlots = (
+            (await manager.find(ShiftSlot, {
+              where: { cycleId: cycle.id, workDate: cycle.startDate },
+              relations: ['assignments', 'workShift'],
+            })) ?? []
+          ).filter((slot) => slot.workShift?.isActive !== false);
           if (!firstDaySlots.length) return nothing();
           const newSlots = firstDaySlots.map((slot) =>
             manager.create(ShiftSlot, {
@@ -7284,9 +7632,22 @@ export class StoresService {
       ) {
         throw new ForbiddenException('Bạn không có quyền xóa slot này');
       }
-      await manager.delete(ShiftSlot, slotId);
+      await this.removeShiftSlotsWithin(manager, [slotId]);
     });
     return { message: 'Shift slot deleted successfully' };
+  }
+
+  /**
+   * Removes shift slots inside the caller's transaction (store availability
+   * lock held). Their assignments and dependent rows go with them through
+   * the ON DELETE CASCADE foreign keys.
+   */
+  private async removeShiftSlotsWithin(
+    manager: EntityManager,
+    slotIds: string[],
+  ): Promise<void> {
+    if (!slotIds.length) return;
+    await manager.delete(ShiftSlot, slotIds.length === 1 ? slotIds[0] : slotIds);
   }
 
   // ==================== STORE SHIFT SLOTS (for staff app calendar) ====================
@@ -7619,6 +7980,15 @@ export class StoresService {
         now > new Date(cycle.registrationDeadline)
       ) {
         throw new BadRequestException('Đã quá hạn đăng ký ca làm việc');
+      }
+
+      // A deleted (hidden) shift takes no new self-registrations. Its
+      // upcoming slots were removed on delete; this covers the rest.
+      if (!authorizedOwnerAssign && workShift?.isActive === false) {
+        throw new BadRequestException({
+          code: WORK_SHIFT_INACTIVE_CODE,
+          message: WORK_SHIFT_INACTIVE_MESSAGE,
+        });
       }
 
       // Staff cannot sign up for a slot that already started or is in the
@@ -18730,6 +19100,9 @@ export class StoresService {
    * Runs before face inference so a policy rejection does not cost a
    * TensorFlow pass. Whether a violation actually rejects the request is
    * governed by ATTENDANCE_ENFORCEMENT_MODE — see attendance-enforcement.ts.
+   *
+   * Also returns the store's attendance minute rules (grace, check-in
+   * window, worked-time credit) from the same settings row.
    */
   private async applyAttendancePolicy(
     label: 'CheckIn' | 'CheckOut',
@@ -18740,6 +19113,7 @@ export class StoresService {
     checkinDistance: number | null;
     checkinLatitude: number | null;
     checkinLongitude: number | null;
+    rules: AttendanceRules;
   }> {
     let checkinDistance: number | null = null;
     let checkinLatitude: number | null = null;
@@ -18804,7 +19178,12 @@ export class StoresService {
       );
     }
 
-    return { checkinDistance, checkinLatitude, checkinLongitude };
+    return {
+      checkinDistance,
+      checkinLatitude,
+      checkinLongitude,
+      rules: resolveAttendanceRules(timekeeping),
+    };
   }
 
   async checkInWithFace(
@@ -18873,13 +19252,31 @@ export class StoresService {
 
     // ===== Step 1: Store policy (QR + location) =====
     // Evaluated before face inference so a policy rejection is cheap.
-    const { checkinDistance, checkinLatitude, checkinLongitude } =
+    const { checkinDistance, checkinLatitude, checkinLongitude, rules } =
       await this.applyAttendancePolicy(
         'CheckIn',
         storeId,
         assignment.employeeId,
         options,
       );
+
+    // Check-in opens the store's "Cho phép check-in trước giờ làm" minutes
+    // before the shift start.
+    {
+      const slot = assignment.shiftSlot;
+      const { start } = resolveShiftBoundaries(
+        slot?.workDate,
+        slot?.startTime || slot?.workShift?.startTime,
+        slot?.endTime || slot?.workShift?.endTime,
+      );
+      const opensAt = checkInOpensAt(start, rules);
+      if (opensAt && Date.now() < opensAt.getTime()) {
+        throw new BadRequestException({
+          code: CHECK_IN_TOO_EARLY_CODE,
+          message: `Chưa đến giờ check-in. Bạn có thể check-in từ ${vnClockHHmm(opensAt)}.`,
+        });
+      }
+    }
 
     // ===== Step 2: Face Verification =====
     const employeeFace = await this.employeeFaceRepository.findOne({
@@ -18926,7 +19323,11 @@ export class StoresService {
       slot?.startTime || workShift?.startTime,
       slot?.endTime || workShift?.endTime,
     );
-    const lateMinutes = calculateLateMinutes(shiftStart, now);
+    // Late within the store's allowed minutes counts as on time (0).
+    const lateMinutes = applyGrace(
+      calculateLateMinutes(shiftStart, now),
+      rules,
+    );
 
     const attendanceStatus =
       lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
@@ -19104,7 +19505,7 @@ export class StoresService {
 
     // ===== Step 1: Store policy (QR + location) =====
     // Evaluated before face inference so a policy rejection is cheap.
-    const { checkinDistance, checkinLatitude, checkinLongitude } =
+    const { checkinDistance, checkinLatitude, checkinLongitude, rules } =
       await this.applyAttendancePolicy(
         'CheckOut',
         storeId,
@@ -19150,16 +19551,24 @@ export class StoresService {
     const now = new Date();
     const slot = assignment.shiftSlot;
     const workShift = slot?.workShift;
-    const { end: shiftEnd } = resolveShiftBoundaries(
+    const { start: shiftStart, end: shiftEnd } = resolveShiftBoundaries(
       slot?.workDate,
       slot?.startTime || workShift?.startTime,
       slot?.endTime || workShift?.endTime,
     );
-    const earlyMinutes = calculateEarlyMinutes(shiftEnd, now);
+    // Leaving early within the store's allowed minutes counts as on time (0).
+    const earlyMinutes = applyGrace(calculateEarlyMinutes(shiftEnd, now), rules);
 
-    const workedMinutes = Math.floor(
-      (now.getTime() - new Date(assignment.checkInTime).getTime()) / 60000,
-    );
+    // Check-in to check-out, with forgiven (or not deducted) late/early time
+    // counted. Whether the late arrival was forgiven is what check-in stored.
+    const workedMinutes = creditedWorkedMinutes({
+      start: shiftStart,
+      end: shiftEnd,
+      checkIn: new Date(assignment.checkInTime),
+      checkOut: now,
+      rules,
+      storedLateMinutes: assignment.lateMinutes,
+    });
 
     // Determine final attendance status
     let attendanceStatus =
@@ -20680,6 +21089,19 @@ export class StoresService {
         String(data.startDate).slice(0, 10) < todayVn
           ? todayVn
           : data.startDate;
+      // Fixed registration targets a shift of the settings list; a deleted
+      // (hidden) shift is refused up front. Another store's id finds no
+      // slots below (the slot query is store-scoped).
+      const targetShift = await this.workShiftRepository.findOne({
+        where: { id: data.workShiftId, storeId: data.storeId },
+        select: ['id', 'isActive'],
+      });
+      if (targetShift?.isActive === false) {
+        throw new BadRequestException({
+          code: WORK_SHIFT_INACTIVE_CODE,
+          message: WORK_SHIFT_INACTIVE_MESSAGE,
+        });
+      }
       const rangeEnd = await this.resolveFixedShiftRangeEnd(
         data.storeId,
         data.workShiftId,
