@@ -43,6 +43,7 @@ import { StoreResourceAccessGuard } from './guards/store-resource-access.guard';
 import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
 import { CreateWorkShiftDto, UpdateWorkShiftDto } from './dto/work-shift.dto';
+import { CreateWorkedTimeRuleDto } from './dto/worked-time-rule.dto';
 import { parseAttendanceCoordinate } from './attendance-enforcement';
 import { resolveUploadedDocxPath } from './contract-template-file.utils';
 import { GetUser } from '../auth/decorators/get-user.decorator';
@@ -1246,6 +1247,51 @@ export class StoresController {
     @GetUser() user: any,
   ) {
     return this.storesService.upsertTimekeepingSetting(id, body, user.userId);
+  }
+
+  // "Cách tính giờ công": theo ca / làm bao nhiêu trả bấy nhiêu.
+  @StoreOwnerOnly()
+  @Get(':id/worked-time-rules')
+  @ApiOperation({ summary: 'Danh sách cách tính giờ công (toàn cửa hàng / từng nhân viên)' })
+  async listWorkedTimeRules(@Param('id') id: string, @GetUser() user: any) {
+    return this.storesService.listWorkedTimeRules(id, user.userId);
+  }
+
+  @StoreOwnerOnly()
+  @Post(':id/worked-time-rules')
+  @ApiOperation({
+    summary: 'Thêm cách tính giờ công',
+    description:
+      'Áp dụng từ startDate trong 1 ngày / 1 tuần / 1 tháng / vô thời hạn. Tính lại các ca đã xong trong khoảng đó, trừ tháng đã duyệt/đã trả lương.',
+  })
+  async createWorkedTimeRule(
+    @Param('id') id: string,
+    @Body() body: CreateWorkedTimeRuleDto,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.createWorkedTimeRule(id, body, user.userId);
+  }
+
+  @StoreOwnerOnly()
+  @Post(':id/worked-time-rules/:ruleId/recompute')
+  @ApiOperation({ summary: 'Tính lại các ca của một cách tính giờ công (thử lại khi lần trước lỗi)' })
+  async recomputeWorkedTimeRule(
+    @Param('id') id: string,
+    @Param('ruleId', ParseUUIDPipe) ruleId: string,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.recomputeWorkedTimeRule(id, ruleId, user.userId);
+  }
+
+  @StoreOwnerOnly()
+  @Delete(':id/worked-time-rules/:ruleId')
+  @ApiOperation({ summary: 'Xoá cách tính giờ công (tính lại các ca nó áp dụng)' })
+  async deleteWorkedTimeRule(
+    @Param('id') id: string,
+    @Param('ruleId', ParseUUIDPipe) ruleId: string,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.deleteWorkedTimeRule(id, ruleId, user.userId);
   }
 
   // Shift Config (Ca làm việc)

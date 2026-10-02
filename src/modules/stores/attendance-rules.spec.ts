@@ -84,7 +84,10 @@ describe('checkInOpensAt', () => {
       vn('2026-10-01T07:45'),
     );
     expect(
-      checkInOpensAt(start, { ...DEFAULT_ATTENDANCE_RULES, earlyCheckinMinutes: 0 }),
+      checkInOpensAt(start, {
+        ...DEFAULT_ATTENDANCE_RULES,
+        earlyCheckinMinutes: 0,
+      }),
     ).toEqual(vn('2026-10-01T08:00'));
   });
 
@@ -278,5 +281,88 @@ describe('creditedWorkedMinutes', () => {
         rules: DEFAULT_ATTENDANCE_RULES,
       }),
     ).toBe(0);
+  });
+});
+
+describe('creditedWorkedMinutes – "Làm bao nhiêu trả bấy nhiêu" (ACTUAL)', () => {
+  const { start, end } = resolveShiftBoundaries('2026-10-01', '05:00', '10:00');
+
+  it('pays actual check-in to check-out, including staying late', () => {
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T05:00'),
+        checkOut: vn('2026-10-01T12:00'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+        mode: 'ACTUAL',
+      }),
+    ).toBe(420);
+  });
+
+  it('pays early arrival and deducts lateness, ignoring grace credit', () => {
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T04:45'),
+        checkOut: vn('2026-10-01T10:00'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+        mode: 'ACTUAL',
+      }),
+    ).toBe(315);
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T05:07'),
+        checkOut: vn('2026-10-01T10:00'),
+        rules: {
+          ...DEFAULT_ATTENDANCE_RULES,
+          graceMinutes: 10,
+          creditLateEarly: true,
+        },
+        storedLateMinutes: 0,
+        mode: 'ACTUAL',
+      }),
+    ).toBe(293);
+  });
+
+  it('stops a forgotten check-out at the shift end (or approved overtime end)', () => {
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T04:50'),
+        checkOut: vn('2026-10-01T10:20'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+        mode: 'ACTUAL',
+        capAtPaidEnd: true,
+      }),
+    ).toBe(310);
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T05:00'),
+        checkOut: vn('2026-10-01T11:30'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+        mode: 'ACTUAL',
+        capAtPaidEnd: true,
+        paidUntil: vn('2026-10-01T11:00'),
+      }),
+    ).toBe(360);
+  });
+
+  it('keeps "theo ca" as the default mode', () => {
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T05:00'),
+        checkOut: vn('2026-10-01T12:00'),
+        rules: DEFAULT_ATTENDANCE_RULES,
+      }),
+    ).toBe(300);
   });
 });

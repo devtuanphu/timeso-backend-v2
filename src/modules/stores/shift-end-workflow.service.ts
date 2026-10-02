@@ -2,7 +2,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Queue } from 'bullmq';
-import { DataSource, In, IsNull, Repository } from 'typeorm';
+import { DataSource, EntityManager, In, IsNull, Repository } from 'typeorm';
 import { NotificationsService } from '../notifications/notifications.service';
 import { OwnerNotificationService } from './owner-notification.service';
 import {
@@ -39,6 +39,12 @@ import {
   resolveAttendanceRules,
 } from './attendance-rules';
 import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
+import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
+import {
+  DEFAULT_WORKED_TIME_MODE,
+  resolveWorkedTimeMode,
+  type WorkedTimeMode,
+} from './worked-time-rules';
 import { describeWorkDate } from '../../common/utils/relative-day';
 import {
   toDateMarker,
@@ -166,7 +172,34 @@ export class ShiftEndWorkflowService {
     @Optional()
     @InjectRepository(StoreTimekeepingSetting)
     private readonly timekeepingSettingRepository?: Repository<StoreTimekeepingSetting>,
+    // "Cách tính giờ công" rules; optional, missing = "theo ca".
+    @Optional()
+    @InjectRepository(StoreWorkedTimeRule)
+    private readonly workedTimeRuleRepository?: Repository<StoreWorkedTimeRule>,
   ) {}
+
+  /** Worked-time mode of that employee's shift on that work date. */
+  private async workedTimeModeFor(
+    storeId: string | null | undefined,
+    employeeProfileId: string | null | undefined,
+    workDate: string | null,
+    manager?: EntityManager,
+  ): Promise<WorkedTimeMode> {
+    if (!storeId || !workDate || !this.workedTimeRuleRepository) {
+      return DEFAULT_WORKED_TIME_MODE;
+    }
+    try {
+      // On the caller's transaction when given: no second connection.
+      const repository = manager
+        ? manager.getRepository(StoreWorkedTimeRule)
+        : this.workedTimeRuleRepository;
+      const rules = await repository.find({ where: { storeId } });
+      return resolveWorkedTimeMode(rules, employeeProfileId, workDate);
+    } catch {
+      this.logger.warn('Worked-time rules unavailable, counting "theo ca"');
+      return DEFAULT_WORKED_TIME_MODE;
+    }
+  }
 
   /** The store's attendance rules; the defaults when unknown. */
   async rulesFor(storeId: string | null | undefined): Promise<AttendanceRules> {
@@ -572,8 +605,9 @@ export class ShiftEndWorkflowService {
       // shift ended moves the close to now + 5 min). A late arrival forgiven
       // at check-in (or not deducted by the store) counts from the start.
       const slot = assignment.shiftSlot;
+      const workDate = slot?.workDate ? String(slot.workDate).slice(0, 10) : null;
       const { start, end } = resolveShiftBoundaries(
-        slot?.workDate ? String(slot.workDate).slice(0, 10) : null,
+        workDate,
         slot?.startTime || slot?.workShift?.startTime,
         slot?.endTime || slot?.workShift?.endTime,
       );
@@ -585,6 +619,15 @@ export class ShiftEndWorkflowService {
         rules,
         storedLateMinutes: assignment.lateMinutes,
         paidUntil: approvedOvertimeEnd,
+        // "Làm bao nhiêu trả bấy nhiêu" still stops a forgotten check-out at
+        // the shift end (or the approved overtime end).
+        mode: await this.workedTimeModeFor(
+          slot?.cycle?.storeId,
+          assignment.employeeId,
+          workDate,
+          manager,
+        ),
+        capAtPaidEnd: true,
       });
       const updated = await manager
         .createQueryBuilder()

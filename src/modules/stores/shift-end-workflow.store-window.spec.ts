@@ -55,6 +55,7 @@ function build(opts: {
   workflow?: Record<string, unknown>;
   assignment?: Record<string, unknown>;
   overtime?: any;
+  workedTimeRules?: unknown[];
 }) {
   const workflowQueue = { add: jest.fn().mockResolvedValue(undefined) };
   const attendanceQueue = { add: jest.fn().mockResolvedValue(undefined) };
@@ -110,6 +111,10 @@ function build(opts: {
     execute: jest.fn().mockResolvedValue({ affected: 1 }),
   };
   const manager: any = {
+    // Worked-time rules are read on the auto-checkout transaction.
+    getRepository: jest.fn(() => ({
+      find: jest.fn().mockResolvedValue(opts.workedTimeRules ?? []),
+    })),
     findOne: jest.fn().mockResolvedValue(row),
     find: jest.fn().mockResolvedValue(opts.overtime ? [opts.overtime] : []),
     createQueryBuilder: jest.fn(() => closeBuilder),
@@ -130,6 +135,7 @@ function build(opts: {
     attendanceQueue as any,
     undefined,
     timekeepingSettingRepository,
+    { find: jest.fn().mockResolvedValue(opts.workedTimeRules ?? []) } as any,
   );
   jest
     .spyOn(service as any, 'appendForgotCheckout')
@@ -433,5 +439,47 @@ describe('ShiftEndWorkflowService dependency injection', () => {
 
     const service = moduleRef.get(ShiftEndWorkflowService);
     expect((service as any).timekeepingSettingRepository).toBe(settings);
+  });
+});
+
+describe('auto-checkout with "Làm bao nhiêu trả bấy nhiêu"', () => {
+  beforeEach(() => {
+    jest.useFakeTimers({
+      now: plus(15),
+      doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
+    });
+  });
+  afterEach(() => jest.useRealTimers());
+
+  const actualRule = {
+    mode: 'ACTUAL',
+    startDate: '2026-07-01',
+    endDate: null,
+    employeeProfileId: null,
+    createdAt: new Date('2026-07-01T00:00:00Z'),
+  };
+
+  it('pays the early arrival but still stops at the shift end', async () => {
+    // Checked in 07:50 VN (10 min early), never checked out; shift ends 17:00.
+    const { service, written } = build({
+      setting: null as any,
+      assignment: { checkInTime: new Date('2026-07-12T00:50:00.000Z'), lateMinutes: 0 },
+      workedTimeRules: [actualRule],
+    });
+
+    await service.autoCheckout('assignment-1', END);
+
+    expect(written[0]).toMatchObject({ workedMinutes: 550 });
+  });
+
+  it('pays from the shift start "theo ca" (default)', async () => {
+    const { service, written } = build({
+      setting: null as any,
+      assignment: { checkInTime: new Date('2026-07-12T00:50:00.000Z'), lateMinutes: 0 },
+    });
+
+    await service.autoCheckout('assignment-1', END);
+
+    expect(written[0]).toMatchObject({ workedMinutes: 540 });
   });
 });

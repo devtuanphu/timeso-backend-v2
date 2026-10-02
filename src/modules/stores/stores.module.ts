@@ -68,6 +68,7 @@ import { SalaryFundHistory } from './entities/salary-fund-history.entity';
 import { SalaryAdvanceRequest } from './entities/salary-advance-request.entity';
 import { StoreApprovalSetting } from './entities/store-approval-setting.entity';
 import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
+import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import { StorePayrollSetting } from './entities/store-payroll-setting.entity';
 import { StorePayrollRule } from './entities/store-payroll-rule.entity';
 import { StorePayrollIncrementRule } from './entities/store-payroll-increment-rule.entity';
@@ -194,6 +195,7 @@ import { CustomShiftRequest } from './entities/custom-shift-request.entity';
       StorePaymentAccount,
       StoreApprovalSetting,
       StoreTimekeepingSetting,
+      StoreWorkedTimeRule,
       StorePayrollSetting,
       StorePayrollRule,
       StorePayrollIncrementRule,

@@ -364,6 +364,14 @@ import {
   creditedWorkedMinutes,
   resolveAttendanceRules,
 } from './attendance-rules';
+import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
+import {
+  DEFAULT_WORKED_TIME_MODE,
+  resolveWorkedTimeMode,
+  ruleEndDate,
+  type WorkedTimeMode,
+  type WorkedTimePeriod,
+} from './worked-time-rules';
 import { overtimeEndAt } from './shift-end-workflow.service';
 import { DEFAULT_ANDROID_CHANNEL } from '../push/push-capabilities';
 import {
@@ -380,7 +388,7 @@ import {
   resolveAttendanceEnforcementMode,
 } from './attendance-enforcement';
 import * as ExcelJS from 'exceljs';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import {
   legacyNormalizedPhoneSql,
   normalizeVietnamPhone,
@@ -1324,7 +1332,359 @@ export class StoresService {
     private readonly activityLogService?: ActivityLogService,
     @Optional()
     private readonly ownerNotificationService?: OwnerNotificationService,
+    // "Cách tính giờ công" rules. Optional: without it (or its table) worked
+    // time is counted "theo ca", the default.
+    @Optional()
+    @InjectRepository(StoreWorkedTimeRule)
+    private readonly workedTimeRuleRepository?: Repository<StoreWorkedTimeRule>,
   ) {}
+
+  /** The store's worked-time rules (not deleted); [] when unavailable. */
+  private async loadWorkedTimeRules(
+    storeId: string | null | undefined,
+  ): Promise<StoreWorkedTimeRule[]> {
+    if (!storeId || !this.workedTimeRuleRepository) return [];
+    try {
+      return await this.workedTimeRuleRepository.find({
+        where: { storeId },
+        order: { createdAt: 'ASC' },
+      });
+    } catch {
+      this.logger.warn('Worked-time rules unavailable, counting "theo ca"');
+      return [];
+    }
+  }
+
+  /** "Cách tính giờ công" rules of the store, newest first (owner only). */
+  async listWorkedTimeRules(storeId: string, ownerAccountId: string) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const rules = await this.loadWorkedTimeRules(storeId);
+    return rules.slice().reverse();
+  }
+
+  /**
+   * Adds a rule (store-wide, or for one or more employees of the store) and
+   * recomputes the completed shifts it covers. Several employees get one row
+   * each, sharing a group id. Months whose payslip is already approved or
+   * paid are left as they are.
+   */
+  async createWorkedTimeRule(
+    storeId: string,
+    data: {
+      mode: WorkedTimeMode;
+      period: WorkedTimePeriod;
+      startDate: string;
+      employeeProfileIds?: string[] | null;
+      employeeProfileId?: string | null;
+    },
+    ownerAccountId: string,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    if (!this.workedTimeRuleRepository) {
+      throw new BadRequestException('Chưa thể lưu cách tính giờ công. Vui lòng thử lại sau.');
+    }
+    const employeeIds = [
+      ...new Set(
+        [...(data.employeeProfileIds ?? []), data.employeeProfileId].filter(
+          (id): id is string => !!id,
+        ),
+      ),
+    ];
+    if (employeeIds.length) {
+      const profiles = await this.profileRepository.find({
+        where: { id: In(employeeIds), storeId },
+        select: ['id'],
+      });
+      if (profiles.length !== employeeIds.length) {
+        throw new BadRequestException({
+          code: 'WORKED_TIME_RULE_EMPLOYEE_NOT_IN_STORE',
+          message: 'Nhân viên không thuộc cửa hàng này.',
+        });
+      }
+    }
+    const startDate = String(data.startDate).slice(0, 10);
+    const [y, m, d] = startDate.split('-').map(Number);
+    const parsed = new Date(Date.UTC(y, m - 1, d));
+    if (
+      Number.isNaN(parsed.getTime()) ||
+      parsed.toISOString().slice(0, 10) !== startDate
+    ) {
+      throw new BadRequestException('Ngày bắt đầu không hợp lệ.');
+    }
+    const endDate = ruleEndDate(startDate, data.period);
+    const groupId = randomUUID();
+    const repo = this.workedTimeRuleRepository;
+    // save() of a list writes all rows in one transaction.
+    const rules = await repo.save(
+      (employeeIds.length ? employeeIds : [null]).map((employeeProfileId) =>
+        repo.create({
+          storeId,
+          employeeProfileId,
+          groupId,
+          mode: data.mode,
+          period: data.period,
+          startDate,
+          endDate,
+          createdByAccountId: ownerAccountId,
+        }),
+      ),
+    );
+    const recompute = await this.recomputeWorkedTime(storeId, {
+      from: startDate,
+      to: endDate,
+      employeeProfileIds: employeeIds.length ? employeeIds : null,
+    });
+    return { rule: rules[0], rules, recompute };
+  }
+
+  /**
+   * The rule and the rows saved with it (same group), or [] when it does not
+   * exist in the store.
+   */
+  private async findWorkedTimeRuleGroup(
+    storeId: string,
+    ruleId: string,
+    withDeleted = false,
+  ): Promise<StoreWorkedTimeRule[]> {
+    const repo = this.workedTimeRuleRepository;
+    if (!repo) return [];
+    const rule = await repo.findOne({ where: { id: ruleId, storeId }, withDeleted });
+    if (!rule) return [];
+    if (!rule.groupId) return [rule];
+    const group = await repo.find({
+      where: { storeId, groupId: rule.groupId },
+      withDeleted,
+    });
+    return group.length ? group : [rule];
+  }
+
+  /** Range and employees a rule group covers, for recomputeWorkedTime. */
+  private workedTimeGroupRange(rules: StoreWorkedTimeRule[]) {
+    const [rule] = rules;
+    const employeeIds = rules
+      .map((r) => r.employeeProfileId)
+      .filter((id): id is string => !!id);
+    return {
+      from: String(rule.startDate).slice(0, 10),
+      to: rule.endDate ? String(rule.endDate).slice(0, 10) : null,
+      // A store-wide row in the group means every employee.
+      employeeProfileIds:
+        employeeIds.length === rules.length ? employeeIds : null,
+    };
+  }
+
+  /**
+   * Removes a rule with the rows saved with it; the shifts they covered are
+   * recomputed with what remains.
+   */
+  async deleteWorkedTimeRule(storeId: string, ruleId: string, ownerAccountId: string) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const rules = await this.findWorkedTimeRuleGroup(storeId, ruleId);
+    if (!rules.length) throw new NotFoundException('Không tìm thấy cách tính giờ công này');
+    await this.workedTimeRuleRepository!.softDelete({
+      id: In(rules.map((r) => r.id)),
+      storeId,
+    });
+    const recompute = await this.recomputeWorkedTime(storeId, this.workedTimeGroupRange(rules));
+    return {
+      id: ruleId,
+      deletedIds: rules.map((r) => r.id),
+      deleted: true,
+      recompute,
+    };
+  }
+
+  /**
+   * Re-prices the completed shifts of the store whose work date is in
+   * [from, to] (to null = open) with the rules now in force.
+   *
+   * Per employee and month, in one transaction holding the month lock and the
+   * payslip row: an approved / paid payslip leaves the month untouched;
+   * otherwise the rules and the shifts are re-read under the lock (so two
+   * rule changes at once still end on the newest rule), and the worked
+   * minutes, the per-shift pay of every touched date and the payslip are
+   * rewritten together. The monthly summary is refreshed after commit.
+   * Idempotent: a re-run changes nothing. A failing employee-month is counted
+   * in `failedShifts` and can be retried (recomputeWorkedTimeRule).
+   */
+  async recomputeWorkedTime(
+    storeId: string,
+    range: { from: string; to: string | null; employeeProfileIds?: string[] | null },
+  ): Promise<{ updatedShifts: number; skippedLockedShifts: number; failedShifts: number }> {
+    const result = { updatedShifts: 0, skippedLockedShifts: 0, failedShifts: 0 };
+    const query = this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .innerJoin('a.shiftSlot', 'slot')
+      .innerJoin('slot.cycle', 'cycle')
+      .select(['a.id', 'a.employeeId', 'slot.id', 'slot.workDate'])
+      .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('a.status = :status', { status: ShiftAssignmentStatus.COMPLETED })
+      .andWhere('a.checkInTime IS NOT NULL')
+      .andWhere('a.checkOutTime IS NOT NULL')
+      .andWhere('slot.workDate >= :from', { from: range.from });
+    if (range.to) query.andWhere('slot.workDate <= :to', { to: range.to });
+    if (range.employeeProfileIds?.length) {
+      query.andWhere('a.employeeId IN (:...employeeIds)', {
+        employeeIds: range.employeeProfileIds,
+      });
+    }
+    const candidates = await query.getMany();
+    if (!candidates.length) return result;
+
+    // Group the shift ids by employee and payslip month.
+    const groups = new Map<string, { employeeId: string; month: VnMonth; ids: string[] }>();
+    for (const a of candidates) {
+      const month = vnMonthOfDateString(String(a.shiftSlot?.workDate ?? '').slice(0, 10));
+      if (!month) continue;
+      const key = `${a.employeeId}:${month.label}`;
+      const group = groups.get(key) ?? { employeeId: a.employeeId, month, ids: [] };
+      group.ids.push(a.id);
+      groups.set(key, group);
+    }
+
+    for (const group of groups.values()) {
+      let refreshId: string | null = null;
+      try {
+        const outcome = await this.dataSource.transaction((manager) =>
+          this.recomputeWorkedTimeGroup(manager, storeId, group),
+        );
+        result.updatedShifts += outcome.updated.length;
+        result.skippedLockedShifts += outcome.skippedLocked;
+        refreshId = outcome.updated[outcome.updated.length - 1] ?? null;
+      } catch (error) {
+        result.failedShifts += group.ids.length;
+        this.logger.error(
+          `[WorkedTime] recompute failed store=${storeId} month=${group.month.label}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      // Monthly summary (hours, counters) from committed data. Best effort:
+      // the next checkout of that month refreshes it too.
+      if (refreshId) {
+        try {
+          await this.processCheckoutPayroll(refreshId);
+        } catch {
+          this.logger.warn('[WorkedTime] monthly summary not refreshed');
+        }
+      }
+    }
+    if (result.updatedShifts || result.skippedLockedShifts || result.failedShifts) {
+      this.logger.log(
+        `[WorkedTime] store=${storeId} recomputed=${result.updatedShifts} lockedSkipped=${result.skippedLockedShifts} failed=${result.failedShifts}`,
+      );
+    }
+    return result;
+  }
+
+  /** One employee-month of recomputeWorkedTime, inside its transaction. */
+  private async recomputeWorkedTimeGroup(
+    manager: EntityManager,
+    storeId: string,
+    group: { employeeId: string; month: VnMonth; ids: string[] },
+  ): Promise<{ updated: string[]; skippedLocked: number }> {
+    await this.findOrCreateMonthlyPayroll(storeId, group.month, manager);
+    const payslip = await this.lockEmployeePayslip(manager, group.employeeId, group.month);
+    // Same protection as upsertEmployeePayslip, soft-deleted rows included.
+    if (payslip && this.isProtectedPayslip(payslip)) {
+      return { updated: [], skippedLocked: group.ids.length };
+    }
+
+    // Re-read under the lock: rules saved meanwhile and the current rows.
+    const rules = await manager.getRepository(StoreWorkedTimeRule).find({ where: { storeId } });
+    const setting = await manager
+      .getRepository(StoreTimekeepingSetting)
+      .findOne({ where: { storeId } });
+    const attendanceRules = resolveAttendanceRules(setting);
+    const rows = await manager.getRepository(ShiftAssignment).find({
+      where: { id: In(group.ids), status: ShiftAssignmentStatus.COMPLETED },
+      relations: ['shiftSlot', 'shiftSlot.workShift'],
+    });
+    const approved = rows.length
+      ? await manager.getRepository(BonusWorkRequest).find({
+          where: {
+            shiftAssignmentId: In(rows.map((row) => row.id)),
+            status: BonusWorkRequestStatus.APPROVED,
+          },
+          order: { updatedAt: 'ASC' },
+        })
+      : [];
+    const approvedByAssignment = new Map(approved.map((r) => [r.shiftAssignmentId, r]));
+
+    const updated: string[] = [];
+    const touchedDates = new Map<string, string>();
+    for (const a of rows) {
+      if (!a.checkInTime || !a.checkOutTime) continue;
+      const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+      const { start, end } = resolveShiftBoundaries(
+        workDate,
+        a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime,
+        a.shiftSlot?.endTime || a.shiftSlot?.workShift?.endTime,
+      );
+      const autoClosed = !!(a.isAutoCheckout || a.autoCheckoutReason);
+      const request = approvedByAssignment.get(a.id);
+      const minutes = creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: new Date(a.checkInTime),
+        // A forgotten check-out is priced from the end the system closed it
+        // at, never from the moment the job ran.
+        checkOut: autoClosed
+          ? new Date(a.scheduledCheckoutTime ?? end ?? a.checkOutTime)
+          : new Date(a.checkOutTime),
+        rules: attendanceRules,
+        storedLateMinutes: a.lateMinutes,
+        paidUntil: request ? overtimeEndAt(request, end ?? undefined) : null,
+        mode: resolveWorkedTimeMode(rules, a.employeeId, workDate),
+        capAtPaidEnd: autoClosed,
+      });
+      if (minutes === Number(a.workedMinutes)) continue;
+      // Guarded: an overtime decision repricing the shift meanwhile wins.
+      const written = await manager
+        .createQueryBuilder()
+        .update(ShiftAssignment)
+        .set({ workedMinutes: minutes })
+        .where('id = :id', { id: a.id })
+        .andWhere('status = :status', { status: ShiftAssignmentStatus.COMPLETED })
+        .andWhere('worked_minutes IS NOT DISTINCT FROM :old', { old: a.workedMinutes ?? null })
+        .execute();
+      if (!written.affected) continue;
+      updated.push(a.id);
+      touchedDates.set(workDate, a.id);
+    }
+    // Per-shift pay of each touched date, and the month payslip.
+    for (const assignmentId of touchedDates.values()) {
+      await this.processCheckoutPayroll(assignmentId, { manager });
+    }
+    return { updated, skippedLocked: 0 };
+  }
+
+  /**
+   * Runs the recompute of a rule (with its group) again, also a removed one,
+   * e.g. after a partial failure was reported.
+   */
+  async recomputeWorkedTimeRule(storeId: string, ruleId: string, ownerAccountId: string) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+    const rules = await this.findWorkedTimeRuleGroup(storeId, ruleId, true);
+    if (!rules.length) throw new NotFoundException('Không tìm thấy cách tính giờ công này');
+    const recompute = await this.recomputeWorkedTime(storeId, this.workedTimeGroupRange(rules));
+    return { id: ruleId, recompute };
+  }
+
+  /** How worked time is counted for that employee's shift on that date. */
+  async workedTimeModeFor(
+    storeId: string | null | undefined,
+    employeeProfileId: string | null | undefined,
+    workDate: string | Date | null | undefined,
+  ): Promise<WorkedTimeMode> {
+    if (!workDate) return DEFAULT_WORKED_TIME_MODE;
+    const date = String(workDate instanceof Date ? workDate.toISOString() : workDate).slice(0, 10);
+    return resolveWorkedTimeMode(
+      await this.loadWorkedTimeRules(storeId),
+      employeeProfileId,
+      date,
+    );
+  }
 
   /**
    * Writes one activity-log entry (inside `manager`'s transaction when given).
@@ -18839,6 +19199,7 @@ export class StoresService {
       rules: resolveAttendanceRules(setting),
       storedLateMinutes: assignment.lateMinutes,
       paidUntil: await this.approvedOvertimeEnd(assignment.id, end),
+      mode: await this.workedTimeModeFor(storeId, assignment.employeeId, slot?.workDate),
     });
     if (workedMinutes === Number(assignment.workedMinutes)) return;
     await this.shiftAssignmentRepository.update(
@@ -19725,6 +20086,7 @@ export class StoresService {
       rules,
       storedLateMinutes: assignment.lateMinutes,
       paidUntil: await this.approvedOvertimeEnd(assignmentId, shiftEnd),
+      mode: await this.workedTimeModeFor(storeId, assignment.employeeId, slot?.workDate),
     });
 
     // Determine final attendance status
@@ -19953,8 +20315,24 @@ export class StoresService {
     });
   }
 
-  async processCheckoutPayroll(assignmentId: string): Promise<void> {
-    const assignment = await this.shiftAssignmentRepository.findOne({
+  /**
+   * Prices a completed shift's work date and the employee's month payslip,
+   * then refreshes the employee's monthly summary.
+   *
+   * With `options.manager` it only prices, inside the caller's transaction
+   * (which must already hold the month lock), so a worked-time recompute
+   * updates minutes, per-shift pay and payslip atomically. It then touches no
+   * other connection: the caller refreshes the summary after commit with a
+   * plain call.
+   */
+  async processCheckoutPayroll(
+    assignmentId: string,
+    options: { manager?: EntityManager } = {},
+  ): Promise<void> {
+    const outer = options.manager;
+    const assignment = await (
+      outer ? outer.getRepository(ShiftAssignment) : this.shiftAssignmentRepository
+    ).findOne({
       where: { id: assignmentId },
       relations: [
         'shiftSlot',
@@ -20045,6 +20423,8 @@ export class StoresService {
     let payslip: PayslipComputation;
     let monthAssignments: PayrollAssignmentFact[];
     let currentStintEarned: number | null | undefined;
+    // Nothing to price without a contract; the summary is the caller's.
+    if (outer && !activeContract) return;
     if (!activeContract) {
       ({
         facts,
@@ -20060,8 +20440,8 @@ export class StoresService {
         payslip,
         assignments: monthAssignments,
         currentStintEarned,
-      } = await this.dataSource.transaction(
-        async (manager) => {
+      } = await (async () => {
+        const priceInTransaction = async (manager: EntityManager) => {
           const payroll = await this.findOrCreateMonthlyPayroll(
             storeId,
             month,
@@ -20130,9 +20510,13 @@ export class StoresService {
           });
           await this.refreshMonthlyPayrollTotals(manager, payroll.id);
           return composed;
-        },
-      ));
+        };
+        return outer
+          ? priceInTransaction(outer)
+          : this.dataSource.transaction(priceInTransaction);
+      })());
     }
+    if (outer) return;
 
     // The payslip above keeps every assignment of the month, so a same-month
     // rehire is paid for both stints, each at its own contract's pricing. The display summary below covers only
