@@ -1,15 +1,22 @@
 /**
  * How worked time is counted for pay ("Cách tính giờ công"), configured by the
- * owner per store or per employee, for a limited period or indefinitely.
+ * owner per store or per employee, from a date and time, for a limited period
+ * or indefinitely.
  *
- *  - SHIFT  "Tính lương theo ca": only time inside the shift, plus approved
- *           overtime. Arriving early or staying late adds nothing.
- *  - ACTUAL "Làm bao nhiêu trả bấy nhiêu": actual check-in to check-out.
+ *  - SHIFT  "Tính theo lịch làm": only time inside the scheduled shift, plus
+ *           approved overtime. Arriving early or staying late adds nothing.
+ *  - ACTUAL "Tính theo giờ chấm công": actual check-in to check-out (a
+ *           forgotten check-out counts to the scheduled end).
  *
- * A rule applies from `startDate` for one day / week / month or indefinitely.
- * For a shift on a given work date, the newest employee rule covering the date
- * wins, then the newest store-wide rule, then SHIFT.
+ * A shift belongs to a rule by its scheduled start (Vietnam wall clock,
+ * `YYYY-MM-DD HH:mm` keys compared as strings). A rule covers the shifts
+ * starting in [start, end); a removed rule keeps covering the shifts that
+ * started before it was removed, so a change never touches a shift already
+ * under way or done. For a shift, the newest covering employee rule wins, then
+ * the newest covering store-wide rule, then the default.
  */
+
+import { vnClockHHmm, vnDateString } from '../../common/utils/vn-calendar';
 
 export type WorkedTimeMode = 'SHIFT' | 'ACTUAL';
 export type WorkedTimePeriod = 'DAY' | 'WEEK' | 'MONTH' | 'INDEFINITE';
@@ -22,77 +29,135 @@ export const WORKED_TIME_PERIODS: WorkedTimePeriod[] = [
   'INDEFINITE',
 ];
 
-/** Mode for a store or employee without any rule covering the date. */
-export const DEFAULT_WORKED_TIME_MODE: WorkedTimeMode = 'SHIFT';
+/**
+ * Without a rule, shifts starting at or after this moment (Vietnam wall
+ * clock) are paid "theo giờ chấm công"; earlier shifts keep "theo lịch làm",
+ * the default before this release. Set to when this release goes live.
+ */
+export const ACTUAL_DEFAULT_FROM = '2026-10-04 00:40';
+
+/** Mode of a shift no rule covers. */
+export const defaultWorkedTimeMode = (shiftKey: string): WorkedTimeMode =>
+  shiftKey >= ACTUAL_DEFAULT_FROM ? 'ACTUAL' : 'SHIFT';
 
 export interface WorkedTimeRuleLike {
   employeeProfileId?: string | null;
   mode: WorkedTimeMode;
-  startDate: string;
-  endDate?: string | null;
+  startDate: string | Date;
+  /** `HH:mm`; missing = 00:00. */
+  startTime?: string | null;
+  /** With `endTime`: exclusive end. Without (legacy rows): last day, inclusive. */
+  endDate?: string | Date | null;
+  endTime?: string | null;
   createdAt?: Date | string | null;
+  /** A removed rule stops covering shifts that start from this instant. */
+  deletedAt?: Date | string | null;
 }
 
-const DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
+export const DATE_KEY = /^\d{4}-\d{2}-\d{2}$/;
+export const TIME_KEY = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-/** `YYYY-MM-DD` of a date column (string or Date at UTC midnight). */
+/** `YYYY-MM-DD` of a date column (string, or a Date read from one). */
 export const toDateKey = (value: string | Date): string =>
-  typeof value === 'string'
-    ? value.slice(0, 10)
-    : value.toISOString().slice(0, 10);
+  typeof value === 'string' ? value.slice(0, 10) : vnDateString(value);
 
-const fromParts = (year: number, monthIndex: number, day: number): string => {
-  const d = new Date(Date.UTC(year, monthIndex, day));
-  return d.toISOString().slice(0, 10);
+/** `HH:mm` of a time column (`HH:mm` or `HH:mm:ss`); missing = 00:00. */
+export const toTimeKey = (value?: string | null): string =>
+  value ? String(value).slice(0, 5) : '00:00';
+
+export const toRuleKey = (date: string | Date, time?: string | null) =>
+  `${toDateKey(date)} ${toTimeKey(time)}`;
+
+/** Key of a shift: its work date and scheduled start time. */
+export const shiftStartKey = (
+  workDate: string | Date | null | undefined,
+  startTime?: string | null,
+): string | null => (workDate ? toRuleKey(workDate, startTime) : null);
+
+/** Vietnam wall clock of an instant, rounded up to the next whole minute. */
+export const vnKeyCeil = (instant: Date): string => {
+  const up = new Date(Math.ceil(instant.getTime() / 60_000) * 60_000);
+  return `${vnDateString(up)} ${vnClockHHmm(up)}`;
+};
+
+const addDays = (dateKey: string, days: number): string => {
+  const [y, m, d] = dateKey.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
 };
 
 /**
- * Last day a rule applies (inclusive), or null for INDEFINITE.
- * MONTH runs to the day before the same day next month; when next month is
- * shorter (31/01 -> 28/02) it runs to the end of that month.
+ * Exclusive end of a rule starting at `startDate startTime`, or null for
+ * INDEFINITE: a day, a week, or the same day and time next month (the last
+ * day of a shorter month: 31/01 -> 28/02).
  */
-export function ruleEndDate(
+export function ruleWindowEnd(
   startDate: string,
+  startTime: string,
   period: WorkedTimePeriod,
-): string | null {
+): { endDate: string; endTime: string } | null {
   if (!DATE_KEY.test(startDate))
     throw new Error(`Invalid start date ${startDate}`);
-  const [y, m, d] = startDate.split('-').map(Number);
   switch (period) {
     case 'DAY':
-      return startDate;
+      return { endDate: addDays(startDate, 1), endTime: startTime };
     case 'WEEK':
-      return fromParts(y, m - 1, d + 6);
+      return { endDate: addDays(startDate, 7), endTime: startTime };
     case 'MONTH': {
+      const [y, m, d] = startDate.split('-').map(Number);
       const lastOfNext = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
-      if (d > lastOfNext) return fromParts(y, m, lastOfNext);
-      return fromParts(y, m, d - 1);
+      const endDate = new Date(Date.UTC(y, m, Math.min(d, lastOfNext)))
+        .toISOString()
+        .slice(0, 10);
+      return { endDate, endTime: startTime };
     }
     case 'INDEFINITE':
       return null;
   }
 }
 
-/** Whether the rule applies on the work date (`YYYY-MM-DD`). */
+/** Start, exclusive end and removal cut of a rule, as keys. */
+export function ruleBounds(rule: WorkedTimeRuleLike): {
+  start: string;
+  end: string | null;
+  cut: string | null;
+} {
+  let end: string | null = null;
+  if (rule.endDate) {
+    end = rule.endTime
+      ? toRuleKey(rule.endDate, rule.endTime)
+      : // Legacy row: end_date was the last day covered.
+        `${addDays(toDateKey(rule.endDate), 1)} 00:00`;
+  }
+  return {
+    start: toRuleKey(rule.startDate, rule.startTime),
+    end,
+    cut: rule.deletedAt ? vnKeyCeil(new Date(rule.deletedAt)) : null,
+  };
+}
+
+/** Whether the rule covers a shift starting at `shiftKey`. */
 export function ruleCovers(
   rule: WorkedTimeRuleLike,
-  workDate: string,
+  shiftKey: string,
 ): boolean {
-  const start = toDateKey(rule.startDate);
-  const end = rule.endDate ? toDateKey(rule.endDate) : null;
-  return workDate >= start && (end === null || workDate <= end);
+  const { start, end, cut } = ruleBounds(rule);
+  return (
+    shiftKey >= start &&
+    (end === null || shiftKey < end) &&
+    (cut === null || shiftKey < cut)
+  );
 }
 
 const createdMs = (rule: WorkedTimeRuleLike) =>
   rule.createdAt ? new Date(rule.createdAt).getTime() : 0;
 
-/** The rule deciding the mode on that date for that employee, or null. */
+/** The rule deciding the mode of that employee's shift, or null. */
 export function resolveWorkedTimeRule<T extends WorkedTimeRuleLike>(
   rules: T[],
   employeeProfileId: string | null | undefined,
-  workDate: string,
+  shiftKey: string,
 ): T | null {
-  const covering = rules.filter((rule) => ruleCovers(rule, workDate));
+  const covering = rules.filter((rule) => ruleCovers(rule, shiftKey));
   const newest = (list: T[]) =>
     list.reduce<T | null>(
       (best, rule) =>
@@ -107,14 +172,14 @@ export function resolveWorkedTimeRule<T extends WorkedTimeRuleLike>(
   return own ?? newest(covering.filter((rule) => !rule.employeeProfileId));
 }
 
-/** Mode for a shift of that employee on that work date. */
+/** Mode of that employee's shift starting at `shiftKey`. */
 export function resolveWorkedTimeMode(
   rules: WorkedTimeRuleLike[],
   employeeProfileId: string | null | undefined,
-  workDate: string,
+  shiftKey: string,
 ): WorkedTimeMode {
   return (
-    resolveWorkedTimeRule(rules, employeeProfileId, workDate)?.mode ??
-    DEFAULT_WORKED_TIME_MODE
+    resolveWorkedTimeRule(rules, employeeProfileId, shiftKey)?.mode ??
+    defaultWorkedTimeMode(shiftKey)
   );
 }

@@ -43,6 +43,17 @@ export class CreateWorkedTimeRuleDto {
   startDate: string;
 
   @ApiPropertyOptional({
+    example: '14:00',
+    description:
+      'Giờ bắt đầu áp dụng (HH:mm, giờ Việt Nam). Bỏ trống: hôm nay = bây giờ, ngày sau = 00:00',
+  })
+  @IsOptional()
+  @Matches(/^([01]\d|2[0-3]):[0-5]\d$/, {
+    message: 'Giờ bắt đầu không hợp lệ (HH:mm).',
+  })
+  startTime?: string;
+
+  @ApiPropertyOptional({
     type: [String],
     description:
       'Các nhân viên được áp dụng. Bỏ trống (và không có employeeProfileId) = toàn cửa hàng',

@@ -20,10 +20,7 @@
  * opens 15 minutes before it unless the store sets otherwise.
  */
 
-import {
-  DEFAULT_WORKED_TIME_MODE,
-  type WorkedTimeMode,
-} from './worked-time-rules';
+import type { WorkedTimeMode } from './worked-time-rules';
 
 export interface AttendanceRules {
   graceMinutes: number;
@@ -124,7 +121,10 @@ export function creditedWorkedMinutes(input: {
   storedLateMinutes?: number | null;
   /** End of approved overtime, when later than the shift end. */
   paidUntil?: Date | null;
-  /** How the owner counts worked time for this shift (default SHIFT). */
+  /**
+   * How the owner counts worked time for this shift (see worked-time-rules).
+   * Callers resolve it; when missing, the strict SHIFT count applies.
+   */
   mode?: WorkedTimeMode;
   /** The check-out was made by the system: never pay past the paid end. */
   capAtPaidEnd?: boolean;
@@ -136,7 +136,7 @@ export function creditedWorkedMinutes(input: {
       ? input.paidUntil
       : end;
 
-  if ((input.mode ?? DEFAULT_WORKED_TIME_MODE) === 'ACTUAL') {
+  if ((input.mode ?? 'SHIFT') === 'ACTUAL') {
     let to = checkOut.getTime();
     if (input.capAtPaidEnd && paidEnd && to > paidEnd.getTime())
       to = paidEnd.getTime();

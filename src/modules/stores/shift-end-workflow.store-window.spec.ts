@@ -110,11 +110,12 @@ function build(opts: {
     andWhere: jest.fn().mockReturnThis(),
     execute: jest.fn().mockResolvedValue({ affected: 1 }),
   };
+  // Worked-time rules are read on the auto-checkout transaction.
+  const rulesOnManager = {
+    find: jest.fn().mockResolvedValue(opts.workedTimeRules ?? []),
+  };
   const manager: any = {
-    // Worked-time rules are read on the auto-checkout transaction.
-    getRepository: jest.fn(() => ({
-      find: jest.fn().mockResolvedValue(opts.workedTimeRules ?? []),
-    })),
+    getRepository: jest.fn(() => rulesOnManager),
     findOne: jest.fn().mockResolvedValue(row),
     find: jest.fn().mockResolvedValue(opts.overtime ? [opts.overtime] : []),
     createQueryBuilder: jest.fn(() => closeBuilder),
@@ -153,6 +154,7 @@ function build(opts: {
     jobIds,
     autoJob,
     written,
+    rulesOnManager,
   };
 }
 
@@ -442,7 +444,7 @@ describe('ShiftEndWorkflowService dependency injection', () => {
   });
 });
 
-describe('auto-checkout with "Làm bao nhiêu trả bấy nhiêu"', () => {
+describe('auto-checkout with "Tính theo giờ chấm công"', () => {
   beforeEach(() => {
     jest.useFakeTimers({
       now: plus(15),
@@ -472,7 +474,24 @@ describe('auto-checkout with "Làm bao nhiêu trả bấy nhiêu"', () => {
     expect(written[0]).toMatchObject({ workedMinutes: 550 });
   });
 
-  it('pays from the shift start "theo ca" (default)', async () => {
+  it('keeps a rule removed after the shift started, reading removed rules', async () => {
+    const { service, written, rulesOnManager } = build({
+      setting: null as any,
+      assignment: { checkInTime: new Date('2026-07-12T00:50:00.000Z'), lateMinutes: 0 },
+      // Removed at 09:00 VN, the 08:00 shift was under way.
+      workedTimeRules: [{ ...actualRule, deletedAt: new Date('2026-07-12T02:00:00.000Z') }],
+    });
+
+    await service.autoCheckout('assignment-1', END);
+
+    expect(written[0]).toMatchObject({ workedMinutes: 550 });
+    expect(rulesOnManager.find).toHaveBeenCalledWith({
+      where: { storeId: expect.anything() },
+      withDeleted: true,
+    });
+  });
+
+  it('pays from the shift start "theo lịch làm" (default before the release)', async () => {
     const { service, written } = build({
       setting: null as any,
       assignment: { checkInTime: new Date('2026-07-12T00:50:00.000Z'), lateMinutes: 0 },

@@ -1273,17 +1273,6 @@ export class StoresController {
   }
 
   @StoreOwnerOnly()
-  @Post(':id/worked-time-rules/:ruleId/recompute')
-  @ApiOperation({ summary: 'Tính lại các ca của một cách tính giờ công (thử lại khi lần trước lỗi)' })
-  async recomputeWorkedTimeRule(
-    @Param('id') id: string,
-    @Param('ruleId', ParseUUIDPipe) ruleId: string,
-    @GetUser() user: any,
-  ) {
-    return this.storesService.recomputeWorkedTimeRule(id, ruleId, user.userId);
-  }
-
-  @StoreOwnerOnly()
   @Delete(':id/worked-time-rules/:ruleId')
   @ApiOperation({ summary: 'Xoá cách tính giờ công (tính lại các ca nó áp dụng)' })
   async deleteWorkedTimeRule(

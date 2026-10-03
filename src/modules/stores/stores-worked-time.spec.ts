@@ -1,8 +1,9 @@
 /**
  * "Cách tính giờ công": per-store / per-employee worked-time mode rules.
- * Check-out follows the rule in force on the shift's work date; adding or
- * removing a rule recomputes the completed shifts it covers, inside the month
- * lock, and never touches a month whose payslip is approved or paid.
+ * Check-out follows the rule covering the shift's scheduled start (a removed
+ * rule still covers the shifts started before its removal), else the default;
+ * saving or removing a rule only affects shifts not started yet, and never
+ * recomputes anything.
  */
 import {
   BadRequestException,
@@ -11,26 +12,23 @@ import {
 } from '@nestjs/common';
 
 import { CreateWorkedTimeRuleDto } from './dto/worked-time-rule.dto';
-import { PaymentStatus } from './entities/employee-salary.entity';
 import {
   AttendanceStatus,
-  ShiftAssignment,
   ShiftAssignmentStatus,
 } from './entities/shift-management.entity';
-import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
-import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import { StoresService } from './stores.service';
 
 const STORE = 'store-1';
 const OWNER = 'owner-1';
-// Shift 05:00-10:00 VN on 2026-10-01.
-const SLOT = {
-  workDate: '2026-10-01',
+// Shift 05:00-10:00 VN; 2026-10-01 is before the default switch
+// (ACTUAL_DEFAULT_FROM), 2026-10-05 after it.
+const slotOn = (workDate: string) => ({
+  workDate,
   startTime: null,
   endTime: null,
   cycle: { storeId: STORE },
   workShift: { startTime: '05:00:00', endTime: '10:00:00' },
-};
+});
 const vn = (clock: string, date = '2026-10-01') =>
   new Date(`${date}T${clock}:00+07:00`);
 
@@ -38,33 +36,22 @@ const rule = (over: Record<string, unknown> = {}) => ({
   id: 'rule-1',
   storeId: STORE,
   employeeProfileId: null,
+  groupId: null,
   mode: 'ACTUAL',
   period: 'INDEFINITE',
   startDate: '2026-10-01',
+  startTime: '00:00',
   endDate: null,
-  createdAt: new Date('2026-10-01T00:00:00Z'),
-  ...over,
-});
-
-const completed = (over: Record<string, unknown> = {}) => ({
-  id: 'as-1',
-  employeeId: 'emp-a',
-  status: ShiftAssignmentStatus.COMPLETED,
-  checkInTime: vn('05:00'),
-  checkOutTime: vn('12:00'),
-  workedMinutes: 300,
-  lateMinutes: 0,
-  isAutoCheckout: false,
-  autoCheckoutReason: null,
-  scheduledCheckoutTime: null,
-  shiftSlot: SLOT,
+  endTime: null,
+  deletedAt: null,
+  createdAt: new Date('2026-09-30T00:00:00Z'),
   ...over,
 });
 
 describe('check-out follows the worked-time rule', () => {
   afterEach(() => jest.useRealTimers());
 
-  const buildCheckout = (rules: unknown[]) => {
+  const buildCheckout = (rules: unknown[], workDate: string) => {
     const service = Object.create(StoresService.prototype) as any;
     service.logger = {
       log: jest.fn(),
@@ -77,10 +64,14 @@ describe('check-out follows the worked-time rule', () => {
     };
     service.shiftAssignmentRepository = {
       findOne: jest.fn().mockResolvedValue({
-        ...completed(),
+        id: 'as-1',
+        employeeId: 'emp-a',
         status: ShiftAssignmentStatus.CONFIRMED,
+        checkInTime: vn('05:00', workDate),
         checkOutTime: null,
+        lateMinutes: 0,
         attendanceStatus: AttendanceStatus.ON_TIME,
+        shiftSlot: slotOn(workDate),
         employee: {
           id: 'emp-a',
           accountId: 'staff-1',
@@ -134,24 +125,33 @@ describe('check-out follows the worked-time rule', () => {
     return { service, written: () => set.mock.calls[0]?.[0] };
   };
 
-  const checkOutAtNoon = async (rules: unknown[]) => {
+  /** Checks in 05:00, out 12:00 (2h after the 10:00 end); worked minutes. */
+  const checkOutAtNoon = async (
+    rules: unknown[],
+    workDate = '2026-10-01',
+    tweak?: (service: any) => void,
+  ) => {
     jest.useFakeTimers({
-      now: vn('12:00'),
+      now: vn('12:00', workDate),
       doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
     });
-    const { service, written } = buildCheckout(rules);
+    const { service, written } = buildCheckout(rules, workDate);
+    tweak?.(service);
     await service.checkOutWithFace('as-1', Buffer.from('x'), 'staff-1');
-    return written();
+    return { minutes: written()?.workedMinutes, service };
   };
 
-  it('pays the 2 hours after the shift with "Làm bao nhiêu trả bấy nhiêu"', async () => {
-    expect(await checkOutAtNoon([rule()])).toMatchObject({
-      workedMinutes: 420,
-    });
+  it('pays check-in to check-out with "Tính theo giờ chấm công"', async () => {
+    expect((await checkOutAtNoon([rule()])).minutes).toBe(420);
   });
 
-  it('pays only the shift without a rule ("theo ca" by default)', async () => {
-    expect(await checkOutAtNoon([])).toMatchObject({ workedMinutes: 300 });
+  it('pays only the schedule with "Tính theo lịch làm"', async () => {
+    expect((await checkOutAtNoon([rule({ mode: 'SHIFT' })])).minutes).toBe(300);
+  });
+
+  it('without a rule: "theo lịch làm" before the release, "theo giờ chấm công" after', async () => {
+    expect((await checkOutAtNoon([], '2026-10-01')).minutes).toBe(300);
+    expect((await checkOutAtNoon([], '2026-10-05')).minutes).toBe(420);
   });
 
   it('lets the employee rule beat the store rule', async () => {
@@ -159,299 +159,132 @@ describe('check-out follows the worked-time rule', () => {
       rule(),
       rule({ id: 'rule-2', employeeProfileId: 'emp-a', mode: 'SHIFT' }),
     ];
-    expect(await checkOutAtNoon(rules)).toMatchObject({ workedMinutes: 300 });
+    expect((await checkOutAtNoon(rules)).minutes).toBe(300);
   });
 
-  it('counts "theo ca" when the rules cannot be read', async () => {
-    jest.useFakeTimers({
-      now: vn('12:00'),
-      doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
+  it('decides by the shift start: a rule from 14:00 leaves the 05:00 shift alone', async () => {
+    const afternoon = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      startTime: '14:00',
     });
-    const { service, written } = buildCheckout([]);
-    service.workedTimeRuleRepository = {
-      find: jest.fn().mockRejectedValue(new Error('no table')),
+    expect((await checkOutAtNoon([afternoon], '2026-10-05')).minutes).toBe(420);
+    const early = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      startTime: '05:00',
+    });
+    expect((await checkOutAtNoon([early], '2026-10-05')).minutes).toBe(300);
+  });
+
+  it('keeps a rule removed during the shift for that shift, reading removed rules', async () => {
+    // "Theo lịch làm" removed at 06:00, after the 05:00 shift started.
+    const removed = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      deletedAt: vn('06:00', '2026-10-05'),
+    });
+    const { minutes, service } = await checkOutAtNoon([removed], '2026-10-05');
+    expect(minutes).toBe(300);
+    expect(service.workedTimeRuleRepository.find).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { storeId: STORE }, withDeleted: true }),
+    );
+  });
+
+  it('stops a removed rule for the shifts starting after its removal', async () => {
+    // "Theo lịch làm" removed at 04:00, before the 05:00 shift started.
+    const removed = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      deletedAt: vn('04:00', '2026-10-05'),
+    });
+    expect((await checkOutAtNoon([removed], '2026-10-05')).minutes).toBe(420);
+  });
+
+  it('uses the default when the rules cannot be read', async () => {
+    const unreadable = (service: any) => {
+      service.workedTimeRuleRepository = {
+        find: jest.fn().mockRejectedValue(new Error('no table')),
+      };
     };
-    await service.checkOutWithFace('as-1', Buffer.from('x'), 'staff-1');
-    expect(written()).toMatchObject({ workedMinutes: 300 });
+    expect((await checkOutAtNoon([], '2026-10-01', unreadable)).minutes).toBe(
+      300,
+    );
+    expect((await checkOutAtNoon([], '2026-10-05', unreadable)).minutes).toBe(
+      420,
+    );
   });
 });
 
-describe('recomputeWorkedTime', () => {
-  const buildRecompute = (opts: {
-    assignments: any[];
-    rules?: unknown[];
-    payslip?: Record<string, unknown> | null;
-    affected?: number;
-    failFor?: string;
-  }) => {
+describe('overtime repricing follows the rule of the shift start', () => {
+  // A completed 05:00-10:00 shift on 2026-10-05, checked out at 12:00.
+  const buildReprice = (rules: unknown[]) => {
     const service = Object.create(StoresService.prototype) as any;
-    service.logger = {
-      log: jest.fn(),
-      warn: jest.fn(),
-      error: jest.fn(),
-      debug: jest.fn(),
-    };
-    const query: any = {
-      innerJoin: jest.fn().mockReturnThis(),
-      select: jest.fn().mockReturnThis(),
-      where: jest.fn().mockReturnThis(),
-      andWhere: jest.fn().mockReturnThis(),
-      getMany: jest.fn().mockResolvedValue(opts.assignments),
-    };
+    service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
     service.shiftAssignmentRepository = {
-      createQueryBuilder: jest.fn(() => query),
-    };
-    const updates: any[] = [];
-    const builder: any = {
-      update: jest.fn().mockReturnThis(),
-      set: jest.fn((values: unknown) => {
-        updates.push(values);
-        return builder;
+      findOne: jest.fn().mockResolvedValue({
+        id: 'as-1',
+        employeeId: 'emp-a',
+        status: ShiftAssignmentStatus.COMPLETED,
+        checkInTime: vn('05:00', '2026-10-05'),
+        checkOutTime: vn('12:00', '2026-10-05'),
+        workedMinutes: 0,
+        lateMinutes: 0,
+        isAutoCheckout: false,
+        shiftSlot: slotOn('2026-10-05'),
       }),
-      where: jest.fn().mockReturnThis(),
-      andWhere: jest.fn().mockReturnThis(),
-      execute: jest.fn().mockResolvedValue({ affected: opts.affected ?? 1 }),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
-    // Rules and rows are re-read on the transaction.
-    const manager = {
-      createQueryBuilder: jest.fn(() => builder),
-      getRepository: jest.fn((entity: unknown) => {
-        if (entity === StoreWorkedTimeRule) {
-          return { find: jest.fn().mockResolvedValue(opts.rules ?? [rule()]) };
-        }
-        if (entity === StoreTimekeepingSetting) {
-          return { findOne: jest.fn().mockResolvedValue(null) };
-        }
-        if (entity === ShiftAssignment) {
-          return {
-            find: jest.fn(async ({ where }: any) => {
-              const ids: string[] = where.id._value ?? where.id.value ?? [];
-              return opts.assignments.filter((a) => ids.includes(a.id));
-            }),
-          };
-        }
-        return { find: jest.fn().mockResolvedValue([]) };
-      }),
+    service.timekeepingSettingRepository = {
+      findOne: jest.fn().mockResolvedValue(null),
     };
-    service.dataSource = {
-      transaction: jest.fn(async (cb: any) => {
-        return cb(manager);
-      }),
+    service.bonusWorkRequestRepository = {
+      findOne: jest.fn().mockResolvedValue(null),
     };
-    service.findOrCreateMonthlyPayroll = jest.fn(
-      async (_s: string, month: any) => {
-        if (opts.failFor && month.label.includes(opts.failFor))
-          throw new Error('lock timeout');
-        return { id: 'payroll-1' };
-      },
-    );
-    service.lockEmployeePayslip = jest
-      .fn()
-      .mockResolvedValue(opts.payslip ?? null);
+    service.workedTimeRuleRepository = {
+      find: jest.fn().mockResolvedValue(rules),
+    };
     service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
-    return { service, updates, manager, query };
+    return service;
+  };
+  const reprice = async (rules: unknown[]) => {
+    const service = buildReprice(rules);
+    await service.repriceCheckedOutOvertime({ shiftAssignmentId: 'as-1' });
+    return service.shiftAssignmentRepository.update.mock.calls[0]?.[1]
+      ?.workedMinutes;
   };
 
-  it('re-prices shifts the new rule covers, then each touched date and the payslip', async () => {
-    const { service, updates, manager } = buildRecompute({
-      assignments: [
-        completed(),
-        completed({
-          id: 'as-2',
-          shiftSlot: { ...SLOT, workDate: '2026-10-02' },
-          checkInTime: vn('05:00', '2026-10-02'),
-          checkOutTime: vn('11:00', '2026-10-02'),
-        }),
-      ],
+  it('ignores a rule starting later that day (14:00) for the 05:00 shift', async () => {
+    const afternoon = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      startTime: '14:00',
     });
-
-    const result = await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: null,
-    });
-
-    expect(result).toEqual({
-      updatedShifts: 2,
-      skippedLockedShifts: 0,
-      failedShifts: 0,
-    });
-    expect(updates).toEqual([{ workedMinutes: 420 }, { workedMinutes: 360 }]);
-    // One transaction for the employee-month, holding the month lock.
-    expect(service.dataSource.transaction).toHaveBeenCalledTimes(1);
-    expect(service.findOrCreateMonthlyPayroll).toHaveBeenCalledWith(
-      STORE,
-      expect.objectContaining({ label: expect.stringContaining('2026') }),
-      manager,
-    );
-    expect(service.processCheckoutPayroll).toHaveBeenCalledWith('as-1', {
-      manager,
-    });
-    expect(service.processCheckoutPayroll).toHaveBeenCalledWith('as-2', {
-      manager,
-    });
-    // The monthly summary is refreshed after commit, outside the lock.
-    expect(service.processCheckoutPayroll).toHaveBeenLastCalledWith('as-2');
+    expect(await reprice([afternoon])).toBe(420);
   });
 
-  it('leaves a month with an approved or paid payslip untouched, even soft-deleted', async () => {
-    for (const payslip of [
-      { id: 'slip-1', paymentStatus: PaymentStatus.APPROVED, deletedAt: null },
-      {
-        id: 'slip-1',
-        paymentStatus: PaymentStatus.PAID,
-        deletedAt: new Date(),
-      },
-    ]) {
-      const { service, updates } = buildRecompute({
-        assignments: [completed()],
-        payslip,
-      });
-
-      const result = await service.recomputeWorkedTime(STORE, {
-        from: '2026-10-01',
-        to: null,
-      });
-
-      expect(result).toEqual({
-        updatedShifts: 0,
-        skippedLockedShifts: 1,
-        failedShifts: 0,
-      });
-      expect(updates).toHaveLength(0);
-      expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
-    }
-  });
-
-  it('does nothing for shifts already priced with the rules in force (idempotent)', async () => {
-    const { service, updates } = buildRecompute({
-      assignments: [completed({ workedMinutes: 420 })],
+  it('applies a rule covering the shift start', async () => {
+    const morning = rule({
+      mode: 'SHIFT',
+      startDate: '2026-10-05',
+      startTime: '05:00',
     });
-
-    const result = await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: null,
-    });
-
-    expect(result).toEqual({
-      updatedShifts: 0,
-      skippedLockedShifts: 0,
-      failedShifts: 0,
-    });
-    expect(updates).toHaveLength(0);
-    expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
-  });
-
-  it('uses the rules read under the lock (a newer rule saved meanwhile wins)', async () => {
-    const { service, updates } = buildRecompute({
-      assignments: [completed({ workedMinutes: 420 })],
-      rules: [
-        rule(),
-        rule({
-          id: 'rule-2',
-          mode: 'SHIFT',
-          createdAt: new Date('2026-10-02'),
-        }),
-      ],
-    });
-
-    await service.recomputeWorkedTime(STORE, { from: '2026-10-01', to: null });
-
-    expect(updates).toEqual([{ workedMinutes: 300 }]);
-  });
-
-  it('prices a forgotten check-out to the shift end, not to when the job ran', async () => {
-    const { service, updates } = buildRecompute({
-      assignments: [
-        completed({
-          checkInTime: vn('04:50'),
-          checkOutTime: vn('10:20'),
-          isAutoCheckout: true,
-          scheduledCheckoutTime: null,
-          workedMinutes: 300,
-        }),
-      ],
-    });
-
-    await service.recomputeWorkedTime(STORE, { from: '2026-10-01', to: null });
-
-    // Early arrival counts in ACTUAL; the end stops at 10:00.
-    expect(updates).toEqual([{ workedMinutes: 310 }]);
-  });
-
-  it('skips a shift changed meanwhile (guarded update)', async () => {
-    const { service } = buildRecompute({
-      assignments: [completed()],
-      affected: 0,
-    });
-
-    const result = await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: null,
-    });
-
-    expect(result.updatedShifts).toBe(0);
-    expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
-  });
-
-  it('counts a failing month and still does the others', async () => {
-    const { service } = buildRecompute({
-      assignments: [
-        completed(),
-        completed({
-          id: 'as-nov',
-          shiftSlot: { ...SLOT, workDate: '2026-11-03' },
-          checkInTime: vn('05:00', '2026-11-03'),
-          checkOutTime: vn('12:00', '2026-11-03'),
-        }),
-      ],
-      failFor: '11',
-    });
-
-    const result = await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: null,
-    });
-
-    expect(result).toEqual({
-      updatedShifts: 1,
-      skippedLockedShifts: 0,
-      failedShifts: 1,
-    });
-  });
-
-  it('limits the scan to the rule range and employees', async () => {
-    const { service, query } = buildRecompute({ assignments: [] });
-
-    await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: '2026-10-07',
-      employeeProfileIds: ['emp-a', 'emp-b'],
-    });
-
-    expect(query.andWhere).toHaveBeenCalledWith('slot.workDate <= :to', {
-      to: '2026-10-07',
-    });
-    expect(query.andWhere).toHaveBeenCalledWith(
-      'a.employeeId IN (:...employeeIds)',
-      { employeeIds: ['emp-a', 'emp-b'] },
-    );
-  });
-
-  it('scans every employee for a store-wide range', async () => {
-    const { service, query } = buildRecompute({ assignments: [] });
-
-    await service.recomputeWorkedTime(STORE, {
-      from: '2026-10-01',
-      to: null,
-      employeeProfileIds: null,
-    });
-
-    const clauses = query.andWhere.mock.calls.map((call: unknown[]) => call[0]);
-    expect(clauses.some((c: string) => c.includes('employeeId'))).toBe(false);
+    expect(await reprice([morning])).toBe(300);
   });
 });
 
 describe('worked-time rule CRUD', () => {
+  // Now: 2026-10-05 10:00:20 Vietnam time.
+  const NOW = new Date('2026-10-05T03:00:20Z');
+
+  beforeEach(() => {
+    jest.useFakeTimers({
+      now: NOW,
+      doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'],
+    });
+  });
+  afterEach(() => jest.useRealTimers());
+
   const buildCrud = () => {
     const service = Object.create(StoresService.prototype) as any;
     service.logger = {
@@ -472,103 +305,121 @@ describe('worked-time rule CRUD', () => {
       save: jest.fn(async (values: any[]) =>
         values.map((value, index) => ({ id: `rule-${index + 9}`, ...value })),
       ),
-      findOne: jest
-        .fn()
-        .mockResolvedValue(rule({ period: 'WEEK', endDate: '2026-10-07' })),
-      softDelete: jest.fn().mockResolvedValue({ affected: 1 }),
+      findOne: jest.fn().mockResolvedValue(rule()),
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
       find: jest.fn().mockResolvedValue([]),
     };
-    service.recomputeWorkedTime = jest
-      .fn()
-      .mockResolvedValue({ updatedShifts: 3, skippedLockedShifts: 1 });
+    // Nothing worked is ever recomputed.
+    service.recomputeWorkedTime = jest.fn();
+    service.processCheckoutPayroll = jest.fn();
     return service;
   };
 
-  it('saves one row per chosen employee in one group, then recomputes them', async () => {
-    const service = buildCrud();
-
-    const result = await service.createWorkedTimeRule(
+  const create = (service: any, body: Record<string, unknown>) =>
+    service.createWorkedTimeRule(
       STORE,
-      {
-        mode: 'ACTUAL',
-        period: 'WEEK',
-        startDate: '2026-10-01',
-        employeeProfileIds: ['emp-a', 'emp-b', 'emp-a'],
-      },
+      { mode: 'SHIFT', period: 'DAY', startDate: '2026-10-05', ...body },
       OWNER,
     );
+  const saved = (service: any) =>
+    service.workedTimeRuleRepository.save.mock.calls[0][0];
+
+  it('saves the start date and time and the round end, without recomputing', async () => {
+    const service = buildCrud();
+
+    const result = await create(service, { startTime: '14:00' });
 
     expect(service.assertOwnerStoreAccess).toHaveBeenCalledWith(STORE, OWNER);
-    const [saved] = service.workedTimeRuleRepository.save.mock.calls[0];
-    expect(saved).toHaveLength(2);
-    expect(saved.map((r: any) => r.employeeProfileId)).toEqual([
+    expect(saved(service)).toEqual([
+      expect.objectContaining({
+        storeId: STORE,
+        employeeProfileId: null,
+        mode: 'SHIFT',
+        period: 'DAY',
+        startDate: '2026-10-05',
+        startTime: '14:00',
+        endDate: '2026-10-06',
+        endTime: '14:00',
+        createdByAccountId: OWNER,
+      }),
+    ]);
+    expect(result.rules).toHaveLength(1);
+    expect(result.rule).toBe(result.rules[0]);
+    expect(result).not.toHaveProperty('recompute');
+    expect(service.recomputeWorkedTime).not.toHaveBeenCalled();
+    expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
+  });
+
+  it('saves one row per chosen employee in one group', async () => {
+    const service = buildCrud();
+
+    await create(service, {
+      startTime: '14:00',
+      period: 'INDEFINITE',
+      employeeProfileIds: ['emp-a', 'emp-b', 'emp-a'],
+    });
+
+    const rows = saved(service);
+    expect(rows.map((r: any) => r.employeeProfileId)).toEqual([
       'emp-a',
       'emp-b',
     ]);
-    expect(saved[0].groupId).toBeTruthy();
-    expect(saved[1].groupId).toBe(saved[0].groupId);
-    expect(saved[0]).toEqual(
+    expect(rows[0].groupId).toBeTruthy();
+    expect(rows[1].groupId).toBe(rows[0].groupId);
+    expect(rows[0]).toEqual(
+      expect.objectContaining({ endDate: null, endTime: null }),
+    );
+  });
+
+  it('refuses a start more than 15 minutes ago', async () => {
+    const service = buildCrud();
+
+    await expect(create(service, { startTime: '09:45' })).rejects.toMatchObject(
+      {
+        response: expect.objectContaining({
+          code: 'WORKED_TIME_RULE_START_IN_PAST',
+        }),
+      },
+    );
+    await expect(
+      create(service, { startDate: '2026-10-04', startTime: '23:00' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(service.workedTimeRuleRepository.save).not.toHaveBeenCalled();
+  });
+
+  it('starts from now (next minute) for a start picked moments ago', async () => {
+    const service = buildCrud();
+
+    // 15 minutes before 10:01 (now rounded up) is still accepted.
+    await create(service, { startTime: '09:46', period: 'WEEK' });
+
+    expect(saved(service)[0]).toEqual(
       expect.objectContaining({
-        storeId: STORE,
-        mode: 'ACTUAL',
-        startDate: '2026-10-01',
-        endDate: '2026-10-07',
-        createdByAccountId: OWNER,
+        startDate: '2026-10-05',
+        startTime: '10:01',
+        endDate: '2026-10-12',
+        endTime: '10:01',
       }),
     );
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(STORE, {
-      from: '2026-10-01',
-      to: '2026-10-07',
-      employeeProfileIds: ['emp-a', 'emp-b'],
-    });
-    expect(result.rules).toHaveLength(2);
-    expect(result.rule).toBe(result.rules[0]);
-    expect(result.recompute).toEqual({
-      updatedShifts: 3,
-      skippedLockedShifts: 1,
-    });
   });
 
-  it('still takes a single employeeProfileId', async () => {
-    const service = buildCrud();
-
-    await service.createWorkedTimeRule(
-      STORE,
-      {
-        mode: 'ACTUAL',
-        period: 'DAY',
-        startDate: '2026-10-01',
-        employeeProfileId: 'emp-a',
-      },
-      OWNER,
+  it('takes a date without time from older apps: today from now, later days from 00:00', async () => {
+    const today = buildCrud();
+    await create(today, {});
+    expect(saved(today)[0]).toEqual(
+      expect.objectContaining({ startTime: '10:01' }),
     );
 
-    const [saved] = service.workedTimeRuleRepository.save.mock.calls[0];
-    expect(saved.map((r: any) => r.employeeProfileId)).toEqual(['emp-a']);
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(
-      STORE,
-      expect.objectContaining({ employeeProfileIds: ['emp-a'] }),
-    );
-  });
-
-  it('saves one store-wide row without employees', async () => {
-    const service = buildCrud();
-
-    await service.createWorkedTimeRule(
-      STORE,
-      { mode: 'SHIFT', period: 'INDEFINITE', startDate: '2026-10-01' },
-      OWNER,
+    const later = buildCrud();
+    await create(later, { startDate: '2026-10-07' });
+    expect(saved(later)[0]).toEqual(
+      expect.objectContaining({ startDate: '2026-10-07', startTime: '00:00' }),
     );
 
-    const [saved] = service.workedTimeRuleRepository.save.mock.calls[0];
-    expect(saved).toHaveLength(1);
-    expect(saved[0].employeeProfileId).toBeNull();
-    expect(service.profileRepository.find).not.toHaveBeenCalled();
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(STORE, {
-      from: '2026-10-01',
-      to: null,
-      employeeProfileIds: null,
-    });
+    const past = buildCrud();
+    await expect(
+      create(past, { startDate: '2026-10-04' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 
   it('refuses the whole list when one employee is of another store', async () => {
@@ -576,121 +427,56 @@ describe('worked-time rule CRUD', () => {
     service.profileRepository.find.mockResolvedValue([{ id: 'emp-a' }]);
 
     await expect(
-      service.createWorkedTimeRule(
-        STORE,
-        {
-          mode: 'ACTUAL',
-          period: 'DAY',
-          startDate: '2026-10-01',
-          employeeProfileIds: ['emp-a', 'emp-x'],
-        },
-        OWNER,
-      ),
+      create(service, {
+        startTime: '14:00',
+        employeeProfileIds: ['emp-a', 'emp-x'],
+      }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(service.workedTimeRuleRepository.save).not.toHaveBeenCalled();
-  });
-
-  it('removes a store-wide rule and recomputes the shifts it covered', async () => {
-    const service = buildCrud();
-
-    const result = await service.deleteWorkedTimeRule(STORE, 'rule-1', OWNER);
-
-    expect(service.workedTimeRuleRepository.softDelete).toHaveBeenCalledWith({
-      id: expect.objectContaining({ _value: ['rule-1'] }),
-      storeId: STORE,
-    });
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(STORE, {
-      from: '2026-10-01',
-      to: '2026-10-07',
-      employeeProfileIds: null,
-    });
-    expect(result.deletedIds).toEqual(['rule-1']);
-  });
-
-  it('removes every row of a several-employee rule together', async () => {
-    const service = buildCrud();
-    const group = [
-      rule({
-        id: 'rule-1',
-        groupId: 'g-1',
-        employeeProfileId: 'emp-a',
-        endDate: '2026-10-07',
-      }),
-      rule({
-        id: 'rule-2',
-        groupId: 'g-1',
-        employeeProfileId: 'emp-b',
-        endDate: '2026-10-07',
-      }),
-    ];
-    service.workedTimeRuleRepository.findOne.mockResolvedValue(group[0]);
-    service.workedTimeRuleRepository.find.mockResolvedValue(group);
-
-    const result = await service.deleteWorkedTimeRule(STORE, 'rule-1', OWNER);
-
-    expect(service.workedTimeRuleRepository.find).toHaveBeenCalledWith({
-      where: { storeId: STORE, groupId: 'g-1' },
-      withDeleted: false,
-    });
-    expect(service.workedTimeRuleRepository.softDelete).toHaveBeenCalledWith({
-      id: expect.objectContaining({ _value: ['rule-1', 'rule-2'] }),
-      storeId: STORE,
-    });
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(STORE, {
-      from: '2026-10-01',
-      to: '2026-10-07',
-      employeeProfileIds: ['emp-a', 'emp-b'],
-    });
-    expect(result.deletedIds).toEqual(['rule-1', 'rule-2']);
   });
 
   it('refuses a date that does not exist', async () => {
     const service = buildCrud();
 
     await expect(
-      service.createWorkedTimeRule(
-        STORE,
-        { mode: 'ACTUAL', period: 'DAY', startDate: '2026-02-30' },
-        OWNER,
-      ),
+      create(service, { startDate: '2026-02-30' }),
     ).rejects.toBeInstanceOf(BadRequestException);
     expect(service.workedTimeRuleRepository.save).not.toHaveBeenCalled();
   });
 
-  it('re-runs the recompute of a rule group, also a removed one', async () => {
+  it('removes a rule without recomputing (shifts started before stay as they are)', async () => {
+    const service = buildCrud();
+
+    const result = await service.deleteWorkedTimeRule(STORE, 'rule-1', OWNER);
+
+    expect(service.workedTimeRuleRepository.update).toHaveBeenCalledWith(
+      { id: expect.objectContaining({ _value: ['rule-1'] }), storeId: STORE },
+      { deletedAt: NOW },
+    );
+    expect(result).toEqual({
+      id: 'rule-1',
+      deletedIds: ['rule-1'],
+      deleted: true,
+    });
+    expect(service.recomputeWorkedTime).not.toHaveBeenCalled();
+    expect(service.processCheckoutPayroll).not.toHaveBeenCalled();
+  });
+
+  it('removes every row of a several-employee rule together', async () => {
     const service = buildCrud();
     const group = [
-      rule({
-        id: 'rule-1',
-        groupId: 'g-1',
-        employeeProfileId: 'emp-a',
-        endDate: '2026-10-07',
-      }),
-      rule({
-        id: 'rule-2',
-        groupId: 'g-1',
-        employeeProfileId: 'emp-b',
-        endDate: '2026-10-07',
-      }),
+      rule({ id: 'rule-1', groupId: 'g-1', employeeProfileId: 'emp-a' }),
+      rule({ id: 'rule-2', groupId: 'g-1', employeeProfileId: 'emp-b' }),
     ];
     service.workedTimeRuleRepository.findOne.mockResolvedValue(group[0]);
     service.workedTimeRuleRepository.find.mockResolvedValue(group);
 
-    await service.recomputeWorkedTimeRule(STORE, 'rule-1', OWNER);
+    const result = await service.deleteWorkedTimeRule(STORE, 'rule-1', OWNER);
 
-    expect(service.workedTimeRuleRepository.findOne).toHaveBeenCalledWith({
-      where: { id: 'rule-1', storeId: STORE },
-      withDeleted: true,
-    });
     expect(service.workedTimeRuleRepository.find).toHaveBeenCalledWith({
       where: { storeId: STORE, groupId: 'g-1' },
-      withDeleted: true,
     });
-    expect(service.recomputeWorkedTime).toHaveBeenCalledWith(STORE, {
-      from: '2026-10-01',
-      to: '2026-10-07',
-      employeeProfileIds: ['emp-a', 'emp-b'],
-    });
+    expect(result.deletedIds).toEqual(['rule-1', 'rule-2']);
   });
 
   it('404s a rule of another store', async () => {
@@ -700,6 +486,39 @@ describe('worked-time rule CRUD', () => {
     await expect(
       service.deleteWorkedTimeRule(STORE, 'nope', OWNER),
     ).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('lists the rules in force, newest first, without removed ones', async () => {
+    const service = buildCrud();
+
+    await service.listWorkedTimeRules(STORE, OWNER);
+
+    expect(service.workedTimeRuleRepository.find).toHaveBeenCalledWith({
+      where: { storeId: STORE },
+      order: { createdAt: 'DESC' },
+    });
+  });
+
+  it('lists none when the rules cannot be read', async () => {
+    const service = buildCrud();
+    service.workedTimeRuleRepository.find.mockRejectedValue(
+      new Error('no table'),
+    );
+
+    await expect(service.listWorkedTimeRules(STORE, OWNER)).resolves.toEqual(
+      [],
+    );
+  });
+
+  it('takes "today" from an older app at 23:59:30 as 00:00 the next day', async () => {
+    jest.setSystemTime(new Date('2026-10-05T16:59:30Z'));
+    const service = buildCrud();
+
+    await create(service, { startDate: '2026-10-05' });
+
+    expect(saved(service)[0]).toEqual(
+      expect.objectContaining({ startDate: '2026-10-06', startTime: '00:00' }),
+    );
   });
 });
 
@@ -756,6 +575,19 @@ describe('CreateWorkedTimeRuleDto', () => {
         startDate: '2026-10-01',
         employeeProfileIds: ['not-a-uuid'],
       }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('accepts a start time and refuses a malformed one', async () => {
+    const base = { mode: 'SHIFT', period: 'DAY', startDate: '2026-10-01' };
+    await expect(
+      validate({ ...base, startTime: '14:05' }),
+    ).resolves.toBeTruthy();
+    await expect(
+      validate({ ...base, startTime: '25:00' }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    await expect(
+      validate({ ...base, startTime: '9:00' }),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 

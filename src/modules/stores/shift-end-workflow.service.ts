@@ -41,8 +41,9 @@ import {
 import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
 import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import {
-  DEFAULT_WORKED_TIME_MODE,
+  defaultWorkedTimeMode,
   resolveWorkedTimeMode,
+  shiftStartKey,
   type WorkedTimeMode,
 } from './worked-time-rules';
 import { describeWorkDate } from '../../common/utils/relative-day';
@@ -172,32 +173,41 @@ export class ShiftEndWorkflowService {
     @Optional()
     @InjectRepository(StoreTimekeepingSetting)
     private readonly timekeepingSettingRepository?: Repository<StoreTimekeepingSetting>,
-    // "Cách tính giờ công" rules; optional, missing = "theo ca".
+    // "Cách tính giờ công" rules; optional, missing = the default.
     @Optional()
     @InjectRepository(StoreWorkedTimeRule)
     private readonly workedTimeRuleRepository?: Repository<StoreWorkedTimeRule>,
   ) {}
 
-  /** Worked-time mode of that employee's shift on that work date. */
+  /**
+   * Worked-time mode of that employee's shift starting at `shiftKey`
+   * (`YYYY-MM-DD HH:mm`, see worked-time-rules).
+   */
   private async workedTimeModeFor(
     storeId: string | null | undefined,
     employeeProfileId: string | null | undefined,
-    workDate: string | null,
+    shiftKey: string | null,
     manager?: EntityManager,
   ): Promise<WorkedTimeMode> {
-    if (!storeId || !workDate || !this.workedTimeRuleRepository) {
-      return DEFAULT_WORKED_TIME_MODE;
+    // No work date: count strictly to the schedule.
+    if (!shiftKey) return 'SHIFT';
+    if (!storeId || !this.workedTimeRuleRepository) {
+      return defaultWorkedTimeMode(shiftKey);
     }
     try {
       // On the caller's transaction when given: no second connection.
       const repository = manager
         ? manager.getRepository(StoreWorkedTimeRule)
         : this.workedTimeRuleRepository;
-      const rules = await repository.find({ where: { storeId } });
-      return resolveWorkedTimeMode(rules, employeeProfileId, workDate);
+      // Removed rules still cover the shifts started before their removal.
+      const rules = await repository.find({
+        where: { storeId },
+        withDeleted: true,
+      });
+      return resolveWorkedTimeMode(rules, employeeProfileId, shiftKey);
     } catch {
-      this.logger.warn('Worked-time rules unavailable, counting "theo ca"');
-      return DEFAULT_WORKED_TIME_MODE;
+      this.logger.warn('Worked-time rules unavailable, using the default');
+      return defaultWorkedTimeMode(shiftKey);
     }
   }
 
@@ -624,7 +634,7 @@ export class ShiftEndWorkflowService {
         mode: await this.workedTimeModeFor(
           slot?.cycle?.storeId,
           assignment.employeeId,
-          workDate,
+          shiftStartKey(workDate, slot?.startTime || slot?.workShift?.startTime),
           manager,
         ),
         capAtPaidEnd: true,
