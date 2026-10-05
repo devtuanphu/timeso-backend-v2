@@ -159,10 +159,10 @@ describe('evaluateFacelessAttendance (GPS + QR, no FaceID)', () => {
     expect(evaluateFacelessAttendance(faceless())).toEqual([]);
   });
 
-  it('needs a face photo in every other mode', () => {
+  // "Chỉ QR" checks in without a face now (QR only).
+  it('needs a face photo in the modes that use FaceID or GPS alone', () => {
     for (const requirement of [
       TimekeepingRequirement.LOCATION_QR_GPS_FACEID,
-      TimekeepingRequirement.QR_ONLY,
       TimekeepingRequirement.GPS_ONLY,
       null,
     ]) {

@@ -32,7 +32,7 @@ import {
   ShiftAssignment,
   ShiftAssignmentStatus,
 } from './entities/shift-management.entity';
-import { resolveShiftBoundaries } from './attendance-time.utils';
+import { effectiveWindowOf } from './attendance-time.utils';
 import {
   AttendanceRules,
   creditedWorkedMinutes,
@@ -256,11 +256,10 @@ export class ShiftEndWorkflowService {
     const endTime = slot?.endTime || slot?.workShift?.endTime;
     if (!slot?.workDate || !startTime || !endTime) return;
 
-    const scheduledEndAt = this.calculateScheduledEnd(
-      slot.workDate,
-      startTime,
-      endTime,
-    );
+    // The end in force: an approved early leave moves it earlier.
+    const scheduledEndAt =
+      assignment.adjustedEndAt ??
+      this.calculateScheduledEnd(slot.workDate, startTime, endTime);
     const existing = await this.workflowRepository.findOne({
       where: { shiftAssignmentId: assignmentId },
     });
@@ -616,11 +615,8 @@ export class ShiftEndWorkflowService {
       // at check-in (or not deducted by the store) counts from the start.
       const slot = assignment.shiftSlot;
       const workDate = slot?.workDate ? String(slot.workDate).slice(0, 10) : null;
-      const { start, end } = resolveShiftBoundaries(
-        workDate,
-        slot?.startTime || slot?.workShift?.startTime,
-        slot?.endTime || slot?.workShift?.endTime,
-      );
+      // An approved late arrival / early leave moves the start / end.
+      const { start, end } = effectiveWindowOf(assignment);
       const workedMinutes = creditedWorkedMinutes({
         start,
         end,
@@ -810,6 +806,46 @@ export class ShiftEndWorkflowService {
     );
   }
 
+  /**
+   * After an approved early leave on a shift under way: the shift now ends at
+   * the assignment's adjusted end (never before `now`, so time already worked
+   * is not cut). Reminders and the auto-checkout move there; the jobs queued
+   * for the old end find a different end and do nothing. Before check-in
+   * nothing is scheduled yet: check-in schedules from the adjusted end.
+   */
+  async applyAdjustedEnd(assignmentId: string): Promise<void> {
+    const assignment = await this.assignmentRepository.findOne({
+      where: { id: assignmentId },
+      relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+    });
+    if (!assignment?.checkInTime || assignment.checkOutTime) return;
+    if (!assignment.adjustedEndAt) return;
+    const workflow = await this.workflowRepository.findOne({
+      where: { shiftAssignmentId: assignmentId },
+    });
+    if (!workflow) {
+      await this.scheduleForAssignment(assignmentId);
+      return;
+    }
+    // Approved overtime keeps its own end.
+    if (workflow.state !== ShiftEndWorkflowState.ACTIVE) return;
+    const endAt = new Date(
+      Math.max(new Date(assignment.adjustedEndAt).getTime(), Date.now()),
+    );
+    await this.workflowRepository.update(workflow.id, {
+      scheduledEndAt: endAt,
+      effectiveEndAt: endAt,
+      reminder0SentAt: null,
+      reminder5SentAt: null,
+      reminder10SentAt: null,
+    });
+    await this.scheduleJobs(
+      assignmentId,
+      endAt,
+      (await this.rulesFor(assignment.shiftSlot?.cycle?.storeId)).lateCheckoutMinutes,
+    );
+  }
+
   async resumeAfterOvertime(request: BonusWorkRequest): Promise<void> {
     if (!request.shiftAssignmentId) return;
     const workflow = await this.workflowRepository.findOne({
@@ -876,11 +912,8 @@ export class ShiftEndWorkflowService {
       const workDate = String(slot.workDate).slice(0, 10);
       const startTime = slot.startTime || slot.workShift?.startTime;
       const endTime = slot.endTime || slot.workShift?.endTime;
-      const { start, end } = resolveShiftBoundaries(
-        workDate,
-        startTime,
-        endTime,
-      );
+      // The start / end in force (an approved late arrival or early leave).
+      const { start, end } = effectiveWindowOf(assignment);
       if (!start || !end) continue;
 
       try {

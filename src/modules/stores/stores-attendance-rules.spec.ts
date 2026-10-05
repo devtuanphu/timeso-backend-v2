@@ -386,14 +386,18 @@ describe('overtime decided after the employee checked out', () => {
 
   it('runs when the owner approves or rejects', async () => {
     const service = Object.create(StoresService.prototype) as any;
-    const saved = { ...request, status: 'APPROVED' };
-    service.loadBonusWorkRequestForOwner = jest.fn().mockResolvedValue({
-      request: { ...request },
+    // Decisions are a conditional update from the status the owner saw, and
+    // tell the employee.
+    service.loadBonusWorkRequestForOwner = jest.fn().mockImplementation(async () => ({
+      request: { ...request, status: 'PENDING' },
       approverProfileId: 'owner-profile',
-    });
-    service.bonusWorkRequestRepository = { save: jest.fn().mockResolvedValue(saved) };
+    }));
+    service.bonusWorkRequestRepository = {
+      update: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
     service.logBonusWorkActivity = jest.fn().mockResolvedValue(undefined);
     service.repriceCheckedOutOvertime = jest.fn().mockResolvedValue(undefined);
+    service.notifyOvertimeDecision = jest.fn().mockResolvedValue(undefined);
 
     await service.approveBonusWorkRequest('ot-1', 'owner-1');
     await service.rejectBonusWorkRequest('ot-1', 'owner-1', 'Không cần');

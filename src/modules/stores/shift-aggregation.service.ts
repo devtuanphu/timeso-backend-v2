@@ -43,7 +43,12 @@ import {
 import { SalaryAdjustment } from './entities/salary-adjustment.entity';
 import { pickDayOwnerAssignmentIds } from './payroll-calculation.utils';
 import { stintFloor, stintStartVnDate } from './employment-stint.utils';
-import { resolveShiftBoundaries } from './attendance-time.utils';
+import {
+  computeAttendanceDeltas,
+  effectiveWindowOf,
+  formatDurationVi,
+  resolveShiftBoundaries,
+} from './attendance-time.utils';
 
 
 // ── Helper Maps ────────────────────────────────────────────────────────────────
@@ -305,6 +310,26 @@ export const activityHHmm = (value: unknown): string => {
   const text = String(value);
   const match = /^(\d{1,2}):(\d{2})/.exec(text);
   return match ? `${match[1].padStart(2, '0')}:${match[2]}` : text;
+};
+
+/**
+ * Minutes early in / late out of an attendance against the shift in force
+ * (an approved late arrival or early leave moves it); none when its times
+ * cannot be read.
+ */
+const attendanceDeltasOf = (sa: ShiftAssignment) => {
+  try {
+    const { start, end } = effectiveWindowOf(sa);
+    return computeAttendanceDeltas({
+      start,
+      end,
+      checkIn: sa.checkInTime ? new Date(sa.checkInTime) : null,
+      checkOut: sa.checkOutTime ? new Date(sa.checkOutTime) : null,
+      autoCheckedOut: !!(sa.isAutoCheckout || sa.autoCheckoutReason),
+    });
+  } catch {
+    return null;
+  }
 };
 
 @Injectable()
@@ -2090,12 +2115,19 @@ export class ShiftAggregationService {
 
       let statusText = 'Đúng giờ';
       let statusColor = '#12B76A'; // Green
+      // Same wording as the check-in/out result screens: arriving before the
+      // start is "Vào sớm", leaving after the end "Ra muộn" (not "Đúng giờ").
+      const deltas = sa ? attendanceDeltasOf(sa) : null;
       if (isCheckIn && sa && sa.lateMinutes > 0) {
-        statusText = `Trễ ${sa.lateMinutes} phút`;
+        statusText = `Trễ ${formatDurationVi(sa.lateMinutes)}`;
         statusColor = '#F79009'; // Yellow/Orange
+      } else if (isCheckIn && deltas && deltas.earlyArrivalMinutes > 0) {
+        statusText = `Vào sớm ${formatDurationVi(deltas.earlyArrivalMinutes)}`;
       } else if (!isCheckIn && sa && sa.earlyMinutes > 0) {
-        statusText = `Về sớm ${sa.earlyMinutes} phút`;
+        statusText = `Về sớm ${formatDurationVi(sa.earlyMinutes)}`;
         statusColor = '#F04438'; // Red
+      } else if (!isCheckIn && deltas && deltas.overtimeMinutes > 0) {
+        statusText = `Ra muộn ${formatDurationVi(deltas.overtimeMinutes)}`;
       }
 
       activities.push({

@@ -274,6 +274,24 @@ export class ShiftAssignment extends BaseEntity {
 
   @Column({ name: 'scheduled_checkout_time', type: 'timestamptz', nullable: true })
   scheduledCheckoutTime: Date | null;
+
+  /**
+   * Start in force after the owner approved a late arrival ("xin đi trễ"):
+   * not late before it, and (counting by schedule) paid from it. Null = the
+   * scheduled start. See resolveEffectiveShiftWindow.
+   */
+  @Column({ name: 'adjusted_start_at', type: 'timestamptz', nullable: true })
+  adjustedStartAt: Date | null;
+
+  /** End in force after an approved early leave ("xin về sớm"). */
+  @Column({ name: 'adjusted_end_at', type: 'timestamptz', nullable: true })
+  adjustedEndAt: Date | null;
+
+  @Column({ name: 'late_request_id', type: 'uuid', nullable: true })
+  lateRequestId: string | null;
+
+  @Column({ name: 'early_request_id', type: 'uuid', nullable: true })
+  earlyRequestId: string | null;
 }
 
 @Entity('shift_swaps')

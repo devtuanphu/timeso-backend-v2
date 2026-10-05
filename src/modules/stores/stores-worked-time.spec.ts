@@ -297,7 +297,10 @@ describe('worked-time rule CRUD', () => {
     service.profileRepository = {
       // Every asked employee belongs to the store unless a test says otherwise.
       find: jest.fn(async ({ where }: any) =>
-        (where.id._value as string[]).map((id) => ({ id })),
+        (where.id._value as string[]).map((id) => ({
+          id,
+          account: { fullName: `Tên ${id}` },
+        })),
       ),
     };
     service.workedTimeRuleRepository = {
@@ -308,6 +311,17 @@ describe('worked-time rule CRUD', () => {
       findOne: jest.fn().mockResolvedValue(rule()),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
       find: jest.fn().mockResolvedValue([]),
+    };
+    // Saving checks the rules in force under a store lock, in a transaction.
+    const manager = {
+      query: jest.fn().mockResolvedValue(undefined),
+      getRepository: jest.fn(() => ({
+        ...service.workedTimeRuleRepository,
+        find: jest.fn().mockResolvedValue([]),
+      })),
+    };
+    service.dataSource = {
+      transaction: jest.fn(async (cb: any) => cb(manager)),
     };
     // Nothing worked is ever recomputed.
     service.recomputeWorkedTime = jest.fn();

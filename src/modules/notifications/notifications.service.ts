@@ -166,9 +166,12 @@ export class NotificationsService {
       qb.andWhere('n.createdAt <= :dateTo', { dateTo: new Date(query.dateTo) });
     }
 
-    // Search by title
     if (query.search) {
-      qb.andWhere('n.title ILIKE :search', { search: `%${query.search}%` });
+      // Title or content; % and _ typed by the user are matched literally.
+      const term = query.search.replace(/[\\%_]/g, (c) => `\\${c}`);
+      qb.andWhere('(n.title ILIKE :search OR n.content ILIKE :search)', {
+        search: `%${term}%`,
+      });
     }
 
     // Pagination

@@ -13,7 +13,7 @@ export enum AttendanceMethod {
   FACE = 'FACE',
   MANUAL = 'MANUAL',
   SYSTEM = 'SYSTEM',
-  /** QR + GPS without a face photo (store mode GPS_QR). */
+  /** Without a face photo: QR + GPS (GPS_QR) or QR alone (QR_ONLY). */
   QR_GPS = 'QR_GPS',
 }
 

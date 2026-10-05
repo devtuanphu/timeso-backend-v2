@@ -156,25 +156,34 @@ export interface FacelessAttendanceInput {
 }
 
 /**
- * Attendance without a face photo, allowed only for a GPS_QR store. With no
- * face to identify the person, QR and location are the only evidence, so they
- * are always checked — whatever ATTENDANCE_ENFORCEMENT_MODE says, whatever
- * the requireQrScan / requireLocation toggles and the location exemption list
- * (an exempt employee would be left with nothing to check). Returns every
- * violation, the most decisive first; empty means accepted.
+ * Attendance without a face photo, allowed only for a GPS_QR or QR_ONLY
+ * store. With no face to identify the person, the store's QR (and, for
+ * GPS_QR, the location) is the only evidence, so it is always checked —
+ * whatever ATTENDANCE_ENFORCEMENT_MODE says, whatever the requireQrScan /
+ * requireLocation toggles and the location exemption list (an exempt employee
+ * would be left with nothing to check). QR_ONLY checks no location: the owner
+ * chose the QR alone. Returns every violation, the most decisive first; empty
+ * means accepted.
  */
 export function evaluateFacelessAttendance(
   input: FacelessAttendanceInput,
 ): AttendanceViolation[] {
-  if (input.requirement !== TimekeepingRequirement.GPS_QR) {
+  if (
+    input.requirement !== TimekeepingRequirement.GPS_QR &&
+    input.requirement !== TimekeepingRequirement.QR_ONLY
+  ) {
     return ['FACE_REQUIRED'];
   }
   const violations: AttendanceViolation[] = [];
   if (!input.qrStoreId) {
     violations.push('QR_REQUIRED');
-  } else if (!input.expectedStoreId || input.qrStoreId !== input.expectedStoreId) {
+  } else if (
+    !input.expectedStoreId ||
+    input.qrStoreId !== input.expectedStoreId
+  ) {
     violations.push('QR_MISMATCH');
   }
+  if (input.requirement === TimekeepingRequirement.QR_ONLY) return violations;
   if (!input.storeHasLocation) {
     violations.push('STORE_LOCATION_MISSING');
   } else if (

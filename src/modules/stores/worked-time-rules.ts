@@ -135,6 +135,20 @@ export function ruleBounds(rule: WorkedTimeRuleLike): {
   };
 }
 
+/**
+ * Whether two rules' windows share a moment ([start, end), no end = open).
+ * Only one rule may be in force at a time for the whole store, and only one
+ * for each employee (an employee rule may sit inside a store-wide one).
+ */
+export function ruleWindowsOverlap(
+  a: { start: string; end: string | null },
+  b: { start: string; end: string | null },
+): boolean {
+  return (
+    (b.end === null || a.start < b.end) && (a.end === null || b.start < a.end)
+  );
+}
+
 /** Whether the rule covers a shift starting at `shiftKey`. */
 export function ruleCovers(
   rule: WorkedTimeRuleLike,

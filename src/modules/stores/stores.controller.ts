@@ -2053,13 +2053,52 @@ export class StoresController {
     @Param('requestId') requestId: string,
     @Body() body: ApprovalRequestDto,
   ) {
-    return this.storesService.processRequest(
-      req.user?.userId || req.user?.id,
+    const accountId = req.user?.userId || req.user?.id;
+    // "Xin tăng ca" requests are listed with the leave requests and decided
+    // here too (same effect as the bonus-work-request approve/reject routes).
+    if (
+      body.type === 'LEAVE' &&
+      (await this.storesService.isBonusWorkRequestId(requestId))
+    ) {
+      if (body.status === 'APPROVED') {
+        const request = await this.storesService.approveBonusWorkRequest(
+          requestId,
+          accountId,
+        );
+        await this.shiftEndWorkflowService.approveOvertime(request);
+        return request;
+      }
+      const request = await this.storesService.rejectBonusWorkRequest(
+        requestId,
+        accountId,
+        body.reason,
+      );
+      await this.shiftEndWorkflowService.resumeAfterOvertime(request);
+      return request;
+    }
+    const result: any = await this.storesService.processRequest(
+      accountId,
       requestId,
       body.type,
       body.status,
       body.reason,
     );
+    // An early leave approved during the shift: reminders and the
+    // auto-checkout move to the new end.
+    const change = result?.appliedShiftChange;
+    if (change?.kind === 'EARLY' && change.phase === 'during') {
+      // The approval stands; the reminders then keep the old end.
+      await this.shiftEndWorkflowService
+        .applyAdjustedEnd(change.assignmentId)
+        .catch((error) =>
+          this.logger.error(
+            `[processApproval] could not move the end of assignment ${change.assignmentId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
+    return result;
   }
 
   // --- Employee Asset Management ---
@@ -4791,7 +4830,7 @@ export class StoresController {
   @ApiOperation({
     summary: 'Check-in ca làm việc (QR → GPS → Face)',
     description:
-      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR); khi đó QR và vị trí trong bán kính là bắt buộc.',
+      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR) hoặc chỉ QR (QR_ONLY); khi đó QR (và với GPS_QR, vị trí trong bán kính) là bắt buộc.',
   })
   @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkIn(
@@ -4838,7 +4877,7 @@ export class StoresController {
   @ApiOperation({
     summary: 'Check-out ca làm việc (QR → GPS → Face)',
     description:
-      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR); khi đó QR và vị trí trong bán kính là bắt buộc.',
+      'Không gửi ảnh chỉ được khi cửa hàng chọn chấm công GPS + QR (GPS_QR) hoặc chỉ QR (QR_ONLY); khi đó QR (và với GPS_QR, vị trí trong bán kính) là bắt buộc.',
   })
   @UseInterceptors(FileInterceptor('photo', attendanceMulterConfig))
   async checkOut(

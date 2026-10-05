@@ -30,6 +30,13 @@ const ALLOWED_LATE_MESSAGE = `Thời gian cho phép đi muộn/về sớm phải
 const EARLY_CHECKIN_MESSAGE = `Thời gian check-in trước giờ làm phải là số phút nguyên từ 0 đến ${ATTENDANCE_WINDOW_MINUTES_MAX}.`;
 const LATE_CHECKOUT_MESSAGE = `Thời gian check-out sau giờ làm phải là số phút nguyên từ 0 đến ${ATTENDANCE_WINDOW_MINUTES_MAX}.`;
 
+/** Bounds of "Tăng ca tối đa mỗi ca" (minutes). */
+export const MAX_OVERTIME_MINUTES_MIN = 15;
+export const MAX_OVERTIME_MINUTES_MAX = 24 * 60;
+/** Stores that never set it: 8 hours. */
+export const DEFAULT_MAX_OVERTIME_MINUTES = 480;
+const MAX_OVERTIME_MESSAGE = `Tăng ca tối đa mỗi ca phải là số phút nguyên từ ${MAX_OVERTIME_MINUTES_MIN} đến ${MAX_OVERTIME_MINUTES_MAX}.`;
+
 export class StoreTimekeepingSettingDto {
   @ApiProperty({ description: 'Bật ca linh hoạt', example: false })
   @IsBoolean()
@@ -116,6 +123,18 @@ export class StoreTimekeepingSettingDto {
   @Max(ATTENDANCE_WINDOW_MINUTES_MAX, { message: LATE_CHECKOUT_MESSAGE })
   @IsOptional()
   lateCheckoutMinutes?: number;
+
+  @ApiProperty({
+    description: 'Tăng ca tối đa cho một ca (phút); đơn xin tăng ca dài hơn bị từ chối',
+    example: DEFAULT_MAX_OVERTIME_MINUTES,
+    minimum: MAX_OVERTIME_MINUTES_MIN,
+    maximum: MAX_OVERTIME_MINUTES_MAX,
+  })
+  @IsInt({ message: MAX_OVERTIME_MESSAGE })
+  @Min(MAX_OVERTIME_MINUTES_MIN, { message: MAX_OVERTIME_MESSAGE })
+  @Max(MAX_OVERTIME_MINUTES_MAX, { message: MAX_OVERTIME_MESSAGE })
+  @IsOptional()
+  maxOvertimeMinutes?: number;
 
   @ApiProperty({ description: 'Bật tính lương phụ trội làm thêm giờ', example: false })
   @IsBoolean()

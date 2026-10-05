@@ -49,6 +49,10 @@ export class StoreTimekeepingSetting extends BaseEntity {
   @Column({ name: 'late_checkout_minutes', type: 'int', default: 15 })
   lateCheckoutMinutes: number; // Cho phép check-out sau giờ làm
 
+  /** Tăng ca tối đa cho một ca (phút); đơn xin tăng ca dài hơn bị từ chối. */
+  @Column({ name: 'max_overtime_minutes', type: 'int', default: 480 })
+  maxOvertimeMinutes: number;
+
   // -- Làm trễ / Làm thêm giờ --
   @Column({ name: 'enable_overtime_multiplier', default: false })
   enableOvertimeMultiplier: boolean;

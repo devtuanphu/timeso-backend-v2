@@ -202,7 +202,10 @@ import {
 } from './dto/store-response.dto';
 
 import { StoreApprovalSettingDto } from './dto/store-approval-setting.dto';
-import { StoreTimekeepingSettingDto } from './dto/store-timekeeping-setting.dto';
+import {
+  DEFAULT_MAX_OVERTIME_MINUTES,
+  StoreTimekeepingSettingDto,
+} from './dto/store-timekeeping-setting.dto';
 import {
   CreateWorkShiftDto,
   UpdateWorkShiftDto,
@@ -248,6 +251,7 @@ import {
 } from './entities/salary-advance-request.entity';
 import { StoreApprovalSetting } from './entities/store-approval-setting.entity';
 import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.entity';
+
 import {
   StorePayrollSetting,
   PayrollCalculationMethod,
@@ -355,6 +359,9 @@ import {
   calculateEarlyMinutes,
   calculateLateMinutes,
   computeAttendanceDeltas,
+  effectiveWindowOf,
+  formatDurationVi,
+  resolveRequestedInstant,
   resolveShiftBoundaries,
 } from './attendance-time.utils';
 import {
@@ -367,7 +374,9 @@ import {
 import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import {
   resolveWorkedTimeMode,
+  ruleBounds,
   ruleWindowEnd,
+  ruleWindowsOverlap,
   shiftStartKey,
   TIME_KEY,
   vnKeyCeil,
@@ -1146,6 +1155,26 @@ const DEFAULT_TIMEKEEPING_SHIFTS = [
 const sameShiftTime = (left: string, right: string) =>
   left.slice(0, 5) === right.slice(0, 5);
 
+/** Overtime times that do not fit the linked shift (an older build's). */
+const OVERTIME_SHIFT_MISMATCH = 'OVERTIME_SHIFT_MISMATCH';
+const isOvertimeShiftMismatch = (error: unknown): boolean => {
+  if (!(error instanceof BadRequestException)) return false;
+  const response = error.getResponse();
+  return (
+    typeof response === 'object' &&
+    response !== null &&
+    (response as { code?: string }).code === OVERTIME_SHIFT_MISMATCH
+  );
+};
+
+/** A shift handed to someone else drops the previous holder's approved times. */
+const CLEARED_SHIFT_REQUEST_EFFECTS = {
+  adjustedStartAt: null,
+  adjustedEndAt: null,
+  lateRequestId: null,
+  earlyRequestId: null,
+};
+
 const defaultTimekeepingSettingData = (storeId: string) => ({
   storeId,
   enableFlexibleShift: false,
@@ -1159,6 +1188,7 @@ const defaultTimekeepingSettingData = (storeId: string) => ({
   countFullTimeIfLate: false,
   earlyCheckinMinutes: 15,
   lateCheckoutMinutes: 15,
+  maxOvertimeMinutes: DEFAULT_MAX_OVERTIME_MINUTES,
   enableOvertimeMultiplier: false,
   overtimeMultiplier: 1.5,
   notifyLateShift: false,
@@ -1382,7 +1412,10 @@ export class StoresService {
    * the shifts starting from its start date and time. Only shifts not started
    * yet are affected: the start may not be in the past (a start up to 15
    * minutes ago means "now"), and nothing already worked is recomputed.
-   * Several employees get one row each, sharing a group id.
+   * Several employees get one row each, sharing a group id. Only one rule may
+   * be in force at a time for the whole store, and one for each employee:
+   * an overlapping rule is refused (an employee rule may sit inside a
+   * store-wide one).
    */
   async createWorkedTimeRule(
     storeId: string,
@@ -1407,11 +1440,17 @@ export class StoresService {
         ),
       ),
     ];
+    const employeeNames = new Map<string, string>();
     if (employeeIds.length) {
       const profiles = await this.profileRepository.find({
         where: { id: In(employeeIds), storeId },
-        select: ['id'],
+        relations: { account: true },
+        // Only the name, for an overlap message.
+        select: { id: true, account: { id: true, fullName: true } },
       });
+      for (const profile of profiles) {
+        employeeNames.set(profile.id, profile.account?.fullName || 'Nhân viên');
+      }
       if (profiles.length !== employeeIds.length) {
         throw new BadRequestException({
           code: 'WORKED_TIME_RULE_EMPLOYEE_NOT_IN_STORE',
@@ -1457,25 +1496,62 @@ export class StoresService {
       [startDate, startTime] = nowKey.split(' ');
     }
     const end = ruleWindowEnd(startDate, startTime, data.period);
+    const window = {
+      start: `${startDate} ${startTime}`,
+      end: end ? `${end.endDate} ${end.endTime}` : null,
+    };
     const groupId = randomUUID();
-    const repo = this.workedTimeRuleRepository;
-    // save() of a list writes all rows in one transaction.
-    const rules = await repo.save(
-      (employeeIds.length ? employeeIds : [null]).map((employeeProfileId) =>
-        repo.create({
-          storeId,
-          employeeProfileId,
-          groupId,
-          mode: data.mode,
-          period: data.period,
-          startDate,
-          startTime,
-          endDate: end?.endDate ?? null,
-          endTime: end?.endTime ?? null,
-          createdByAccountId: ownerAccountId,
-        }),
-      ),
-    );
+    const rules = await this.dataSource.transaction(async (manager) => {
+      // One writer per store: two overlapping rules saved at once cannot
+      // both pass the check below.
+      await manager.query(
+        'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`worked-time-rules:${storeId}`],
+      );
+      const repo = manager.getRepository(StoreWorkedTimeRule);
+      const inForce = await repo.find({ where: { storeId } });
+      const overlapping = inForce.filter((rule) =>
+        ruleWindowsOverlap(window, ruleBounds(rule)),
+      );
+      if (!employeeIds.length) {
+        if (overlapping.some((rule) => !rule.employeeProfileId)) {
+          throw new BadRequestException({
+            code: 'WORKED_TIME_RULE_OVERLAP',
+            message:
+              'Toàn cửa hàng đã có cách tính giờ công trong khoảng thời gian này. Mỗi thời điểm chỉ được có một cách tính, vui lòng xoá cách tính cũ hoặc chọn thời gian khác.',
+          });
+        }
+      } else {
+        const taken = employeeIds.filter((id) =>
+          overlapping.some((rule) => rule.employeeProfileId === id),
+        );
+        if (taken.length) {
+          const names = taken.map((id) => employeeNames.get(id) || 'Nhân viên');
+          throw new BadRequestException({
+            code: 'WORKED_TIME_RULE_OVERLAP',
+            message: `${names.join(', ')} đã có cách tính giờ công trong khoảng thời gian này. Mỗi thời điểm chỉ được có một cách tính, vui lòng xoá cách tính cũ, bỏ chọn nhân viên này hoặc chọn thời gian khác.`,
+            employeeProfileIds: taken,
+          });
+        }
+      }
+      // save() of a list writes all rows together.
+      return repo.save(
+        (employeeIds.length ? employeeIds : [null]).map((employeeProfileId) =>
+          repo.create({
+            storeId,
+            employeeProfileId,
+            groupId,
+            mode: data.mode,
+            period: data.period,
+            startDate,
+            startTime,
+            endDate: end?.endDate ?? null,
+            endTime: end?.endTime ?? null,
+            createdByAccountId: ownerAccountId,
+          }),
+        ),
+      );
+    });
     return { rule: rules[0], rules };
   }
 
@@ -4563,7 +4639,9 @@ export class StoresService {
               id: swap.fromAssignment.id,
               employeeId: swap.fromAssignment.employeeId,
             },
-            { employeeId: swap.toEmployeeId },
+            // The approved late arrival / early leave was the other
+            // employee's: the shift is back to its own hours.
+            { employeeId: swap.toEmployeeId, ...CLEARED_SHIFT_REQUEST_EFFECTS },
           );
           if (!result.affected)
             throw new BadRequestException(
@@ -4643,6 +4721,12 @@ export class StoresService {
             'Yêu cầu đã được cập nhật, vui lòng tải lại',
           );
         }
+        // An approved late arrival / early leave moves the shift's start /
+        // end (same transaction: the status and the shift change together).
+        const appliedShiftChange =
+          status === 'APPROVED'
+            ? await this.applyApprovedShiftChange(manager, leave)
+            : null;
         const leaveAction =
           status === 'APPROVED'
             ? ACTIVITY_ACTIONS.LEAVE_REQUEST_APPROVED
@@ -4659,9 +4743,13 @@ export class StoresService {
         });
         return {
           ...leave,
+          ...(appliedShiftChange && !leave.shiftAssignmentId
+            ? { shiftAssignmentId: appliedShiftChange.assignmentId }
+            : {}),
           status: nextStatus,
           approvedById: approver?.id ?? null,
           ...(status === 'REJECTED' ? { rejectionReason: reason || '' } : {}),
+          appliedShiftChange,
         };
       });
       if (nextStatus === LeaveRequestStatus.APPROVED) {
@@ -4669,10 +4757,306 @@ export class StoresService {
           this.logger?.error('Failed to cancel reminders for an approved leave');
         });
       }
+      const change = processed.appliedShiftChange;
+      // Late / early minutes of a finished shift changed: the payslip's
+      // counters follow (worked minutes are never cut by an approval).
+      if (change?.phase === 'after') {
+        void this.processCheckoutPayroll(change.assignmentId).catch(() => {
+          this.logger?.warn('Payslip not refreshed after a late/early approval');
+        });
+      }
+      const kind =
+        leave.type === LeaveType.LATE
+          ? 'LATE'
+          : leave.type === LeaveType.EARLY
+            ? 'EARLY'
+            : leave.type === LeaveType.OVERTIME
+              ? 'OVERTIME'
+              : 'LEAVE';
+      void this.notifyRequestDecision({
+        employeeProfileId: leave.employeeProfileId,
+        storeId: leave.storeId,
+        requestId: leave.id,
+        kind,
+        approved: nextStatus === LeaveRequestStatus.APPROVED,
+        reason: status === 'REJECTED' ? reason : null,
+        assignmentId: change?.assignmentId ?? leave.shiftAssignmentId ?? null,
+        workDate: String(leave.startDate).slice(0, 10),
+        endDate: String(leave.endDate).slice(0, 10),
+        // A time only when the shift really moved (or for a refusal): an
+        // approval that changed nothing must not promise new hours, nor an
+        // old-style overtime leave (it does not extend paid time).
+        time: change
+          ? vnClockHHmm(change.kind === 'EARLY' ? change.at : change.requested)
+          : nextStatus === LeaveRequestStatus.APPROVED
+            ? null
+            : kind === 'LATE'
+              ? leave.startTime
+              : kind === 'EARLY'
+                ? leave.endTime
+                : null,
+      });
       return processed;
     }
 
     throw new BadRequestException('Loại yêu cầu không hợp lệ');
+  }
+
+  /**
+   * The shift a late / early-leave request is about: its own assignment, or
+   * (older requests without one) the only shift of that day whose scheduled
+   * window contains the requested time.
+   */
+  private async resolveRequestAssignmentId(
+    manager: EntityManager,
+    leave: EmployeeLeaveRequest,
+    time: string,
+  ): Promise<string | null> {
+    if (leave.shiftAssignmentId) return leave.shiftAssignmentId;
+    const workDate = String(leave.startDate).slice(0, 10);
+    const candidates = await manager
+      .getRepository(ShiftAssignment)
+      .createQueryBuilder('a')
+      .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoin('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeId', { employeeId: leave.employeeProfileId })
+      .andWhere('cycle.storeId = :storeId', { storeId: leave.storeId })
+      .andWhere('slot.workDate = :workDate', { workDate })
+      .andWhere('a.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.APPROVED,
+          ShiftAssignmentStatus.CONFIRMED,
+          ShiftAssignmentStatus.COMPLETED,
+        ],
+      })
+      .getMany();
+    const matching = candidates.filter((a) => {
+      const window = effectiveWindowOf({ shiftSlot: a.shiftSlot });
+      return !!resolveRequestedInstant(window, workDate, time);
+    });
+    return matching.length === 1 ? matching[0].id : null;
+  }
+
+  /**
+   * An approved late arrival ("xin đi trễ", requested arrival T) or early
+   * leave ("xin về sớm", requested leave time T) moves the shift's start /
+   * end to T, on the locked assignment row:
+   *  - before check-in (late) / check-out (early): the shift starts / ends
+   *    at T — not late before T, paid from / to T when counted by schedule;
+   *  - late approved after check-in: never cuts time already worked (the
+   *    start is not later than the check-in); the late minutes are redone;
+   *  - early approved during the shift: ends at T, or now if T has passed;
+   *  - early approved after check-out: only the early-leave mark goes
+   *    (the end is not before the check-out).
+   * Returns what changed, or null when the request does not fit a shift
+   * (status-only approval, as before).
+   */
+  private async applyApprovedShiftChange(
+    manager: EntityManager,
+    leave: EmployeeLeaveRequest,
+  ): Promise<{
+    assignmentId: string;
+    kind: 'LATE' | 'EARLY';
+    phase: 'before' | 'during' | 'after';
+    at: Date;
+    /** The time the employee asked for (what the notification says). */
+    requested: Date;
+  } | null> {
+    const kind =
+      leave.type === LeaveType.LATE ? 'LATE' : leave.type === LeaveType.EARLY ? 'EARLY' : null;
+    const time = kind === 'LATE' ? leave.startTime : kind === 'EARLY' ? leave.endTime : null;
+    if (!kind || !time) return null;
+    const assignmentId = await this.resolveRequestAssignmentId(manager, leave, time);
+    if (!assignmentId) return null;
+
+    const locked = await manager.findOne(ShiftAssignment, {
+      where: { id: assignmentId, employeeId: leave.employeeProfileId },
+      lock: { mode: 'pessimistic_write' },
+    });
+    if (
+      !locked ||
+      locked.status === ShiftAssignmentStatus.CANCELLED ||
+      locked.attendanceStatus === AttendanceStatus.ABSENT
+    ) {
+      return null;
+    }
+    const withSlot = await manager.findOne(ShiftAssignment, {
+      where: { id: assignmentId },
+      relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+    });
+    const slot = withSlot?.shiftSlot;
+    if (!slot || slot.cycle?.storeId !== leave.storeId) return null;
+    const workDate = String(slot.workDate).slice(0, 10);
+    const scheduled = effectiveWindowOf({ shiftSlot: slot });
+    const requested = resolveRequestedInstant(scheduled, workDate, time);
+    if (!requested) return null;
+    const current = effectiveWindowOf({
+      adjustedStartAt: locked.adjustedStartAt,
+      adjustedEndAt: locked.adjustedEndAt,
+      shiftSlot: slot,
+    });
+    const setting = await manager
+      .getRepository(StoreTimekeepingSetting)
+      .findOne({ where: { storeId: leave.storeId } });
+    const rules = resolveAttendanceRules(setting);
+    const checkIn = locked.checkInTime ? new Date(locked.checkInTime) : null;
+    const checkOut = locked.checkOutTime ? new Date(locked.checkOutTime) : null;
+    const updates: Partial<ShiftAssignment> = {};
+    let phase: 'before' | 'during' | 'after';
+    let at: Date;
+
+    if (kind === 'LATE') {
+      // Must still leave a shift to work.
+      if (current.end && requested.getTime() >= current.end.getTime()) return null;
+      phase = !checkIn ? 'before' : !checkOut ? 'during' : 'after';
+      // Never later than the check-in (time worked is not cut), never before
+      // the scheduled start (arriving early is not paid more).
+      at =
+        checkIn && checkIn.getTime() < requested.getTime() ? checkIn : requested;
+      if (scheduled.start && at.getTime() < scheduled.start.getTime()) {
+        at = scheduled.start;
+      }
+      updates.adjustedStartAt = at;
+      updates.lateRequestId = leave.id;
+      if (checkIn) {
+        updates.lateMinutes = applyGrace(calculateLateMinutes(at, checkIn), rules);
+      }
+    } else {
+      if (current.start && requested.getTime() <= current.start.getTime()) return null;
+      phase = !checkIn ? 'before' : !checkOut ? 'during' : 'after';
+      at =
+        phase === 'during'
+          ? new Date(Math.max(requested.getTime(), Date.now()))
+          : phase === 'after' && checkOut && checkOut.getTime() > requested.getTime()
+            ? checkOut
+            : requested;
+      // Never past the end in force: an approval after the end must not
+      // pay minutes beyond the shift without an approved overtime.
+      if (current.end && at.getTime() > current.end.getTime()) at = current.end;
+      updates.adjustedEndAt = at;
+      updates.earlyRequestId = leave.id;
+      if (checkOut) {
+        updates.earlyMinutes = applyGrace(calculateEarlyMinutes(at, checkOut), rules);
+      }
+    }
+
+    // The attendance status follows the redone late / early minutes; an
+    // automatic check-out keeps "Quên chấm công ra".
+    if (checkIn && locked.attendanceStatus !== AttendanceStatus.FORGOT_CHECKOUT) {
+      const late = Number(updates.lateMinutes ?? locked.lateMinutes) || 0;
+      const early = checkOut ? Number(updates.earlyMinutes ?? locked.earlyMinutes) || 0 : 0;
+      updates.attendanceStatus =
+        late > 0 && early > 0
+          ? AttendanceStatus.LATE_AND_EARLY
+          : late > 0
+            ? AttendanceStatus.LATE
+            : early > 0
+              ? AttendanceStatus.EARLY
+              : AttendanceStatus.ON_TIME;
+    }
+    await manager.update(ShiftAssignment, { id: assignmentId }, updates);
+    if (!leave.shiftAssignmentId) {
+      await manager.update(EmployeeLeaveRequest, { id: leave.id }, {
+        shiftAssignmentId: assignmentId,
+      });
+    }
+    return { assignmentId, kind, phase, at, requested };
+  }
+
+  /**
+   * Tells the employee the owner decided their request (late, early leave,
+   * leave or overtime): in-app row + push. Never fails the decision.
+   */
+  private async notifyRequestDecision(input: {
+    employeeProfileId: string;
+    storeId: string;
+    requestId: string;
+    kind: 'LATE' | 'EARLY' | 'LEAVE' | 'OVERTIME';
+    approved: boolean;
+    reason?: string | null;
+    assignmentId?: string | null;
+    workDate?: string | null;
+    endDate?: string | null;
+    /** HH:mm the request is about (arrival, leave or overtime end). */
+    time?: string | null;
+    /** Scheduled end (HH:mm), for a refused overtime. */
+    shiftEnd?: string | null;
+  }): Promise<void> {
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { id: input.employeeProfileId },
+        select: ['id', 'accountId'],
+      });
+      if (!profile?.accountId) return;
+      const day = (d?: string | null) => {
+        const [, m, dd] = String(d || '').slice(0, 10).split('-');
+        return m && dd ? `${dd}/${m}` : '';
+      };
+      const on = input.workDate ? ` ngày ${day(input.workDate)}` : '';
+      const clock = String(input.time || '').slice(0, 5);
+      const reasonText = input.reason?.trim() ? ` Lý do: ${input.reason.trim()}` : '';
+      const label = {
+        LATE: 'Đơn xin đi trễ',
+        EARLY: 'Đơn xin về sớm',
+        LEAVE: 'Đơn xin nghỉ',
+        OVERTIME: 'Yêu cầu tăng ca',
+      }[input.kind];
+      const title = `${label} ${input.approved ? 'đã được duyệt' : 'bị từ chối'}`;
+      let content: string;
+      if (!input.approved) {
+        content =
+          input.kind === 'OVERTIME' && input.shiftEnd
+            ? `Ca${on} vẫn kết thúc lúc ${String(input.shiftEnd).slice(0, 5)}.${reasonText}`
+            : `${label}${on} không được chấp nhận.${reasonText}`;
+      } else if (input.kind === 'LATE' && clock) {
+        content = `Ca${on} bắt đầu lúc ${clock}. Đến trước ${clock} không bị tính trễ.`;
+      } else if (input.kind === 'EARLY' && clock) {
+        content = `Ca${on} kết thúc lúc ${clock}. Giờ làm được tính đến ${clock}.`;
+      } else if (input.kind === 'OVERTIME' && clock) {
+        content = `Ca${on} được tăng ca đến ${clock}. Giờ làm được tính đến ${clock}.`;
+      } else if (input.kind === 'LEAVE') {
+        const range =
+          input.endDate && input.endDate !== input.workDate
+            ? ` ${day(input.workDate)} – ${day(input.endDate)}`
+            : on;
+        content = `Đơn nghỉ${range} đã được chủ cửa hàng chấp nhận.`;
+      } else {
+        content = `${label}${on} đã được chủ cửa hàng chấp nhận.`;
+      }
+      const today = vnDateString();
+      await this.notificationsService.create(
+        {
+          accountId: profile.accountId,
+          storeId: input.storeId,
+          title,
+          content,
+          type:
+            input.kind === 'OVERTIME'
+              ? NotificationType.OVERTIME_REQUEST_STATUS
+              : NotificationType.SHIFT_APPROVAL,
+          priority: NotificationPriority.HIGH,
+          actionUrl:
+            input.workDate && String(input.workDate).slice(0, 10) === today
+              ? '/(home)'
+              : '/(home)/workshift',
+          metadata: {
+            type: input.approved ? 'REQUEST_APPROVED' : 'REQUEST_REJECTED',
+            requestKind: input.kind,
+            requestId: input.requestId,
+            assignmentId: input.assignmentId ?? null,
+            workDate: input.workDate ?? null,
+            ...(input.workDate ? { workDates: [String(input.workDate).slice(0, 10)] } : {}),
+          },
+        } as any,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `[notifyRequestDecision] request ${input.requestId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 
   async getEmployeeByAccountAndStore(accountId: string, storeId: string) {
@@ -8828,7 +9212,8 @@ export class StoresService {
             id: swap.fromAssignment.id,
             employeeId: swap.fromAssignment.employeeId,
           },
-          { employeeId: swap.toEmployeeId },
+          // The approved late arrival / early leave was the other employee's.
+          { employeeId: swap.toEmployeeId, ...CLEARED_SHIFT_REQUEST_EFFECTS },
         );
         if (!assignmentResult.affected)
           throw new BadRequestException(
@@ -11327,6 +11712,8 @@ export class StoresService {
     standardWorkingDays: number;
     isFinalized: boolean;
     month: string;
+    /** The shift under way (live estimate only): see inProgressShiftEstimate. */
+    inProgress?: Awaited<ReturnType<StoresService['inProgressShiftEstimate']>>;
   }> {
     const month = parseVnMonthInput(monthStr) ?? vnMonthOf();
     const standardWorkingDays = await this.getStandardWorkingDays(
@@ -11372,6 +11759,13 @@ export class StoresService {
       standardWorkingDays,
     );
 
+    // Counted live by the app on top of the estimate (completed shifts only).
+    const inProgress = isCurrentMonth
+      ? await this.inProgressShiftEstimate(employeeProfileId, storeId, month).catch(
+          () => null,
+        )
+      : null;
+
     return {
       estimatedSalary: payslip.netSalary,
       earnedBaseSalary: payslip.earnedBaseSalary,
@@ -11381,6 +11775,7 @@ export class StoresService {
       standardWorkingDays,
       isFinalized: false,
       month: month.label,
+      inProgress,
     };
   }
 
@@ -12499,11 +12894,12 @@ export class StoresService {
         // Việt Nam trên work_date của ca (ca qua đêm kết thúc ngày hôm sau).
         // `setHours` trên đồng hồ máy chủ bỏ sót mọi ca kết thúc sau 16:30 VN
         // khi máy chủ chạy UTC.
-        const { end: shiftEnd } = resolveShiftBoundaries(
-          slot.workDate,
-          slot.startTime ?? slot.workShift?.startTime,
-          slot.endTime ?? slot.workShift?.endTime,
-        );
+        // Kết thúc theo giờ đang áp dụng (đơn về sớm đã duyệt dời sớm hơn).
+        const { end: shiftEnd } = effectiveWindowOf({
+          adjustedStartAt: assignment.adjustedStartAt,
+          adjustedEndAt: assignment.adjustedEndAt,
+          shiftSlot: slot,
+        });
         if (!shiftEnd || now < shiftEnd) continue; // Ca chưa kết thúc, bỏ qua
 
         // Quên chấm công ra: ca đã được hệ thống tự kết thúc.
@@ -17727,6 +18123,7 @@ export class StoresService {
     const assignments = await this.shiftAssignmentRepository
       .createQueryBuilder('a')
       .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('CAST(slot.workDate AS DATE) = :dateString', { dateString })
       .getMany();
@@ -17738,6 +18135,8 @@ export class StoresService {
     // above came from. The report returned only the clock readings, so the app
     // had nothing to say whether 10:02 was on time or two minutes late.
     let lateMinutes = 0;
+    // Checked in before the start (the app said "Đúng giờ" for it).
+    let earlyArrivalMinutes = 0;
     let earlyMinutes = 0;
     let warning = '';
     const shiftsCount = assignments.length;
@@ -17747,6 +18146,7 @@ export class StoresService {
         if (a.checkInTime) {
           checkIn = vnClockHHmm(new Date(a.checkInTime));
           lateMinutes = Number(a.lateMinutes) || 0;
+          earlyArrivalMinutes = this.storedAttendanceDeltas(a).earlyArrivalMinutes;
         }
         if (a.checkOutTime) {
           checkOut = vnClockHHmm(new Date(a.checkOutTime));
@@ -17792,9 +18192,13 @@ export class StoresService {
 
     return {
       income: dailyIncome,
+      // false: `income` is a day's share of the payslip, not shift pay, so
+      // the app must not add the shift under way on top of it.
+      incomeFromShifts: hasRealTimeEarnings,
       trendPercent: 0,
       trendUp: false,
       lateMinutes,
+      earlyArrivalMinutes,
       earlyMinutes,
       shifts: shiftsCount,
       hours,
@@ -17956,12 +18360,16 @@ export class StoresService {
       take: 500,
     });
     const nowInstant = new Date();
+    // The start / end in force (an approved late arrival or early leave).
     const boundariesOf = (a: any) =>
-      resolveShiftBoundaries(
-        String(a.shiftSlot?.workDate || '').slice(0, 10),
-        a.shiftSlot?.startTime ?? a.shiftSlot?.workShift?.startTime,
-        a.shiftSlot?.endTime ?? a.shiftSlot?.workShift?.endTime,
-      );
+      effectiveWindowOf({
+        adjustedStartAt: a.adjustedStartAt,
+        adjustedEndAt: a.adjustedEndAt,
+        shiftSlot: {
+          ...a.shiftSlot,
+          workDate: String(a.shiftSlot?.workDate || '').slice(0, 10),
+        },
+      });
     const onLeaveIds = new Set<string>();
     for (const a of loaded as any[]) {
       if (a.checkInTime || a.attendanceStatus) continue;
@@ -18184,6 +18592,15 @@ export class StoresService {
       });
       if (duplicate) return duplicate;
 
+      await this.assertShiftChangeRequestFits(
+        manager,
+        type,
+        startDate,
+        shiftAssignmentId,
+        type === LeaveType.LATE ? data?.startTime : data?.endTime,
+        data.employeeProfileId,
+      );
+
       // Explicit allowlist. The previous `create({ ...data })` spread let a
       // client set `id` (turning the save into an update of an arbitrary row),
       // `approvedById`, `approvedAt` and every other column.
@@ -18214,6 +18631,109 @@ export class StoresService {
       });
       return saved;
     });
+  }
+
+  /**
+   * A late arrival must be asked for a time still ahead; late / early times
+   * must fall inside the shift. One late and one early request per shift
+   * once approved, and no early leave on a shift with overtime asked for.
+   * Times in another format (older builds send "8:30AM") are not checked.
+   */
+  private async assertShiftChangeRequestFits(
+    manager: EntityManager,
+    type: LeaveType,
+    startDate: string,
+    shiftAssignmentId: string | null,
+    rawTime: unknown,
+    employeeProfileId?: string,
+  ): Promise<void> {
+    if (type !== LeaveType.LATE && type !== LeaveType.EARLY) return;
+    const label = type === LeaveType.LATE ? 'đi trễ' : 'về sớm';
+    const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(String(rawTime ?? '').trim());
+    const clock = match ? `${match[1].padStart(2, '0')}:${match[2]}:00` : null;
+
+    // Same row lock as "Xin tăng ca": an early leave and an overtime sent
+    // together for one shift are checked one after the other, so they
+    // cannot both get in.
+    if (shiftAssignmentId) {
+      // (No relation in the lock: FOR UPDATE refuses outer joins. The id
+      // was resolved within the caller's store already.)
+      await manager.findOne(ShiftAssignment, {
+        where: employeeProfileId
+          ? { id: shiftAssignmentId, employeeId: employeeProfileId }
+          : { id: shiftAssignmentId },
+        select: ['id'],
+        lock: { mode: 'pessimistic_write' },
+      });
+    }
+    let requested: Date | null = null;
+    if (clock && shiftAssignmentId) {
+      const assignment = await manager.findOne(ShiftAssignment, {
+        where: { id: shiftAssignmentId },
+        relations: ['shiftSlot', 'shiftSlot.workShift'],
+      });
+      if (assignment?.shiftSlot) {
+        const window = effectiveWindowOf({ shiftSlot: assignment.shiftSlot });
+        requested = resolveRequestedInstant(
+          window,
+          String(assignment.shiftSlot.workDate).slice(0, 10),
+          clock,
+        );
+        // Strictly inside: arriving at the start is not late, leaving at the
+        // end is not early (a 0-minute request changes nothing).
+        if (
+          !requested ||
+          requested.getTime() === window.start?.getTime() ||
+          requested.getTime() === window.end?.getTime()
+        ) {
+          throw new BadRequestException(
+            `Giờ xin ${label} phải nằm trong giờ của ca làm.`,
+          );
+        }
+      }
+    } else if (clock) {
+      requested = new Date(`${startDate}T${clock}+07:00`);
+    }
+    if (
+      type === LeaveType.LATE &&
+      requested &&
+      !Number.isNaN(requested.getTime()) &&
+      requested.getTime() <= Date.now()
+    ) {
+      throw new BadRequestException({
+        code: 'LATE_REQUEST_TIME_PASSED',
+        message: 'Giờ xin đến phải sau thời điểm hiện tại.',
+      });
+    }
+    if (!shiftAssignmentId) return;
+    const approved = await manager.findOne(EmployeeLeaveRequest, {
+      where: {
+        shiftAssignmentId,
+        type,
+        status: LeaveRequestStatus.APPROVED,
+      },
+      select: ['id'],
+    });
+    if (approved) {
+      throw new BadRequestException(`Ca làm đã có đơn xin ${label} được duyệt.`);
+    }
+    if (type === LeaveType.EARLY) {
+      const overtime = await manager.findOne(BonusWorkRequest, {
+        where: {
+          shiftAssignmentId,
+          status: In([
+            BonusWorkRequestStatus.PENDING,
+            BonusWorkRequestStatus.APPROVED,
+          ]),
+        },
+        select: ['id'],
+      });
+      if (overtime) {
+        throw new BadRequestException(
+          'Ca làm đã có yêu cầu tăng ca, không thể xin về sớm.',
+        );
+      }
+    }
   }
 
   /**
@@ -18316,7 +18836,16 @@ export class StoresService {
     if (status) query.andWhere('lr.status = :status', { status });
     if (from) query.andWhere('lr.endDate >= :from', { from });
     if (to) query.andWhere('lr.startDate <= :to', { to });
-    return query.orderBy('lr.createdAt', 'DESC').getMany();
+    const leaves = await query.orderBy('lr.createdAt', 'DESC').getMany();
+    // Overtime requests tied to a shift ("Xin tăng ca") are reviewed in the
+    // same list, shaped like an OVERTIME leave row; approving one goes
+    // through POST /stores/approvals/:id with type LEAVE as well.
+    const overtime = await this.linkedOvertimeRowsForStore(storeId, status, from, to);
+    if (!overtime.length) return leaves;
+    return [...leaves, ...overtime].sort(
+      (a: any, b: any) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    );
     /* return this.leaveRequestRepository.find({
       where,
       order: { createdAt: 'DESC' },
@@ -18328,6 +18857,62 @@ export class StoresService {
         'shiftAssignment',
       ],
     }); */
+  }
+
+  /** Shift-linked overtime requests of a store as OVERTIME leave rows. */
+  private async linkedOvertimeRowsForStore(
+    storeId: string,
+    status?: LeaveRequestStatus | string,
+    from?: string,
+    to?: string,
+  ): Promise<any[]> {
+    let rows: BonusWorkRequest[] = [];
+    try {
+      const query = this.bonusWorkRequestRepository
+        .createQueryBuilder('bw')
+        .leftJoinAndSelect('bw.employeeProfile', 'employeeProfile')
+        .leftJoinAndSelect('employeeProfile.account', 'employeeAccount')
+        .where('bw.storeId = :storeId', { storeId })
+        .andWhere('bw.shiftAssignmentId IS NOT NULL');
+      if (status) query.andWhere('bw.status = :status', { status });
+      if (from) query.andWhere('bw.requestDate >= :from', { from });
+      if (to) query.andWhere('bw.requestDate <= :to', { to });
+      rows = await query.orderBy('bw.createdAt', 'DESC').take(500).getMany();
+    } catch {
+      // Best effort: the leave requests are still listed.
+      return [];
+    }
+    return rows.map((bw) => ({
+      id: bw.id,
+      storeId: bw.storeId,
+      employeeProfileId: bw.employeeProfileId,
+      startDate: bw.requestDate,
+      endDate: bw.requestDate,
+      startTime: bw.startTime,
+      endTime: bw.endTime,
+      type: LeaveType.OVERTIME,
+      reason: bw.reason,
+      status: bw.status,
+      rejectionReason: bw.rejectionReason,
+      createdAt: bw.createdAt,
+      updatedAt: bw.updatedAt,
+      employeeProfile: bw.employeeProfile
+        ? {
+            id: bw.employeeProfile.id,
+            employeeTypeId: (bw.employeeProfile as any).employeeTypeId,
+            account: bw.employeeProfile.account
+              ? {
+                  id: bw.employeeProfile.account.id,
+                  fullName: bw.employeeProfile.account.fullName,
+                  avatar: (bw.employeeProfile.account as any).avatar,
+                }
+              : null,
+          }
+        : null,
+      store: { id: storeId },
+      shiftAssignment: { id: bw.shiftAssignmentId },
+      source: 'BONUS_WORK',
+    }));
   }
 
   async cancelLeaveRequest(id: string, accountId: string) {
@@ -18801,6 +19386,17 @@ export class StoresService {
   }
 
   // ===== Bonus Work Request Management =====
+  /**
+   * "Xin tăng ca" for a shift: until `endTime` (Vietnam clock, after the
+   * shift end, possibly past midnight), at most the store's "Tăng ca tối đa
+   * mỗi ca". Tied to the employee's assignment (given, or found from the
+   * slot), which must be upcoming or under way and not checked out; one
+   * pending/approved request per shift, none with an early leave. The start
+   * is the shift end, whatever the client sent.
+   *
+   * Older builds send only a slot and fixed 17:00-18:00 times: when such a
+   * request does not fit a shift it is saved unlinked, as it always was.
+   */
   async createBonusWorkRequest(
     data: {
       storeId: string;
@@ -18815,48 +19411,160 @@ export class StoresService {
     },
     actorAccountId?: string,
   ) {
-    if (data.shiftAssignmentId) {
-      const assignment = await this.shiftAssignmentRepository.findOne({
+    const strict = !!data.shiftAssignmentId;
+    let assignmentId = data.shiftAssignmentId || null;
+    if (!assignmentId && data.shiftSlotId) {
+      const bySlot = await this.shiftAssignmentRepository.findOne({
         where: {
-          id: data.shiftAssignmentId,
+          shiftSlotId: data.shiftSlotId,
           employeeId: data.employeeProfileId,
-        },
-      });
-      if (
-        !assignment ||
-        assignment.status !== ShiftAssignmentStatus.CONFIRMED ||
-        assignment.checkOutTime
-      ) {
-        throw new BadRequestException('Ca làm không còn hợp lệ để xin tăng ca');
-      }
-      const existing = await this.bonusWorkRequestRepository.findOne({
-        where: {
-          shiftAssignmentId: data.shiftAssignmentId,
           status: In([
-            BonusWorkRequestStatus.PENDING,
-            BonusWorkRequestStatus.APPROVED,
+            ShiftAssignmentStatus.APPROVED,
+            ShiftAssignmentStatus.CONFIRMED,
           ]),
         },
       });
-      if (existing) {
-        throw new BadRequestException(
-          'Ca làm đã có yêu cầu tăng ca đang xử lý',
-        );
+      assignmentId = bySlot?.id ?? null;
+    }
+
+    const saveUnlinked = async () => {
+      const request = this.bonusWorkRequestRepository.create({
+        storeId: data.storeId,
+        employeeProfileId: data.employeeProfileId,
+        shiftSlotId: data.shiftSlotId || undefined,
+        requestDate: data.requestDate,
+        startTime: data.startTime || undefined,
+        endTime: data.endTime || undefined,
+        reason: data.reason || undefined,
+        attachments: data.attachments ? JSON.stringify(data.attachments) : null,
+        status: BonusWorkRequestStatus.PENDING,
+      });
+      return this.bonusWorkRequestRepository.save(request);
+    };
+
+    let saved: BonusWorkRequest;
+    if (!assignmentId) {
+      if (strict) {
+        throw new BadRequestException('Ca làm không còn hợp lệ để xin tăng ca');
+      }
+      saved = await saveUnlinked();
+    } else {
+      const linkedId = assignmentId;
+      try {
+        saved = await this.dataSource.transaction(async (manager) => {
+          // One decision at a time per shift (two requests, or a request and
+          // the check-out).
+          const locked = await manager.findOne(ShiftAssignment, {
+            where: { id: linkedId, employeeId: data.employeeProfileId },
+            lock: { mode: 'pessimistic_write' },
+          });
+          if (
+            !locked ||
+            ![
+              ShiftAssignmentStatus.APPROVED,
+              ShiftAssignmentStatus.CONFIRMED,
+            ].includes(locked.status) ||
+            locked.checkOutTime
+          ) {
+            throw new BadRequestException({
+              code: OVERTIME_SHIFT_MISMATCH,
+              message: 'Ca làm không còn hợp lệ để xin tăng ca',
+            });
+          }
+          const assignment = await manager.findOne(ShiftAssignment, {
+            where: { id: linkedId },
+            relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+          });
+          const slot = assignment?.shiftSlot;
+          if (!assignment || !slot || slot.cycle?.storeId !== data.storeId) {
+            throw new BadRequestException({
+              code: OVERTIME_SHIFT_MISMATCH,
+              message: 'Ca làm không còn hợp lệ để xin tăng ca',
+            });
+          }
+          const workDate = String(slot.workDate).slice(0, 10);
+          const { end } = effectiveWindowOf(assignment);
+          const endClock = String(data.endTime || '').slice(0, 8);
+          const endAt = end
+            ? overtimeEndAt({ requestDate: workDate, endTime: endClock }, end)
+            : null;
+          if (!end || !endAt || endAt.getTime() <= end.getTime()) {
+            throw new BadRequestException({
+              code: OVERTIME_SHIFT_MISMATCH,
+              message: 'Giờ kết thúc tăng ca phải sau giờ kết thúc ca.',
+            });
+          }
+          const setting = await manager
+            .getRepository(StoreTimekeepingSetting)
+            .findOne({ where: { storeId: data.storeId } });
+          const maxMinutes =
+            Number(setting?.maxOvertimeMinutes) > 0
+              ? Number(setting!.maxOvertimeMinutes)
+              : DEFAULT_MAX_OVERTIME_MINUTES;
+          const requestedMinutes = Math.round(
+            (endAt.getTime() - end.getTime()) / 60_000,
+          );
+          if (requestedMinutes > maxMinutes) {
+            throw new BadRequestException({
+              code: 'OVERTIME_TOO_LONG',
+              message: `Cửa hàng cho tăng ca tối đa ${formatDurationVi(maxMinutes)} mỗi ca.`,
+            });
+          }
+          const existing = await manager.findOne(BonusWorkRequest, {
+            where: {
+              shiftAssignmentId: linkedId,
+              status: In([
+                BonusWorkRequestStatus.PENDING,
+                BonusWorkRequestStatus.APPROVED,
+              ]),
+            },
+          });
+          if (existing) {
+            throw new BadRequestException(
+              'Ca làm đã có yêu cầu tăng ca đang xử lý',
+            );
+          }
+          const earlyLeave = await manager.findOne(EmployeeLeaveRequest, {
+            where: {
+              shiftAssignmentId: linkedId,
+              type: LeaveType.EARLY,
+              status: In([
+                LeaveRequestStatus.PENDING,
+                LeaveRequestStatus.APPROVED,
+              ]),
+            },
+          });
+          if (earlyLeave) {
+            throw new BadRequestException(
+              'Ca làm đã có đơn xin về sớm, không thể xin tăng ca.',
+            );
+          }
+          return manager.save(
+            BonusWorkRequest,
+            manager.create(BonusWorkRequest, {
+              storeId: data.storeId,
+              employeeProfileId: data.employeeProfileId,
+              shiftSlotId: slot.id,
+              shiftAssignmentId: linkedId,
+              requestDate: workDate,
+              startTime: `${vnClockHHmm(end)}:00`,
+              endTime: `${vnClockHHmm(endAt)}:00`,
+              reason: data.reason || undefined,
+              attachments: data.attachments
+                ? JSON.stringify(data.attachments)
+                : null,
+              status: BonusWorkRequestStatus.PENDING,
+            }),
+          );
+        });
+      } catch (error) {
+        // An older build's fixed times that do not fit the shift: keep its
+        // unlinked request, as before. The store's rules (limit, one request
+        // per shift, early leave) apply to it as to any other.
+        if (strict || !isOvertimeShiftMismatch(error)) throw error;
+        saved = await saveUnlinked();
       }
     }
-    const request = this.bonusWorkRequestRepository.create({
-      storeId: data.storeId,
-      employeeProfileId: data.employeeProfileId,
-      shiftSlotId: data.shiftSlotId || undefined,
-      shiftAssignmentId: data.shiftAssignmentId || undefined,
-      requestDate: data.requestDate,
-      startTime: data.startTime || undefined,
-      endTime: data.endTime || undefined,
-      reason: data.reason || undefined,
-      attachments: data.attachments ? JSON.stringify(data.attachments) : null,
-      status: BonusWorkRequestStatus.PENDING,
-    });
-    const saved = await this.bonusWorkRequestRepository.save(request);
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_CREATED,
       saved,
@@ -18961,18 +19669,84 @@ export class StoresService {
     return { request, approverProfileId: approverProfile?.id ?? null };
   }
 
+  /**
+   * Moves a request from the status the owner saw to `next`; a second
+   * decision sent at the same time (or on a stale screen) is refused.
+   */
+  private async decideBonusWorkRequest(
+    request: BonusWorkRequest,
+    next: BonusWorkRequestStatus,
+    changes: Partial<BonusWorkRequest>,
+  ): Promise<BonusWorkRequest> {
+    if (request.status === next) {
+      throw new BadRequestException('Yêu cầu đã được cập nhật, vui lòng tải lại');
+    }
+    // Only a pending request is approved: approving one refused earlier
+    // could leave a shift with two approved overtimes. (Refusing one
+    // approved earlier stays possible: the owner takes it back.)
+    if (
+      next === BonusWorkRequestStatus.APPROVED &&
+      request.status !== BonusWorkRequestStatus.PENDING
+    ) {
+      throw new BadRequestException('Chỉ duyệt được yêu cầu tăng ca đang chờ duyệt.');
+    }
+    const result = await this.bonusWorkRequestRepository.update(
+      { id: request.id, status: request.status },
+      { ...changes, status: next },
+    );
+    if (result && result.affected === 0) {
+      throw new BadRequestException('Yêu cầu đã được cập nhật, vui lòng tải lại');
+    }
+    return Object.assign(request, changes, { status: next });
+  }
+
+  /** Shift label for an overtime decision notification. */
+  private async notifyOvertimeDecision(
+    request: BonusWorkRequest,
+    approved: boolean,
+    reason?: string | null,
+  ) {
+    let shiftEnd: string | null = null;
+    if (!approved && request.shiftAssignmentId) {
+      const assignment = await this.shiftAssignmentRepository
+        .findOne({
+          where: { id: request.shiftAssignmentId },
+          relations: ['shiftSlot', 'shiftSlot.workShift'],
+        })
+        .catch(() => null);
+      const end = assignment ? effectiveWindowOf(assignment).end : null;
+      shiftEnd = end ? vnClockHHmm(end) : null;
+    }
+    await this.notifyRequestDecision({
+      employeeProfileId: request.employeeProfileId,
+      storeId: request.storeId,
+      requestId: request.id,
+      kind: 'OVERTIME',
+      approved,
+      reason,
+      assignmentId: request.shiftAssignmentId,
+      workDate: request.requestDate ? String(request.requestDate).slice(0, 10) : null,
+      // Unlinked (older build): approving it does not extend paid time.
+      time: request.shiftAssignmentId ? request.endTime : null,
+      shiftEnd,
+    });
+  }
+
   async approveBonusWorkRequest(id: string, ownerAccountId: string | undefined) {
     const { request, approverProfileId } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
-    request.status = BonusWorkRequestStatus.APPROVED;
-    request.approvedById = approverProfileId;
-    const saved = await this.bonusWorkRequestRepository.save(request);
+    const saved = await this.decideBonusWorkRequest(
+      request,
+      BonusWorkRequestStatus.APPROVED,
+      { approvedById: approverProfileId },
+    );
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_APPROVED,
       request,
       ownerAccountId ?? null,
     );
     await this.repriceCheckedOutOvertime(saved);
+    void this.notifyOvertimeDecision(saved, true);
     return saved;
   }
 
@@ -18983,17 +19757,28 @@ export class StoresService {
   ) {
     const { request, approverProfileId } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
-    request.status = BonusWorkRequestStatus.REJECTED;
-    request.approvedById = approverProfileId;
-    request.rejectionReason = reason ?? null;
-    const saved = await this.bonusWorkRequestRepository.save(request);
+    const saved = await this.decideBonusWorkRequest(
+      request,
+      BonusWorkRequestStatus.REJECTED,
+      { approvedById: approverProfileId, rejectionReason: reason ?? null },
+    );
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_REJECTED,
       request,
       ownerAccountId ?? null,
     );
     await this.repriceCheckedOutOvertime(saved);
+    void this.notifyOvertimeDecision(saved, false, reason);
     return saved;
+  }
+
+  /** Whether `id` is an overtime ("bổ sung công") request, not a leave row. */
+  async isBonusWorkRequestId(id: string): Promise<boolean> {
+    if (!/^[0-9a-f-]{36}$/i.test(id)) return false;
+    const found = await this.bonusWorkRequestRepository
+      .findOne({ where: { id }, select: ['id'] })
+      .catch(() => null);
+    return !!found;
   }
 
   /**
@@ -19039,11 +19824,7 @@ export class StoresService {
       return;
     }
     const slot = assignment.shiftSlot;
-    const { start, end } = resolveShiftBoundaries(
-      slot?.workDate,
-      slot?.startTime || slot?.workShift?.startTime,
-      slot?.endTime || slot?.workShift?.endTime,
-    );
+    const { start, end } = effectiveWindowOf(assignment);
     const storeId = slot?.cycle?.storeId;
     const setting = storeId
       ? await this.timekeepingSettingRepository.findOne({ where: { storeId } })
@@ -19179,8 +19960,23 @@ export class StoresService {
       where: { storeId },
       select: ['status', 'createdAt'],
     });
+    // Shift-linked overtime requests are reviewed with the leave requests.
+    let overtimeRequests: BonusWorkRequest[] = [];
+    try {
+      overtimeRequests = await this.bonusWorkRequestRepository.find({
+        where: { storeId, shiftAssignmentId: Not(IsNull()) },
+        select: ['status', 'createdAt'],
+      });
+    } catch {
+      // Best effort, like the custom-time count below.
+    }
 
-    const allRequests = [...registrations, ...changeRequests, ...leaveRequests];
+    const allRequests = [
+      ...registrations,
+      ...changeRequests,
+      ...leaveRequests,
+      ...overtimeRequests,
+    ];
 
     // X5 custom-time requests: only the PENDING ones matter to the badge.
     const custom = await this.countPendingCustomShiftRequests(
@@ -19424,7 +20220,7 @@ export class StoresService {
     storeId: string | undefined,
     employeeProfileId: string | undefined,
     options?: { latitude?: number; longitude?: number; qrStoreId?: string },
-    /** No face photo: allowed only for a GPS_QR store, and always enforced. */
+    /** No face photo: allowed only for a GPS_QR / QR_ONLY store, always enforced. */
     faceless = false,
   ): Promise<{
     checkinDistance: number | null;
@@ -19581,14 +20377,9 @@ export class StoresService {
       );
     }
     // Qua giờ kết thúc mà chưa vào ca thì ca đã bị ghi nghỉ không phép; không
-    // cho check-in muộn hơn giờ kết thúc nữa.
+    // cho check-in muộn hơn giờ kết thúc nữa (giờ kết thúc sau khi duyệt về sớm).
     {
-      const slot = assignment.shiftSlot;
-      const { end } = resolveShiftBoundaries(
-        slot?.workDate ? String(slot.workDate).slice(0, 10) : null,
-        slot?.startTime || slot?.workShift?.startTime,
-        slot?.endTime || slot?.workShift?.endTime,
-      );
+      const { end } = effectiveWindowOf(assignment);
       if (
         assignment.attendanceStatus === AttendanceStatus.ABSENT ||
         (end && Date.now() >= end.getTime())
@@ -19673,27 +20464,31 @@ export class StoresService {
       );
     }
 
-    // Calculate late minutes against the slot's work date in Vietnam time, so
-    // the result does not depend on the server timezone and overnight shifts
-    // are measured against the correct calendar day.
+    // Late minutes are measured against the shift's start on its Vietnam work
+    // date (overnight shifts on the right day), or the start in force after an
+    // approved late arrival. Computed under the row lock, so an approval
+    // landing at the same moment is either seen here or sees this check-in.
     const now = new Date();
     const slot = assignment.shiftSlot;
-    const workShift = slot?.workShift;
-    const { start: shiftStart } = resolveShiftBoundaries(
-      slot?.workDate,
-      slot?.startTime || workShift?.startTime,
-      slot?.endTime || workShift?.endTime,
-    );
-    // Late within the store's allowed minutes counts as on time (0).
-    const lateMinutes = applyGrace(
-      calculateLateMinutes(shiftStart, now),
-      rules,
-    );
-
-    const attendanceStatus =
-      lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
+    let shiftStart: Date | null = effectiveWindowOf(assignment).start;
+    let lateMinutes = 0;
+    let attendanceStatus = AttendanceStatus.ON_TIME;
 
     const persistence = await this.dataSource.transaction(async (manager) => {
+      const locked = await manager.findOne(ShiftAssignment, {
+        where: { id: assignmentId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      shiftStart = effectiveWindowOf({
+        adjustedStartAt: locked?.adjustedStartAt ?? assignment.adjustedStartAt,
+        adjustedEndAt: locked?.adjustedEndAt ?? assignment.adjustedEndAt,
+        shiftSlot: slot,
+      }).start;
+      // Late within the store's allowed minutes counts as on time (0).
+      lateMinutes = applyGrace(calculateLateMinutes(shiftStart, now), rules);
+      attendanceStatus =
+        lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
+
       const updateResult = await manager
         .createQueryBuilder()
         .update(ShiftAssignment)
@@ -19919,43 +20714,58 @@ export class StoresService {
 
     // Calculate early minutes and worked minutes. Same Vietnam-anchored
     // boundaries as check-in, so an overnight shift ending at 06:00 is compared
-    // against the following morning rather than the current calendar day.
+    // against the following morning rather than the current calendar day; an
+    // approved late arrival / early leave moves the start / end.
     const now = new Date();
     const slot = assignment.shiftSlot;
-    const workShift = slot?.workShift;
-    const { start: shiftStart, end: shiftEnd } = resolveShiftBoundaries(
-      slot?.workDate,
-      slot?.startTime || workShift?.startTime,
-      slot?.endTime || workShift?.endTime,
+    const paidUntil = await this.approvedOvertimeEnd(
+      assignmentId,
+      effectiveWindowOf(assignment).end,
     );
-    // Leaving early within the store's allowed minutes counts as on time (0).
-    const earlyMinutes = applyGrace(calculateEarlyMinutes(shiftEnd, now), rules);
-
-    // Paid time inside the shift, with forgiven (or not deducted) late/early
-    // time counted; staying after the end is paid only up to an approved
-    // overtime end. Whether the late arrival was forgiven is what check-in
-    // stored.
-    const workedMinutes = creditedWorkedMinutes({
-      start: shiftStart,
-      end: shiftEnd,
-      checkIn: new Date(assignment.checkInTime),
-      checkOut: now,
-      rules,
-      storedLateMinutes: assignment.lateMinutes,
-      paidUntil: await this.approvedOvertimeEnd(assignmentId, shiftEnd),
-      mode: await this.workedTimeModeFor(storeId, assignment.employeeId, slot),
-    });
-
-    // Determine final attendance status
-    let attendanceStatus =
-      assignment.attendanceStatus || AttendanceStatus.ON_TIME;
-    if (assignment.lateMinutes > 0 && earlyMinutes > 0) {
-      attendanceStatus = AttendanceStatus.LATE_AND_EARLY;
-    } else if (earlyMinutes > 0) {
-      attendanceStatus = AttendanceStatus.EARLY;
-    }
+    const mode = await this.workedTimeModeFor(storeId, assignment.employeeId, slot);
+    let shiftEnd: Date | null = null;
+    let earlyMinutes = 0;
+    let workedMinutes = 0;
+    let attendanceStatus = assignment.attendanceStatus || AttendanceStatus.ON_TIME;
 
     const persistence = await this.dataSource.transaction(async (manager) => {
+      // Under the row lock: an approved late arrival / early leave saved at the
+      // same moment is either seen here or sees this check-out.
+      const locked = await manager.findOne(ShiftAssignment, {
+        where: { id: assignmentId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      const current = locked ?? assignment;
+      const window = effectiveWindowOf({
+        adjustedStartAt: current.adjustedStartAt,
+        adjustedEndAt: current.adjustedEndAt,
+        shiftSlot: slot,
+      });
+      shiftEnd = window.end;
+      // Leaving early within the store's allowed minutes counts as on time (0).
+      earlyMinutes = applyGrace(calculateEarlyMinutes(window.end, now), rules);
+      // Paid time inside the shift, with forgiven (or not deducted) late/early
+      // time counted; staying after the end is paid only up to an approved
+      // overtime end. Whether the late arrival was forgiven is what check-in
+      // (or a later approval) stored.
+      workedMinutes = creditedWorkedMinutes({
+        start: window.start,
+        end: window.end,
+        checkIn: new Date(current.checkInTime ?? assignment.checkInTime),
+        checkOut: now,
+        rules,
+        storedLateMinutes: current.lateMinutes,
+        paidUntil,
+        mode,
+      });
+      const lateMinutes = Number(current.lateMinutes ?? assignment.lateMinutes) || 0;
+      attendanceStatus = current.attendanceStatus || AttendanceStatus.ON_TIME;
+      if (lateMinutes > 0 && earlyMinutes > 0) {
+        attendanceStatus = AttendanceStatus.LATE_AND_EARLY;
+      } else if (earlyMinutes > 0) {
+        attendanceStatus = AttendanceStatus.EARLY;
+      }
+
       const updateResult = await manager
         .createQueryBuilder()
         .update(ShiftAssignment)
@@ -20807,6 +21617,133 @@ export class StoresService {
   }
 
   /**
+   * How a shift under way counts so far, for live display (not stored):
+   * from `from` to now, never past `until`. Same rule as the check-out:
+   * "theo lịch làm" from the start in force (a forgiven late arrival counts
+   * from the start) to the end or the approved overtime end; "theo giờ chấm
+   * công" from the check-in, open-ended.
+   */
+  private async liveCountWindow(
+    assignment: ShiftAssignment,
+    storeId: string,
+  ): Promise<{ from: Date; until: Date | null } | null> {
+    if (!assignment.checkInTime || assignment.checkOutTime) return null;
+    const checkIn = new Date(assignment.checkInTime);
+    try {
+      const window = effectiveWindowOf(assignment);
+      const mode = await this.workedTimeModeFor(
+        storeId,
+        assignment.employeeId,
+        assignment.shiftSlot,
+      );
+      if (mode === 'ACTUAL') return { from: checkIn, until: null };
+      const paidUntil = await this.approvedOvertimeEnd(assignment.id, window.end);
+      // As the check-out pays it: a store that does not deduct late time
+      // counts from the start anyway.
+      const setting = await this.timekeepingSettingRepository
+        .findOne({ where: { storeId } })
+        .catch(() => null);
+      const lateCounted =
+        !!window.start &&
+        checkIn.getTime() > window.start.getTime() &&
+        Number(assignment.lateMinutes) > 0 &&
+        !resolveAttendanceRules(setting).creditLateEarly;
+      return {
+        from: window.start && !lateCounted ? window.start : checkIn,
+        until:
+          paidUntil && (!window.end || paidUntil.getTime() > window.end.getTime())
+            ? paidUntil
+            : window.end,
+      };
+    } catch {
+      return { from: checkIn, until: null };
+    }
+  }
+
+  /**
+   * The shift under way with its live count window and what it earns: per
+   * minute for an hourly contract, its fixed amount otherwise. Shown on top
+   * of the month's estimate, which counts completed shifts only.
+   */
+  async inProgressShiftEstimate(
+    employeeProfileId: string,
+    storeId: string,
+    /** Only a shift of this month (payroll counts a shift by its work date). */
+    forMonth?: VnMonth,
+  ): Promise<{
+    assignmentId: string;
+    countFrom: string;
+    countUntil: string | null;
+    ratePerMinute: number;
+    shiftAmount: number;
+  } | null> {
+    const active = await this.shiftAssignmentRepository
+      .createQueryBuilder('a')
+      .leftJoinAndSelect('a.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'ws')
+      .leftJoinAndSelect('slot.cycle', 'cycle')
+      .where('a.employeeId = :employeeProfileId', { employeeProfileId })
+      .andWhere('a.status = :status', { status: ShiftAssignmentStatus.CONFIRMED })
+      .andWhere('a.checkInTime IS NOT NULL')
+      .andWhere('a.checkOutTime IS NULL')
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .orderBy('a.checkInTime', 'DESC')
+      .getOne();
+    if (!active) return null;
+    // An overnight shift of the 31st, still under way on the 1st, belongs
+    // to the month it started in.
+    if (
+      forMonth &&
+      vnMonthOfDateString(String(active.shiftSlot?.workDate ?? '').slice(0, 10))?.key !==
+        forMonth.key
+    ) {
+      return null;
+    }
+    const count = await this.liveCountWindow(active, storeId);
+    if (!count) return null;
+    let ratePerMinute = 0;
+    let shiftAmount = 0;
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { id: employeeProfileId, storeId },
+        relations: ['contracts'],
+      });
+      const contract = profile?.contracts?.find((c) => c.isActive) ?? null;
+      const workDate = String(active.shiftSlot?.workDate ?? '').slice(0, 10);
+      const month = vnMonthOfDateString(workDate) ?? vnMonthOf(new Date());
+      if (contract) {
+        const { rate } = await this.resolveRateForMonth(employeeProfileId, contract, month);
+        if (contract.paymentType === PaymentType.HOUR) {
+          ratePerMinute = Number(rate) > 0 ? Number(rate) / 60 : 0;
+        } else {
+          const window = effectiveWindowOf(active);
+          const hours =
+            window.start && window.end
+              ? (window.end.getTime() - window.start.getTime()) / 3_600_000
+              : 0;
+          shiftAmount =
+            calculateShiftEarnings({
+              paymentType: contract.paymentType,
+              baseSalary: Number(rate) || 0,
+              hours,
+              referenceDate: workDate ? vnMiddayInstant(workDate) : new Date(),
+              workingDaysInMonth: await this.getStandardWorkingDays(storeId, month),
+            }) ?? 0;
+        }
+      }
+    } catch {
+      // The live time still shows; only the money stays at the estimate.
+    }
+    return {
+      assignmentId: active.id,
+      countFrom: count.from.toISOString(),
+      countUntil: count.until?.toISOString() ?? null,
+      ratePerMinute,
+      shiftAmount,
+    };
+  }
+
+  /**
    * The shift the staff Home / "Hôm nay" cards and the check-in flow act on.
    *
    * Selection (Vietnam time):
@@ -20852,15 +21789,17 @@ export class StoresService {
 
     // Comparison happens on real instants: `endTime` is a bare clock time, and
     // resolveShiftBoundaries anchors it to the work date in Asia/Ho_Chi_Minh,
-    // rolling a 22:00-02:00 shift onto the following day.
+    // rolling a 22:00-02:00 shift onto the following day. An approved late
+    // arrival / early leave moves the start / end.
     const boundsOf = (assignment: ShiftAssignment) => {
       const slot = assignment.shiftSlot;
-      const shift = slot?.workShift;
-      return resolveShiftBoundaries(
-        String(slot?.workDate ?? todayStr).slice(0, 10),
-        slot?.startTime ?? shift?.startTime,
-        slot?.endTime ?? shift?.endTime,
-      );
+      return effectiveWindowOf({
+        adjustedStartAt: assignment.adjustedStartAt,
+        adjustedEndAt: assignment.adjustedEndAt,
+        shiftSlot: slot
+          ? { ...slot, workDate: String(slot.workDate ?? todayStr).slice(0, 10) }
+          : { workDate: todayStr },
+      });
     };
     const hasEnded = (assignment: ShiftAssignment): boolean => {
       const { end } = boundsOf(assignment);
@@ -20912,12 +21851,27 @@ export class StoresService {
     const shiftFields = (assignment: ShiftAssignment) => {
       const slot = assignment.shiftSlot;
       const ws = slot?.workShift;
+      // The slot's own times override its work shift's.
+      const scheduledStartTime = slot?.startTime || ws?.startTime || '';
+      const scheduledEndTime = slot?.endTime || ws?.endTime || '';
+      const window = boundsOf(assignment);
       return {
         assignmentId: assignment.id,
         shiftName: ws?.shiftName || '',
-        // The slot's own times override its work shift's.
-        startTime: slot?.startTime || ws?.startTime || '',
-        endTime: slot?.endTime || ws?.endTime || '',
+        // The times in force: an approved late arrival / early leave shows
+        // the new start / end (older builds display these as they are).
+        startTime: assignment.adjustedStartAt && window.start
+          ? `${vnClockHHmm(window.start)}:00`
+          : scheduledStartTime,
+        endTime: assignment.adjustedEndAt && window.end
+          ? `${vnClockHHmm(window.end)}:00`
+          : scheduledEndTime,
+        scheduledStartTime,
+        scheduledEndTime,
+        effectiveStartAt: window.start?.toISOString() ?? null,
+        effectiveEndAt: window.end?.toISOString() ?? null,
+        lateApproved: !!assignment.adjustedStartAt,
+        earlyLeaveApproved: !!assignment.adjustedEndAt,
         workDate: slot?.workDate || todayStr,
         shiftSlotId: slot?.id || null,
         checkInTime: assignment.checkInTime?.toISOString() || null,
@@ -20962,6 +21916,12 @@ export class StoresService {
         missed: false,
         onLeave: false,
         ...attendanceFields(activeAssignment),
+        // Live "Hôm nay đã làm": count from `liveCountFrom` to now, never past
+        // `liveCountUntil` (how the check-out will count this shift).
+        ...(await this.liveCountWindow(activeAssignment, storeId).then((count) => ({
+          liveCountFrom: count?.from.toISOString() ?? null,
+          liveCountUntil: count?.until?.toISOString() ?? null,
+        }))),
         workedMinutesToday,
         totalShiftsToday,
       };
@@ -21100,6 +22060,12 @@ export class StoresService {
       shiftName: null,
       startTime: null,
       endTime: null,
+      scheduledStartTime: null,
+      scheduledEndTime: null,
+      effectiveStartAt: null,
+      effectiveEndAt: null,
+      lateApproved: false,
+      earlyLeaveApproved: false,
       workDate: null,
       shiftSlotId: null,
       checkInTime: null,
@@ -21130,12 +22096,7 @@ export class StoresService {
    * the first check-in/out response (computeAttendanceDeltas).
    */
   private storedAttendanceDeltas(assignment: ShiftAssignment) {
-    const slot = assignment.shiftSlot;
-    const { start, end } = resolveShiftBoundaries(
-      slot?.workDate,
-      slot?.startTime || slot?.workShift?.startTime,
-      slot?.endTime || slot?.workShift?.endTime,
-    );
+    const { start, end } = effectiveWindowOf(assignment);
     return computeAttendanceDeltas({
       start,
       end,

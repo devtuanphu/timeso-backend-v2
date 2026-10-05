@@ -86,10 +86,15 @@ describe('createLeaveRequest', () => {
       'account-1',
     );
     expect(saved[0].shiftAssignmentId).toBe(ASSIGNMENT);
-    // Both lookups are scoped to the addressed store and the caller.
+    // Both lookups are scoped to the addressed store and the caller; the
+    // row lock taken afterwards (on the id they resolved) to the caller.
     for (const call of manager.findOne.mock.calls.filter(
       ([entity]: any[]) => entity === ShiftAssignment,
     )) {
+      if (call[1].lock) {
+        expect(call[1].where).toEqual({ id: ASSIGNMENT, employeeId: PROFILE });
+        continue;
+      }
       expect(call[1].where).toMatchObject({
         employeeId: PROFILE,
         shiftSlot: { cycle: { storeId: STORE } },
