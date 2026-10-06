@@ -188,6 +188,7 @@ describe('Shift employee options', () => {
         blockingLeaveTypes: [
           LeaveType.SICK,
           LeaveType.PERSONAL,
+          LeaveType.SUDDEN,
           LeaveType.VACATION,
           LeaveType.UNPAID,
           LeaveType.OTHER,
@@ -463,6 +464,7 @@ describe('Shift employee options', () => {
         blockingLeaveTypes: [
           LeaveType.SICK,
           LeaveType.PERSONAL,
+          LeaveType.SUDDEN,
           LeaveType.VACATION,
           LeaveType.UNPAID,
           LeaveType.OTHER,

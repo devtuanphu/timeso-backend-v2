@@ -1,3 +1,5 @@
+import { formatDurationVi } from './attendance-time.utils';
+
 /**
  * X6 owner notifications: settings defaults, metadata types, job identity and
  * message texts. Pure functions only, so both the service and the queue
@@ -94,7 +96,7 @@ export const ownerCheckInText = (input: {
   lateMinutes?: number;
 }) =>
   `${displayName(input.employeeName)} check-in ${shiftLabel(input.shiftName)} lúc ${input.at}${
-    (input.lateMinutes ?? 0) > 0 ? `, trễ ${input.lateMinutes} phút` : ''
+    (input.lateMinutes ?? 0) > 0 ? `, trễ ${formatDurationVi(input.lateMinutes ?? 0)}` : ''
   }`;
 
 /** "Minh check-out ca Sáng lúc 11:50, về sớm 10 phút" */
@@ -105,7 +107,7 @@ export const ownerCheckOutText = (input: {
   earlyMinutes?: number;
 }) =>
   `${displayName(input.employeeName)} check-out ${shiftLabel(input.shiftName)} lúc ${input.at}${
-    (input.earlyMinutes ?? 0) > 0 ? `, về sớm ${input.earlyMinutes} phút` : ''
+    (input.earlyMinutes ?? 0) > 0 ? `, về sớm ${formatDurationVi(input.earlyMinutes ?? 0)}` : ''
   }`;
 
 /** "Ca của Minh bắt đầu lúc 18:00, còn 30 phút" */
@@ -114,7 +116,7 @@ export const ownerPreShiftText = (input: {
   at: string;
   minutes: number;
 }) =>
-  `Ca của ${displayName(input.employeeName)} bắt đầu lúc ${input.at}, còn ${input.minutes} phút`;
+  `Ca của ${displayName(input.employeeName)} bắt đầu lúc ${input.at}, còn ${formatDurationVi(input.minutes)}`;
 
 /** "Ca của Minh kết thúc lúc 22:00, còn 15 phút" */
 export const ownerShiftEndingText = (input: {
@@ -122,4 +124,4 @@ export const ownerShiftEndingText = (input: {
   at: string;
   minutes: number;
 }) =>
-  `Ca của ${displayName(input.employeeName)} kết thúc lúc ${input.at}, còn ${input.minutes} phút`;
+  `Ca của ${displayName(input.employeeName)} kết thúc lúc ${input.at}, còn ${formatDurationVi(input.minutes)}`;

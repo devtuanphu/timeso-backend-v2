@@ -67,6 +67,12 @@ export class ChatMessageQueryService {
       .leftJoinAndSelect('message.sender', 'sender')
       .where('message.groupId = :groupId', { groupId })
       .andWhere('message.sequence IS NOT NULL');
+    // "Xoá hộp thoại": nothing up to the member's cleared mark.
+    if (context?.member?.clearedSequence) {
+      builder.andWhere('message.sequence > :clearedSequence', {
+        clearedSequence: context.member.clearedSequence,
+      });
+    }
     if (query.beforeSequence) {
       builder.andWhere('message.sequence < :beforeSequence', {
         beforeSequence: query.beforeSequence,
@@ -112,7 +118,12 @@ export class ChatMessageQueryService {
       .leftJoinAndSelect('message.sender', 'sender')
       .where('message.groupId = :groupId', { groupId })
       .andWhere('message.sequence > :afterSequence', {
-        afterSequence: query.afterSequence,
+        // Never below the member's "xoá hộp thoại" mark.
+        afterSequence:
+          context?.member?.clearedSequence &&
+          BigInt(context.member.clearedSequence) > BigInt(query.afterSequence)
+            ? context.member.clearedSequence
+            : query.afterSequence,
       })
       .orderBy('message.sequence', 'ASC')
       .take(query.limit + 1)
@@ -156,7 +167,10 @@ export class ChatMessageQueryService {
     ) {
       throw new BadRequestException('page không hợp lệ');
     }
-    await this.authorization.requireGroupAccess(groupId, accountId);
+    const searchContext = await this.authorization.requireGroupAccess(
+      groupId,
+      accountId,
+    );
     const normalizedQuery = query.query.normalize('NFC').trim();
     const codePointLength = Array.from(normalizedQuery).length;
     if (codePointLength < 1 || codePointLength > 200) {
@@ -175,6 +189,11 @@ export class ChatMessageQueryService {
       .andWhere(`message.content ILIKE :pattern ESCAPE '\\'`, {
         pattern: `%${escapeIlikePattern(normalizedQuery)}%`,
       });
+    if (searchContext?.member?.clearedSequence) {
+      builder.andWhere('message.sequence > :clearedSequence', {
+        clearedSequence: searchContext.member.clearedSequence,
+      });
+    }
     if (query.beforeSequence) {
       builder.andWhere('message.sequence < :beforeSequence', {
         beforeSequence: query.beforeSequence,
@@ -564,6 +583,7 @@ export class ChatMessageQueryService {
          WHERE message.group_id = chat_group.id
            AND message.sequence IS NOT NULL
            AND message.deleted_at IS NULL
+           AND message.sequence > COALESCE(membership.cleared_sequence, 0)
          ORDER BY message.sequence DESC
          LIMIT 1
        ) last_message ON true
@@ -590,6 +610,8 @@ export class ChatMessageQueryService {
        WHERE membership.account_id = $1
          AND membership.status = 'active'
          AND membership.deleted_at IS NULL
+         -- A cleared conversation comes back with its next message.
+         AND (membership.cleared_sequence IS NULL OR last_message.id IS NOT NULL)
          AND (store.owner_account_id = $1 OR employee.employment_status IN (${EMPLOYED_STATUS_SQL_LIST}))
          ${storeClause}
          ${cursorClause}

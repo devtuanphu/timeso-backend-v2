@@ -483,10 +483,13 @@ export class ChatGroupsService {
   ) {
     this.assertLegacyPagination(page, limit, 100);
     // Verify membership
-    await this.verifyMembership(groupId, userId);
+    const member = await this.verifyMembership(groupId, userId);
 
     const [messages, total] = await this.chatMessageRepository.findAndCount({
-      where: { groupId },
+      // "Xoá hộp thoại": nothing up to the member's cleared mark.
+      where: member?.clearedSequence
+        ? { groupId, sequence: MoreThan(member.clearedSequence) }
+        : { groupId },
       relations: ['sender'],
       order: { createdAt: 'DESC' },
       skip: (page - 1) * limit,
@@ -674,6 +677,42 @@ export class ChatGroupsService {
     );
 
     return { success: true };
+  }
+
+  /**
+   * "Giải tán nhóm": the group creator (the store owner) closes the group for
+   * everyone. Soft delete: every list and access check skips it; messages
+   * are kept. A direct chat cannot be disbanded.
+   */
+  async disbandGroup(groupId: string, userId: string) {
+    const context = await this.authorization.requireGroupAdmin(groupId, userId);
+    if (context.group.directKey) throw directChatImmutable();
+    await this.dataSource.getRepository(ChatGroup).softDelete({ id: groupId });
+    return { success: true };
+  }
+
+  /**
+   * "Xoá hộp thoại": hides the conversation's history for this member only
+   * (and the conversation itself until a new message). Everything up to now
+   * is also marked read.
+   */
+  async clearConversation(groupId: string, userId: string) {
+    await this.authorization.requireGroupAccess(groupId, userId);
+    const [row] = await this.dataSource.query(
+      `SELECT COALESCE(MAX(sequence), 0)::text AS "maxSequence"
+         FROM chat_messages WHERE group_id = $1 AND sequence IS NOT NULL`,
+      [groupId],
+    );
+    const maxSequence = String(row?.maxSequence ?? '0');
+    await this.dataSource.query(
+      `UPDATE chat_group_members
+          SET cleared_sequence = $3::bigint,
+              last_read_sequence = GREATEST(COALESCE(last_read_sequence, 0), $3::bigint),
+              last_read_at = NOW()
+        WHERE group_id = $1 AND account_id = $2 AND deleted_at IS NULL`,
+      [groupId, userId, maxSequence],
+    );
+    return { success: true, clearedSequence: maxSequence };
   }
 
   // Leave group
@@ -928,7 +967,7 @@ export class ChatGroupsService {
   ) {
     this.assertLegacyPagination(page, limit, 100);
     // Verify membership
-    await this.getGroupDetails(groupId, userId);
+    const member = await this.verifyMembership(groupId, userId);
 
     const queryBuilder = this.chatMessageRepository
       .createQueryBuilder('message')
@@ -938,6 +977,12 @@ export class ChatGroupsService {
       .orderBy('message.createdAt', 'DESC')
       .skip((page - 1) * limit)
       .take(limit);
+    // "Xoá hộp thoại": nor its files.
+    if (member?.clearedSequence) {
+      queryBuilder.andWhere('message.sequence > :clearedSequence', {
+        clearedSequence: member.clearedSequence,
+      });
+    }
 
     // Filter by type
     if (type !== 'all') {

@@ -1,3 +1,5 @@
+import { formatDurationVi } from './attendance-time.utils';
+
 /**
  * X1 "Lịch sử thao tác": the v1 action codes, the params allowlist and the
  * Vietnamese one-line summary both apps display.
@@ -139,6 +141,7 @@ const PARAM_RULES: Record<string, ParamRule> = {
     'LATE',
     'EARLY',
     'OVERTIME',
+    'SUDDEN',
     'OTHER',
   ),
   source: oneOf('manual', 'account', 'application'),
@@ -189,6 +192,7 @@ const LEAVE_LABEL: Record<string, string> = {
   LATE: 'đi trễ',
   EARLY: 'về sớm',
   OVERTIME: 'tăng ca',
+  SUDDEN: 'nghỉ đột xuất',
 };
 
 const ddmm = (date: unknown): string | undefined => {
@@ -267,9 +271,9 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
         ? 'Hệ thống'
         : 'Nhân viên');
   const subject = entry.subjectName?.trim() || 'nhân viên';
-  const late = Number(p.lateMinutes) > 0 ? `, trễ ${p.lateMinutes} phút` : '';
+  const late = Number(p.lateMinutes) > 0 ? `, trễ ${formatDurationVi(Number(p.lateMinutes))}` : '';
   const early =
-    Number(p.earlyMinutes) > 0 ? `, về sớm ${p.earlyMinutes} phút` : '';
+    Number(p.earlyMinutes) > 0 ? `, về sớm ${formatDurationVi(Number(p.earlyMinutes))}` : '';
   const at = (key: string) => (p[key] ? ` lúc ${String(p[key])}` : '');
   const A = ACTIVITY_ACTIONS;
 

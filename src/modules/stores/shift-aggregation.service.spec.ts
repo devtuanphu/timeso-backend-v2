@@ -77,7 +77,7 @@ describe('ShiftAggregationService suggestion capacity resolution', () => {
     );
     expect(insufficientSlots.select).toHaveBeenCalledWith(
       expect.arrayContaining([
-        'COALESCE(slot.maxStaff, ws.defaultMaxStaff) as maxStaff',
+        'COALESCE(slot.maxStaff, ws.defaultMaxStaff) as "maxStaff"',
       ]),
     );
     expect(insufficientSlots.having).toHaveBeenCalledWith(

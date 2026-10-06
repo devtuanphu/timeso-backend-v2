@@ -232,6 +232,7 @@ describe('leave history type filter (B7)', () => {
     expect(parseLeaveTypeFilter('LEAVE')).toEqual([
       LeaveType.SICK,
       LeaveType.PERSONAL,
+      LeaveType.SUDDEN,
       LeaveType.VACATION,
       LeaveType.UNPAID,
       LeaveType.OTHER,

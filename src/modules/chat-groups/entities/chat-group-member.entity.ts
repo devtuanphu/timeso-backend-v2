@@ -63,6 +63,13 @@ export class ChatGroupMember extends BaseEntity {
   @Column({ type: 'timestamp', nullable: true, name: 'last_delivered_at' })
   lastDeliveredAt: Date | null;
 
+  /**
+   * "Xoá hộp thoại": messages up to this sequence are hidden for this member,
+   * and the conversation leaves their list until a newer message arrives.
+   */
+  @Column({ type: 'bigint', nullable: true, name: 'cleared_sequence' })
+  clearedSequence: string | null;
+
   @Column({ type: 'boolean', default: true, name: 'notifications_enabled' })
   notificationsEnabled: boolean;
 

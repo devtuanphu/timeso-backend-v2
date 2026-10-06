@@ -63,6 +63,14 @@ export class StoreShiftConfig extends BaseEntity {
   })
   timekeepingRequirement: TimekeepingRequirement;
 
+  // Giờ mở cửa / đóng cửa ("HH:mm:ss", giờ Việt Nam). Đóng ≤ mở: mở qua đêm.
+  // Màn xem trước lịch ca cảnh báo khung giờ mở cửa chưa có nhân viên.
+  @Column({ name: 'open_time', type: 'time', default: '06:00:00' })
+  openTime: string;
+
+  @Column({ name: 'close_time', type: 'time', default: '22:00:00' })
+  closeTime: string;
+
   @Column({ name: 'is_active', default: true })
   isActive: boolean;
 }

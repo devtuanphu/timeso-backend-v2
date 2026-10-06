@@ -3707,7 +3707,8 @@ export class StoresController {
     @Param('profileId') profileId: string,
     @Body()
     body: {
-      employeeSalaryId: string;
+      /** Omitted by the staff app: this month's payslip. */
+      employeeSalaryId?: string;
       requestedAmount: number;
       requestReason?: string;
     },
@@ -5197,6 +5198,7 @@ export class StoresController {
       profileId,
       body.question,
       body.month,
+      user.userId,
     );
   }
 

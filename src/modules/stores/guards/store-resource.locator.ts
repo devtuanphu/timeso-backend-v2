@@ -60,6 +60,8 @@ export interface ResourceScope {
   ownerAccountField?: string;
   withDeleted?: boolean;
   via?: ResourceScope & { field: string };
+  /** Where else the id may live when it is not in `entity` (a polymorphic id). */
+  fallback?: ResourceScope;
 }
 
 type ViaHop = ResourceScope & { field: string };
@@ -202,7 +204,13 @@ export const ROUTE_RULES: RouteRule[] = [
             },
           };
         case 'LEAVE':
-          return { entity: EmployeeLeaveRequest };
+          // Overtime requests are listed and decided with the leave
+          // requests (the owner's approval list): their ids are bonus-work
+          // request ids.
+          return {
+            entity: EmployeeLeaveRequest,
+            fallback: { entity: BonusWorkRequest },
+          };
         default:
           return null;
       }
@@ -278,6 +286,14 @@ export class StoreResourceLocator {
     scope: ResourceScope,
     id: string,
   ): Promise<ResourceLocation> {
+    if (scope.fallback) {
+      try {
+        return await this.resolve({ ...scope, fallback: undefined }, id);
+      } catch (error) {
+        if (!(error instanceof NotFoundException)) throw error;
+        return this.resolve(scope.fallback, id);
+      }
+    }
     try {
       let current: ResourceScope = scope;
       let currentId = id;

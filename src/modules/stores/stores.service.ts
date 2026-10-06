@@ -356,6 +356,11 @@ import {
   vnMonthOfDateString,
 } from '../../common/utils/vn-calendar';
 import {
+  describeOwnerRequestNotification,
+  OWNER_REQUEST_NOTIFICATION_TYPE,
+  type OwnerRequestKind,
+} from './owner-request-notification.utils';
+import {
   calculateEarlyMinutes,
   calculateLateMinutes,
   computeAttendanceDeltas,
@@ -843,6 +848,7 @@ const isShiftEligibleEmploymentStatus = (
 const BLOCKING_LEAVE_TYPES = new Set<LeaveType>([
   LeaveType.SICK,
   LeaveType.PERSONAL,
+  LeaveType.SUDDEN,
   LeaveType.VACATION,
   LeaveType.UNPAID,
   LeaveType.OTHER,
@@ -898,11 +904,14 @@ const toBlockingLeaveIntervals = (
   leave: Pick<
     EmployeeLeaveRequest,
     'type' | 'startDate' | 'endDate' | 'startTime' | 'endTime'
-  >,
+  > & { shiftAssignmentId?: string | null },
   anchorRangeStart: string,
   anchorRangeEnd: string,
 ): ShiftInterval[] => {
   if (!BLOCKING_LEAVE_TYPES.has(leave.type)) return [];
+  // A sudden absence is asked for one shift: it frees that shift only (whose
+  // assignment still holds its time), not the whole day.
+  if (leave.type === LeaveType.SUDDEN && leave.shiftAssignmentId) return [];
 
   if (!leave.startTime || !leave.endTime) {
     return [
@@ -1154,6 +1163,47 @@ const DEFAULT_TIMEKEEPING_SHIFTS = [
 
 const sameShiftTime = (left: string, right: string) =>
   left.slice(0, 5) === right.slice(0, 5);
+
+/** "17:00:00" → "19:30:00" is 150; past midnight wraps; null when unknown. */
+const overtimeLengthMinutes = (
+  start?: string | null,
+  end?: string | null,
+): number | null => {
+  const a = /^(\d{1,2}):(\d{2})/.exec(String(start ?? ''));
+  const b = /^(\d{1,2}):(\d{2})/.exec(String(end ?? ''));
+  if (!a || !b) return null;
+  let minutes = Number(b[1]) * 60 + Number(b[2]) - (Number(a[1]) * 60 + Number(a[2]));
+  if (minutes <= 0) minutes += 24 * 60;
+  return minutes;
+};
+
+/**
+ * A new schedule's first day must not start in the past — checked for every
+ * shift of the form, not only the first (Vietnam time).
+ */
+export function assertShiftsStartAhead(
+  drafts: Array<{ shiftName: string; startTime: string }>,
+  firstWorkDate: string | undefined,
+  now: Date,
+): void {
+  if (!firstWorkDate) return;
+  const today = vnDateString(now);
+  const date = String(firstWorkDate).slice(0, 10);
+  const clock = vnClockHHmm(now);
+  const past = drafts.filter(
+    (draft) =>
+      date < today ||
+      // Before the current minute: 04:30 is still accepted at 04:30.
+      (date === today && String(draft.startTime).slice(0, 5) < clock),
+  );
+  if (past.length) {
+    throw new BadRequestException({
+      code: 'SHIFT_START_PASSED',
+      message: `${past.map((d) => d.shiftName).join(', ')}: thời gian bắt đầu không được trước thời gian hiện tại`,
+      shiftNames: past.map((d) => d.shiftName),
+    });
+  }
+}
 
 /** Overtime times that do not fit the linked shift (an older build's). */
 const OVERTIME_SHIFT_MISMATCH = 'OVERTIME_SHIFT_MISMATCH';
@@ -3923,8 +3973,13 @@ export class StoresService {
       .andWhere('slot.workDate >= :from', { from: from > today ? from : today })
       .andWhere('slot.workDate <= :to', { to })
       .limit(500);
-    // Đơn nghỉ theo giờ chỉ phủ đúng ca nó gắn.
-    if (leave.startTime && leave.endTime) {
+    // Đơn nghỉ theo giờ — và đơn nghỉ đột xuất gắn ca — chỉ phủ đúng ca nó
+    // gắn (như leave-coverage.utils), không phải mọi ca trong ngày.
+    if (leave.type === LeaveType.SUDDEN && leave.shiftAssignmentId) {
+      qb.andWhere('sa.id = :assignmentId', {
+        assignmentId: leave.shiftAssignmentId,
+      });
+    } else if (leave.startTime && leave.endTime) {
       if (!leave.shiftAssignmentId) return;
       qb.andWhere('sa.id = :assignmentId', {
         assignmentId: leave.shiftAssignmentId,
@@ -4772,7 +4827,9 @@ export class StoresService {
             ? 'EARLY'
             : leave.type === LeaveType.OVERTIME
               ? 'OVERTIME'
-              : 'LEAVE';
+              : leave.type === LeaveType.SUDDEN
+                ? 'SUDDEN'
+                : 'LEAVE';
       void this.notifyRequestDecision({
         employeeProfileId: leave.employeeProfileId,
         storeId: leave.storeId,
@@ -4972,7 +5029,7 @@ export class StoresService {
     employeeProfileId: string;
     storeId: string;
     requestId: string;
-    kind: 'LATE' | 'EARLY' | 'LEAVE' | 'OVERTIME';
+    kind: 'LATE' | 'EARLY' | 'LEAVE' | 'OVERTIME' | 'SUDDEN';
     approved: boolean;
     reason?: string | null;
     assignmentId?: string | null;
@@ -5000,6 +5057,7 @@ export class StoresService {
         LATE: 'Đơn xin đi trễ',
         EARLY: 'Đơn xin về sớm',
         LEAVE: 'Đơn xin nghỉ',
+        SUDDEN: 'Đơn xin nghỉ đột xuất',
         OVERTIME: 'Yêu cầu tăng ca',
       }[input.kind];
       const title = `${label} ${input.approved ? 'đã được duyệt' : 'bị từ chối'}`;
@@ -6615,6 +6673,7 @@ export class StoresService {
     await this.assertOwnerStoreAccess(storeId, ownerAccountId);
     const plan = this.planShiftSchedule(data);
     const { drafts, workDates } = plan;
+    assertShiftsStartAhead(drafts, workDates[0], new Date());
 
     let result: Awaited<ReturnType<StoresService['persistShiftSchedule']>>;
     try {
@@ -8840,6 +8899,119 @@ export class StoresService {
     } catch (error) {
       this.logger.warn(
         `[registerToShiftSlot] could not notify the owner of store ${storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Tells the store owner a request arrived — late arrival, early leave,
+   * sudden absence, leave, overtime, a payslip question or a salary advance —
+   * with what was asked, so it can be decided from the notification. Sent
+   * after the request is saved; never fails it.
+   */
+  private async notifyOwnerOfRequest(input: {
+    storeId: string;
+    employeeProfileId: string;
+    kind: OwnerRequestKind;
+    requestId: string;
+    shiftAssignmentId?: string | null;
+    workDate?: string | null;
+    endDate?: string | null;
+    time?: string | null;
+    minutes?: number | null;
+    reason?: string | null;
+    amount?: number | null;
+    question?: string | null;
+    /** Who filed it: the owner filing for an employee is not told of it. */
+    actorAccountId?: string | null;
+  }): Promise<void> {
+    try {
+      const [store, profile, assignment] = await Promise.all([
+        this.storeRepository.findOne({
+          where: { id: input.storeId },
+          select: ['id', 'name', 'ownerAccountId'],
+        }),
+        this.profileRepository.findOne({
+          where: { id: input.employeeProfileId },
+          relations: ['account'],
+        }),
+        input.shiftAssignmentId
+          ? this.shiftAssignmentRepository.findOne({
+              where: { id: input.shiftAssignmentId },
+              relations: ['shiftSlot', 'shiftSlot.workShift'],
+            })
+          : Promise.resolve(null),
+      ]);
+      if (!store?.ownerAccountId) return;
+      if (input.actorAccountId && input.actorAccountId === store.ownerAccountId) return;
+      const slot = assignment?.shiftSlot;
+      const window = assignment ? effectiveWindowOf(assignment) : null;
+      const workDate =
+        (slot?.workDate ? String(slot.workDate).slice(0, 10) : null) ??
+        (input.workDate ? String(input.workDate).slice(0, 10) : null);
+      // Late / early: how long that is against the shift in force.
+      let minutes = input.minutes ?? null;
+      if (minutes == null && window && workDate && input.time) {
+        const clock = /^(\d{1,2}):(\d{2})/.exec(String(input.time));
+        const at = clock
+          ? resolveRequestedInstant(
+              window,
+              workDate,
+              `${clock[1].padStart(2, '0')}:${clock[2]}:00`,
+            )
+          : null;
+        if (at && input.kind === 'LATE' && window.start) {
+          minutes = Math.round((at.getTime() - window.start.getTime()) / 60_000);
+        } else if (at && input.kind === 'EARLY' && window.end) {
+          minutes = Math.round((window.end.getTime() - at.getTime()) / 60_000);
+        }
+      }
+      const { title, content } = describeOwnerRequestNotification({
+        kind: input.kind,
+        who: profile?.account?.fullName?.trim() || 'Một nhân viên',
+        shiftName: slot?.workShift?.shiftName ?? null,
+        workDate,
+        endDate: input.endDate ? String(input.endDate).slice(0, 10) : null,
+        shiftStart: window?.start ? vnClockHHmm(window.start) : null,
+        shiftEnd: window?.end ? vnClockHHmm(window.end) : null,
+        time: input.time ?? null,
+        minutes,
+        reason: input.reason ?? null,
+        amount: input.amount ?? null,
+        question: input.question ?? null,
+      });
+      const isMoney = input.kind === 'SALARY_ADVANCE' || input.kind === 'SALARY_INQUIRY';
+      await this.notificationsService.create({
+        accountId: store.ownerAccountId,
+        storeId: input.storeId,
+        title,
+        content,
+        type: NotificationType.SYSTEM,
+        priority: NotificationPriority.HIGH,
+        // App chủ: đơn ca làm mở màn duyệt; ứng lương mở tab yêu cầu của
+        // màn lương; câu hỏi về bảng lương đọc ngay trong thông báo.
+        actionUrl:
+          input.kind === 'SALARY_ADVANCE'
+            ? '/(salary)?tab=yeu-cau'
+            : input.kind === 'SALARY_INQUIRY'
+              ? null
+              : '/(work-shift-v2)/approval',
+        metadata: {
+          type: OWNER_REQUEST_NOTIFICATION_TYPE[input.kind],
+          requestKind: input.kind,
+          requestId: input.requestId,
+          storeId: input.storeId,
+          employeeProfileId: input.employeeProfileId,
+          ...(input.shiftAssignmentId ? { assignmentId: input.shiftAssignmentId } : {}),
+          ...(!isMoney && workDate ? { workDate, workDates: [workDate] } : {}),
+        },
+      } as any);
+    } catch (error) {
+      // Fire-and-forget: this must never reject (it is not awaited).
+      this.logger?.warn(
+        `[notifyOwnerOfRequest] ${input.kind} ${input.requestId}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
@@ -15436,20 +15608,31 @@ export class StoresService {
   async createSalaryAdvanceRequest(
     employeeProfileId: string,
     data: {
-      employeeSalaryId: string;
+      employeeSalaryId?: string;
       requestedAmount: number;
       requestReason?: string;
     },
     actorAccountId?: string,
   ) {
-    // 1. Lấy thông tin phiếu lương
-    const employeeSalary = await this.employeeSalaryRepository.findOne({
-      where: { id: data.employeeSalaryId },
-      relations: ['employeeProfile'],
-    });
+    // 1. Lấy thông tin phiếu lương. The staff app sends no payslip id: the
+    // advance is on this month's payslip (written at each check-out). An
+    // undefined id used to match an arbitrary payslip and fail.
+    const employeeSalary = data.employeeSalaryId
+      ? await this.employeeSalaryRepository.findOne({
+          where: { id: data.employeeSalaryId },
+          relations: ['employeeProfile'],
+        })
+      : await this.employeeSalaryRepository.findOne({
+          where: { employeeProfileId, month: toMonthMarker(vnMonthOf()) } as any,
+          relations: ['employeeProfile'],
+        });
 
     if (!employeeSalary) {
-      throw new NotFoundException('Không tìm thấy phiếu lương');
+      throw new NotFoundException(
+        data.employeeSalaryId
+          ? 'Không tìm thấy phiếu lương'
+          : 'Chưa có lương tháng này để ứng. Vui lòng thử lại sau khi làm ca đầu tiên trong tháng.',
+      );
     }
 
     if (employeeSalary.employeeProfileId !== employeeProfileId) {
@@ -15459,7 +15642,7 @@ export class StoresService {
     // 2. Tính tổng số tiền đã ứng (bao gồm cả pending và approved)
     const existingAdvances = await this.salaryAdvanceRequestRepository.find({
       where: {
-        employeeSalaryId: data.employeeSalaryId,
+        employeeSalaryId: employeeSalary.id,
         status: In([
           AdvanceRequestStatus.PENDING,
           AdvanceRequestStatus.APPROVED,
@@ -15487,7 +15670,7 @@ export class StoresService {
     // 4. Tạo yêu cầu ứng lương
     const request = this.salaryAdvanceRequestRepository.create({
       employeeProfileId,
-      employeeSalaryId: data.employeeSalaryId,
+      employeeSalaryId: employeeSalary.id,
       requestedAmount: data.requestedAmount,
       requestReason: data.requestReason,
       status: AdvanceRequestStatus.PENDING,
@@ -15506,6 +15689,18 @@ export class StoresService {
       params: { month: this.activityMonth(employeeSalary.month) },
       idempotencyKey: `${ACTIVITY_ACTIONS.SALARY_ADVANCE_CREATED}:${saved.id}`,
     });
+    const storeId = employeeSalary.employeeProfile?.storeId;
+    if (storeId) {
+      void this.notifyOwnerOfRequest({
+        storeId,
+        employeeProfileId,
+        kind: 'SALARY_ADVANCE',
+        requestId: saved.id,
+        amount: Number(saved.requestedAmount),
+        reason: saved.requestReason ?? null,
+        actorAccountId: actorAccountId ?? null,
+      });
+    }
     return saved;
   }
 
@@ -17672,6 +17867,20 @@ export class StoresService {
     let config = await this.shiftConfigRepository.findOne({
       where: { storeId },
     });
+    const hours = (value?: string) =>
+      value ? `${value.slice(0, 5)}:00` : undefined;
+    // A first save stores the column defaults (06:00 / 22:00) for what it
+    // leaves out, so those are what the other value is checked against.
+    const openTime = hours(data.openTime) ?? config?.openTime ?? '06:00:00';
+    const closeTime = hours(data.closeTime) ?? config?.closeTime ?? '22:00:00';
+    if (openTime && closeTime && openTime.slice(0, 5) === closeTime.slice(0, 5)) {
+      throw new BadRequestException('Giờ mở cửa và đóng cửa phải khác nhau.');
+    }
+    data = {
+      ...data,
+      ...(data.openTime ? { openTime: hours(data.openTime) } : {}),
+      ...(data.closeTime ? { closeTime: hours(data.closeTime) } : {}),
+    };
 
     if (config) {
       Object.assign(config, data);
@@ -18562,7 +18771,8 @@ export class StoresService {
       });
     }
 
-    return this.dataSource.transaction(async (manager) => {
+    let created: EmployeeLeaveRequest | null = null;
+    const result = await this.dataSource.transaction(async (manager) => {
       // Serialise this employee's submissions (as createShiftChangeRequest
       // does) so a double submit cannot slip past the duplicate check.
       await manager.findOne(EmployeeProfile, {
@@ -18629,8 +18839,40 @@ export class StoresService {
         params: this.activityLeaveParams(saved),
         idempotencyKey: `${ACTIVITY_ACTIONS.LEAVE_REQUEST_CREATED}:${saved.id}`,
       });
+      created = saved;
       return saved;
     });
+    // A new request (not a resubmitted duplicate): tell the owner.
+    const fresh = created as EmployeeLeaveRequest | null;
+    if (fresh) {
+      void this.notifyOwnerOfRequest({
+        storeId,
+        employeeProfileId: fresh.employeeProfileId,
+        kind:
+          fresh.type === LeaveType.LATE
+            ? 'LATE'
+            : fresh.type === LeaveType.EARLY
+              ? 'EARLY'
+              : fresh.type === LeaveType.SUDDEN
+                ? 'SUDDEN'
+                : fresh.type === LeaveType.OVERTIME
+                  ? 'OVERTIME'
+                  : 'LEAVE',
+        requestId: fresh.id,
+        shiftAssignmentId: fresh.shiftAssignmentId ?? null,
+        workDate: String(fresh.startDate).slice(0, 10),
+        endDate: String(fresh.endDate).slice(0, 10),
+        time:
+          fresh.type === LeaveType.LATE
+            ? fresh.startTime
+            : fresh.type === LeaveType.EARLY || fresh.type === LeaveType.OVERTIME
+              ? fresh.endTime
+              : null,
+        reason: fresh.reason ?? null,
+        actorAccountId: accountId,
+      });
+    }
+    return result;
   }
 
   /**
@@ -19570,6 +19812,18 @@ export class StoresService {
       saved,
       actorAccountId ?? null,
     );
+    void this.notifyOwnerOfRequest({
+      storeId: saved.storeId,
+      employeeProfileId: saved.employeeProfileId,
+      kind: 'OVERTIME',
+      requestId: saved.id,
+      shiftAssignmentId: saved.shiftAssignmentId ?? null,
+      workDate: saved.requestDate ? String(saved.requestDate).slice(0, 10) : null,
+      time: saved.endTime ?? null,
+      minutes: overtimeLengthMinutes(saved.startTime, saved.endTime),
+      reason: saved.reason ?? null,
+      actorAccountId: actorAccountId ?? null,
+    });
     return saved;
   }
 
@@ -22744,6 +22998,7 @@ export class StoresService {
     profileId: string,
     question: string,
     month?: string,
+    actorAccountId?: string,
   ) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -22760,6 +23015,16 @@ export class StoresService {
       status: FeedbackStatus.PENDING,
     });
     const saved = await this.feedbackRepository.save(feedbackData);
+    if (profile.storeId) {
+      void this.notifyOwnerOfRequest({
+        storeId: profile.storeId,
+        employeeProfileId: profileId,
+        kind: 'SALARY_INQUIRY',
+        requestId: saved.id,
+        question: saved.content,
+        actorAccountId: actorAccountId ?? null,
+      });
+    }
 
     return {
       id: saved.id,

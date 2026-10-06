@@ -19,6 +19,7 @@ export enum LeaveType {
   LATE = 'LATE', // Xin đi trễ
   EARLY = 'EARLY', // Xin về sớm
   OVERTIME = 'OVERTIME', // Xin tăng ca
+  SUDDEN = 'SUDDEN', // Xin nghỉ đột xuất (một ca, gửi gấp)
   OTHER = 'OTHER',
 }
 

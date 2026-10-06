@@ -3,7 +3,6 @@ import {
   Controller,
   Delete,
   Get,
-  NotImplementedException,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -145,15 +144,18 @@ export class ChatGroupsController {
   }
 
   @Delete(':id')
-  @ApiOperation({ summary: 'Xóa nhóm chat' })
+  @ApiOperation({ summary: 'Giải tán nhóm chat (người tạo nhóm)' })
   async deleteGroup(@Param('id', ParseUUIDPipe) id: string, @Request() req) {
-    // Not implemented. This previously answered HTTP 200 with a message, so a
-    // client could not tell a no-op from a successful delete; 501 states
-    // plainly that the route exists but does nothing yet.
-    throw new NotImplementedException({
-      code: 'CHAT_GROUP_DELETE_NOT_IMPLEMENTED',
-      message: 'Tính năng xoá nhóm chat chưa khả dụng.',
-    });
+    return this.chatGroupsService.disbandGroup(id, req.user.userId);
+  }
+
+  @Post(':id/clear')
+  @ApiOperation({ summary: 'Xoá hộp thoại (chỉ với người dùng hiện tại)' })
+  async clearConversation(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Request() req,
+  ) {
+    return this.chatGroupsService.clearConversation(id, req.user.userId);
   }
 
   // Members

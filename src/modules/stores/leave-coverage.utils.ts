@@ -8,6 +8,7 @@ import { LeaveType } from './entities/employee-leave-request.entity';
 export const AUTHORIZED_ABSENCE_LEAVE_TYPES: readonly LeaveType[] = [
   LeaveType.SICK,
   LeaveType.PERSONAL,
+  LeaveType.SUDDEN,
   LeaveType.VACATION,
   LeaveType.UNPAID,
   LeaveType.OTHER,
@@ -38,6 +39,10 @@ export const approvedLeaveCoversShiftSql = (refs: {
        AND elr.end_date >= ${refs.workDate}
        AND (elr.start_time IS NULL
             OR elr.end_time IS NULL
+            OR elr.shift_assignment_id = ${refs.assignmentId})
+       -- A sudden absence is asked for one shift: only that one.
+       AND (elr.type::text <> '${LeaveType.SUDDEN}'
+            OR elr.shift_assignment_id IS NULL
             OR elr.shift_assignment_id = ${refs.assignmentId}))`;
 
 interface QueryExecutor {
@@ -86,6 +91,14 @@ export function leaveCoversShift(
   const date = workDate.slice(0, 10);
   if (String(leave.startDate).slice(0, 10) > date) return false;
   if (String(leave.endDate).slice(0, 10) < date) return false;
+  // A sudden absence is asked for one shift: only that one.
+  if (
+    leave.type === LeaveType.SUDDEN &&
+    leave.shiftAssignmentId &&
+    leave.shiftAssignmentId !== assignmentId
+  ) {
+    return false;
+  }
   return (
     !leave.startTime || !leave.endTime || leave.shiftAssignmentId === assignmentId
   );
