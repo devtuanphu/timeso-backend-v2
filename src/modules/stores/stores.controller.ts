@@ -196,6 +196,7 @@ import { StoreEventType } from './entities/store-event.entity';
 import { KpiStatus } from './entities/employee-kpi.entity';
 import { KpiRequestStatus } from './entities/kpi-approval-request.entity';
 import { InventoryReportStatus } from './entities/inventory-report.entity';
+import { SavePayslipRowsDto } from './dto/payslip-rows.dto';
 
 @ApiTags('Cửa hàng & Vận hành (Stores)')
 @ApiBearerAuth()
@@ -1316,6 +1317,24 @@ export class StoresController {
     @Body() body: UpdatePayrollSettingDto,
   ) {
     return this.storesService.upsertPayrollSetting(id, body);
+  }
+
+  // Payslip template: the rows every employee's payslip shows
+  @StoreOwnerOnly()
+  @Get(':id/payslip-rows')
+  @ApiOperation({ summary: 'Lấy các hàng bảng lương chi tiết của nhân viên' })
+  async getPayslipRows(@Param('id') id: string) {
+    return this.storesService.getPayslipRows(id);
+  }
+
+  @StoreOwnerOnly()
+  @Put(':id/payslip-rows')
+  @ApiOperation({ summary: 'Cập nhật các hàng bảng lương chi tiết của nhân viên' })
+  async savePayslipRows(
+    @Param('id') id: string,
+    @Body() body: SavePayslipRowsDto,
+  ) {
+    return this.storesService.savePayslipRows(id, body);
   }
 
   // Employees

@@ -1,5 +1,6 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  IsEmail,
   IsEnum,
   IsIn,
   IsInt,
@@ -10,6 +11,7 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { EmployeeWorkAssignmentDto } from './add-existing-employee.dto';
 import {
@@ -74,6 +76,9 @@ export class CreateJobApplicationDto {
   @IsOptional()
   @IsString()
   @MaxLength(160)
+  // Empty is "no email"; anything entered must be an address.
+  @ValidateIf((dto: { email?: unknown }) => dto.email !== undefined && dto.email !== null && dto.email !== '')
+  @IsEmail({}, { message: 'Email không đúng định dạng' })
   email?: string;
 
   @Transform(multiLine(1000))

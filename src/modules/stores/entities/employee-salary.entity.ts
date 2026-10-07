@@ -2,6 +2,7 @@ import { Entity, Column, ManyToOne, JoinColumn, Unique } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { EmployeeProfile } from './employee-profile.entity';
 import { MonthlyPayroll } from './monthly-payroll.entity';
+import type { PayslipRowsSnapshot } from '../payslip-rows.utils';
 
 export enum PaymentStatus {
   PENDING = 'Chờ duyệt',
@@ -110,6 +111,14 @@ export class EmployeeSalary extends BaseEntity {
     default: 0,
   })
   otherDeductions: number; // Khấu trừ khác
+
+  /**
+   * The store's payslip template this payslip was computed with
+   * (payslip-rows.utils PayslipRowsSnapshot): renamed / removed built-in rows
+   * and the extra PLUS / MINUS lines. Null: the default payslip.
+   */
+  @Column({ name: 'payslip_rows', type: 'jsonb', nullable: true })
+  payslipRows: PayslipRowsSnapshot | null;
 
   // Tổng kết
   @Column({

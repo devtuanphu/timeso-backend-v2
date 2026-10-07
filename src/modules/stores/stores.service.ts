@@ -100,6 +100,21 @@ import {
 } from './dto/product-export.dto';
 
 import { MonthlyPayroll } from './entities/monthly-payroll.entity';
+import {
+  PayslipBuiltinRow,
+  PayslipRowSign,
+  StorePayslipRow,
+} from './entities/store-payslip-row.entity';
+import {
+  countedPayslipDeductions,
+  isBuiltinRemoved,
+  PAYSLIP_BUILTIN_DEFAULT_LABELS,
+  payslipExtraTotals,
+  payslipRowsSnapshot,
+  readPayslipRowsSnapshot,
+  type PayslipRowsSnapshot,
+} from './payslip-rows.utils';
+import { SavePayslipRowsDto } from './dto/payslip-rows.dto';
 import { SalaryConfig, ConfigStatus } from './entities/salary-config.entity';
 import {
   EmployeeSalary,
@@ -2646,7 +2661,7 @@ export class StoresService {
     const type = await this.employeeTypeRepository.findOne({
       where: { id: typeId, storeId },
     });
-    if (!type) throw new NotFoundException('Không tìm thấy loại nhân viên');
+    if (!type) throw new NotFoundException('Không tìm thấy bộ phận');
 
     // storeId and id are fixed by the route; anything else in the body would
     // let a caller move a rung into another store.
@@ -2664,7 +2679,7 @@ export class StoresService {
     const type = await this.employeeTypeRepository.findOne({
       where: { id: typeId, storeId },
     });
-    if (!type) throw new NotFoundException('Không tìm thấy loại nhân viên');
+    if (!type) throw new NotFoundException('Không tìm thấy bộ phận');
 
     const inUse = await this.profileRepository.count({
       where: { storeId, employeeTypeId: typeId },
@@ -10365,6 +10380,8 @@ export class StoresService {
         month,
         manager,
       );
+      // One template for the whole rebuild (not one query per employee).
+      const payslipTemplate = await this.loadPayslipTemplate(storeId, manager);
       // Everyone who can work shifts is paid: active and probation staff.
       // ON_LEAVE staff are still skipped, as before: they are not rostered,
       // and a payslip they already have is left as it is (not rebuilt).
@@ -10427,6 +10444,7 @@ export class StoresService {
             otherDeductions: existing?.otherDeductions,
             now,
             stint: employee,
+            payslipRows: payslipTemplate,
           }));
         }
 
@@ -10523,15 +10541,23 @@ export class StoresService {
       existing?.id,
       manager,
     );
+    // The owner's entered "khấu trừ khác" stays stored; the payslip takes it
+    // unless the store's template removed the "Khấu trừ" row.
     const otherDeductions = Math.round(Number(existing?.otherDeductions) || 0);
     const payslip = input.payslip;
+    const template = payslip?.payslipRows ?? null;
+    const extras = payslipExtraTotals(template);
     const totals = computePayslipTotals({
       earnedBase: payslip?.earnedBaseSalary ?? 0,
       allowancesTotal: payslip?.allowancesTotal ?? 0,
       bonus: payslip?.bonus ?? 0,
       penalty: payslip?.penalty ?? 0,
       advancePayment,
-      otherDeductions,
+      otherDeductions: isBuiltinRemoved(template, PayslipBuiltinRow.DEDUCTION)
+        ? 0
+        : otherDeductions,
+      extraIncome: extras.additions,
+      extraDeductions: extras.deductions,
     });
 
     const payload: Partial<EmployeeSalary> = {
@@ -10547,6 +10573,7 @@ export class StoresService {
       unauthorizedLeaveDays: payslip?.unauthorizedLeaveDays ?? 0,
       advancePayment: Math.round(advancePayment),
       otherDeductions,
+      payslipRows: template,
       ...totals,
     };
 
@@ -10706,6 +10733,130 @@ export class StoresService {
     return { rate: Number.isFinite(rate) ? rate : 0, adjustment: adjustment ?? null };
   }
 
+  // --- Payslip template ("Thiết lập tính lương" → bảng lương nhân viên) ---
+
+  /** The store's payslip template (no stored rows: the default payslip). */
+  private async loadPayslipTemplate(
+    storeId: string,
+    manager?: EntityManager,
+  ): Promise<PayslipRowsSnapshot | null> {
+    // Unit-test doubles may have no manager / repository for this table.
+    const repository = (manager ?? this.dataSource?.manager)?.getRepository?.(
+      StorePayslipRow,
+    );
+    if (!repository?.find) return null;
+    const rows = await repository.find({
+      where: { storeId },
+      order: { sortOrder: 'ASC', createdAt: 'ASC' },
+    });
+    return rows?.length ? payslipRowsSnapshot(rows) : null;
+  }
+
+  /**
+   * Phụ cấp of a stored payslip: its allowances, or 0 when the template it
+   * was computed with removed the row (the stored jsonb keeps the contract's).
+   */
+  private storedAllowancesTotal(row: EmployeeSalary): number {
+    return isBuiltinRemoved(
+      readPayslipRowsSnapshot(row.payslipRows),
+      PayslipBuiltinRow.ALLOWANCE,
+    )
+      ? 0
+      : sumAllowances(row.allowances);
+  }
+
+  /** Stored figures of rows the payslip's template removed, zeroed. */
+  private removedPayslipFigures(row: EmployeeSalary) {
+    const snapshot = readPayslipRowsSnapshot(row.payslipRows);
+    return {
+      ...(isBuiltinRemoved(snapshot, PayslipBuiltinRow.ALLOWANCE) ? { allowances: {} } : {}),
+      ...(isBuiltinRemoved(snapshot, PayslipBuiltinRow.DEDUCTION) ? { otherDeductions: 0 } : {}),
+    };
+  }
+
+  /** A payslip's stored snapshot as the apps read it (default when none). */
+  private payslipRowsOf(value: unknown): PayslipRowsSnapshot {
+    return readPayslipRowsSnapshot(value) ?? payslipRowsSnapshot([]);
+  }
+
+  async getPayslipRows(storeId: string): Promise<PayslipRowsSnapshot> {
+    return (await this.loadPayslipTemplate(storeId)) ?? payslipRowsSnapshot([]);
+  }
+
+  /**
+   * Replaces the store's payslip template. Built-in rows: a label (renamed)
+   * or `removed`; extra lines: label, PLUS / MINUS and an amount. The current
+   * month's stored payslips are then recomputed with it (when that month's
+   * payroll exists; the live salary screen always reads the template).
+   * Finalized / approved payslips keep their own snapshot.
+   */
+  async savePayslipRows(
+    storeId: string,
+    body: SavePayslipRowsDto,
+  ): Promise<PayslipRowsSnapshot & { recalculationFailed?: boolean }> {
+    const builtins = body?.builtins ?? {};
+    const items = Array.isArray(body?.items) ? body.items : [];
+    await this.dataSource.transaction(async (manager) => {
+      // Saves of one store run one after the other: two concurrent
+      // delete-then-insert would otherwise both insert their extra lines
+      // (and pay them twice).
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `payslip-rows:${storeId}`,
+      ]);
+      const repository = manager.getRepository(StorePayslipRow);
+      await repository.delete({ storeId });
+      const rows: Partial<StorePayslipRow>[] = [];
+      for (const key of Object.values(PayslipBuiltinRow)) {
+        const builtin = builtins[key];
+        if (!builtin) continue;
+        const label = String(builtin.label ?? '').trim();
+        const isDefault = !label || label === PAYSLIP_BUILTIN_DEFAULT_LABELS[key];
+        if (!builtin.removed && isDefault) continue;
+        rows.push({
+          storeId,
+          builtinKey: key,
+          label: label || PAYSLIP_BUILTIN_DEFAULT_LABELS[key],
+          sign: key === PayslipBuiltinRow.DEDUCTION ? PayslipRowSign.MINUS : PayslipRowSign.PLUS,
+          amount: 0,
+          sortOrder: 0,
+          isActive: !builtin.removed,
+        });
+      }
+      items.forEach((item, index) => {
+        rows.push({
+          storeId,
+          builtinKey: null,
+          label: String(item.label).trim(),
+          sign: item.sign === PayslipRowSign.MINUS ? PayslipRowSign.MINUS : PayslipRowSign.PLUS,
+          amount: Math.round(Number(item.amount) || 0),
+          sortOrder: index + 1,
+          isActive: true,
+        });
+      });
+      if (rows.length) await repository.save(rows.map((row) => repository.create(row)));
+    });
+
+    const month = vnMonthOf();
+    const payroll = await this.dataSource
+      .getRepository(MonthlyPayroll)
+      .findOne({ where: { storeId, month: toMonthMarker(month) } });
+    let recalculationFailed = false;
+    if (payroll) {
+      try {
+        await this.recalculatePayroll(storeId);
+      } catch (error) {
+        recalculationFailed = true;
+        this.logger?.warn(
+          `Payslip template saved but recalculation failed for ${storeId}: ${String(error)}`,
+        );
+      }
+    }
+    const saved = await this.getPayslipRows(storeId);
+    // The app tells the owner: this month's stored payslips still show the
+    // previous template until the next recalculation.
+    return recalculationFailed ? { ...saved, recalculationFailed } : saved;
+  }
+
   /**
    * The single payslip composer used by generation, recalculation, check-out
    * and the live estimate. Read-only: it performs no writes.
@@ -10722,6 +10873,8 @@ export class StoresService {
     existingSalaryId?: string | null;
     otherDeductions?: number | null;
     now?: Date;
+    /** The store's payslip template, when the caller already loaded it. */
+    payslipRows?: PayslipRowsSnapshot | null;
     /**
      * The employee's current stint (`joinedAt`) and contracts. When the month
      * also holds shifts of a previous stint (a same-month rehire), those keep
@@ -10799,6 +10952,13 @@ export class StoresService {
       calendarDays: p.month.calendarDays,
       advancePayment,
       otherDeductions: Number(p.otherDeductions) || 0,
+      // Like the bonus / fine rules, the template only applies with a contract:
+      // without one the stored payslip is a zero payslip (upsertEmployeePayslip).
+      payslipRows: !p.contract
+        ? null
+        : p.payslipRows !== undefined
+          ? p.payslipRows
+          : await this.loadPayslipTemplate(p.storeId, p.manager),
     });
     return {
       facts,
@@ -11621,11 +11781,12 @@ export class StoresService {
       return Object.assign(row, {
         isEstimate: false,
         isFinalized,
-        allowancesTotal: sumAllowances(row.allowances),
+        allowancesTotal: this.storedAllowancesTotal(row),
         adjustmentBreakdown: null,
         // No store: the attendance behind the stored amount cannot be read.
         earnedBreakdown: this.storedEarnedBreakdown(row, month, null),
         ...describePayslipTotals(row),
+        payslipRows: this.payslipRowsOf(row.payslipRows),
       });
     }
     const live = await this.composeLivePayslip(
@@ -11650,10 +11811,11 @@ export class StoresService {
       return Object.assign(row, {
         isEstimate: false,
         isFinalized,
-        allowancesTotal: sumAllowances(row.allowances),
+        allowancesTotal: this.storedAllowancesTotal(row),
         adjustmentBreakdown: consistent ? lines : null,
         earnedBreakdown: this.storedEarnedBreakdown(row, month, live),
         ...describePayslipTotals(row),
+        payslipRows: this.payslipRowsOf(row.payslipRows),
       });
     }
     const payslip = live.payslip;
@@ -11730,7 +11892,10 @@ export class StoresService {
       earnedBaseSalary: payslip.earnedBaseSalary,
       // The allowances the live income was computed from (the contract's),
       // not the stored jsonb, so Phụ cấp + earned + bonus = totalIncome.
-      allowances: (live.contract?.allowances ?? {}) as Record<string, number>,
+      // (none when the store's template removed "Phụ cấp").
+      allowances: (isBuiltinRemoved(payslip.payslipRows, PayslipBuiltinRow.ALLOWANCE)
+        ? {}
+        : (live.contract?.allowances ?? {})) as Record<string, number>,
       bonus: payslip.bonus,
       penalty: payslip.penalty,
       workingDays: payslip.workingDays,
@@ -11748,6 +11913,7 @@ export class StoresService {
       ),
       earnedBreakdown: this.liveEarnedBreakdown(live),
       ...describePayslipTotals(payslip),
+      payslipRows: this.payslipRowsOf(payslip.payslipRows),
     };
   }
 
@@ -15912,13 +16078,16 @@ export class StoresService {
           request.employeeSalaryId,
           manager,
         );
-        // Stored income, penalty and other deductions are kept; net is
-        // floored at 0 like every other net-salary computation.
+        // Stored income, penalty, other deductions and the template's
+        // MINUS lines are kept; net is floored at 0 like every other
+        // net-salary computation.
+        const counted = countedPayslipDeductions(payslip);
         const totals = computeNetFromIncome({
           totalIncome: Number(payslip.totalIncome) || 0,
-          penalty: Number(payslip.penalty) || 0,
+          penalty: counted.penalty,
           advancePayment,
-          otherDeductions: Number(payslip.otherDeductions) || 0,
+          otherDeductions: counted.otherDeductions,
+          extraDeductions: counted.extraDeductions,
         });
         await salaryRepository.update(request.employeeSalaryId, {
           advancePayment: Math.round(advancePayment),
@@ -16569,6 +16738,10 @@ export class StoresService {
       },
       // Đổ toàn bộ dữ liệu từ EmployeeSalary
       ...salaryRecord,
+      // A row the store's template removed is not paid / taken: its stored
+      // figures (the contract's allowances, the owner's other deductions)
+      // are not listed as if they were.
+      ...this.removedPayslipFigures(salaryRecord),
       // Lịch sử thanh toán
       paymentHistory: paymentHistory,
     };

@@ -71,6 +71,7 @@ import { StoreTimekeepingSetting } from './entities/store-timekeeping-setting.en
 import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import { StorePayrollSetting } from './entities/store-payroll-setting.entity';
 import { StorePayrollRule } from './entities/store-payroll-rule.entity';
+import { StorePayslipRow } from './entities/store-payslip-row.entity';
 import { StorePayrollIncrementRule } from './entities/store-payroll-increment-rule.entity';
 import { StoreInternalRule } from './entities/store-internal-rule.entity';
 import { StorePermissionConfig } from './entities/store-permission-config.entity';
@@ -198,6 +199,7 @@ import { CustomShiftRequest } from './entities/custom-shift-request.entity';
       StoreWorkedTimeRule,
       StorePayrollSetting,
       StorePayrollRule,
+      StorePayslipRow,
       StorePayrollIncrementRule,
       StoreInternalRule,
       StorePermissionConfig,

@@ -9,6 +9,13 @@ import {
   StorePayrollRule,
 } from './entities/store-payroll-rule.entity';
 import { WORKING_DAYS_PER_WEEK } from './shift-earnings.utils';
+import { PayslipBuiltinRow } from './entities/store-payslip-row.entity';
+import {
+  countedPayslipDeductions,
+  isBuiltinRemoved,
+  payslipExtraTotals,
+  type PayslipRowsSnapshot,
+} from './payslip-rows.utils';
 
 /**
  * Monthly payroll arithmetic, in one place.
@@ -547,12 +554,15 @@ export function computeNetFromIncome(input: {
   penalty: number;
   advancePayment: number;
   otherDeductions?: number;
+  /** The store template's MINUS lines (payslip-rows.utils). */
+  extraDeductions?: number;
 }): { totalIncome: number; totalDeductions: number; netSalary: number } {
   const totalIncome = Math.round(toFiniteNumber(input.totalIncome));
   const totalDeductions =
     Math.round(toFiniteNumber(input.penalty)) +
     Math.round(toFiniteNumber(input.advancePayment)) +
-    Math.round(toFiniteNumber(input.otherDeductions));
+    Math.round(toFiniteNumber(input.otherDeductions)) +
+    Math.round(toFiniteNumber(input.extraDeductions));
   return {
     totalIncome,
     totalDeductions,
@@ -572,16 +582,21 @@ export function computePayslipTotals(input: {
   penalty: number;
   advancePayment: number;
   otherDeductions?: number;
+  /** The store template's PLUS / MINUS lines (payslip-rows.utils). */
+  extraIncome?: number;
+  extraDeductions?: number;
 }): { totalIncome: number; totalDeductions: number; netSalary: number } {
   const totalIncome =
     Math.round(toFiniteNumber(input.earnedBase)) +
     Math.round(toFiniteNumber(input.allowancesTotal)) +
-    Math.round(toFiniteNumber(input.bonus));
+    Math.round(toFiniteNumber(input.bonus)) +
+    Math.round(toFiniteNumber(input.extraIncome));
   return computeNetFromIncome({
     totalIncome,
     penalty: input.penalty,
     advancePayment: input.advancePayment,
     otherDeductions: input.otherDeductions,
+    extraDeductions: input.extraDeductions,
   });
 }
 
@@ -598,20 +613,25 @@ export function describePayslipTotals(input: {
   penalty: unknown;
   otherDeductions: unknown;
   netSalary: unknown;
+  /** The payslip's template snapshot (removed "Khấu trừ", MINUS lines). */
+  payslipRows?: unknown;
 }): {
   incomeAfterAdvance: number;
   deductionsExcludingAdvance: number;
+  /** The template's MINUS lines, taken after TỔNG THU NHẬP like Khấu trừ. */
+  extraDeductions: number;
   isNetClamped: boolean;
 } {
+  const counted = countedPayslipDeductions(input);
   const incomeAfterAdvance =
     toFiniteNumber(input.totalIncome) - toFiniteNumber(input.advancePayment);
-  const deductionsExcludingAdvance =
-    toFiniteNumber(input.penalty) + toFiniteNumber(input.otherDeductions);
+  const deductionsExcludingAdvance = counted.penalty + counted.otherDeductions;
   return {
     incomeAfterAdvance,
     deductionsExcludingAdvance,
+    extraDeductions: counted.extraDeductions,
     isNetClamped:
-      incomeAfterAdvance - deductionsExcludingAdvance < 0 &&
+      incomeAfterAdvance - deductionsExcludingAdvance - counted.extraDeductions < 0 &&
       toFiniteNumber(input.netSalary) === 0,
   };
 }
@@ -634,6 +654,8 @@ export interface PayslipComputation {
   /** Absent shifts. */
   unauthorizedLeaveDays: number;
   standardWorkingDays: number;
+  /** The store template applied (null: the default payslip). */
+  payslipRows: PayslipRowsSnapshot | null;
 }
 
 export function computePayslip(input: {
@@ -652,6 +674,11 @@ export function computePayslip(input: {
    * at `rate`. Bonus and fine rules always read the whole month's `facts`.
    */
   earnedBaseSalary?: number | null;
+  /**
+   * The store's payslip template: removed built-in rows are not paid / taken
+   * and its extra lines are added to the income or taken from the net pay.
+   */
+  payslipRows?: PayslipRowsSnapshot | null;
 }): PayslipComputation {
   const paymentType = resolvePayrollPaymentType(input.paymentType);
   const rate = toFiniteNumber(input.rate);
@@ -665,14 +692,25 @@ export function computePayslip(input: {
           standardWorkingDays: input.standardWorkingDays,
           calendarDays: input.calendarDays,
         });
-  const { bonus, penalty } = computeRuleAdjustments(
+  const template = input.payslipRows ?? null;
+  const adjustments = computeRuleAdjustments(
     input.rules,
     input.facts,
     earnedBaseSalary,
   );
-  const allowancesTotal = sumAllowances(input.allowances);
+  const deductionRemoved = isBuiltinRemoved(template, PayslipBuiltinRow.DEDUCTION);
+  const bonus = isBuiltinRemoved(template, PayslipBuiltinRow.BONUS)
+    ? 0
+    : adjustments.bonus;
+  const penalty = deductionRemoved ? 0 : adjustments.penalty;
+  const allowancesTotal = isBuiltinRemoved(template, PayslipBuiltinRow.ALLOWANCE)
+    ? 0
+    : sumAllowances(input.allowances);
   const advancePayment = Math.round(toFiniteNumber(input.advancePayment));
-  const otherDeductions = Math.round(toFiniteNumber(input.otherDeductions));
+  const otherDeductions = deductionRemoved
+    ? 0
+    : Math.round(toFiniteNumber(input.otherDeductions));
+  const extras = payslipExtraTotals(template);
   const totals = computePayslipTotals({
     earnedBase: earnedBaseSalary,
     allowancesTotal,
@@ -680,6 +718,8 @@ export function computePayslip(input: {
     penalty,
     advancePayment,
     otherDeductions,
+    extraIncome: extras.additions,
+    extraDeductions: extras.deductions,
   });
 
   return {
@@ -696,6 +736,7 @@ export function computePayslip(input: {
     workingHours: input.facts.workingHours,
     unauthorizedLeaveDays: input.facts.absentCount,
     standardWorkingDays: input.standardWorkingDays,
+    payslipRows: template,
   };
 }
 
