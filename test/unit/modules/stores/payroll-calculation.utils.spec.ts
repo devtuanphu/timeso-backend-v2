@@ -1,0 +1,881 @@
+import { PaymentType } from '../../../../src/modules/stores/entities/employee-contract.entity';
+import {
+  AttendanceStatus,
+  ShiftAssignmentStatus,
+} from '../../../../src/modules/stores/entities/shift-management.entity';
+import {
+  PayrollCalcType,
+  PayrollRuleCategory,
+} from '../../../../src/modules/stores/entities/store-payroll-rule.entity';
+import { WeekDay } from '../../../../src/modules/stores/entities/store-shift-config.entity';
+import {
+  computeEarnedBase,
+  computePayslip,
+  computePayslipTotals,
+  computeRuleAdjustments,
+  computeStintSplitEarnedBase,
+  describeEarnedBase,
+  describePayslipTotals,
+  MonthlyAttendanceFacts,
+  PayrollAssignmentFact,
+  pickDayOwnerAssignmentIds,
+  resolvePayrollPaymentType,
+  sumAllowances,
+  summarizeMonthlyAttendance,
+} from '../../../../src/modules/stores/payroll-calculation.utils';
+import { countWorkingDaysInMonth } from '../../../../src/modules/stores/working-days.utils';
+
+const facts = (over: Partial<MonthlyAttendanceFacts> = {}): MonthlyAttendanceFacts => ({
+  totalAssignedShifts: 0,
+  completedShifts: 0,
+  workedMinutes: 0,
+  workingHours: 0,
+  daysWorked: 0,
+  lateCount: 0,
+  earlyCount: 0,
+  absentCount: 0,
+  totalLateMinutes: 0,
+  totalEarlyMinutes: 0,
+  ...over,
+});
+
+const completed = (
+  id: string,
+  workDate: string,
+  over: Partial<PayrollAssignmentFact> = {},
+): PayrollAssignmentFact => ({
+  id,
+  workDate,
+  status: ShiftAssignmentStatus.COMPLETED,
+  checkInTime: `${workDate}T01:00:00Z`,
+  workedMinutes: 480,
+  ...over,
+});
+
+const lateRule = {
+  category: PayrollRuleCategory.FINE,
+  ruleType: 'LATE',
+  calcType: PayrollCalcType.PERCENTAGE,
+  value: 1,
+};
+
+describe('computeEarnedBase', () => {
+  const base = { standardWorkingDays: 26, calendarDays: 30 };
+
+  describe('HOUR: rate × hours worked (no ÷176)', () => {
+    it('pays the hours actually worked', () => {
+      const summary = summarizeMonthlyAttendance(
+        [
+          completed('a', '2026-09-01', { workedMinutes: 450 }),
+          completed('b', '2026-09-02', { workedMinutes: 480 }),
+          completed('c', '2026-09-03', { workedMinutes: 300 }),
+        ],
+        '2026-09-30',
+      );
+      const earned = computeEarnedBase({
+        ...base,
+        paymentType: PaymentType.HOUR,
+        rate: 25_000,
+        facts: summary,
+      });
+      expect(earned).toBe(512_500);
+      // The old fallback divided by 176 standard hours.
+      expect(earned).not.toBe(Math.round((25_000 * 20.5) / 176));
+    });
+
+    it('rounds to whole VND once', () => {
+      expect(
+        computeEarnedBase({
+          ...base,
+          paymentType: PaymentType.HOUR,
+          rate: 33_333,
+          facts: facts({ workedMinutes: 70 }),
+        }),
+      ).toBe(38_889);
+    });
+  });
+
+  describe('MONTH: salary ÷ standard working days × distinct days worked', () => {
+    const sept = countWorkingDaysInMonth(2026, 8, [WeekDay.SUNDAY]);
+
+    it('uses the store working days of the month', () => {
+      expect(sept).toBe(26);
+      const pay = (daysWorked: number) =>
+        computeEarnedBase({
+          paymentType: PaymentType.MONTH,
+          rate: 10_000_000,
+          facts: facts({ daysWorked }),
+          standardWorkingDays: sept,
+          calendarDays: 30,
+        });
+      expect(pay(13)).toBe(5_000_000);
+      expect(pay(26)).toBe(10_000_000);
+    });
+
+    it('counts two shifts on one day as one day', () => {
+      const summary = summarizeMonthlyAttendance(
+        [
+          completed('a', '2026-09-02'),
+          completed('b', '2026-09-02'),
+          completed('c', '2026-09-03'),
+        ],
+        '2026-09-30',
+      );
+      expect(summary.completedShifts).toBe(3);
+      expect(summary.daysWorked).toBe(2);
+      expect(
+        computeEarnedBase({
+          paymentType: PaymentType.MONTH,
+          rate: 10_000_000,
+          facts: summary,
+          standardWorkingDays: sept,
+          calendarDays: 30,
+        }),
+      ).toBe(769_231);
+    });
+
+    it('does not count shifts that were not completed', () => {
+      const summary = summarizeMonthlyAttendance(
+        [
+          { id: 'p', workDate: '2026-09-04', status: ShiftAssignmentStatus.PENDING },
+          { id: 'a', workDate: '2026-09-05', status: ShiftAssignmentStatus.APPROVED },
+          { id: 'c', workDate: '2026-09-06', status: ShiftAssignmentStatus.CONFIRMED },
+        ],
+        '2026-09-01',
+      );
+      expect(summary.daysWorked).toBe(0);
+      expect(summary.completedShifts).toBe(0);
+    });
+
+    it('falls back to calendar days without a days-off configuration', () => {
+      expect(countWorkingDaysInMonth(2026, 8, null)).toBe(30);
+      expect(
+        computeEarnedBase({
+          paymentType: PaymentType.MONTH,
+          rate: 10_000_000,
+          facts: facts({ daysWorked: 15 }),
+          standardWorkingDays: 0,
+          calendarDays: 30,
+        }),
+      ).toBe(5_000_000);
+    });
+
+    it('sizes February with a weekend off', () => {
+      expect(countWorkingDaysInMonth(2026, 1, [WeekDay.SATURDAY_SUNDAY])).toBe(20);
+    });
+  });
+
+  it('WEEK: rate × shifts ÷ 6', () => {
+    expect(
+      computeEarnedBase({
+        ...base,
+        paymentType: PaymentType.WEEK,
+        rate: 1_200_000,
+        facts: facts({ completedShifts: 5 }),
+      }),
+    ).toBe(1_000_000);
+  });
+
+  it('SHIFT and DAY: rate × completed shifts', () => {
+    for (const paymentType of [PaymentType.SHIFT, PaymentType.DAY]) {
+      expect(
+        computeEarnedBase({
+          ...base,
+          paymentType,
+          rate: 300_000,
+          facts: facts({ completedShifts: 4 }),
+        }),
+      ).toBe(1_200_000);
+    }
+  });
+
+  it('pays nothing for a zero or invalid rate', () => {
+    expect(
+      computeEarnedBase({
+        ...base,
+        paymentType: PaymentType.SHIFT,
+        rate: Number.NaN,
+        facts: facts({ completedShifts: 4 }),
+      }),
+    ).toBe(0);
+  });
+});
+
+describe('resolvePayrollPaymentType', () => {
+  it('treats a null or unknown payment type as MONTH', () => {
+    expect(resolvePayrollPaymentType(null)).toBe(PaymentType.MONTH);
+    expect(resolvePayrollPaymentType('???')).toBe(PaymentType.MONTH);
+    expect(resolvePayrollPaymentType(PaymentType.HOUR)).toBe(PaymentType.HOUR);
+  });
+
+  it('computes a null-type payslip as MONTH', () => {
+    const slip = computePayslip({
+      paymentType: null,
+      rate: 2_600_000,
+      allowances: null,
+      rules: [],
+      facts: facts({ daysWorked: 1, completedShifts: 1 }),
+      standardWorkingDays: 26,
+      calendarDays: 30,
+      advancePayment: 0,
+    });
+    expect(slip.paymentType).toBe(PaymentType.MONTH);
+    expect(slip.earnedBaseSalary).toBe(100_000);
+  });
+});
+
+describe('summarizeMonthlyAttendance', () => {
+  it('counts a past approved shift without check-in as absent, by Vietnam date', () => {
+    const summary = summarizeMonthlyAttendance(
+      [
+        {
+          id: 'x',
+          workDate: '2026-08-31',
+          status: ShiftAssignmentStatus.APPROVED,
+          checkInTime: null,
+        },
+        {
+          id: 'today',
+          workDate: '2026-09-01',
+          status: ShiftAssignmentStatus.APPROVED,
+          checkInTime: null,
+        },
+        {
+          id: 'marked',
+          workDate: '2026-09-01',
+          status: ShiftAssignmentStatus.APPROVED,
+          attendanceStatus: AttendanceStatus.ABSENT,
+        },
+      ],
+      '2026-09-01',
+    );
+    expect(summary.absentCount).toBe(2);
+  });
+
+  it('never counts a shift covered by approved leave as absent', () => {
+    const summary = summarizeMonthlyAttendance(
+      [
+        {
+          id: 'leave-past',
+          workDate: '2026-08-20',
+          status: ShiftAssignmentStatus.APPROVED,
+          checkInTime: null,
+          leaveCovered: true,
+        },
+        {
+          id: 'leave-marked',
+          workDate: '2026-08-21',
+          status: ShiftAssignmentStatus.APPROVED,
+          attendanceStatus: AttendanceStatus.ABSENT,
+          leaveCovered: true,
+        },
+        {
+          id: 'no-leave',
+          workDate: '2026-08-22',
+          status: ShiftAssignmentStatus.APPROVED,
+          checkInTime: null,
+          leaveCovered: false,
+        },
+      ],
+      '2026-09-01',
+    );
+    expect(summary.absentCount).toBe(1);
+    expect(summary.totalAssignedShifts).toBe(3);
+  });
+
+  it('counts late and early shifts and sums completed minutes', () => {
+    const summary = summarizeMonthlyAttendance(
+      [
+        completed('a', '2026-09-01', { lateMinutes: 5, workedMinutes: 475 }),
+        completed('b', '2026-09-02', { earlyMinutes: 10, workedMinutes: 470 }),
+      ],
+      '2026-09-30',
+    );
+    expect(summary.lateCount).toBe(1);
+    expect(summary.earlyCount).toBe(1);
+    expect(summary.totalLateMinutes).toBe(5);
+    expect(summary.workedMinutes).toBe(945);
+    expect(summary.workingHours).toBe(15.75);
+  });
+});
+
+describe('computeRuleAdjustments', () => {
+  it('applies a percentage late fine per late shift', () => {
+    expect(
+      computeRuleAdjustments([lateRule], facts({ lateCount: 2 }), 5_000_000),
+    ).toEqual({ bonus: 0, penalty: 100_000 });
+  });
+
+  it('applies the absent fine only for AMOUNT rules', () => {
+    const seeded = {
+      category: PayrollRuleCategory.FINE,
+      ruleType: 'ABSENT',
+      calcType: PayrollCalcType.SHIFT,
+      value: 1,
+    };
+    expect(
+      computeRuleAdjustments([seeded], facts({ absentCount: 3 }), 5_000_000).penalty,
+    ).toBe(0);
+    expect(
+      computeRuleAdjustments(
+        [{ ...seeded, calcType: PayrollCalcType.AMOUNT, value: 200_000 }],
+        facts({ absentCount: 3 }),
+        5_000_000,
+      ).penalty,
+    ).toBe(600_000);
+  });
+
+  it('grants the attendance bonus only without lateness or absence', () => {
+    const bonusRule = {
+      category: PayrollRuleCategory.BONUS,
+      ruleType: 'ATTENDANCE',
+      calcType: PayrollCalcType.AMOUNT,
+      value: 300_000,
+    };
+    const worked = { completedShifts: 3 };
+    expect(computeRuleAdjustments([bonusRule], facts(worked), 0).bonus).toBe(300_000);
+    expect(
+      computeRuleAdjustments([bonusRule], facts({ ...worked, lateCount: 1 }), 0).bonus,
+    ).toBe(0);
+    expect(
+      computeRuleAdjustments(
+        [{ ...bonusRule, ruleType: 'GENERAL', value: 100_000 }],
+        facts({ ...worked, lateCount: 1 }),
+        0,
+      ).bonus,
+    ).toBe(100_000);
+  });
+
+  it('pays no attendance or general bonus for a month with no completed shift', () => {
+    const rules = [
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: 'ATTENDANCE',
+        calcType: PayrollCalcType.AMOUNT,
+        value: 200_000,
+      },
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: 'GENERAL',
+        calcType: PayrollCalcType.AMOUNT,
+        value: 100_000,
+      },
+      {
+        category: PayrollRuleCategory.BONUS,
+        ruleType: null as any,
+        calcType: PayrollCalcType.AMOUNT,
+        value: 50_000,
+      },
+    ];
+    expect(computeRuleAdjustments(rules, facts(), 0)).toEqual({
+      bonus: 0,
+      penalty: 0,
+    });
+    const { computeRuleAdjustmentBreakdown: breakdown } = jest.requireActual(
+      '../../../../src/modules/stores/payroll-calculation.utils',
+    );
+    expect(breakdown(rules, facts(), 0)).toEqual([]);
+    // One completed shift is enough.
+    expect(
+      computeRuleAdjustments(rules, facts({ completedShifts: 1 }), 0).bonus,
+    ).toBe(350_000);
+    // A fine is still charged without a completed shift (e.g. absences).
+    expect(
+      computeRuleAdjustments(
+        [
+          {
+            category: PayrollRuleCategory.FINE,
+            ruleType: 'ABSENT',
+            calcType: PayrollCalcType.AMOUNT,
+            value: 100_000,
+          },
+        ],
+        facts({ absentCount: 2 }),
+        0,
+      ).penalty,
+    ).toBe(200_000);
+  });
+});
+
+describe('totals', () => {
+  it('sums allowances to whole VND', () => {
+    expect(sumAllowances({ an: 500_000.4, xang: '300000', bad: 'x' })).toBe(800_000);
+    expect(sumAllowances(null)).toBe(0);
+  });
+
+  it('builds an integer payslip end to end', () => {
+    const slip = computePayslip({
+      paymentType: PaymentType.MONTH,
+      rate: 10_000_000,
+      allowances: { ăn: 500_000 },
+      rules: [lateRule],
+      facts: facts({ daysWorked: 13, completedShifts: 13, lateCount: 2 }),
+      standardWorkingDays: 26,
+      calendarDays: 30,
+      advancePayment: 1_000_000,
+    });
+    expect(slip).toEqual(
+      expect.objectContaining({
+        earnedBaseSalary: 5_000_000,
+        allowancesTotal: 500_000,
+        penalty: 100_000,
+        advancePayment: 1_000_000,
+        totalIncome: 5_500_000,
+        totalDeductions: 1_100_000,
+        netSalary: 4_400_000,
+        workingDays: 13,
+      }),
+    );
+    for (const key of [
+      'earnedBaseSalary',
+      'allowancesTotal',
+      'bonus',
+      'penalty',
+      'advancePayment',
+      'totalIncome',
+      'totalDeductions',
+      'netSalary',
+    ] as const) {
+      expect(Number.isInteger(slip[key])).toBe(true);
+    }
+  });
+
+  it('always includes allowances and floors net at zero', () => {
+    expect(
+      computePayslipTotals({
+        earnedBase: 0,
+        allowancesTotal: 500_000,
+        bonus: 0,
+        penalty: 0,
+        advancePayment: 0,
+      }),
+    ).toEqual({ totalIncome: 500_000, totalDeductions: 0, netSalary: 500_000 });
+    expect(
+      computePayslipTotals({
+        earnedBase: 0,
+        allowancesTotal: 500_000,
+        bonus: 0,
+        penalty: 200_000,
+        advancePayment: 1_000_000,
+      }),
+    ).toEqual({ totalIncome: 500_000, totalDeductions: 1_200_000, netSalary: 0 });
+  });
+});
+
+describe('pickDayOwnerAssignmentIds', () => {
+  it('picks the earliest completed check-in per day, ties by id, order independent', () => {
+    const rows: PayrollAssignmentFact[] = [
+      completed('b', '2026-09-02', { checkInTime: '2026-09-02T05:00:00Z' }),
+      completed('a', '2026-09-02', { checkInTime: '2026-09-02T01:00:00Z' }),
+      completed('z', '2026-09-03', { checkInTime: '2026-09-03T01:00:00Z' }),
+      completed('y', '2026-09-03', { checkInTime: '2026-09-03T01:00:00Z' }),
+      {
+        id: '0',
+        workDate: '2026-09-02',
+        status: ShiftAssignmentStatus.APPROVED,
+        checkInTime: '2026-09-02T00:00:00Z',
+      },
+    ];
+    const expected = new Set(['a', 'y']);
+    expect(pickDayOwnerAssignmentIds(rows)).toEqual(expected);
+    expect(pickDayOwnerAssignmentIds([...rows].reverse())).toEqual(expected);
+  });
+});
+
+describe('computeRuleAdjustmentBreakdown', () => {
+  const { computeRuleAdjustmentBreakdown, computeRuleAdjustments } =
+    jest.requireActual('../../../../src/modules/stores/payroll-calculation.utils');
+  const { PayrollRuleCategory, PayrollCalcType } = jest.requireActual(
+    '../../../../src/modules/stores/entities/store-payroll-rule.entity',
+  );
+
+  const rules = [
+    { category: PayrollRuleCategory.FINE, ruleType: 'LATE', calcType: PayrollCalcType.AMOUNT, value: 50_000 },
+    { category: PayrollRuleCategory.FINE, ruleType: 'EARLY', calcType: PayrollCalcType.PERCENTAGE, value: 0.333 },
+    { category: PayrollRuleCategory.FINE, ruleType: 'ABSENT', calcType: PayrollCalcType.AMOUNT, value: 100_000 },
+    { category: PayrollRuleCategory.BONUS, ruleType: 'ATTENDANCE', calcType: PayrollCalcType.AMOUNT, value: 300_000 },
+    { category: PayrollRuleCategory.BONUS, ruleType: null, calcType: PayrollCalcType.AMOUNT, value: 200_000, name: 'Thưởng lễ' },
+  ];
+
+  it('lines sum exactly to the bonus and penalty totals', () => {
+    const facts = { lateCount: 3, earlyCount: 2, absentCount: 1, completedShifts: 5 };
+    const earned = 7_123_457;
+    const lines = computeRuleAdjustmentBreakdown(rules, facts, earned);
+    const totals = computeRuleAdjustments(rules, facts, earned);
+    const sum = (kind: string) =>
+      lines
+        .filter((line: any) => line.kind === kind)
+        .reduce((total: number, line: any) => total + line.amount, 0);
+    expect(sum('FINE')).toBe(totals.penalty);
+    expect(sum('BONUS')).toBe(totals.bonus);
+    expect(lines).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'FINE', ruleType: 'LATE', label: 'Đi trễ', count: 3, amount: 150_000 }),
+        expect.objectContaining({ kind: 'FINE', ruleType: 'ABSENT', count: 1, amount: 100_000 }),
+        expect.objectContaining({ kind: 'BONUS', ruleType: 'GENERAL', label: 'Thưởng lễ', amount: 200_000 }),
+      ]),
+    );
+    // Attendance bonus not earned with a late arrival.
+    expect(lines.find((line: any) => line.ruleType === 'ATTENDANCE')).toBeUndefined();
+  });
+
+  it('no rule hit gives no line', () => {
+    expect(
+      computeRuleAdjustmentBreakdown(
+        rules.filter((rule) => rule.category === PayrollRuleCategory.FINE),
+        { lateCount: 0, earlyCount: 0, absentCount: 0, completedShifts: 5 },
+        1_000_000,
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe('computeStintSplitEarnedBase (same-month rehire)', () => {
+  // September 2026, 26 standard working days. Previous stint: MONTH
+  // 5,200,000 (200,000 per day worked), terminated on the 5th. Rehired on
+  // the 10th on an HOUR contract at 30,000 per hour.
+  const prior = { paymentType: PaymentType.MONTH, rate: 5_200_000 };
+  const current = { paymentType: PaymentType.HOUR, rate: 30_000 };
+  const month = (over: Partial<PayrollAssignmentFact>[] = []) => [
+    completed('old-1', '2026-09-03', { shiftEarnings: 200_000, ...over[0] }),
+    completed('old-2', '2026-09-04', { shiftEarnings: 200_000, ...over[1] }),
+    completed('new-1', '2026-09-12', { workedMinutes: 240, ...over[2] }),
+  ];
+  const run = (
+    assignments: PayrollAssignmentFact[],
+    priorPricing: typeof prior | null = prior,
+  ) =>
+    computeStintSplitEarnedBase({
+      assignments,
+      stintStartDate: '2026-09-10',
+      todayVn: '2026-09-22',
+      current,
+      prior: priorPricing,
+      standardWorkingDays: 26,
+      calendarDays: 30,
+    });
+
+  it('keeps the stored old pricing and prices the new stint with the new contract', () => {
+    // 200,000 + 200,000 stored, plus 4 h × 30,000 = 120,000.
+    expect(run(month())).toEqual({
+      earnedBase: 520_000,
+      priorStintEarned: 400_000,
+      currentStintEarned: 120_000,
+    });
+    // Repricing the whole month at the new contract would have paid
+    // 20 h × 30,000 = 600,000.
+  });
+
+  it('prices a previous-stint shift without a stored figure with the previous contract', () => {
+    // old-2 has no shiftEarnings: 5,200,000 ÷ 26 × 1 day = 200,000.
+    expect(run(month([{}, { shiftEarnings: null }]))?.earnedBase).toBe(520_000);
+  });
+
+  it('falls back to the current contract when no previous contract is known', () => {
+    // old-2 at 8 h × 30,000 = 240,000.
+    expect(
+      run(month([{}, { shiftEarnings: null }]), null)?.earnedBase,
+    ).toBe(560_000);
+  });
+
+  it('never pays a previous-stint shift that was not completed', () => {
+    const rows = month();
+    rows[1] = { ...rows[1], status: ShiftAssignmentStatus.APPROVED, checkInTime: null };
+    expect(run(rows)?.priorStintEarned).toBe(200_000);
+  });
+
+  it('returns null without a previous-stint shift or without a stint start', () => {
+    expect(run([completed('new-1', '2026-09-12')])).toBeNull();
+    expect(
+      computeStintSplitEarnedBase({
+        assignments: month(),
+        stintStartDate: null,
+        todayVn: '2026-09-22',
+        current,
+        prior,
+        standardWorkingDays: 26,
+        calendarDays: 30,
+      }),
+    ).toBeNull();
+  });
+
+  it('computePayslip uses the split base and applies rules to the whole month', () => {
+    const assignments = month([{ lateMinutes: 10 }]);
+    const split = run(assignments)!;
+    const payslip = computePayslip({
+      paymentType: current.paymentType,
+      rate: current.rate,
+      allowances: null,
+      rules: [
+        {
+          category: PayrollRuleCategory.FINE,
+          ruleType: 'LATE',
+          calcType: PayrollCalcType.AMOUNT,
+          value: 50_000,
+        },
+      ],
+      facts: summarizeMonthlyAttendance(assignments, '2026-09-22'),
+      standardWorkingDays: 26,
+      calendarDays: 30,
+      advancePayment: 0,
+      earnedBaseSalary: split.earnedBase,
+    });
+    // The late arrival was in the previous stint and is still fined.
+    expect(payslip).toMatchObject({
+      earnedBaseSalary: 520_000,
+      penalty: 50_000,
+      totalIncome: 520_000,
+      netSalary: 470_000,
+      workingDays: 3,
+      baseSalary: 30_000,
+      paymentType: PaymentType.HOUR,
+    });
+  });
+});
+
+describe('describeEarnedBase', () => {
+  const base = {
+    standardWorkingDays: 26,
+    calendarDays: 31,
+  };
+
+  it('HOUR: unrounded hours, minutes kept, reproducible with the same rounding', () => {
+    const f = facts({ workedMinutes: 487, completedShifts: 1, daysWorked: 1 });
+    const amount = computeEarnedBase({
+      paymentType: PaymentType.HOUR,
+      rate: 25_000,
+      facts: f,
+      ...base,
+    });
+    expect(amount).toBe(202_917);
+    const b = describeEarnedBase({
+      paymentType: PaymentType.HOUR,
+      rate: 25_000,
+      facts: f,
+      ...base,
+      amount,
+    });
+    expect(b).toEqual({
+      paymentType: 'Giờ',
+      rate: 25_000,
+      rateLabel: 'Lương giờ',
+      rateUnitLabel: 'giờ',
+      quantity: 487 / 60,
+      quantityUnit: 'HOUR',
+      quantityLabel: 'Tổng giờ làm',
+      workedMinutes: 487,
+      divisor: null,
+      divisorLabel: null,
+      amount: 202_917,
+      reproducible: true,
+      mixedRates: false,
+    });
+    expect(b.quantity).toBeCloseTo(8.1166667, 6);
+  });
+
+  it('SHIFT: two shifts on one day count as two', () => {
+    const f = facts({ completedShifts: 2, daysWorked: 1, workedMinutes: 480 });
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 150_000,
+      facts: f,
+      ...base,
+      amount: computeEarnedBase({ paymentType: PaymentType.SHIFT, rate: 150_000, facts: f, ...base }),
+    });
+    expect(b).toMatchObject({
+      paymentType: 'Ca',
+      rateLabel: 'Lương ca',
+      rateUnitLabel: 'ca',
+      quantity: 2,
+      quantityUnit: 'SHIFT',
+      quantityLabel: 'Số ca làm',
+      workedMinutes: null,
+      divisor: null,
+      amount: 300_000,
+      reproducible: true,
+    });
+  });
+
+  it('DAY: completed shifts, no divisor', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.DAY,
+      rate: 300_000,
+      facts: facts({ completedShifts: 3, daysWorked: 3 }),
+      ...base,
+      amount: 900_000,
+    });
+    expect(b).toMatchObject({
+      paymentType: 'Ngày',
+      rateLabel: 'Lương ngày',
+      rateUnitLabel: 'ngày',
+      quantity: 3,
+      quantityUnit: 'SHIFT',
+      divisor: null,
+      reproducible: true,
+    });
+  });
+
+  it('WEEK: divided by 6 working days per week', () => {
+    const f = facts({ completedShifts: 5, daysWorked: 5 });
+    const amount = computeEarnedBase({ paymentType: PaymentType.WEEK, rate: 1_000_000, facts: f, ...base });
+    expect(amount).toBe(833_333);
+    expect(
+      describeEarnedBase({ paymentType: PaymentType.WEEK, rate: 1_000_000, facts: f, ...base, amount }),
+    ).toMatchObject({
+      paymentType: 'Tuần',
+      rateLabel: 'Lương tuần',
+      rateUnitLabel: 'tuần',
+      quantity: 5,
+      quantityUnit: 'SHIFT',
+      divisor: 6,
+      divisorLabel: 'ngày/tuần',
+      amount: 833_333,
+      reproducible: true,
+    });
+  });
+
+  it('MONTH: days worked over the standard working days', () => {
+    const f = facts({ completedShifts: 14, daysWorked: 12 });
+    const amount = computeEarnedBase({
+      paymentType: PaymentType.MONTH,
+      rate: 10_000_000,
+      facts: f,
+      standardWorkingDays: 27,
+      calendarDays: 31,
+    });
+    expect(
+      describeEarnedBase({
+        paymentType: PaymentType.MONTH,
+        rate: 10_000_000,
+        facts: f,
+        standardWorkingDays: 27,
+        calendarDays: 31,
+        amount,
+      }),
+    ).toMatchObject({
+      paymentType: 'Tháng',
+      rateLabel: 'Lương tháng',
+      rateUnitLabel: 'tháng',
+      quantity: 12,
+      quantityUnit: 'DAY',
+      quantityLabel: 'Ngày công',
+      divisor: 27,
+      divisorLabel: 'ngày công chuẩn',
+      amount: Math.round((10_000_000 * 12) / 27),
+      reproducible: true,
+    });
+  });
+
+  it('MONTH: falls back to calendar days when there is no standard', () => {
+    const f = facts({ daysWorked: 10 });
+    const input = { paymentType: PaymentType.MONTH, rate: 9_300_000, facts: f, standardWorkingDays: 0, calendarDays: 31 };
+    const amount = computeEarnedBase(input);
+    expect(amount).toBe(3_000_000);
+    expect(describeEarnedBase({ ...input, amount })).toMatchObject({
+      divisor: 31,
+      quantity: 10,
+      reproducible: true,
+    });
+  });
+
+  it('mixed rates (same-month stint split) are flagged and never reproducible', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 100_000,
+      facts: facts({ completedShifts: 3 }),
+      ...base,
+      amount: 300_000,
+      mixedRates: true,
+    });
+    expect(b.mixedRates).toBe(true);
+    expect(b.reproducible).toBe(false);
+  });
+
+  it('a stored amount priced at another rate is not reproducible; decimal strings become numbers', () => {
+    const b = describeEarnedBase({
+      paymentType: 'Giờ',
+      rate: '30000.00',
+      facts: facts({ workedMinutes: 600 }),
+      ...base,
+      amount: '250000.00',
+    });
+    expect(b.rate).toBe(30_000);
+    expect(b.amount).toBe(250_000);
+    expect(b.reproducible).toBe(false);
+    expect(
+      describeEarnedBase({
+        paymentType: 'Giờ',
+        rate: '25000.00',
+        facts: facts({ workedMinutes: 600 }),
+        ...base,
+        amount: '250000.00',
+      }).reproducible,
+    ).toBe(true);
+  });
+
+  it('missing facts: kept, but not reproducible', () => {
+    const b = describeEarnedBase({
+      paymentType: PaymentType.SHIFT,
+      rate: 100_000,
+      facts: null,
+      ...base,
+      amount: 0,
+    });
+    expect(b).toMatchObject({ quantity: 0, amount: 0, reproducible: false });
+  });
+});
+
+describe('describePayslipTotals', () => {
+  it('derives the design totals from the returned figures', () => {
+    expect(
+      describePayslipTotals({
+        totalIncome: 2_000_000,
+        advancePayment: 500_000,
+        penalty: 100_000,
+        otherDeductions: 50_000,
+        netSalary: 1_350_000,
+      }),
+    ).toEqual({
+      incomeAfterAdvance: 1_500_000,
+      deductionsExcludingAdvance: 150_000,
+      extraDeductions: 0,
+      isNetClamped: false,
+    });
+  });
+
+  it('flags a net clamped to zero', () => {
+    const totals = computePayslipTotals({
+      earnedBase: 100_000,
+      allowancesTotal: 0,
+      bonus: 0,
+      penalty: 150_000,
+      advancePayment: 20_000,
+    });
+    expect(totals.netSalary).toBe(0);
+    expect(
+      describePayslipTotals({ ...totals, penalty: 150_000, advancePayment: 20_000, otherDeductions: 0 }),
+    ).toEqual({
+      incomeAfterAdvance: 80_000,
+      deductionsExcludingAdvance: 150_000,
+      extraDeductions: 0,
+      isNetClamped: true,
+    });
+  });
+
+  it('converts stored decimal strings to numbers', () => {
+    expect(
+      describePayslipTotals({
+        totalIncome: '1600000.00',
+        advancePayment: '100000.00',
+        penalty: '0.00',
+        otherDeductions: null,
+        netSalary: '1500000.00',
+      }),
+    ).toEqual({
+      incomeAfterAdvance: 1_500_000,
+      deductionsExcludingAdvance: 0,
+      extraDeductions: 0,
+      isNetClamped: false,
+    });
+  });
+});

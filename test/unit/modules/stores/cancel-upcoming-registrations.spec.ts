@@ -1,0 +1,278 @@
+import { ForbiddenException } from '@nestjs/common';
+import { Brackets } from 'typeorm';
+
+import { StoresService } from '../../../../src/modules/stores/stores.service';
+import { ShiftAssignmentStatus } from '../../../../src/modules/stores/entities/shift-management.entity';
+
+/**
+ * A "fixed" registration fans out into one ShiftAssignment per matching slot
+ * with nothing linking them, so switching the fixed schedule off cannot delete
+ * a registration record — there isn't one. It withdraws the caller's own
+ * self-registered shifts that have not started yet (PENDING, or APPROVED by
+ * the owner later), never an owner assignment, and never anything worked.
+ */
+const STORE = 'store-1';
+const PROFILE = 'profile-1';
+const ACCOUNT = 'account-1';
+// 2026-09-22 10:00 in Vietnam (03:00 UTC).
+const NOW = new Date('2026-09-22T03:00:00Z');
+
+type Row = {
+  id: string;
+  status: ShiftAssignmentStatus;
+  workDate: string;
+  slotStartTime: string | null;
+  shiftStartTime: string | null;
+};
+
+/** Flattens nested Brackets into the SQL fragments and parameters used. */
+function collect(sink: { clauses: string[]; params: Record<string, unknown> }) {
+  const qb: any = {};
+  const add = (clause: unknown, params?: Record<string, unknown>) => {
+    if (clause instanceof Brackets) {
+      clause.whereFactory(collect(sink));
+    } else {
+      sink.clauses.push(String(clause));
+    }
+    Object.assign(sink.params, params ?? {});
+    return qb;
+  };
+  qb.where = jest.fn(add);
+  qb.andWhere = jest.fn(add);
+  qb.orWhere = jest.fn(add);
+  return qb;
+}
+
+function build(profile: unknown, rows: Row[] = []) {
+  const service = Object.create(StoresService.prototype) as any;
+  const sink = { clauses: [] as string[], params: {} as Record<string, unknown> };
+  const builder = collect(sink);
+  for (const m of ['innerJoin', 'leftJoin', 'select', 'addSelect']) {
+    builder[m] = jest.fn(() => builder);
+  }
+  builder.getRawMany = jest.fn().mockResolvedValue(rows);
+  service.logger = { error: jest.fn() };
+  service.profileRepository = { findOne: jest.fn().mockResolvedValue(profile) };
+  service.shiftAssignmentRepository = {
+    createQueryBuilder: jest.fn(() => builder),
+    update: jest.fn().mockResolvedValue({ affected: rows.length }),
+  };
+  service.shiftReminderService = {
+    cancelAssignmentReminders: jest.fn().mockResolvedValue(undefined),
+  };
+  return { service, sink };
+}
+
+const row = (over: Partial<Row>): Row => ({
+  id: 'a1',
+  status: ShiftAssignmentStatus.PENDING,
+  workDate: '2026-09-23',
+  slotStartTime: null,
+  shiftStartTime: '08:00:00',
+  ...over,
+});
+
+describe('cancelUpcomingShiftRegistrations', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('cancels the caller’s pending and later-approved self-registrations', async () => {
+    const { service } = build({ id: PROFILE }, [
+      row({ id: 'pending' }),
+      row({ id: 'approved', status: ShiftAssignmentStatus.APPROVED }),
+    ]);
+
+    const result = await service.cancelUpcomingShiftRegistrations(
+      STORE,
+      PROFILE,
+      ACCOUNT,
+    );
+
+    expect(result).toEqual({ cancelled: 2 });
+    const [criteria, changes] = service.shiftAssignmentRepository.update.mock.calls[0];
+    expect(criteria.id.value).toEqual(['pending', 'approved']);
+    // Guarded: rows checked in or decided meanwhile are not touched.
+    expect(criteria.status.value).toEqual([
+      ShiftAssignmentStatus.PENDING,
+      ShiftAssignmentStatus.APPROVED,
+    ]);
+    expect(criteria.checkInTime.type).toBe('isNull');
+    expect(changes).toEqual({ status: ShiftAssignmentStatus.CANCELLED });
+    // Only approved rows had reminders.
+    expect(service.shiftReminderService.cancelAssignmentReminders).toHaveBeenCalledWith([
+      'approved',
+    ]);
+  });
+
+  it('selects only self-registrations: PENDING, or APPROVED after insert and not owner notes', async () => {
+    const { service, sink } = build({ id: PROFILE }, []);
+
+    await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(sink.clauses).toEqual(
+      expect.arrayContaining([
+        'a.employeeId = :employeeProfileId',
+        'cycle.storeId = :storeId',
+        'a.checkInTime IS NULL',
+        'slot.workDate >= :today',
+        'a.status = :pending',
+        'a.status = :approved',
+        "a.updated_at > a.created_at + interval '2 seconds'",
+        '(a.note IS NULL OR a.note NOT IN (:...ownerNotes))',
+      ]),
+    );
+    expect(sink.params).toMatchObject({
+      pending: ShiftAssignmentStatus.PENDING,
+      approved: ShiftAssignmentStatus.APPROVED,
+      ownerNotes: ['Owner assigned during shift creation', 'Auto-assigned from cycle'],
+      // Vietnam day, not the server's.
+      today: '2026-09-22',
+    });
+    // The old broad "every APPROVED row" filter is gone.
+    expect(sink.clauses).not.toContain('a.status = :status');
+  });
+
+  it('uses the Vietnam date just after midnight VN (still yesterday in UTC)', async () => {
+    jest.setSystemTime(new Date('2026-09-21T17:30:00Z')); // 00:30 VN on 22/09
+    const { service, sink } = build({ id: PROFILE }, []);
+
+    await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(sink.params.today).toBe('2026-09-22');
+  });
+
+  it('keeps shifts that already started today (VN time)', async () => {
+    const { service } = build({ id: PROFILE }, [
+      // 08:00 VN today: started at 10:00 VN.
+      row({ id: 'started', workDate: '2026-09-22', shiftStartTime: '08:00:00' }),
+      // Slot override 18:00 today: not started.
+      row({ id: 'tonight', workDate: '2026-09-22', slotStartTime: '18:00' }),
+    ]);
+
+    const result = await service.cancelUpcomingShiftRegistrations(
+      STORE,
+      PROFILE,
+      ACCOUNT,
+    );
+
+    expect(result).toEqual({ cancelled: 1 });
+    const [criteria] = service.shiftAssignmentRepository.update.mock.calls[0];
+    expect(criteria.id.value).toEqual(['tonight']);
+  });
+
+  it('narrows to one work shift when asked', async () => {
+    const { service, sink } = build({ id: PROFILE }, []);
+
+    await service.cancelUpcomingShiftRegistrations(
+      STORE,
+      PROFILE,
+      ACCOUNT,
+      'workshift-9',
+    );
+
+    expect(sink.params.workShiftId).toBe('workshift-9');
+  });
+
+  it('writes nothing when there is nothing upcoming', async () => {
+    const { service } = build({ id: PROFILE }, []);
+
+    const result = await service.cancelUpcomingShiftRegistrations(
+      STORE,
+      PROFILE,
+      ACCOUNT,
+    );
+
+    expect(result).toEqual({ cancelled: 0 });
+    expect(service.shiftAssignmentRepository.update).not.toHaveBeenCalled();
+  });
+
+  // Self-service only: the profile must belong to the authenticated account.
+  it('refuses to cancel someone else’s shifts', async () => {
+    const { service } = build(null);
+
+    await expect(
+      service.cancelUpcomingShiftRegistrations(STORE, PROFILE, 'another-account'),
+    ).rejects.toThrow(ForbiddenException);
+    expect(service.shiftAssignmentRepository.update).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A seat a staff member gives back by withdrawing their own upcoming
+ * registrations is announced to the store's other staff (free-seat path,
+ * throttled, one aggregated notice); termination and owner rejections are not.
+ */
+describe('cancelUpcomingShiftRegistrations — announces the freed seats', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('announces the withdrawn, not-started slots, excluding the person who withdrew', async () => {
+    const { service } = build({ id: PROFILE }, [
+      { ...row({ id: 'a1' }), slotId: 'slot-1' } as Row,
+      { ...row({ id: 'a2', status: ShiftAssignmentStatus.APPROVED }), slotId: 'slot-2' } as Row,
+      // Already started: not withdrawn, so not announced.
+      {
+        ...row({ id: 'a3', workDate: '2026-09-22', shiftStartTime: '08:00:00' }),
+        slotId: 'slot-3',
+      } as Row,
+    ]);
+    service.announceFreeSeatsOfSlots = jest.fn().mockResolvedValue(undefined);
+
+    const result = await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(result).toEqual({ cancelled: 2 });
+    expect(service.announceFreeSeatsOfSlots).toHaveBeenCalledTimes(1);
+    expect(service.announceFreeSeatsOfSlots).toHaveBeenCalledWith(
+      ['slot-1', 'slot-2'],
+      'self_cancelled',
+      [PROFILE],
+    );
+  });
+
+  it('announces nothing when nothing was withdrawn', async () => {
+    const { service } = build({ id: PROFILE }, []);
+    service.announceFreeSeatsOfSlots = jest.fn().mockResolvedValue(undefined);
+
+    await service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT);
+
+    expect(service.announceFreeSeatsOfSlots).not.toHaveBeenCalled();
+  });
+
+  it('an announcement failure never fails the withdrawal', async () => {
+    const { service } = build({ id: PROFILE }, [
+      { ...row({ id: 'a1' }), slotId: 'slot-1' } as Row,
+    ]);
+    service.announceFreeSeatsOfSlots = jest.fn().mockRejectedValue(new Error('x'));
+
+    await expect(
+      service.cancelUpcomingShiftRegistrations(STORE, PROFILE, ACCOUNT),
+    ).resolves.toEqual({ cancelled: 1 });
+  });
+});
+
+describe('termination / rehire cancellation does not announce', () => {
+  beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
+  afterEach(() => jest.useRealTimers());
+
+  it('cancelFutureShiftAssignments cancels without any free-seat notice', async () => {
+    const service = Object.create(StoresService.prototype) as any;
+    service.announceFreeSeatsOfSlot = jest.fn();
+    service.announceFreeSeatsOfSlots = jest.fn();
+    const builder: any = {};
+    for (const m of ['innerJoin', 'leftJoin', 'select', 'addSelect', 'where', 'andWhere']) {
+      builder[m] = jest.fn(() => builder);
+    }
+    builder.getRawMany = jest.fn().mockResolvedValue([
+      { id: 'a1', workDate: '2026-09-23', slotStartTime: null, shiftStartTime: '08:00:00' },
+    ]);
+    const repo = { createQueryBuilder: jest.fn(() => builder), update: jest.fn() };
+    const manager = { getRepository: jest.fn(() => repo) };
+
+    const ids = await service.cancelFutureShiftAssignments(manager, PROFILE, NOW);
+
+    expect(ids).toEqual(['a1']);
+    expect(repo.update).toHaveBeenCalled();
+    expect(service.announceFreeSeatsOfSlot).not.toHaveBeenCalled();
+    expect(service.announceFreeSeatsOfSlots).not.toHaveBeenCalled();
+  });
+});

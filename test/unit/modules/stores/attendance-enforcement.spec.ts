@@ -1,0 +1,232 @@
+import { TimekeepingRequirement } from '../../../../src/modules/stores/entities/store-shift-config.entity';
+import {
+  describeAttendanceViolation,
+  evaluateAttendanceRules,
+  evaluateFacelessAttendance,
+  resolveAttendanceEnforcementMode,
+  type AttendanceRuleInput,
+  type FacelessAttendanceInput,
+} from '../../../../src/modules/stores/attendance-enforcement';
+
+const STORE = 'store-1';
+
+const base = (over: Partial<AttendanceRuleInput> = {}): AttendanceRuleInput => ({
+  requirement: TimekeepingRequirement.LOCATION_QR_GPS_FACEID,
+  requireQrScan: true,
+  requireLocation: true,
+  attendanceRadius: 50,
+  expectedStoreId: STORE,
+  qrStoreId: STORE,
+  hasLocationFix: true,
+  distanceMeters: 10,
+  ...over,
+});
+
+describe('resolveAttendanceEnforcementMode', () => {
+  it('defaults to off so a deploy cannot lock anyone out', () => {
+    expect(resolveAttendanceEnforcementMode({})).toBe('off');
+    expect(resolveAttendanceEnforcementMode({ ATTENDANCE_ENFORCEMENT_MODE: '' })).toBe('off');
+    expect(resolveAttendanceEnforcementMode({ ATTENDANCE_ENFORCEMENT_MODE: 'off' })).toBe('off');
+  });
+
+  it('accepts enforce', () => {
+    expect(
+      resolveAttendanceEnforcementMode({ ATTENDANCE_ENFORCEMENT_MODE: 'enforce' }),
+    ).toBe('enforce');
+  });
+
+  it('rejects anything else rather than silently disabling enforcement', () => {
+    expect(() =>
+      resolveAttendanceEnforcementMode({ ATTENDANCE_ENFORCEMENT_MODE: 'true' }),
+    ).toThrow(/must be/);
+  });
+});
+
+describe('evaluateAttendanceRules', () => {
+  it('passes a compliant request', () => {
+    expect(evaluateAttendanceRules(base())).toEqual([]);
+  });
+
+  // Regression: the QR step was `if (options?.qrStoreId && storeId)`, so simply
+  // omitting the field skipped store verification entirely.
+  it('rejects a missing QR when the store requires one', () => {
+    expect(evaluateAttendanceRules(base({ qrStoreId: null }))).toEqual(['QR_REQUIRED']);
+  });
+
+  it('rejects a QR from another store', () => {
+    expect(evaluateAttendanceRules(base({ qrStoreId: 'store-2' }))).toEqual(['QR_MISMATCH']);
+  });
+
+  it('checks a supplied QR even when the store does not require one', () => {
+    expect(
+      evaluateAttendanceRules(base({ requireQrScan: false, qrStoreId: 'store-2' })),
+    ).toEqual(['QR_MISMATCH']);
+  });
+
+  it('allows a missing QR when the store does not require one', () => {
+    expect(evaluateAttendanceRules(base({ requireQrScan: false, qrStoreId: null }))).toEqual([]);
+  });
+
+  it('does not ask for QR under a GPS-only policy', () => {
+    expect(
+      evaluateAttendanceRules(
+        base({ requirement: TimekeepingRequirement.GPS_ONLY, qrStoreId: null }),
+      ),
+    ).toEqual([]);
+  });
+
+  // Regression: GPS was recorded but explicitly "never blocked".
+  it('rejects a missing location fix when the store requires one', () => {
+    expect(
+      evaluateAttendanceRules(base({ hasLocationFix: false, distanceMeters: null })),
+    ).toEqual(['LOCATION_REQUIRED']);
+  });
+
+  it('rejects a fix outside the configured radius', () => {
+    expect(evaluateAttendanceRules(base({ distanceMeters: 120 }))).toEqual(['OUT_OF_RANGE']);
+  });
+
+  it('accepts a fix exactly on the radius boundary', () => {
+    expect(evaluateAttendanceRules(base({ distanceMeters: 50 }))).toEqual([]);
+  });
+
+  it('exempts employees listed as location exceptions', () => {
+    expect(
+      evaluateAttendanceRules(base({ locationExempt: true, hasLocationFix: false })),
+    ).toEqual([]);
+    expect(
+      evaluateAttendanceRules(base({ locationExempt: true, distanceMeters: 5000 })),
+    ).toEqual([]);
+  });
+
+  it('does not ask for location under a QR-only policy', () => {
+    expect(
+      evaluateAttendanceRules(
+        base({ requirement: TimekeepingRequirement.QR_ONLY, hasLocationFix: false }),
+      ),
+    ).toEqual([]);
+  });
+
+  it('ignores a non-positive radius', () => {
+    expect(evaluateAttendanceRules(base({ attendanceRadius: 0, distanceMeters: 9999 }))).toEqual([]);
+  });
+
+  it('reports every broken rule at once', () => {
+    expect(
+      evaluateAttendanceRules(base({ qrStoreId: null, hasLocationFix: false })),
+    ).toEqual(['QR_REQUIRED', 'LOCATION_REQUIRED']);
+  });
+
+  it('falls back to the strictest policy when settings are absent', () => {
+    expect(
+      evaluateAttendanceRules({
+        expectedStoreId: STORE,
+        hasLocationFix: false,
+      }),
+    ).toEqual(['QR_REQUIRED', 'LOCATION_REQUIRED']);
+  });
+});
+
+describe('GPS_QR mode in the face-photo rules', () => {
+  it('asks for both QR and location', () => {
+    expect(
+      evaluateAttendanceRules(
+        base({
+          requirement: TimekeepingRequirement.GPS_QR,
+          qrStoreId: null,
+          hasLocationFix: false,
+        }),
+      ),
+    ).toEqual(['QR_REQUIRED', 'LOCATION_REQUIRED']);
+  });
+});
+
+describe('evaluateFacelessAttendance (GPS + QR, no FaceID)', () => {
+  const faceless = (
+    over: Partial<FacelessAttendanceInput> = {},
+  ): FacelessAttendanceInput => ({
+    requirement: TimekeepingRequirement.GPS_QR,
+    attendanceRadius: 50,
+    qrStoreId: STORE,
+    expectedStoreId: STORE,
+    hasLocationFix: true,
+    storeHasLocation: true,
+    distanceMeters: 20,
+    ...over,
+  });
+
+  it('accepts the store QR within the radius', () => {
+    expect(evaluateFacelessAttendance(faceless())).toEqual([]);
+  });
+
+  // "Chỉ QR" checks in without a face now (QR only).
+  it('needs a face photo in the modes that use FaceID or GPS alone', () => {
+    for (const requirement of [
+      TimekeepingRequirement.LOCATION_QR_GPS_FACEID,
+      TimekeepingRequirement.GPS_ONLY,
+      null,
+    ]) {
+      expect(evaluateFacelessAttendance(faceless({ requirement }))).toEqual([
+        'FACE_REQUIRED',
+      ]);
+    }
+  });
+
+  it('requires the QR of this store', () => {
+    expect(evaluateFacelessAttendance(faceless({ qrStoreId: null }))).toEqual([
+      'QR_REQUIRED',
+    ]);
+    expect(
+      evaluateFacelessAttendance(faceless({ qrStoreId: 'other-store' })),
+    ).toEqual(['QR_MISMATCH']);
+  });
+
+  it('requires a location fix inside the radius', () => {
+    expect(
+      evaluateFacelessAttendance(
+        faceless({ hasLocationFix: false, distanceMeters: null }),
+      ),
+    ).toEqual(['LOCATION_REQUIRED']);
+    expect(evaluateFacelessAttendance(faceless({ distanceMeters: 51 }))).toEqual(
+      ['OUT_OF_RANGE'],
+    );
+  });
+
+  it('treats a non-finite distance as no location', () => {
+    for (const distanceMeters of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(evaluateFacelessAttendance(faceless({ distanceMeters }))).toEqual([
+        'LOCATION_REQUIRED',
+      ]);
+    }
+  });
+
+  it('uses 50 m when the store saved no radius', () => {
+    expect(
+      evaluateFacelessAttendance(
+        faceless({ attendanceRadius: null, distanceMeters: 49 }),
+      ),
+    ).toEqual([]);
+    expect(
+      evaluateFacelessAttendance(
+        faceless({ attendanceRadius: null, distanceMeters: 60 }),
+      ),
+    ).toEqual(['OUT_OF_RANGE']);
+  });
+
+  it('refuses when the store has no coordinates to measure against', () => {
+    expect(
+      evaluateFacelessAttendance(
+        faceless({ storeHasLocation: false, distanceMeters: null }),
+      ),
+    ).toEqual(['STORE_LOCATION_MISSING']);
+  });
+
+  it('explains each refusal in Vietnamese', () => {
+    expect(describeAttendanceViolation('FACE_REQUIRED')).toBe(
+      'Cửa hàng yêu cầu xác thực khuôn mặt khi chấm công.',
+    );
+    expect(describeAttendanceViolation('STORE_LOCATION_MISSING')).toMatch(
+      /chưa thiết lập vị trí/,
+    );
+  });
+});

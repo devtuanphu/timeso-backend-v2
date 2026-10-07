@@ -95,18 +95,19 @@
       "json",
       "ts"
     ],
-    "rootDir": "src",
+    "rootDir": ".",
+    "roots": [
+      "<rootDir>/test/unit"
+    ],
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
       "^.+\\.(t|j)s$": "ts-jest"
     },
     "collectCoverageFrom": [
-      "**/*.(t|j)s",
-      "!**/*.spec.ts",
-      "!**/*.e2e-spec.ts",
-      "!**/*.dto.ts",
-      "!**/entities/**",
-      "!main.ts"
+      "src/**/*.(t|j)s",
+      "!src/**/*.dto.ts",
+      "!src/**/entities/**",
+      "!src/main.ts"
     ],
     "coveragePathIgnorePatterns": [
       "/node_modules/",
@@ -114,7 +115,7 @@
       "/entities/",
       "/dto/"
     ],
-    "coverageDirectory": "../coverage",
+    "coverageDirectory": "./coverage",
     "testEnvironment": "node"
   }
 }
