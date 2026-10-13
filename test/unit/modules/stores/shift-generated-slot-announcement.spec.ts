@@ -276,7 +276,19 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
   beforeEach(() => jest.useFakeTimers().setSystemTime(NOW));
   afterEach(() => jest.useRealTimers());
 
-  const build = (firstDaySlots: any[], existingTomorrow: any[] = []) => {
+  // NOW is 00:25 on 22/09 in Vietnam: the run covers 22/09 (today) and
+  // 23/09 (tomorrow). In the steady state today's slots were made by the
+  // previous night's run, so only tomorrow is new.
+  const TODAY = '2026-09-22';
+  const TOMORROW = '2026-09-23';
+  const build = (
+    firstDaySlots: any[],
+    existingTomorrow: any[] = [],
+    {
+      todayGenerated = true,
+      cycle = { id: 'c1', storeId: 'store-1', startDate: '2026-09-01' } as any,
+    } = {},
+  ) => {
     const service = Object.create(StoresService.prototype) as any;
     service.logger = {
       warn: jest.fn(),
@@ -288,11 +300,7 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
     for (const m of ['leftJoinAndSelect', 'where', 'andWhere']) {
       builder[m] = jest.fn(() => builder);
     }
-    builder.getMany = jest
-      .fn()
-      .mockResolvedValue([
-        { id: 'c1', storeId: 'store-1', startDate: '2026-09-01' },
-      ]);
+    builder.getMany = jest.fn().mockResolvedValue([cycle]);
     service.workCycleRepository = {
       createQueryBuilder: jest.fn(() => builder),
     };
@@ -306,7 +314,11 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
       ),
       find: jest.fn(async (entity: unknown, options: any) => {
         if (entity !== ShiftSlot) return [];
-        return options.relations ? firstDaySlots : existingTomorrow;
+        if (options.relations) return firstDaySlots;
+        if (options.where.workDate === TODAY) {
+          return todayGenerated ? [{ id: 'today-existing' }] : [];
+        }
+        return options.where.workDate === TOMORROW ? existingTomorrow : [];
       }),
       create: jest.fn((_e: unknown, value: any) => ({ ...value })),
       save: jest.fn(async (_e: unknown, value: any) =>
@@ -388,6 +400,54 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
     ]);
   });
 
+  it('a day without slots yet (new cycle, first run after deploy) gets today and tomorrow', async () => {
+    const service = build([template({})], [], { todayGenerated: false });
+
+    const result = await service.generateDailySlotsForAllCycles();
+
+    expect(result.createdSlots).toBe(2);
+    const savedDates = service.dataSource.transaction.mock.calls.length;
+    expect(savedDates).toBe(2);
+    const announced = service.notifyEmployeesOfCreatedShifts.mock.calls.flatMap(
+      (call: any[]) => call[1],
+    );
+    expect(announced.map((slot: any) => slot.workDate).sort()).toEqual([
+      TODAY,
+      TOMORROW,
+    ]);
+  });
+
+  it('never generates a day before the cycle starts or after it ends', async () => {
+    const startsTomorrow = build([template({})], [], {
+      todayGenerated: false,
+      cycle: { id: 'c1', storeId: 'store-1', startDate: TOMORROW },
+    });
+    await expect(
+      startsTomorrow.generateDailySlotsForAllCycles(),
+    ).resolves.toEqual({ processedCycles: 1, createdSlots: 1 });
+    expect(
+      startsTomorrow.notifyEmployeesOfCreatedShifts.mock.calls[0][1][0]
+        .workDate,
+    ).toBe(TOMORROW);
+
+    const endsToday = build([template({})], [], {
+      todayGenerated: false,
+      cycle: {
+        id: 'c1',
+        storeId: 'store-1',
+        startDate: '2026-09-01',
+        endDate: TODAY,
+      },
+    });
+    await expect(endsToday.generateDailySlotsForAllCycles()).resolves.toEqual({
+      processedCycles: 1,
+      createdSlots: 1,
+    });
+    expect(
+      endsToday.notifyEmployeesOfCreatedShifts.mock.calls[0][1][0].workDate,
+    ).toBe(TODAY);
+  });
+
   it('already generated tomorrow: nothing created, nothing announced', async () => {
     const service = build([template({})], [{ id: 'existing' }]);
 
@@ -429,11 +489,11 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
     const [p1, p2] = calls;
     // p1 holds the morning seat: told only about the evening one.
     expect(p1.content).toBe(
-      'Cửa hàng vừa mở Ca sáng hôm nay (22/09) (18:00–22:00). Vào đăng ký ngay nhé!',
+      'Cửa hàng vừa mở Ca sáng ngày mai (23/09) (18:00–22:00). Vào đăng ký ngay nhé!',
     );
     expect(p2.title).toBe('Có ca mới để đăng ký');
     expect(p2.content).toBe(
-      'Cửa hàng vừa mở 2 ca mới, hôm nay (22/09). Vào đăng ký ngay nhé!',
+      'Cửa hàng vừa mở 2 ca mới, ngày mai (23/09). Vào đăng ký ngay nhé!',
     );
     expect(p2.metadata).toEqual(
       expect.objectContaining({ type: 'SHIFT_CREATED', storeId: 'store-1' }),
@@ -488,8 +548,10 @@ describe('generateDailySlotsForAllCycles — announces free copied slots', () =>
       { id: 'c2', storeId: 'store-2', startDate: '2026-09-01' },
     ]);
     const first = service.dataSource.transaction.getMockImplementation();
+    // c1 runs two days (today already generated, tomorrow created); c2 fails.
     service.dataSource.transaction = jest
       .fn()
+      .mockImplementationOnce(first)
       .mockImplementationOnce(first)
       .mockRejectedValueOnce(new Error('cycle c2 failed'));
 

@@ -1,4 +1,4 @@
-import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
+import { Entity, Column, ManyToOne, JoinColumn, Index } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { EmployeeProfile } from './employee-profile.entity';
 import { StoreLadder } from './store-ladder.entity';
@@ -25,6 +25,10 @@ export interface CriteriaSnapshotItem {
  * đây không được lưu ở đâu cả.
  */
 @Entity('employee_career_events')
+@Index('ux_employee_career_events_request', ['employeeProfileId', 'clientRequestId'], {
+  unique: true,
+  where: 'client_request_id IS NOT NULL',
+})
 export class EmployeeCareerEvent extends BaseEntity {
   @Column({ name: 'employee_profile_id' })
   employeeProfileId: string;
@@ -33,12 +37,13 @@ export class EmployeeCareerEvent extends BaseEntity {
   @JoinColumn({ name: 'employee_profile_id' })
   employeeProfile: EmployeeProfile;
 
-  @Column({ name: 'ladder_id' })
-  ladderId: string;
+  /** Null với sự kiện của lộ trình v2 (subjectType + toTargetId). */
+  @Column({ name: 'ladder_id', type: 'uuid', nullable: true })
+  ladderId: string | null;
 
-  @ManyToOne(() => StoreLadder, { onDelete: 'CASCADE' })
+  @ManyToOne(() => StoreLadder, { onDelete: 'CASCADE', nullable: true })
   @JoinColumn({ name: 'ladder_id' })
-  ladder: StoreLadder;
+  ladder: StoreLadder | null;
 
   @Column({ name: 'from_rung_id', type: 'uuid', nullable: true })
   fromRungId: string | null;
@@ -47,12 +52,31 @@ export class EmployeeCareerEvent extends BaseEntity {
   @JoinColumn({ name: 'from_rung_id' })
   fromRung: StoreLadderRung | null;
 
-  @Column({ name: 'to_rung_id' })
-  toRungId: string;
+  @Column({ name: 'to_rung_id', type: 'uuid', nullable: true })
+  toRungId: string | null;
 
-  @ManyToOne(() => StoreLadderRung, { onDelete: 'RESTRICT' })
+  @ManyToOne(() => StoreLadderRung, { onDelete: 'RESTRICT', nullable: true })
   @JoinColumn({ name: 'to_rung_id' })
-  toRung: StoreLadderRung;
+  toRung: StoreLadderRung | null;
+
+  /**
+   * Lộ trình v2: chủ thể của bước (bộ phận / vị trí / kỹ năng) và id đích /
+   * nguồn trong bảng của chủ thể đó. Sự kiện lộ trình vị trí / kỹ năng cũ cũng
+   * mang các cột này (migration + CareerLadderService), nên "vào vị trí hiện
+   * tại từ lúc nào" chỉ đọc một nguồn.
+   */
+  @Column({ name: 'subject_type', type: 'varchar', length: 16, nullable: true })
+  subjectType: 'department' | 'position' | 'skill' | null;
+
+  @Column({ name: 'from_target_id', type: 'uuid', nullable: true })
+  fromTargetId: string | null;
+
+  @Column({ name: 'to_target_id', type: 'uuid', nullable: true })
+  toTargetId: string | null;
+
+  /** Chống gửi lặp: unique theo (hồ sơ, clientRequestId). */
+  @Column({ name: 'client_request_id', type: 'varchar', length: 64, nullable: true })
+  clientRequestId: string | null;
 
   @Column({ name: 'effective_at', type: 'timestamp' })
   effectiveAt: Date;

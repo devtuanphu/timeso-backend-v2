@@ -27,6 +27,7 @@ import {
   currentStintSql,
   stintStartVnDate,
 } from '../stores/employment-stint.utils';
+import { vnDateString } from '../../common/utils/vn-calendar';
 
 @Injectable()
 export class AiReportsService {
@@ -483,34 +484,53 @@ export class AiReportsService {
     );
     const totalLossValue = cancelledLoss + promotionLoss;
 
-    // 5. Calculate loss trend (compare with previous period)
+    // 5. Trends against the previous period of the same length. Each counts
+    // the same thing in both periods: cancelled items, and items sold at a
+    // discount. lossTrend used to divide cancelled items by the previous
+    // period's cancelled *money* / 100,000 ("Estimate"), mixing units.
     const periodLength = end.getTime() - start.getTime();
     const prevEnd = new Date(start.getTime() - 1);
     const prevStart = new Date(prevEnd.getTime() - periodLength);
-
-    const prevCancelledLoss = await this.orderRepository
-      .createQueryBuilder('o')
-      .select('SUM(o."totalAmount")', 'total')
-      .where('o.store_id = :storeId', { storeId })
-      .andWhere('o.created_at BETWEEN :start AND :end', {
-        start: prevStart,
-        end: prevEnd,
-      })
-      .andWhere('o.status = :cancelled', { cancelled: OrderStatus.CANCELLED })
-      .setParameter('cancelled', OrderStatus.CANCELLED)
-      .getRawOne();
-
-    const currentCancelledCount = cancelledProductsData.reduce(
-      (sum, p) => sum + parseInt(p.count || '0'),
-      0,
-    );
-    const prevCancelledCount =
-      parseInt(prevCancelledLoss?.total || '0') / 100000; // Estimate
-    const lossTrend =
-      prevCancelledCount > 0
-        ? ((currentCancelledCount - prevCancelledCount) / prevCancelledCount) *
-          100
-        : 0;
+    const countItems = async (
+      from: Date,
+      to: Date,
+      kind: 'cancelled' | 'discounted',
+    ) => {
+      const query = this.orderRepository
+        .createQueryBuilder('o')
+        .innerJoin('o.items', 'item')
+        .select('COUNT(item.id)', 'count')
+        .where('o.store_id = :storeId', { storeId })
+        .andWhere('o.created_at BETWEEN :start AND :end', {
+          start: from,
+          end: to,
+        });
+      if (kind === 'cancelled') {
+        query.andWhere('o.status = :cancelled', {
+          cancelled: OrderStatus.CANCELLED,
+        });
+      } else {
+        query
+          .andWhere('o.status = :completed', {
+            completed: OrderStatus.COMPLETED,
+          })
+          .andWhere('o."discountAmount" > 0');
+      }
+      return parseInt((await query.getRawOne())?.count || '0');
+    };
+    const [cancelledNow, cancelledBefore, discountedNow, discountedBefore] =
+      await Promise.all([
+        countItems(start, end, 'cancelled'),
+        countItems(prevStart, prevEnd, 'cancelled'),
+        countItems(start, end, 'discounted'),
+        countItems(prevStart, prevEnd, 'discounted'),
+      ]);
+    const change = (current: number, previous: number) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return Math.round(((current - previous) / previous) * 100 * 10) / 10;
+    };
+    const lossTrend = change(cancelledNow, cancelledBefore);
+    const promotionTrend = change(discountedNow, discountedBefore);
 
     // 6. Format response to match frontend types
     const cancelledProducts = cancelledProductsData.map((p) => ({
@@ -558,6 +578,7 @@ export class AiReportsService {
         lowProfitProducts: [],
         totalLossValue: 0,
         lossTrend: 0,
+        promotionTrend: 0,
         insight: 'Chưa có dữ liệu phân tích cho kỳ này.',
       };
     }
@@ -567,7 +588,10 @@ export class AiReportsService {
       promotionProducts,
       lowProfitProducts: lowProfitFormatted,
       totalLossValue,
-      lossTrend: Math.round(lossTrend * 10) / 10,
+      // % change in cancelled items vs the previous period (sign kept).
+      lossTrend,
+      // % change in items sold at a discount vs the previous period.
+      promotionTrend,
       insight,
     };
   }
@@ -621,6 +645,39 @@ export class AiReportsService {
         profitMargin,
       };
     });
+
+    // Against the previous period of the same length: items sold and profit,
+    // for the "so với hôm qua" badges (the app showed a fixed 11.2%).
+    const periodLength = end.getTime() - start.getTime();
+    const prevEnd = new Date(start.getTime() - 1);
+    const prevStart = new Date(prevEnd.getTime() - periodLength);
+    const previousTotals = await this.orderRepository
+      .createQueryBuilder('o')
+      .innerJoin('o.items', 'item')
+      .select('SUM(item.quantity)', 'quantity')
+      .addSelect('SUM(item."totalPrice")', 'revenue')
+      .addSelect('SUM(item."totalCost")', 'cost')
+      .where('o.store_id = :storeId', { storeId })
+      .andWhere('o.created_at BETWEEN :start AND :end', {
+        start: prevStart,
+        end: prevEnd,
+      })
+      .andWhere('o.status = :completed', { completed: OrderStatus.COMPLETED })
+      .getRawOne();
+    const change = (current: number, previous: number) => {
+      if (previous === 0) return current > 0 ? 100 : 0;
+      return Math.round(((current - previous) / previous) * 100 * 10) / 10;
+    };
+    const soldNow = productMetrics.reduce((sum, p) => sum + p.quantity, 0);
+    const profitNow = productMetrics.reduce((sum, p) => sum + p.profit, 0);
+    const soldBefore = parseInt(previousTotals?.quantity || '0');
+    const profitBefore =
+      parseFloat(previousTotals?.revenue || '0') -
+      parseFloat(previousTotals?.cost || '0');
+    const comparison = {
+      soldChange: change(soldNow, soldBefore),
+      profitChange: change(profitNow, profitBefore),
+    };
 
     // 2. Top selling products (by quantity)
     const sortedByQuantity = [...productMetrics].sort(
@@ -763,6 +820,7 @@ export class AiReportsService {
         bestSellingShifts: [],
         highlight: 'Chưa có dữ liệu cho kỳ này.',
         insight: 'Chưa có dữ liệu phân tích cho kỳ này.',
+        comparison,
       };
     }
 
@@ -773,6 +831,7 @@ export class AiReportsService {
       bestSellingShifts,
       highlight,
       insight,
+      comparison,
     };
   }
 
@@ -948,6 +1007,10 @@ export class AiReportsService {
   async getAIAnalysisSummary(storeId: string): Promise<AIAnalysisSummary> {
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    // Vietnam calendar days of the window, taken before the local-time
+    // boundaries below (toISOString of a local midnight is the previous day at +07).
+    const startDay = vnDateString(thirtyDaysAgo);
+    const endDay = vnDateString(now);
     const startDate = new Date(thirtyDaysAgo);
     startDate.setHours(0, 0, 0, 0);
     const endDate = new Date(now);
@@ -1027,8 +1090,8 @@ export class AiReportsService {
         status: ShiftAssignmentStatus.COMPLETED,
       })
       .andWhere('slot.work_date BETWEEN :start AND :end', {
-        start: startDate.toISOString().split('T')[0],
-        end: endDate.toISOString().split('T')[0],
+        start: startDay,
+        end: endDay,
       })
       .groupBy('ws.shiftName')
       .addGroupBy('ws.startTime')
@@ -1140,6 +1203,10 @@ export class AiReportsService {
       ? new Date(startDate)
       : new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
 
+    // Vietnam calendar days of the window, taken before the local-time
+    // boundaries below (toISOString of a local midnight is the previous day at +07).
+    const startDay = vnDateString(start);
+    const endDay = vnDateString(end);
     end.setHours(23, 59, 59, 999);
     start.setHours(0, 0, 0, 0);
 
@@ -1197,8 +1264,8 @@ export class AiReportsService {
         status: ShiftAssignmentStatus.COMPLETED,
       })
       .andWhere('slot.work_date BETWEEN :start AND :end', {
-        start: start.toISOString().split('T')[0],
-        end: end.toISOString().split('T')[0],
+        start: startDay,
+        end: endDay,
       })
       .groupBy('e.id')
       .addGroupBy('slot.work_date')
@@ -1281,8 +1348,8 @@ export class AiReportsService {
     return {
       employees,
       period: {
-        startDate: start.toISOString().split('T')[0],
-        endDate: end.toISOString().split('T')[0],
+        startDate: startDay,
+        endDate: endDay,
       },
       summary: {
         totalRevenue: employees.reduce((sum, e) => sum + e.revenue, 0),
@@ -1317,6 +1384,10 @@ export class AiReportsService {
       ? new Date(startDate)
       : new Date(end.getTime() - 7 * 24 * 60 * 60 * 1000);
 
+    // Vietnam calendar days of the window, taken before the local-time
+    // boundaries below (toISOString of a local midnight is the previous day at +07).
+    const startDay = vnDateString(start);
+    const endDay = vnDateString(end);
     end.setHours(23, 59, 59, 999);
     start.setHours(0, 0, 0, 0);
 
@@ -1360,8 +1431,8 @@ export class AiReportsService {
         status: ShiftAssignmentStatus.COMPLETED,
       })
       .andWhere('slot.work_date BETWEEN :start AND :end', {
-        start: start.toISOString().split('T')[0],
-        end: end.toISOString().split('T')[0],
+        start: startDay,
+        end: endDay,
       })
       .groupBy('slot.work_date')
       .addGroupBy('ws.shiftName')
@@ -1462,7 +1533,7 @@ export class AiReportsService {
     // Build daily data
     const dailyDataMap: Record<string, ShiftDailyData> = {};
     orderStats.forEach((stat) => {
-      const dateStr = new Date(stat.date).toISOString().split('T')[0];
+      const dateStr = vnDateString(new Date(stat.date));
       const dayLabel = dayMap[stat.dayOfWeek] || stat.dayOfWeek;
 
       if (!dailyDataMap[dateStr]) {
@@ -1504,8 +1575,8 @@ export class AiReportsService {
         shifts: [],
         dailyData: [],
         period: {
-          startDate: start.toISOString().split('T')[0],
-          endDate: end.toISOString().split('T')[0],
+          startDate: startDay,
+          endDate: endDay,
         },
         summary: {
           totalRevenue: 0,
@@ -1524,8 +1595,8 @@ export class AiReportsService {
       shifts,
       dailyData,
       period: {
-        startDate: start.toISOString().split('T')[0],
-        endDate: end.toISOString().split('T')[0],
+        startDate: startDay,
+        endDate: endDay,
       },
       summary: {
         totalRevenue: shifts.reduce((sum, s) => sum + s.revenue, 0),

@@ -5,13 +5,14 @@ jest.mock('../../../../src/common/utils/multer-config', () => ({
   identityImageUrl: (filename: string) => `/api/accounts/identity/image/${filename}`,
 }));
 
-import { StoresController } from '../../../../src/modules/stores/stores.controller';
+import { buildStoreRoutes } from '../../../support/store-route-controllers';
 
 describe('StoresController owner report forwarding', () => {
   const storesService = {
     getPayrollSummary: jest.fn(),
     getDailyReportByDateForOwner: jest.fn(),
     getRevenueReport: jest.fn(),
+    getExpenseReport: jest.fn(),
     getHomeRevenueSummary: jest.fn(),
     getShiftRegistrations: jest.fn(),
     getShiftChangeRequestsByStore: jest.fn(),
@@ -23,7 +24,7 @@ describe('StoresController owner report forwarding', () => {
     cancelShiftChangeRequest: jest.fn(),
     getApprovalStats: jest.fn(),
   };
-  const controller = new StoresController(
+  const controller = buildStoreRoutes(
     storesService as any,
     {} as any,
     {} as any,
@@ -158,7 +159,9 @@ describe('StoresController owner report forwarding', () => {
     );
   });
 
-  it('forwards legacy revenue dates and the authenticated account id', async () => {
+  // Was `new Date('2026-07-22')` = UTC midnight = 07:00 in Vietnam, which
+  // dropped each range's first 7 hours of orders.
+  it('forwards HCM half-open revenue-report bounds and the account id', async () => {
     storesService.getRevenueReport.mockResolvedValueOnce({});
 
     await controller.getRevenueReport('store-1', '2026-07-22', '2026-07-22', {
@@ -167,10 +170,31 @@ describe('StoresController owner report forwarding', () => {
 
     expect(storesService.getRevenueReport).toHaveBeenCalledWith(
       'store-1',
-      new Date('2026-07-22'),
-      new Date('2026-07-22'),
+      new Date('2026-07-21T17:00:00.000Z'),
+      new Date('2026-07-22T17:00:00.000Z'),
       'staff-1',
     );
+  });
+
+  it('forwards HCM half-open expense-report bounds', async () => {
+    storesService.getExpenseReport.mockResolvedValueOnce({});
+
+    await controller.getExpenseReport('store-1', '2026-07-01', '2026-07-22');
+
+    expect(storesService.getExpenseReport).toHaveBeenCalledWith(
+      'store-1',
+      new Date('2026-06-30T17:00:00.000Z'),
+      new Date('2026-07-22T17:00:00.000Z'),
+    );
+  });
+
+  it('rejects a malformed report date with 400 instead of querying', async () => {
+    await expect(
+      controller.getRevenueReport('store-1', '2026-07-22T10:00:00Z', '', {
+        userId: 'staff-1',
+      }),
+    ).rejects.toThrow('startDate phải có định dạng YYYY-MM-DD hợp lệ');
+    expect(storesService.getRevenueReport).not.toHaveBeenCalled();
   });
 
   it('forwards HCM half-open Home revenue bounds and owner id', async () => {

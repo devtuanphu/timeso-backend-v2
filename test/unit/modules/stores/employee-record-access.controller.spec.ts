@@ -22,7 +22,10 @@ import {
 
 import { CareerLadderService } from '../../../../src/modules/stores/career-ladder.service';
 import { EmploymentStatus } from '../../../../src/modules/stores/entities/employee-profile.entity';
-import { StoresController } from '../../../../src/modules/stores/stores.controller';
+import {
+  buildStoreRoutes,
+  StoreRoutes,
+} from '../../../support/store-route-controllers';
 import { StoresService } from '../../../../src/modules/stores/stores.service';
 
 const PROFILES: Record<string, any> = {
@@ -121,7 +124,7 @@ function build() {
   const shiftEndWorkflowService = {
     markOvertimePending: jest.fn().mockResolvedValue(undefined),
   };
-  const controller = new StoresController(
+  const controller = buildStoreRoutes(
     storesService,
     {} as any,
     {} as any,
@@ -132,7 +135,7 @@ function build() {
   return { controller, storesService, careerLadderService, shiftEndWorkflowService };
 }
 
-type Call = (c: StoresController, profileId: string, user: any) => Promise<unknown>;
+type Call = (c: StoreRoutes, profileId: string, user: any) => Promise<unknown>;
 
 const ROUTES: Array<[string, Call]> = [
   ['GET employees/:profileId', (c, p, u) => c.getEmployeeById(p, u)],

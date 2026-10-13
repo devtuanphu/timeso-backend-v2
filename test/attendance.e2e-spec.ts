@@ -2,7 +2,7 @@ import { CanActivate, INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bullmq';
 import request from 'supertest';
-import { StoresController } from '../src/modules/stores/stores.controller';
+import { STORE_ROUTE_CONTROLLERS } from './support/store-route-controllers';
 import { StoresService } from '../src/modules/stores/stores.service';
 import { StoreAccessGuard } from '../src/modules/stores/guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../src/modules/stores/guards/store-resource-access.guard';
@@ -138,7 +138,8 @@ describe('Attendance flow (e2e)', () => {
       },
     };
     const moduleRef = await Test.createTestingModule({
-      controllers: [StoresController],
+      // Every controller that serves StoresController's routes, in router order.
+      controllers: STORE_ROUTE_CONTROLLERS,
       providers: [
         { provide: StoresService, useValue: storesService },
         { provide: AccountsService, useValue: {} },

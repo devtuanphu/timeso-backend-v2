@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as zlib from 'zlib';
 
 /**
  * Extract text content and {{placeholder}} patterns from a DOCX file.
@@ -46,7 +47,6 @@ export function extractTextFromDocxBuffer(buffer: Buffer): string {
         xmlData = zipBin.slice(dataOffset, dataOffset + compressedSize);
       } else if (compression === 8) {
         // Deflated
-        const zlib = require('zlib');
         try {
           xmlData = zlib.inflateRawSync(
             zipBin.slice(dataOffset, dataOffset + compressedSize),
@@ -83,7 +83,7 @@ function extractTextFromXml(xml: string): string {
   for (const para of paraMatches) {
     const texts = para.match(/<w:t[^>]*>([^<]*)<\/w:t>/g) ?? [];
     const line = texts
-      .map((t) => t.replace(/<w:t[^>]*>/, '').replace('<\/w:t>', ''))
+      .map((t) => t.replace(/<w:t[^>]*>/, '').replace('</w:t>', ''))
       .join('');
     if (line.trim()) paraText.push(line);
   }

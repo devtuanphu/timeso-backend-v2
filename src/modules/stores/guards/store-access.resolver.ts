@@ -1,12 +1,16 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, QueryFailedError, Repository } from 'typeorm';
 
 import {
   EMPLOYED_STATUSES,
   EmployeeProfile,
 } from '../entities/employee-profile.entity';
 import { Store } from '../entities/store.entity';
+
+const isInvalidUuidError = (error: unknown): boolean =>
+  error instanceof QueryFailedError &&
+  (error as QueryFailedError & { code?: string }).code === '22P02';
 
 /**
  * The single definition of "may this account act on this store".
@@ -29,10 +33,19 @@ export class StoreAccessResolver {
 
   /** Returns true, or throws. Never returns false. */
   async assertAccess(storeId: string, accountId: string): Promise<boolean> {
-    const store = await this.storeRepository.findOne({
-      where: { id: storeId },
-      select: ['id', 'ownerAccountId'],
-    });
+    const store = await this.storeRepository
+      .findOne({
+        where: { id: storeId },
+        select: ['id', 'ownerAccountId'],
+      })
+      .catch((error: unknown) => {
+        // A malformed id (not a uuid) makes Postgres reject the query (22P02).
+        // It can name no store, so answer as for a missing one instead of
+        // leaking a driver error as a 500 — the rule StoreResourceLocator
+        // already applies to sub-resource ids.
+        if (isInvalidUuidError(error)) return null;
+        throw error;
+      });
     // 404 before 403, so a non-existent store and a foreign one are
     // indistinguishable to someone entitled to neither.
     if (!store) {

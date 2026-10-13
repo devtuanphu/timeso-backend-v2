@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository } from 'typeorm';
 import { randomUUID } from 'crypto';
+import { vnDateString } from '../../common/utils/vn-calendar';
 import {
   ShiftAssignment,
   ShiftAssignmentStatus,
@@ -709,8 +710,6 @@ export class ShiftReminderService {
   ): Promise<{ candidates: number }> {
     const windowHours = options.windowHours ?? 48;
     const limit = Math.min(Math.max(options.limit ?? 2000, 1), 5000);
-    const vnDate = (instant: Date) =>
-      new Date(instant.getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
     const until = new Date(now.getTime() + windowHours * 3_600_000);
     const rows: Array<{ id: string }> = await this.assignmentRepository
       .createQueryBuilder('sa')
@@ -727,8 +726,8 @@ export class ShiftReminderService {
       .andWhere('cycle.status = :cycleStatus', {
         cycleStatus: WorkCycleStatus.ACTIVE,
       })
-      .andWhere('slot.workDate >= :from', { from: vnDate(now) })
-      .andWhere('slot.workDate <= :to', { to: vnDate(until) })
+      .andWhere('slot.workDate >= :from', { from: vnDateString(now) })
+      .andWhere('slot.workDate <= :to', { to: vnDateString(until) })
       .orderBy('slot.workDate', 'ASC')
       .addOrderBy('sa.id', 'ASC')
       .limit(limit)

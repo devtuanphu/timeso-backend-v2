@@ -1,4 +1,5 @@
 import { describeWorkDate } from '../../common/utils/relative-day';
+import { formatVnMoney } from '../../common/utils/money';
 import { formatDurationVi } from './attendance-time.utils';
 
 /** What an employee asked for, as the owner is told about it. */
@@ -56,8 +57,7 @@ const ddmm = (ymd?: string | null): string | null => {
   return match ? `${match[3]}/${match[2]}` : null;
 };
 
-const money = (amount: number): string =>
-  `${Math.round(amount).toLocaleString('vi-VN')}đ`;
+const money = (amount: number): string => formatVnMoney(Math.round(amount));
 
 /**
  * Title and text of the owner's notification for a new request — the kind,

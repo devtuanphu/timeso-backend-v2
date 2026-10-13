@@ -1,3 +1,4 @@
+import { vnClockHHmm } from '../../common/utils/vn-calendar';
 import { effectiveWindowOf } from './attendance-time.utils';
 import { leaveCoversShift } from './leave-coverage.utils';
 
@@ -79,9 +80,7 @@ export interface ApproverLookup {
   owner: { accountId: string | null; name: string | null };
 }
 
-const VN_OFFSET_MS = 7 * 3_600_000;
-const clockOf = (at: Date | null): string | null =>
-  at ? new Date(at.getTime() + VN_OFFSET_MS).toISOString().slice(11, 16) : null;
+const clockOf = (at: Date | null): string | null => (at ? vnClockHHmm(at) : null);
 const hhmm = (value?: string | null): string | null => {
   const match = /^(\d{1,2}):(\d{2})/.exec(String(value ?? ''));
   return match ? `${match[1].padStart(2, '0')}:${match[2]}` : null;

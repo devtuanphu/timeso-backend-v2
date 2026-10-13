@@ -13,7 +13,7 @@ import { AccountsService } from '../src/modules/accounts/accounts.service';
 import { JwtAuthGuard } from '../src/modules/auth/guards/jwt-auth.guard';
 import { JwtStrategy } from '../src/modules/auth/strategies/jwt.strategy';
 import { MailService } from '../src/modules/mail/mail.service';
-import { StoresController } from '../src/modules/stores/stores.controller';
+import { STORE_ROUTE_CONTROLLERS } from './support/store-route-controllers';
 import { ShiftEndWorkflowService } from '../src/modules/stores/shift-end-workflow.service';
 import {
   ShiftAssignment,
@@ -269,7 +269,8 @@ describe('Unified shift schedule flow (e2e)', () => {
     };
 
     const moduleRef = await Test.createTestingModule({
-      controllers: [StoresController],
+      // Every controller that serves StoresController's routes, in router order.
+      controllers: STORE_ROUTE_CONTROLLERS,
       providers: [
         { provide: StoresService, useValue: storesService },
         { provide: AccountsService, useValue: {} },
@@ -736,7 +737,8 @@ describe('Unified shift schedule authentication boundary (e2e)', () => {
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
       imports: [PassportModule],
-      controllers: [StoresController],
+      // Every controller that serves StoresController's routes, in router order.
+      controllers: STORE_ROUTE_CONTROLLERS,
       providers: [
         JwtStrategy,
         JwtAuthGuard,

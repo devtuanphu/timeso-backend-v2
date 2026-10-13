@@ -572,7 +572,7 @@ export class ShiftAggregationService {
     
     const startTimeStr = slot.startTime || slot.workShift?.startTime || '00:00:00';
     const endTimeStr = slot.endTime || slot.workShift?.endTime || '00:00:00';
-    let startMs = new Date(`1970-01-01T${startTimeStr}Z`).getTime();
+    const startMs = new Date(`1970-01-01T${startTimeStr}Z`).getTime();
     let endMs = new Date(`1970-01-01T${endTimeStr}Z`).getTime();
     if (endMs < startMs) endMs += 24 * 60 * 60 * 1000;
     const durationHours = (endMs - startMs) / 3600000;
@@ -1229,7 +1229,7 @@ export class ShiftAggregationService {
     const startTime = slot.startTime || slot.workShift?.startTime || '';
     const endTime = slot.endTime || slot.workShift?.endTime || '';
     if (!startTime || !endTime) return 0;
-    let start = new Date(`1970-01-01T${startTime}Z`).getTime();
+    const start = new Date(`1970-01-01T${startTime}Z`).getTime();
     let end = new Date(`1970-01-01T${endTime}Z`).getTime();
     if (Number.isNaN(start) || Number.isNaN(end)) return 0;
     if (end < start) end += 24 * 60 * 60 * 1000;
@@ -1999,7 +1999,7 @@ export class ShiftAggregationService {
   private formatDateVn(dateInput: string | Date): string {
     let dateStr = '';
     if (dateInput instanceof Date) {
-      dateStr = dateInput.toISOString().split('T')[0];
+      dateStr = vnDateString(dateInput);
     } else {
       dateStr = String(dateInput);
     }
@@ -2338,7 +2338,7 @@ export class ShiftAggregationService {
 
     // Map Attendance Logs
     for (const log of attendanceLogs) {
-      const isCheckIn = log.type === 'CHECK_IN';
+      const isCheckIn = log.type === AttendanceLogType.CHECK_IN;
       const sa = log.shiftAssignment;
       const ws = sa?.shiftSlot?.workShift;
       const slot = sa?.shiftSlot;
@@ -2381,8 +2381,8 @@ export class ShiftAggregationService {
       const ws = sa.shiftSlot?.workShift;
       const slot = sa.shiftSlot;
 
-      let type: 'SHIFT_REGISTER' = 'SHIFT_REGISTER';
-      let title = 'Đăng ký ca làm';
+      const type = 'SHIFT_REGISTER' as const;
+      const title = 'Đăng ký ca làm';
       let statusText = 'Chờ duyệt';
       let statusColor = '#F79009'; // Yellow/Orange
       let hasWarningIcon = false;
@@ -2464,13 +2464,13 @@ export class ShiftAggregationService {
       let type: 'LEAVE' | 'LATE' | 'EARLY' | 'OVERTIME' | 'SUDDEN' = 'LEAVE';
       let title = 'Xin nghỉ phép';
 
-      if (lr.type === 'LATE') {
+      if (lr.type === LeaveType.LATE) {
         type = 'LATE';
         title = 'Xin đi trễ';
-      } else if (lr.type === 'EARLY') {
+      } else if (lr.type === LeaveType.EARLY) {
         type = 'EARLY';
         title = 'Xin về sớm';
-      } else if (lr.type === 'OVERTIME') {
+      } else if (lr.type === LeaveType.OVERTIME) {
         type = 'OVERTIME';
         title = 'Xin tăng ca';
       } else if (lr.type === LeaveType.SUDDEN) {
@@ -2482,14 +2482,14 @@ export class ShiftAggregationService {
       let statusColor = '#F79009';
       let hasWarningIcon = false;
 
-      if (lr.status === 'PENDING') {
+      if (lr.status === LeaveRequestStatus.PENDING) {
         statusText = 'Chờ duyệt';
         statusColor = '#F79009';
         hasWarningIcon = true;
-      } else if (lr.status === 'APPROVED') {
+      } else if (lr.status === LeaveRequestStatus.APPROVED) {
         statusText = 'Đã duyệt';
         statusColor = '#12B76A';
-      } else if (lr.status === 'REJECTED') {
+      } else if (lr.status === LeaveRequestStatus.REJECTED) {
         statusText = 'Đã từ chối';
         statusColor = '#F04438';
       } else {

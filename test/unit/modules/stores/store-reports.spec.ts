@@ -210,6 +210,7 @@ describe('Store Reports Module', () => {
   let dailyReportRepo: ReturnType<typeof mockRepo>;
   let orderRepo: ReturnType<typeof mockRepo>;
   let orderItemRepo: ReturnType<typeof mockRepo>;
+  let workShiftRepo: ReturnType<typeof mockRepo>;
 
   beforeEach(async () => {
     const repoMap = new Map<any, ReturnType<typeof mockRepo>>();
@@ -225,6 +226,7 @@ describe('Store Reports Module', () => {
     dailyReportRepo = repoMap.get(DailyEmployeeReport)!;
     orderRepo = repoMap.get(Order)!;
     orderItemRepo = repoMap.get(OrderItem)!;
+    workShiftRepo = repoMap.get(WorkShift)!;
     storeRepo.findOne.mockResolvedValue({
       id: 'store-1',
       ownerAccountId: 'owner-1',
@@ -327,11 +329,25 @@ describe('Store Reports Module', () => {
         addSelect: jest.fn().mockReturnThis(),
         groupBy: jest.fn().mockReturnThis(),
         orderBy: jest.fn().mockReturnThis(),
-        getRawOne: jest.fn().mockResolvedValueOnce(mockSummary),
+        getRawOne: jest
+          .fn()
+          .mockResolvedValueOnce(mockSummary)
+          // The previous period (same length, just before) for `comparison`.
+          .mockResolvedValueOnce({
+            totalRevenue: '50000',
+            totalCost: '50000',
+            totalTax: '0',
+            totalOrders: '4',
+          }),
         getRawMany: jest
           .fn()
           .mockResolvedValueOnce(mockDaily)
-          .mockResolvedValueOnce([]), // day breakdown and byType
+          .mockResolvedValueOnce([]) // day breakdown and byType
+          // Completed revenue per minute of the day, for byShift.
+          .mockResolvedValueOnce([
+            { minute: '08:30', revenue: '60000', orders: '1' },
+            { minute: '23:10', revenue: '40000', orders: '1' },
+          ]),
       };
 
       orderRepo.createQueryBuilder.mockImplementation(() => qbStore as any);
@@ -356,10 +372,23 @@ describe('Store Reports Module', () => {
         () => qbItemStore as any,
       );
 
+      workShiftRepo.find.mockResolvedValueOnce([
+        {
+          id: 'shift-morning',
+          shiftName: 'Ca sáng',
+          startTime: '06:00:00',
+          endTime: '14:00:00',
+          colorCode: '#FEB273',
+        },
+      ]);
+
+      // One VN day, half-open: [2026-07-22 00:00 VN, 2026-07-23 00:00 VN).
+      const start = new Date('2026-07-21T17:00:00.000Z');
+      const endExclusive = new Date('2026-07-22T17:00:00.000Z');
       const result = await service.getRevenueReport(
         'store-1',
-        new Date(),
-        new Date(),
+        start,
+        endExclusive,
         'owner-1',
       );
 
@@ -373,10 +402,72 @@ describe('Store Reports Module', () => {
         quantity: 10,
         revenue: 50000,
       });
-      expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(3);
-      expect(qbStore.andWhere).toHaveBeenCalledWith(
-        'o.created_at BETWEEN :startDate AND :endDate',
-        expect.any(Object),
+      expect(orderRepo.createQueryBuilder).toHaveBeenCalledTimes(5);
+      // Summary, daily and by-type queries all use the same half-open range,
+      // never an inclusive BETWEEN stretched to 23:59:59.999 server time; the
+      // fourth is the previous day, ending where this range starts.
+      const rangeCalls = qbStore.andWhere.mock.calls.filter(([sql]) =>
+        String(sql).includes('o.created_at'),
+      );
+      const half = 'o.created_at >= :startDate AND o.created_at < :endDate';
+      const equals = (a: unknown, b: unknown) =>
+        JSON.stringify(a) === JSON.stringify(b);
+      const current = [half, { startDate: start, endDate: endExclusive }];
+      const previousDay = [
+        half,
+        { startDate: new Date('2026-07-20T17:00:00.000Z'), endDate: start },
+      ];
+      expect(rangeCalls).toHaveLength(5);
+      expect(rangeCalls.filter((call) => equals(call, current))).toHaveLength(
+        4,
+      );
+      expect(
+        rangeCalls.filter((call) => equals(call, previousDay)),
+      ).toHaveLength(1);
+      // 08:30 falls in the morning shift; 23:10 in none.
+      expect(result.byShift).toEqual([
+        {
+          shiftId: 'shift-morning',
+          name: 'Ca sáng',
+          startTime: '06:00',
+          endTime: '14:00',
+          colorCode: '#FEB273',
+          revenue: 60000,
+          orders: 1,
+        },
+        {
+          shiftId: null,
+          name: 'Ngoài ca',
+          startTime: null,
+          endTime: null,
+          colorCode: null,
+          revenue: 40000,
+          orders: 1,
+        },
+      ]);
+      expect(workShiftRepo.find).toHaveBeenCalledWith({
+        where: { storeId: 'store-1', isActive: true },
+        order: { startTime: 'ASC', id: 'ASC' },
+      });
+      expect(result).not.toHaveProperty('expenseBreakdown');
+      // 100000 vs 50000 revenue, 40000 vs 0 profit, 5 vs 4 orders.
+      expect(result.comparison).toEqual({
+        previousPeriod: { start: '2026-07-21', end: '2026-07-21' },
+        previousTotals: {
+          totalRevenue: 50000,
+          totalCost: 50000,
+          totalProfit: 0,
+          totalOrders: 4,
+          successOrders: 0,
+        },
+        revenueChange: 100,
+        costChange: 0,
+        profitChange: 100,
+        ordersChange: 25,
+      });
+      expect(qbItemStore.andWhere).toHaveBeenCalledWith(
+        'o.created_at >= :startDate AND o.created_at < :endDate',
+        { startDate: start, endDate: endExclusive },
       );
     });
 
@@ -456,6 +547,8 @@ describe('Store Reports Module', () => {
         totalCost: '50000',
         totalTax: '10000',
         totalOrders: '5',
+        successOrders: '4',
+        failedOrders: '1',
       });
       orderRepo.createQueryBuilder.mockReturnValueOnce(qb);
 
@@ -472,6 +565,8 @@ describe('Store Reports Module', () => {
           totalOrders: 5,
           totalProfit: 40000,
           totalCost: 50000,
+          successOrders: 4,
+          failedOrders: 1,
         },
       });
       expect(qb.andWhere).toHaveBeenCalledWith(

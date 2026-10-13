@@ -141,6 +141,8 @@ function build(
   service.shiftQb = shiftQb;
   service.dataSource = {
     getRepository: jest.fn(() => ({ createQueryBuilder: () => shiftQb })),
+    // Cờ lộ trình v2 của cửa hàng: chưa bật.
+    manager: { query: jest.fn().mockResolvedValue([]) },
   };
   service.notificationsService = { create: jest.fn() };
 

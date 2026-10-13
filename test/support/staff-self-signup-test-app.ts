@@ -56,7 +56,7 @@ import {
 } from '../../src/modules/stores/entities/store.entity';
 import { WorkShift } from '../../src/modules/stores/entities/work-shift.entity';
 import { ShiftEndWorkflowService } from '../../src/modules/stores/shift-end-workflow.service';
-import { StoresController } from '../../src/modules/stores/stores.controller';
+import { STORE_ROUTE_CONTROLLERS } from './store-route-controllers';
 import { StoreAccessGuard } from '../../src/modules/stores/guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../../src/modules/stores/guards/store-resource-access.guard';
 import { StoreOwnerOnlyGuard } from '../../src/modules/stores/guards/store-owner-only.guard';
@@ -492,7 +492,7 @@ export async function createStaffSignupTestApp(
       controllers: [
         AuthController,
         AccountsController,
-        StoresController,
+        ...STORE_ROUTE_CONTROLLERS,
         StaffSignupTestControlController,
       ],
       providers: [

@@ -125,12 +125,23 @@ describe('recordEntryCareerEvents', () => {
         ladderId: 'ladder-type',
         fromRungId: null,
         toRungId: 'rung-probation',
+        // Lộ trình hình thức làm việc không có chủ thể v2.
+        subjectType: null,
+        fromTargetId: null,
+        toTargetId: null,
         effectiveAt: HIRED,
         decidedByAccountId: null,
         criteriaSnapshot: null,
         note: 'Vào làm',
       },
-      expect.objectContaining({ ladderId: 'ladder-role', toRungId: 'rung-barista' }),
+      // Lộ trình vị trí mang chủ thể v2: "vào vị trí từ lúc nào" đọc một nguồn.
+      expect.objectContaining({
+        ladderId: 'ladder-role',
+        toRungId: 'rung-barista',
+        subjectType: 'position',
+        fromTargetId: null,
+        toTargetId: 'role-barista',
+      }),
     ]);
   });
 

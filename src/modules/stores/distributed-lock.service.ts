@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import * as os from 'os';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource, EntityManager } from 'typeorm';
@@ -218,7 +219,6 @@ export class DistributedLockService implements OnModuleInit {
 
   private getInstanceId(): string {
     // Unique per process instance (hostname + pid + random suffix)
-    const os = require('os');
     return `${os.hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   }
 

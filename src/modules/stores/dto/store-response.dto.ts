@@ -1,5 +1,15 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { IsEnum, IsOptional, IsString, IsNotEmpty, IsBoolean, IsDateString, IsNumber } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  IsArray,
+  IsInt,
+  IsObject,
+  Max,
+  Min,
+  ValidateNested,
+} from 'class-validator';
+import { ContractTermDto } from './add-existing-employee.dto';
 
 export class StoreResponseDto {
   @ApiProperty()
@@ -514,6 +524,12 @@ export class HomeRevenueSummaryMetricsDto {
 
   @ApiProperty()
   totalCost: number;
+
+  @ApiProperty({ description: 'Đơn hoàn thành trong kỳ' })
+  successOrders: number;
+
+  @ApiProperty({ description: 'Đơn bị huỷ trong kỳ' })
+  failedOrders: number;
 }
 
 export class HomeRevenueSummaryResponseDto {
@@ -1075,26 +1091,75 @@ export class PermanentDeleteEmployeeDto {
   password: string;
 }
 
+/**
+ * Renewal of the active contract. The new contract starts today (VN); a field
+ * left out keeps the old contract's value, except the term (endDate /
+ * durationMonths), which is the renewal's own.
+ */
 export class RenewContractDto {
-  @ApiProperty({ required: false, example: '2026-06-30' })
+  @ApiProperty({
+    required: false,
+    example: '2027-10-08',
+    description:
+      'Ngày kết thúc (YYYY-MM-DD); bỏ trống = không xác định thời hạn',
+  })
   @IsOptional()
-  endDate?: Date;
+  @IsDateString()
+  endDate?: string;
+
+  @ApiProperty({
+    required: false,
+    example: 12,
+    description: 'Thời hạn (tháng)',
+  })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(1200)
+  durationMonths?: number;
 
   @ApiProperty({ required: false, example: 5000000 })
   @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
   salaryAmount?: number;
 
   @ApiProperty({ required: false })
   @IsOptional()
+  @IsString()
   contractName?: string;
 
   @ApiProperty({ required: false })
   @IsOptional()
+  @IsString()
   jobDescription?: string;
 
   @ApiProperty({ required: false })
   @IsOptional()
+  @IsObject()
   allowances?: Record<string, number>;
+
+  @ApiProperty({ required: false, example: 44 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsNumber()
+  @Min(0)
+  @Max(168)
+  weeklyWorkingHours?: number;
+
+  @ApiProperty({ required: false })
+  @IsOptional()
+  @IsString()
+  probationPeriod?: string;
+
+  @ApiProperty({ required: false, type: [ContractTermDto] })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => ContractTermDto)
+  terms?: ContractTermDto[];
 }
 
 export class UpdateDetailsContractDto {

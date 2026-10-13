@@ -1,3 +1,4 @@
+import { StoreDepartment } from './store-department.entity';
 import {
   Entity,
   Column,
@@ -144,8 +145,21 @@ export class EmployeeProfile extends BaseEntity {
   @Column({ name: 'probation_ends_at', type: 'timestamp', nullable: true })
   probationEndsAt: Date | null;
 
+  /**
+   * Kỹ năng đơn của mô hình cũ. Lộ trình v2 dùng employee_skill_progress; cột
+   * này chỉ còn để app cũ đọc và không được ghi trên cửa hàng đã bật v2.
+   */
   @Column({ name: 'skill_id', nullable: true })
   skillId: string | null;
+
+  /** Lộ trình v2: bộ phận hiện tại (khoá ngoại kép ở migration_career_v2.sql). */
+  @Column({ name: 'department_id', type: 'uuid', nullable: true })
+  departmentId: string | null;
+
+  /** Chỉ để join tên bộ phận; khoá ngoại thật (kép) nằm ở SQL. */
+  @ManyToOne(() => StoreDepartment, { createForeignKeyConstraints: false, nullable: true })
+  @JoinColumn({ name: 'department_id' })
+  department: StoreDepartment | null;
 
   @ManyToOne(() => StoreSkill, { onDelete: 'SET NULL' })
   @JoinColumn({ name: 'skill_id' })

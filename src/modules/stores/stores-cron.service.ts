@@ -3,6 +3,7 @@ import {
   Logger,
   OnApplicationBootstrap,
   OnApplicationShutdown,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
@@ -14,6 +15,8 @@ import { ShiftEndWorkflowService } from './shift-end-workflow.service';
 import { JobApplicationService } from './job-application.service';
 import { CareerLadderService } from './career-ladder.service';
 import { ShiftReminderService } from './shift-reminder.service';
+import { CareerProgressService } from './career/career-progress.service';
+import { CareerReminderService } from './career/career-reminder.service';
 
 /** Delay before the start-up reminder reconcile, so boot is not slowed. */
 export const STARTUP_REMINDER_RECONCILE_DELAY_MS = 30_000;
@@ -34,6 +37,9 @@ export class StoresCronService
     private readonly careerLadderService: CareerLadderService,
     private readonly configService: ConfigService,
     private readonly shiftReminderService?: ShiftReminderService,
+    // Lộ trình v2; optional để các test dựng tay cron service vẫn chạy.
+    @Optional() private readonly careerProgressService?: CareerProgressService,
+    @Optional() private readonly careerReminderService?: CareerReminderService,
   ) {}
 
   private isReadOnlyMode(): boolean {
@@ -80,9 +86,38 @@ export class StoresCronService
         this.logger.log(
           `Xét lộ trình: kiểm ${result.checked} hồ sơ, tự thăng ${result.autoAdvanced}, báo chủ ${result.notified}`,
         );
+        // Lộ trình v2: kỹ năng "tự đạt" đủ điều kiện nhờ giờ thực hành.
+        if (this.careerProgressService) {
+          const skills = await this.careerProgressService.sweepAutoSkills();
+          this.logger.log(
+            `Lộ trình v2: kiểm ${skills.checked} hồ sơ, tự đạt ${skills.achieved} kỹ năng`,
+          );
+        }
       },
     );
   }
+  /**
+   * Chạy 07:00 mỗi ngày (giờ VN): "Nhắc nhở kiểm duyệt" của lộ trình v2. Mỗi
+   * cửa hàng bật nhắc nhận một thông báo mỗi kỳ (ngày / tuần / tháng / quý /
+   * năm theo lịch VN); kỳ đã nhắc được đánh dấu trong khoá dòng nên chạy lại
+   * hay nhiều instance không nhắc trùng.
+   */
+  @Cron('0 7 * * *', {
+    name: 'career-review-reminder',
+    timeZone: 'Asia/Ho_Chi_Minh',
+  })
+  async handleCareerReviewReminder() {
+    if (this.isReadOnlyMode() || !this.careerReminderService) return;
+
+    await this.lockService.withLock('cron:career-review-reminder', 600, async () => {
+      const startedAt = Date.now();
+      const result = await this.careerReminderService!.sendDueReminders();
+      this.logger.log(
+        `Nhắc kiểm duyệt lộ trình: ${result.stores} cửa hàng bật nhắc, gửi ${result.sent}, ${Date.now() - startedAt}ms`,
+      );
+    });
+  }
+
 
   /**
    * Mỗi giờ (phút 55) và một lần lúc khởi động: xếp lại nhắc trước ca cho MỌI

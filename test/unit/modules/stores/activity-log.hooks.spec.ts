@@ -588,6 +588,8 @@ describe('career advance hook', () => {
     const ladder = { id: 'lad-1', storeId: 'store-1', name: 'Vị trí', dimension: 'position' };
     const rung = { id: 'rung-2', ladderId: 'lad-1', targetId: 'role-2', resetsLadderId: null };
     const manager = {
+      // Cờ lộ trình v2 của cửa hàng: chưa bật.
+      query: jest.fn().mockResolvedValue([]),
       findOne: jest.fn(async (entity: any) => {
         switch (entity?.name) {
           case 'EmployeeProfile':

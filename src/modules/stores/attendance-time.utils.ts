@@ -1,3 +1,4 @@
+import { vnDateString } from '../../common/utils/vn-calendar';
 /**
  * Absolute shift boundaries for attendance maths.
  *
@@ -84,7 +85,7 @@ export function resolveEffectiveShiftWindow(input: {
 }): EffectiveShiftWindow {
   const workDate =
     input.workDate instanceof Date
-      ? input.workDate.toISOString().slice(0, 10)
+      ? vnDateString(input.workDate)
       : input.workDate
         ? String(input.workDate).slice(0, 10)
         : null;

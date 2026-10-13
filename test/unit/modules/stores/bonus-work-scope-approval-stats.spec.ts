@@ -12,7 +12,7 @@ jest.mock('../../../../src/common/utils/multer-config', () => ({
 import { UnauthorizedException } from '@nestjs/common';
 
 import { EmploymentStatus } from '../../../../src/modules/stores/entities/employee-profile.entity';
-import { StoresController } from '../../../../src/modules/stores/stores.controller';
+import { buildStoreRoutes } from '../../../support/store-route-controllers';
 import { StoresService } from '../../../../src/modules/stores/stores.service';
 
 const PROFILES: Record<string, any> = {
@@ -47,7 +47,7 @@ function build() {
     { id: `${profileId}-pending`, status: 'PENDING' },
     { id: `${profileId}-approved`, status: 'APPROVED' },
   ]);
-  const controller = new StoresController(
+  const controller = buildStoreRoutes(
     service,
     {} as any,
     {} as any,

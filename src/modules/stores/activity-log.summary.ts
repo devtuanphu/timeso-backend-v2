@@ -1,3 +1,4 @@
+import { vnDateString } from '../../common/utils/vn-calendar';
 import { formatDurationVi } from './attendance-time.utils';
 
 /**
@@ -60,6 +61,8 @@ export const ACTIVITY_ACTIONS = {
   ASSET_RETURNED: 'asset.returned',
 
   CAREER_ADVANCED: 'career.advanced',
+  CAREER_SKILL_ACHIEVED: 'career.skill_achieved',
+  CAREER_STRUCTURE_CHANGED: 'career.structure_changed',
 
   WORK_SHIFT_DELETED: 'work_shift.deleted',
 } as const;
@@ -83,6 +86,7 @@ export type ActivityResourceType =
   | 'employee'
   | 'asset_assignment'
   | 'career_event'
+  | 'career_structure'
   | 'work_shift';
 
 const HHMM = /^\d{2}:\d{2}$/;
@@ -151,6 +155,10 @@ const PARAM_RULES: Record<string, ParamRule> = {
   assetStatus: oneOf('RETURNED', 'DAMAGED', 'LOST'),
   ladderName: text(80),
   rungName: text(80),
+  skillName: text(80),
+  targetName: text(80),
+  careerEntity: oneOf('department', 'position', 'skill'),
+  change: oneOf('created', 'updated', 'deleted', 'duplicated', 'deactivated'),
   byOwner: flag,
 };
 
@@ -182,7 +190,7 @@ export const toActivityDate = (
   if (!value) return undefined;
   if (value instanceof Date) {
     if (Number.isNaN(value.getTime())) return undefined;
-    return new Date(value.getTime() + 7 * 3_600_000).toISOString().slice(0, 10);
+    return vnDateString(value);
   }
   const date = String(value).slice(0, 10);
   return DATE.test(date) ? date : undefined;
@@ -380,6 +388,31 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
       return `${actor} chuyển ${subject} lên bậc ${
         p.rungName ? String(p.rungName) : 'mới'
       }${p.ladderName ? ` (lộ trình ${String(p.ladderName)})` : ''}`;
+    case A.CAREER_SKILL_ACHIEVED:
+      return `${actor} xác nhận ${subject} đạt kỹ năng ${
+        p.skillName ? String(p.skillName) : 'mới'
+      }`;
+    case A.CAREER_STRUCTURE_CHANGED: {
+      const entity =
+        p.careerEntity === 'department'
+          ? 'bộ phận'
+          : p.careerEntity === 'skill'
+            ? 'kỹ năng'
+            : 'vị trí';
+      const verb =
+        p.change === 'created'
+          ? 'thêm'
+          : p.change === 'deleted'
+            ? 'xoá'
+            : p.change === 'duplicated'
+              ? 'nhân bản'
+              : p.change === 'deactivated'
+                ? 'ngừng dùng'
+                : 'sửa';
+      return `${actor} ${verb} ${entity} ${
+        p.targetName ? String(p.targetName) : ''
+      }`.trim();
+    }
     case A.WORK_SHIFT_DELETED:
       return `${actor} xoá ${describeShift(p)}`;
     default:

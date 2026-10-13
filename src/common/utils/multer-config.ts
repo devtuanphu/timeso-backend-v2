@@ -1,7 +1,9 @@
+import { BadRequestException } from '@nestjs/common';
 import { memoryStorage, diskStorage } from 'multer';
 import { mkdirSync } from 'fs';
 import { extname } from 'path';
 import { v4 as uuidv4 } from 'uuid';
+import { CONTRACT_FILE_TYPES, CONTRACT_UPLOAD_DIR } from './contract-file';
 
 export const multerConfig = {
   storage: diskStorage({
@@ -132,3 +134,33 @@ export const storage = diskStorage({
     callback(null, `${name}${extension}`);
   },
 });
+
+export const contractFileMulterConfig = {
+  storage: diskStorage({
+    destination: (req, file, callback) => {
+      mkdirSync(CONTRACT_UPLOAD_DIR, { recursive: true });
+      callback(null, CONTRACT_UPLOAD_DIR);
+    },
+    filename: (req, file, callback) => {
+      callback(null, `${uuidv4()}${extname(file.originalname).toLowerCase()}`);
+    },
+  }),
+  limits: {
+    fileSize: 20 * 1024 * 1024,
+    files: 1,
+    parts: 5,
+  },
+  fileFilter: (req, file, callback) => {
+    const allowed =
+      CONTRACT_FILE_TYPES[extname(file.originalname).toLowerCase()];
+    if (!allowed?.includes(file.mimetype)) {
+      return callback(
+        new BadRequestException(
+          'File hợp đồng phải là PDF, DOC, DOCX, JPG hoặc PNG',
+        ),
+        false,
+      );
+    }
+    callback(null, true);
+  },
+};

@@ -1,3 +1,4 @@
+import { formatVnNumber } from '../../common/utils/money';
 import {
   CriteriaCode,
   CriteriaKind,
@@ -49,19 +50,7 @@ export interface ProgressTextInput {
   met: boolean;
 }
 
-/**
- * Số theo kiểu Việt Nam: "." ngăn hàng nghìn, "," thập phân. Tự dựng thay vì
- * Intl để kết quả không phụ thuộc bản ICU của máy chủ.
- */
-export function formatVnNumber(value: number, decimals: number): string {
-  const factor = 10 ** decimals;
-  const rounded = Math.round(value * factor) / factor;
-  const negative = rounded < 0;
-  const [intPart, fracPart] = Math.abs(rounded).toFixed(decimals).split('.');
-  const grouped = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-  const frac = fracPart ? fracPart.replace(/0+$/, '') : '';
-  return `${negative ? '-' : ''}${grouped}${frac ? `,${frac}` : ''}`;
-}
+export { formatVnNumber };
 
 /** Đơn vị thật dùng để hiển thị: tenure luôn là ngày. */
 export function effectiveCriteriaUnit(

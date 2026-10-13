@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-import { StoresController } from '../../../../src/modules/stores/stores.controller';
+import { buildStoreRoutes } from '../../../support/store-route-controllers';
 
 const OWNER = { userId: 'owner-1' };
 const STAFF = { userId: 'staff-1' };
@@ -46,7 +46,7 @@ describe('StoresController authorization hand-off', () => {
     approveOvertime: jest.fn(),
     resumeAfterOvertime: jest.fn(),
   };
-  const controller = new StoresController(
+  const controller = buildStoreRoutes(
     storesService as any,
     accountsService as any,
     {} as any,

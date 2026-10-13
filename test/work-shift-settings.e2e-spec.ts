@@ -27,7 +27,7 @@ import {
   addDays,
   getTodayDateString,
 } from '../src/modules/stores/shift-schedule.utils';
-import { StoresController } from '../src/modules/stores/stores.controller';
+import { STORE_ROUTE_CONTROLLERS } from './support/store-route-controllers';
 import { StoresService } from '../src/modules/stores/stores.service';
 
 jest.mock('uuid', () => ({ v4: () => 'test-upload-id' }));
@@ -176,7 +176,8 @@ describe('Owner shift settings: work-shifts routes (e2e)', () => {
     };
 
     const moduleRef = await Test.createTestingModule({
-      controllers: [StoresController],
+      // Every controller that serves StoresController's routes, in router order.
+      controllers: STORE_ROUTE_CONTROLLERS,
       providers: [
         { provide: StoresService, useValue: service },
         { provide: AccountsService, useValue: {} },

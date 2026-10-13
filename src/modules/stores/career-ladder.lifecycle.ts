@@ -92,6 +92,26 @@ export async function computeProbationEndsAt(
 }
 
 /**
+ * Cột chủ thể v2 cho sự kiện của lộ trình vị trí / kỹ năng cũ, để lộ trình v2
+ * đọc "vào vị trí hiện tại từ lúc nào" từ một nguồn duy nhất (kể cả sự kiện
+ * ghi trong khoảng giữa migration và lúc cửa hàng bật v2).
+ */
+export function legacyEventSubject(
+  dimension: LadderDimension,
+  fromTargetId: string | null,
+  toTargetId: string,
+): Pick<EmployeeCareerEvent, 'subjectType' | 'fromTargetId' | 'toTargetId'> {
+  if (dimension === LadderDimension.POSITION || dimension === LadderDimension.SKILL) {
+    return {
+      subjectType: dimension === LadderDimension.POSITION ? 'position' : 'skill',
+      fromTargetId,
+      toTargetId,
+    };
+  }
+  return { subjectType: null, fromTargetId: null, toTargetId: null };
+}
+
+/**
  * Records where a newly hired (or rehired) employee enters each active ladder
  * of their store: one event per ladder on whose rung they sit, unless an
  * event at or after `effectiveAt` already exists. Tenure ("days in rung")
@@ -144,6 +164,7 @@ export async function recordEntryCareerEvents(
         ladderId: ladder.id,
         fromRungId: null,
         toRungId: rung.id,
+        ...legacyEventSubject(ladder.dimension, null, targetId),
         effectiveAt: options.effectiveAt,
         decidedByAccountId: options.decidedByAccountId,
         criteriaSnapshot: null,

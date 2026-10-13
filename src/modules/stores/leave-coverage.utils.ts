@@ -93,7 +93,7 @@ export function leaveCoversShift(
   if (String(leave.endDate).slice(0, 10) < date) return false;
   // A sudden absence is asked for one shift: only that one.
   if (
-    leave.type === LeaveType.SUDDEN &&
+    leave.type === (LeaveType.SUDDEN as string) &&
     leave.shiftAssignmentId &&
     leave.shiftAssignmentId !== assignmentId
   ) {

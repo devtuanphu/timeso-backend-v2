@@ -21,8 +21,8 @@
  * space instead, so "A\nB" reads as "A B" rather than silently becoming "AB"
  * and joining two separate words.
  */
-// eslint-disable-next-line no-control-regex
 const UNSAFE_CHARS =
+  // eslint-disable-next-line no-control-regex -- matching control characters is the point
   /[\u0000-\u0008\u000E-\u001F\u007F-\u009F\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g;
 
 /** Keeps a name readable in a one-line push banner. */
@@ -59,6 +59,7 @@ export function sanitizeMultiLine(value: unknown, maxLength: number): string {
     .replace(/\r\n?/g, '\n')
     // The class excludes newline, so paragraph breaks survive untouched.
     .replace(UNSAFE_CHARS, '')
+    // eslint-disable-next-line no-control-regex -- vertical tab / form feed become line breaks
     .replace(/[\u000B\u000C]/g, '\n')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')

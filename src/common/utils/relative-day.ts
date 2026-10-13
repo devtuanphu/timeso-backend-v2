@@ -2,10 +2,7 @@
  * Nhãn ngày tương đối theo giờ Việt Nam cho nội dung thông báo:
  * "hôm nay", "ngày mai", "ngày kia"; ngày khác thì null (giữ nguyên dd/mm).
  */
-const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
-
-const vnDateOnly = (instant: Date): string =>
-  new Date(instant.getTime() + VN_OFFSET_MS).toISOString().slice(0, 10);
+import { vnDateString } from './vn-calendar';
 
 const dayNumber = (date: string): number =>
   Math.round(Date.parse(`${date.slice(0, 10)}T00:00:00Z`) / 86_400_000);
@@ -15,9 +12,9 @@ export function relativeDayLabel(
   now: Date = new Date(),
 ): 'hôm nay' | 'ngày mai' | 'ngày kia' | null {
   const target =
-    typeof workDate === 'string' ? workDate.slice(0, 10) : vnDateOnly(workDate);
+    typeof workDate === 'string' ? workDate.slice(0, 10) : vnDateString(workDate);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(target)) return null;
-  const diff = dayNumber(target) - dayNumber(vnDateOnly(now));
+  const diff = dayNumber(target) - dayNumber(vnDateString(now));
   if (diff === 0) return 'hôm nay';
   if (diff === 1) return 'ngày mai';
   if (diff === 2) return 'ngày kia';
@@ -84,7 +81,7 @@ export function describeWorkDateRange(
   const sorted = uniqueSortedDates(dates);
   if (sorted.length === 0) return '';
   if (sorted.length === 1) return describeWorkDate(sorted[0], now);
-  const today = vnDateOnly(now);
+  const today = vnDateString(now);
   const includesToday = options.continuousRange
     ? sorted[0] <= today && today <= sorted[sorted.length - 1]
     : sorted.some((date) => relativeDayLabel(date, now) === 'hôm nay');

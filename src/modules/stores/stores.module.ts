@@ -129,6 +129,20 @@ import { StoreActivityController } from './store-activity.controller';
 import { CustomShiftRequestController } from './custom-shift-request.controller';
 import { CustomShiftRequestService } from './custom-shift-request.service';
 import { CustomShiftRequest } from './entities/custom-shift-request.entity';
+import { StoresPayrollController } from './controllers/stores-payroll.controller';
+import { StoresRequestsController } from './controllers/stores-requests.controller';
+import { StoresAttendanceController } from './controllers/stores-attendance.controller';
+import { StoresSchedulingController } from './controllers/stores-scheduling.controller';
+import { StoresCareerController } from './controllers/stores-career.controller';
+import { CareerStructureService } from './career/career-structure.service';
+import { CareerEvaluationService } from './career/career-evaluation.service';
+import { CareerProgressService } from './career/career-progress.service';
+import { CareerReminderService } from './career/career-reminder.service';
+import { StoreDepartment } from './entities/store-department.entity';
+import { CareerRequirement } from './entities/career-requirement.entity';
+import { EmployeeSkillProgress } from './entities/employee-skill-progress.entity';
+import { EmployeeSkillEvaluation } from './entities/employee-skill-evaluation.entity';
+import { StoreCareerSetting } from './entities/store-career-setting.entity';
 
 @Module({
   imports: [
@@ -136,6 +150,11 @@ import { CustomShiftRequest } from './entities/custom-shift-request.entity';
       Store,
       StoreEmployeeType,
       StoreLadder,
+      StoreDepartment,
+      CareerRequirement,
+      EmployeeSkillProgress,
+      EmployeeSkillEvaluation,
+      StoreCareerSetting,
       StoreLadderRung,
       StoreLadderEdge,
       StoreRungCriteria,
@@ -236,16 +255,25 @@ import { CustomShiftRequest } from './entities/custom-shift-request.entity';
     }),
   ],
   controllers: [
+    StoresRequestsController,
+    StoresSchedulingController,
     StoresController,
+    StoresPayrollController,
+    StoresAttendanceController,
     StoresPublicController,
     ShiftAggregationController,
     JobApplicationController,
     StoreActivityController,
     CustomShiftRequestController,
+    StoresCareerController,
   ],
   providers: [
     StoresService,
     CareerLadderService,
+    CareerStructureService,
+    CareerEvaluationService,
+    CareerProgressService,
+    CareerReminderService,
     StoresCronService,
     DistributedLockService,
     FaceRecognitionService,

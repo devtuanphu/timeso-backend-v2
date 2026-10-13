@@ -47,7 +47,7 @@ import { StoreSkill } from './entities/store-skill.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { StoreProbationSetting } from './entities/store-probation-setting.entity';
 import { NotificationsService } from '../notifications/notifications.service';
-import { computeProbationEndsAt } from './career-ladder.lifecycle';
+import { computeProbationEndsAt, legacyEventSubject } from './career-ladder.lifecycle';
 import { KpiTask } from './entities/kpi-task.entity';
 import { KpiStatus } from './entities/employee-kpi.entity';
 import { vnDateString } from '../../common/utils/vn-calendar';
@@ -60,6 +60,12 @@ import {
   ShiftAssignmentStatus,
 } from './entities/shift-management.entity';
 import { NotificationType } from '../notifications/entities/notification.entity';
+import { appUpdateRequired, isCareerV2Enabled } from './career/career-store';
+import {
+  CareerEvaluationService,
+  MeasuredRequirement,
+} from './career/career-evaluation.service';
+
 
 /**
  * Cạnh cần gỡ và cạnh cần nối khi gỡ một bậc khỏi lộ trình.
@@ -176,7 +182,59 @@ export class CareerLadderService {
     // X1 activity log; optional so hand-built test instances keep working.
     @Optional()
     private readonly activityLogService?: ActivityLogService,
+    // Lộ trình v2: các route đọc cũ trả dữ liệu v2 khi cửa hàng đã bật cờ.
+    @Optional()
+    private readonly careerEvaluation?: CareerEvaluationService,
   ) {}
+
+  // ---------------------------------------------------------------------
+  // Lộ trình v2 qua các route cũ (SaaS-6)
+  // ---------------------------------------------------------------------
+
+  /** Lộ trình v2 của hồ sơ khi cửa hàng đã bật; null nếu chưa. */
+  private async v2Career(profile: EmployeeProfile) {
+    if (!this.careerEvaluation) return null;
+    if (!(await isCareerV2Enabled(this.dataSource.manager, profile.storeId))) {
+      return null;
+    }
+    const career = await this.careerEvaluation.getEmployeeCareer(profile.id);
+    return career.v2Enabled ? career : null;
+  }
+
+  /** Lộ trình cũ còn dùng: cửa hàng v2 chỉ còn lộ trình hình thức làm việc. */
+  private liveLadders(ladders: StoreLadder[], v2: boolean) {
+    return v2
+      ? ladders.filter((l) => l.dimension === LadderDimension.EMPLOYMENT_TYPE)
+      : ladders;
+  }
+
+  /** Điều kiện v2 theo hình dạng `items` mà app nhân viên cũ đang đọc. */
+  private static v2Items(items: MeasuredRequirement[]) {
+    return items.map((i) => {
+      const measurable = i.target !== null;
+      return {
+        label: i.label,
+        kind: measurable ? 'metric' : 'checklist',
+        met: i.met,
+        isRequired: true,
+        current: measurable ? i.current : null,
+        target: measurable ? i.target : null,
+        unit: measurable ? i.unit : null,
+        operator: measurable ? ('gte' as const) : null,
+        progressText: measurable
+          ? buildCriteriaProgressText({
+              kind: 'metric',
+              code: i.code,
+              operator: 'gte',
+              current: i.current,
+              target: i.target,
+              unit: i.unit,
+              met: i.met,
+            })
+          : null,
+      };
+    });
+  }
 
   // ---------------------------------------------------------------------
   // Danh mục theo tác nhân
@@ -368,6 +426,7 @@ export class CareerLadderService {
     if (!data?.name?.trim()) {
       throw new BadRequestException('Lộ trình cần có tên');
     }
+    await this.assertLegacyWritable(storeId, data.dimension);
     const existing = await this.ladderRepository.findOne({
       where: { storeId, dimension: data.dimension },
     });
@@ -404,7 +463,21 @@ export class CareerLadderService {
     const rung = await this.rungRepository.findOne({ where: { id: rungId } });
     if (!rung) throw new NotFoundException('Không tìm thấy bậc');
     const ladder = await this.ownedLadder(storeId, rung.ladderId);
+    await this.assertLegacyWritable(storeId, ladder.dimension);
     return { rung, ladder };
+  }
+
+  /**
+   * Cửa hàng đã bật lộ trình v2: vị trí và kỹ năng chỉ sửa trên màn mới. App
+   * cũ ghi vào lộ trình vị trí / kỹ năng cũ sẽ làm hai mô hình lệch nhau, nên
+   * trả 409 APP_UPDATE_REQUIRED. Lộ trình hình thức làm việc (thử việc → chính
+   * thức) vẫn dùng cơ chế này.
+   */
+  private async assertLegacyWritable(storeId: string, dimension: LadderDimension) {
+    if (dimension === LadderDimension.EMPLOYMENT_TYPE) return;
+    if (await isCareerV2Enabled(this.dataSource.manager, storeId)) {
+      throw appUpdateRequired();
+    }
   }
 
   async createRung(
@@ -421,6 +494,7 @@ export class CareerLadderService {
     },
   ) {
     const ladder = await this.ownedLadder(storeId, ladderId);
+    await this.assertLegacyWritable(storeId, ladder.dimension);
     await this.assertTargetExists(ladder, data.targetId);
 
     const duplicate = await this.rungRepository.findOne({
@@ -791,10 +865,14 @@ export class CareerLadderService {
     });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
 
-    const ladders = await this.ladderRepository.find({
-      where: { storeId: profile.storeId, isActive: true },
-      order: { dimension: 'ASC' },
-    });
+    const v2 = await this.v2Career(profile);
+    const ladders = this.liveLadders(
+      await this.ladderRepository.find({
+        where: { storeId: profile.storeId, isActive: true },
+        order: { dimension: 'ASC' },
+      }),
+      !!v2,
+    );
 
     const result: Array<{
       ladderId: string;
@@ -873,10 +951,52 @@ export class CareerLadderService {
       });
     }
 
+    if (v2) {
+      result.push({
+        ladderId: 'v2-position',
+        ladderName: v2.department?.name ?? 'Vị trí',
+        dimension: LadderDimension.POSITION,
+        currentName: v2.position?.name ?? null,
+        next: v2.next
+          ? {
+              rungId: v2.next.id,
+              name: v2.next.name,
+              progress: v2.next.progress,
+              passed: v2.next.passed,
+              items: CareerLadderService.v2Items(v2.next.items),
+            }
+          : null,
+      });
+      if (v2.skills.length) {
+        const achieved = v2.skills.filter((k) => k.status === 'achieved');
+        const learning = v2.skills.find(
+          (k) => k.status === 'in_progress' || k.status === 'awaiting_confirmation',
+        );
+        result.push({
+          ladderId: 'v2-skill',
+          ladderName: 'Kỹ năng',
+          dimension: LadderDimension.SKILL,
+          currentName: achieved.at(-1)?.name ?? null,
+          next: learning
+            ? {
+                rungId: learning.skillId,
+                name: learning.name,
+                progress: learning.evaluation?.progress ?? 0,
+                passed: learning.status === 'awaiting_confirmation',
+                items: CareerLadderService.v2Items(learning.evaluation?.items ?? []),
+              }
+            : null,
+        });
+      }
+    }
+
     return { ladders: result };
   }
 
   async nextRungs(profileId: string, ladderId: string) {
+    // App chủ cũ gọi route này cho mọi nhóm của `progression`, kể cả nhóm v2
+    // ('v2-position' / 'v2-skill'): không phải lộ trình thật, không có bậc kế.
+    if (ladderId.startsWith('v2-')) return [];
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
     });
@@ -886,6 +1006,13 @@ export class CareerLadderService {
       where: { id: ladderId, storeId: profile.storeId },
     });
     if (!ladder) throw new NotFoundException('Không tìm thấy lộ trình');
+    // Cửa hàng v2: lộ trình vị trí / kỹ năng cũ không còn được cập nhật.
+    if (
+      ladder.dimension !== LadderDimension.EMPLOYMENT_TYPE &&
+      (await isCareerV2Enabled(this.dataSource.manager, profile.storeId))
+    ) {
+      return [];
+    }
 
     const current = await this.currentRung(profile, ladder);
     const edges = await this.edgeRepository.find({
@@ -1236,6 +1363,13 @@ export class CareerLadderService {
         );
       }
 
+      if (
+        ladder.dimension !== LadderDimension.EMPLOYMENT_TYPE &&
+        (await isCareerV2Enabled(manager, profile.storeId))
+      ) {
+        throw appUpdateRequired();
+      }
+
       const fromRung = await this.currentRung(profile, ladder);
       if (fromRung?.id === rung.id) {
         throw new BadRequestException('Nhân viên đã ở bậc này');
@@ -1310,6 +1444,7 @@ export class CareerLadderService {
           ladderId: ladder.id,
           fromRungId: fromRung?.id ?? null,
           toRungId: rung.id,
+          ...legacyEventSubject(ladder.dimension, fromRung?.targetId ?? null, rung.targetId),
           effectiveAt: new Date(),
           decidedByAccountId,
           criteriaSnapshot: snapshot,
@@ -1417,6 +1552,7 @@ export class CareerLadderService {
         ladderId: ladder.id,
         fromRungId: fromRung?.id ?? null,
         toRungId: entryRung.id,
+        ...legacyEventSubject(ladder.dimension, fromRung?.targetId ?? null, entryRung.targetId),
         effectiveAt: new Date(),
         decidedByAccountId,
         criteriaSnapshot: null,
@@ -1561,14 +1697,22 @@ export class CareerLadderService {
       take: 200,
     });
 
+    // Sự kiện lộ trình cũ có `ladder`; sự kiện v2 (bộ phận / vị trí / kỹ năng)
+    // không có, tên đích đọc từ bảng của chủ thể.
+    const legacy = events.filter(
+      (e): e is EmployeeCareerEvent & { ladder: StoreLadder; toRungId: string } =>
+        !!e.ladder && !!e.toRungId,
+    );
+    const v2Names = await this.v2TargetNames(events.filter((e) => !e.ladder));
+
     const byDimension = new Map<LadderDimension, string[]>();
-    for (const e of events) {
+    for (const e of legacy) {
       const list = byDimension.get(e.ladder.dimension) ?? [];
       list.push(e.fromRungId ?? '', e.toRungId);
       byDimension.set(e.ladder.dimension, list);
     }
 
-    const rungIds = events.flatMap((e) =>
+    const rungIds = legacy.flatMap((e) =>
       e.fromRungId ? [e.fromRungId, e.toRungId] : [e.toRungId],
     );
     const rungs = rungIds.length
@@ -1585,7 +1729,7 @@ export class CareerLadderService {
     for (const [dimension, _ids] of byDimension) {
       const targets = rungs
         .filter((r) =>
-          events.some(
+          legacy.some(
             (e) =>
               e.ladder.dimension === dimension &&
               (e.toRungId === r.id || e.fromRungId === r.id),
@@ -1602,20 +1746,64 @@ export class CareerLadderService {
       return rung ? (names.get(rung.targetId) ?? null) : null;
     };
 
-    return events.map((e) => ({
-      id: e.id,
-      ladderId: e.ladderId,
-      ladderName: e.ladder.name,
-      dimension: e.ladder.dimension,
-      fromRungId: e.fromRungId,
-      fromName: nameOf(e.fromRungId),
-      toRungId: e.toRungId,
-      toName: nameOf(e.toRungId),
-      effectiveAt: e.effectiveAt,
-      decidedBy: e.decidedByAccount?.fullName ?? null,
-      note: e.note,
-      criteriaSnapshot: e.criteriaSnapshot,
-    }));
+    return events.map((e) =>
+      e.ladder
+        ? {
+            id: e.id,
+            ladderId: e.ladderId,
+            ladderName: e.ladder.name,
+            dimension: e.ladder.dimension as string,
+            fromRungId: e.fromRungId,
+            fromName: nameOf(e.fromRungId),
+            toRungId: e.toRungId,
+            toName: nameOf(e.toRungId),
+            effectiveAt: e.effectiveAt,
+            decidedBy: e.decidedByAccount?.fullName ?? null,
+            note: e.note,
+            criteriaSnapshot: e.criteriaSnapshot,
+          }
+        : {
+            id: e.id,
+            ladderId: null,
+            ladderName:
+              e.subjectType === 'department'
+                ? 'Bộ phận'
+                : e.subjectType === 'skill'
+                  ? 'Kỹ năng'
+                  : 'Vị trí',
+            dimension: (e.subjectType ?? 'position') as string,
+            fromRungId: null,
+            fromName: e.fromTargetId ? (v2Names.get(e.fromTargetId) ?? null) : null,
+            toRungId: null,
+            toName: e.toTargetId ? (v2Names.get(e.toTargetId) ?? null) : null,
+            effectiveAt: e.effectiveAt,
+            decidedBy: e.decidedByAccount?.fullName ?? null,
+            note: e.note,
+            criteriaSnapshot: e.criteriaSnapshot,
+          },
+    );
+  }
+
+  /** Tên đích (cả đã xoá) của sự kiện v2. */
+  private async v2TargetNames(events: EmployeeCareerEvent[]) {
+    const ids = (type: string) => [
+      ...new Set(
+        events
+          .filter((e) => e.subjectType === type)
+          .flatMap((e) => [e.fromTargetId, e.toTargetId])
+          .filter((id): id is string => !!id),
+      ),
+    ];
+    const names = new Map<string, string>();
+    const load = async (sql: string, list: string[]) => {
+      if (!list.length) return;
+      const rows: Array<{ id: string; name: string }> = await this.dataSource.manager.query(sql, [list]);
+      rows.forEach((r) => names.set(r.id, r.name));
+    };
+    await load('SELECT id, name FROM store_departments WHERE id = ANY($1::uuid[])', ids('department'));
+    await load('SELECT id, name FROM store_roles WHERE id = ANY($1::uuid[])', ids('position'));
+    await load('SELECT id, name FROM store_skills WHERE id = ANY($1::uuid[])', ids('skill'));
+    return names;
   }
 
   // ---------------------------------------------------------------------
@@ -1635,9 +1823,20 @@ export class CareerLadderService {
     autoAdvanced: number;
     notified: number;
   }> {
-    const ladders = await this.ladderRepository.find({
-      where: { isActive: true },
-    });
+    // Cửa hàng v2: vị trí / kỹ năng xét bằng lộ trình mới (nhắc kiểm duyệt).
+    const v2Stores = new Set<string>(
+      (
+        await this.dataSource.manager.query(
+          'SELECT store_id FROM store_career_settings WHERE v2_enabled',
+        )
+      ).map((r: { store_id: string }) => r.store_id),
+    );
+    const ladders = (
+      await this.ladderRepository.find({ where: { isActive: true } })
+    ).filter(
+      (l) =>
+        l.dimension === LadderDimension.EMPLOYMENT_TYPE || !v2Stores.has(l.storeId),
+    );
     let checked = 0;
     let autoAdvanced = 0;
     let notified = 0;
@@ -1756,10 +1955,14 @@ export class CareerLadderService {
     });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
 
-    const ladders = await this.ladderRepository.find({
-      where: { storeId: profile.storeId, isActive: true },
-      order: { dimension: 'ASC' },
-    });
+    const v2 = await this.v2Career(profile);
+    const ladders = this.liveLadders(
+      await this.ladderRepository.find({
+        where: { storeId: profile.storeId, isActive: true },
+        order: { dimension: 'ASC' },
+      }),
+      !!v2,
+    );
     const stint = stintFloor(profile.joinedAt);
 
     const stages: any[] = [];
@@ -1847,6 +2050,60 @@ export class CareerLadderService {
       }
     }
 
+    if (v2) stages.push(...this.v2Stages(v2));
+    return stages;
+  }
+
+  /** Bậc theo hình dạng `progression` cũ, dựng từ lộ trình v2. */
+  private v2Stages(
+    v2: NonNullable<Awaited<ReturnType<CareerLadderService['v2Career']>>>,
+  ) {
+    const stages: any[] = [];
+    const ladderName = v2.department?.name ?? 'Vị trí';
+    for (const position of v2.positions) {
+      const isCurrent = v2.position?.id === position.id;
+      const isNext = v2.next?.kind === 'position' && v2.next.id === position.id;
+      const isPast = !!v2.position && (position.rank as number) < v2.position.rank;
+      stages.push({
+        title: position.name,
+        progress: isCurrent || isPast ? 100 : isNext ? (v2.next?.progress ?? 0) : 0,
+        requirements: isNext
+          ? CareerLadderService.v2Items(v2.next?.items ?? []).map((i) => ({
+              text: i.label,
+              completed: i.met,
+              progressText: i.progressText,
+            }))
+          : [],
+        suggestion: undefined,
+        ladderId: 'v2-position',
+        ladderName,
+        dimension: LadderDimension.POSITION,
+        rungId: position.id,
+        isCurrent,
+        isReachable: isNext,
+      });
+    }
+    for (const skill of v2.skills) {
+      const open = skill.status === 'in_progress' || skill.status === 'awaiting_confirmation';
+      stages.push({
+        title: skill.name,
+        progress: skill.status === 'achieved' ? 100 : open ? (skill.evaluation?.progress ?? 0) : 0,
+        requirements: open
+          ? CareerLadderService.v2Items(skill.evaluation?.items ?? []).map((i) => ({
+              text: i.label,
+              completed: i.met,
+              progressText: i.progressText,
+            }))
+          : [],
+        suggestion: undefined,
+        ladderId: 'v2-skill',
+        ladderName: 'Kỹ năng',
+        dimension: LadderDimension.SKILL,
+        rungId: skill.skillId,
+        isCurrent: false,
+        isReachable: open,
+      });
+    }
     return stages;
   }
 
@@ -1864,6 +2121,29 @@ export class CareerLadderService {
    * màn chi tiết nhân viên đang đọc.
    */
   async getProgressionSummary(profile: EmployeeProfile) {
+    const v2 = await this.v2Career(profile);
+    if (v2) {
+      const next = v2.next;
+      const missing = next ? next.items.filter((i) => !i.met).length : 0;
+      const achieved = v2.skills.filter((k) => k.status === 'achieved').map((k) => k.name);
+      return {
+        currentPosition: v2.position?.name ?? 'Chưa xếp vị trí',
+        nextTarget: next?.name ?? 'Cấp tối đa',
+        rankInPosition: `${v2.position?.rank ?? 0}/${v2.positions.length}`,
+        suggestion: next
+          ? `Còn ${missing} điều kiện để lên ${next.name}.`
+          : 'Bạn đang hoàn thành tốt công việc!',
+        requirements: CareerLadderService.v2Items(next?.items ?? []).map((i) => ({
+          label: i.label,
+          isMet: i.met,
+          currentValue: i.current,
+          requiredValue: i.target,
+          progressText: i.progressText,
+        })),
+        skills: achieved.length ? achieved.join(', ') : 'N/A',
+      };
+    }
+
     const ladders = await this.ladderRepository.find({
       where: { storeId: profile.storeId, isActive: true },
     });

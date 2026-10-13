@@ -5,20 +5,35 @@ jest.mock('../../../../src/common/utils/multer-config', () => ({
   identityImageUrl: (filename: string) => filename,
 }));
 
-import { GUARDS_METADATA, PATH_METADATA } from '@nestjs/common/constants';
+import {
+  GUARDS_METADATA,
+  MODULE_METADATA,
+  PATH_METADATA,
+} from '@nestjs/common/constants';
 
 import { JobApplicationController } from '../../../../src/modules/stores/job-application.controller';
 import { ShiftAggregationController } from '../../../../src/modules/stores/shift-aggregation.controller';
 import { STORE_OWNER_ONLY_KEY } from '../../../../src/modules/stores/guards/store-owner-only.decorator';
 import { StoreOwnerOnlyGuard } from '../../../../src/modules/stores/guards/store-owner-only.guard';
+import { StoresModule } from '../../../../src/modules/stores/stores.module';
 import {
   RESOURCE_SCOPES,
   ROUTE_RULES,
 } from '../../../../src/modules/stores/guards/store-resource.locator';
-import { StoresController } from '../../../../src/modules/stores/stores.controller';
+import {
+  controllerOf,
+  routeHandler,
+  STORE_ROUTE_CONTROLLERS,
+} from '../../../support/store-route-controllers';
 
 const isOwnerOnly = (controller: any, handler: string) =>
   Reflect.getMetadata(STORE_OWNER_ONLY_KEY, controller.prototype[handler]) !==
+  undefined;
+
+// StoresController's routes are split across STORE_ROUTE_CONTROLLERS; a handler
+// is checked on whichever of them declares it.
+const isStoreRouteOwnerOnly = (handler: string) =>
+  Reflect.getMetadata(STORE_OWNER_ONLY_KEY, routeHandler(handler) as object) !==
   undefined;
 
 /**
@@ -57,9 +72,9 @@ describe('owner-only route metadata', () => {
     'deleteWorkShift', // DELETE :storeId/work-shifts/:shiftId
   ];
 
-  it.each(CRITICAL_STORES_HANDLERS)('StoresController.%s is owner-only', (handler) => {
-    expect(typeof (StoresController.prototype as any)[handler]).toBe('function');
-    expect(isOwnerOnly(StoresController, handler)).toBe(true);
+  it.each(CRITICAL_STORES_HANDLERS)('store route %s is owner-only', (handler) => {
+    expect(typeof routeHandler(handler)).toBe('function');
+    expect(isStoreRouteOwnerOnly(handler)).toBe(true);
   });
 
   // Reads employees need for work, and actions on their own data, must stay
@@ -84,18 +99,33 @@ describe('owner-only route metadata', () => {
     'updateKpiTaskProgress',
     'deleteKpiTask',
     'hideKpiTask',
-  ])('StoresController.%s is not owner-only', (handler) => {
-    expect(typeof (StoresController.prototype as any)[handler]).toBe('function');
-    expect(isOwnerOnly(StoresController, handler)).toBe(false);
+  ])('store route %s is not owner-only', (handler) => {
+    expect(typeof routeHandler(handler)).toBe('function');
+    expect(isStoreRouteOwnerOnly(handler)).toBe(false);
   });
 
-  it.each([
-    [StoresController],
+  it.each<[object]>([
+    ...STORE_ROUTE_CONTROLLERS.map((controller): [object] => [controller]),
     [ShiftAggregationController],
     [JobApplicationController],
   ])('%p runs StoreOwnerOnlyGuard', (controller) => {
     const guards = Reflect.getMetadata(GUARDS_METADATA, controller) as unknown[];
     expect(guards).toContain(StoreOwnerOnlyGuard);
+  });
+
+  // A split controller that is imported but not registered serves no route at
+  // all; registered out of order, it can shadow (or be shadowed by) a route of
+  // StoresController. Express matches in registration order.
+  it('registers every store route controller in StoresModule, in router order', () => {
+    const registered = Reflect.getMetadata(
+      MODULE_METADATA.CONTROLLERS,
+      StoresModule,
+    ) as unknown[];
+    const positions = STORE_ROUTE_CONTROLLERS.map((controller) =>
+      registered.indexOf(controller),
+    );
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((a, b) => a - b)).toEqual(positions);
   });
 
   it('keeps owner routes of the other store controllers owner-only', () => {
@@ -128,19 +158,21 @@ describe('owner-only route metadata', () => {
     'getProductReport',
     'getProductExportReport',
     'getApprovalStats',
-  ])('StoresController.%s reads its store from the query', (handler) => {
+  ])('store route %s reads its store from the query', (handler) => {
+    expect(controllerOf(handler)).toBeDefined();
     expect(
-      Reflect.getMetadata(
-        STORE_OWNER_ONLY_KEY,
-        (StoresController.prototype as any)[handler],
-      ),
+      Reflect.getMetadata(STORE_OWNER_ONLY_KEY, routeHandler(handler) as object),
     ).toEqual({ storeFrom: ['query'] });
   });
 
   it('gives every owner-only route a store source the guard can prove', () => {
     const unresolved: string[] = [];
-    for (const name of Object.getOwnPropertyNames(StoresController.prototype)) {
-      const handler = (StoresController.prototype as any)[name];
+    const handlers = STORE_ROUTE_CONTROLLERS.flatMap((controller) =>
+      Object.getOwnPropertyNames(controller.prototype).map(
+        (name) => [name, (controller.prototype as any)[name]] as const,
+      ),
+    );
+    for (const [name, handler] of handlers) {
       const options = Reflect.getMetadata(STORE_OWNER_ONLY_KEY, handler);
       if (options === undefined) continue;
       const path = String(Reflect.getMetadata(PATH_METADATA, handler)).replace(
