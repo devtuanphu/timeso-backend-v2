@@ -103,6 +103,14 @@ export class EmployeeWorkAssignmentDto {
   @IsUUID()
   storeRoleId?: string;
 
+  /**
+   * Lộ trình v2: bộ phận khi chưa xếp vị trí. Có vị trí thì bộ phận là bộ
+   * phận của vị trí; gửi kèm mà khác thì bị từ chối.
+   */
+  @IsOptional()
+  @IsUUID()
+  departmentId?: string;
+
   @IsOptional()
   @IsUUID()
   employeeTypeId?: string;

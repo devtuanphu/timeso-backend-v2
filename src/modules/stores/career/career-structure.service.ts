@@ -270,6 +270,21 @@ export class CareerStructureService {
     };
   }
 
+  /**
+   * Toàn bộ nhân viên đang làm kèm bộ phận / vị trí (màn xem nhân sự của một
+   * bộ phận, chọn người để chuyển). `getStructure` chỉ trả vài người xem trước.
+   */
+  async getMembers(storeId: string) {
+    const members = await this.employedMembers(this.dataSource.manager, storeId);
+    return {
+      members: members.map((r) => ({
+        ...r.member,
+        departmentId: r.departmentId,
+        positionId: r.positionId,
+      })),
+    };
+  }
+
   // -------------------------------------------------------------------------
   // Bộ phận
   // -------------------------------------------------------------------------

@@ -764,4 +764,99 @@ export class CareerEvaluationService {
       optional,
     };
   }
+
+  /**
+   * Nhân viên theo một kỹ năng (tab Kỹ năng → "Xem nhân viên"):
+   * - achieved: NV đang làm đã đạt (kể cả đã chuyển sang bộ phận khác);
+   * - learning: NV của bộ phận kỹ năng, kỹ năng đang mở (đang học / chờ xác nhận);
+   * - locked: NV của bộ phận kỹ năng, chưa đạt kỹ năng bắt buộc đứng trước.
+   * Trạng thái lấy từ chính `skillStates` của màn chi tiết NV, để hai màn
+   * không bao giờ nói khác nhau. Người đã nghỉ chỉ được đếm (`formerAchieved`),
+   * khớp con số "đã đạt" của tab Kỹ năng (đếm cả người đã nghỉ, D10).
+   */
+  async getSkillEmployees(storeId: string, skillId: string) {
+    const m = this.dataSource.manager;
+    const skill = await m.findOne(StoreSkill, { where: { id: skillId, storeId } });
+    if (!skill) throw new NotFoundException('Không tìm thấy kỹ năng');
+    const graph = await this.loadGraph(m, storeId);
+
+    const profiles = await m
+      .getRepository(EmployeeProfile)
+      .createQueryBuilder('p')
+      .leftJoinAndSelect('p.account', 'a')
+      .where('p.storeId = :storeId', { storeId })
+      .andWhere('p.employmentStatus IN (:...statuses)', { statuses: [...EMPLOYED_STATUSES] })
+      .orderBy('a.fullName', 'ASC', 'NULLS LAST')
+      .getMany();
+    const achievedRows: Array<{ employee_profile_id: string; achieved_at: Date | null }> =
+      await m.query(
+        `SELECT employee_profile_id, achieved_at FROM employee_skill_progress
+          WHERE store_id = $1 AND skill_id = $2 AND status = $3 AND deleted_at IS NULL`,
+        [storeId, skill.id, SkillProgressStatus.ACHIEVED],
+      );
+    const achievedAt = new Map(achievedRows.map((r) => [r.employee_profile_id, r.achieved_at]));
+
+    const person = (p: EmployeeProfile) => {
+      const position = p.storeRoleId ? graph.positions.get(p.storeRoleId) : undefined;
+      const department = p.departmentId ? graph.departments.get(p.departmentId) : undefined;
+      return {
+        profileId: p.id,
+        name: p.account?.fullName ?? '',
+        avatar: p.account?.avatar ?? null,
+        positionName: position && position.rank !== null ? position.name : null,
+        departmentName: department?.name ?? null,
+        inSkillDepartment: !!skill.departmentId && p.departmentId === skill.departmentId,
+      };
+    };
+
+    const achieved: Array<ReturnType<typeof person> & { achievedAt: Date | null }> = [];
+    const learning: Array<
+      ReturnType<typeof person> & {
+        awaitingConfirmation: boolean;
+        passCount: number;
+        progress: number;
+        unlockedAt: Date | null;
+      }
+    > = [];
+    const locked: Array<ReturnType<typeof person>> = [];
+
+    for (const p of profiles) {
+      if (achievedAt.has(p.id)) {
+        achieved.push({ ...person(p), achievedAt: achievedAt.get(p.id) ?? null });
+        continue;
+      }
+      // Kỹ năng đã ngừng dùng không còn mở cho ai: chỉ còn danh sách đã đạt.
+      if (!skill.isActive || !skill.departmentId || p.departmentId !== skill.departmentId) continue;
+      const states = await this.skillStates(this.context(m, p), graph);
+      const state = states.find((s) => s.skillId === skill.id);
+      if (!state) continue;
+      if (state.status === 'locked') {
+        locked.push(person(p));
+      } else if (state.status !== 'achieved') {
+        learning.push({
+          ...person(p),
+          awaitingConfirmation: state.status === 'awaiting_confirmation',
+          passCount: state.passCount,
+          progress: state.evaluation?.progress ?? 0,
+          unlockedAt: state.unlockedAt,
+        });
+      }
+    }
+
+    return {
+      skill: {
+        id: skill.id,
+        name: skill.name,
+        departmentId: skill.departmentId,
+        sequence: skill.sequence,
+        level: skill.level,
+        confirmation: skill.confirmation,
+        isActive: skill.isActive,
+      },
+      achieved,
+      learning,
+      locked,
+      formerAchieved: achievedRows.length - achieved.length,
+    };
+  }
 }

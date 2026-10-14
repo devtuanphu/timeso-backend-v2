@@ -4,6 +4,7 @@ import {
   IsOptional,
   IsString,
   IsDateString,
+  IsUUID,
 } from 'class-validator';
 
 export class CreateManualEmployeeDto {
@@ -69,6 +70,11 @@ export class CreateManualEmployeeDto {
   @IsString()
   @IsOptional()
   storeRoleId?: string;
+
+  /** Lộ trình v2: bộ phận khi chưa xếp vị trí (xem EmployeeWorkAssignmentDto). */
+  @IsUUID()
+  @IsOptional()
+  departmentId?: string;
 
   @IsString()
   @IsOptional()

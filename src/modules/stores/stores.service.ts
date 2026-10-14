@@ -25,6 +25,7 @@ import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import { StoreLadderRung } from './entities/store-ladder-rung.entity';
 import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
+import { StoreDepartment } from './entities/store-department.entity';
 import { StoreRole } from './entities/store-role.entity';
 import { EMPLOYED_STATUSES, EmployeeProfile, EmploymentStatus, isEmployedStatus, WorkingStatus } from './entities/employee-profile.entity';
 import { EmployeeContract, isNoLaborContract, NO_LABOR_CONTRACT_NAME } from './entities/employee-contract.entity';
@@ -1752,7 +1753,7 @@ export class StoresService {
     // đánh giá chứ không chọn lúc tuyển. Khoá chia sẻ cửa hàng để không chen
     // vào giữa một lần xoá đúng vị trí này (career/career-store.ts).
     const careerV2 = await isCareerV2Enabled(manager, storeId);
-    if (careerV2 && data.storeRoleId) {
+    if (careerV2 && (data.storeRoleId || data.departmentId)) {
       await lockCareerStore(manager, storeId, 'share');
     }
     const hireRole = data.storeRoleId
@@ -1764,7 +1765,26 @@ export class StoresService {
     if (careerV2 && data.storeRoleId && !hireRole) {
       throw new BadRequestException('Vị trí không còn tồn tại');
     }
-    const departmentId = hireRole?.departmentId ?? null;
+    let departmentId = hireRole?.departmentId ?? null;
+    // Chưa xếp vị trí: vào thẳng bộ phận được chọn (không phải Cấp 1 hệ
+    // thống). Có vị trí thì bộ phận đi theo vị trí — gửi kèm bộ phận khác là
+    // client lệch dữ liệu, từ chối thay vì lặng lẽ chọn một bên.
+    if (careerV2 && data.departmentId) {
+      if (hireRole) {
+        if (hireRole.departmentId !== data.departmentId) {
+          throw new BadRequestException('Vị trí không thuộc bộ phận đã chọn');
+        }
+      } else {
+        const department = await manager.findOne(StoreDepartment, {
+          where: { id: data.departmentId, storeId },
+          select: ['id', 'isSystem'],
+        });
+        if (!department || department.isSystem) {
+          throw new BadRequestException('Bộ phận không còn tồn tại');
+        }
+        departmentId = department.id;
+      }
+    }
     const hireSkillId = careerV2 ? null : (data.skillId ?? null);
     const profile = await manager.save(
       EmployeeProfile,

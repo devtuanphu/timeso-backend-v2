@@ -25,6 +25,7 @@ import {
   CreateSkillDto,
   PromoteEmployeeDto,
   RecordSkillEvaluationDto,
+  TransferEmployeeDto,
   UpdateCareerSettingsDto,
   UpdateDepartmentDto,
   UpdatePositionDto,
@@ -80,6 +81,13 @@ export class StoresCareerController {
   @ApiOperation({ summary: 'Cây bộ phận, vị trí, kỹ năng, điều kiện và số nhân sự (3 tab)' })
   getStructure(@Param('storeId', uuid) storeId: string) {
     return this.structure.getStructure(storeId);
+  }
+
+  @Get(':storeId/career/members')
+  @StoreOwnerOnly()
+  @ApiOperation({ summary: 'Mọi nhân viên đang làm kèm bộ phận / vị trí (xem nhân sự, chuyển bộ phận)' })
+  getMembers(@Param('storeId', uuid) storeId: string) {
+    return this.structure.getMembers(storeId);
   }
 
   // ----- Bộ phận ---------------------------------------------------------------
@@ -188,6 +196,16 @@ export class StoresCareerController {
     return this.structure.createSkill(storeId, dto, user.userId);
   }
 
+  @Get(':storeId/career/skills/:skillId/employees')
+  @StoreOwnerOnly()
+  @ApiOperation({ summary: 'Nhân viên theo kỹ năng: đã đạt / đang học / chưa mở khoá' })
+  getSkillEmployees(
+    @Param('storeId', uuid) storeId: string,
+    @Param('skillId', uuid) skillId: string,
+  ) {
+    return this.evaluation.getSkillEmployees(storeId, skillId);
+  }
+
   @Patch(':storeId/career/skills/:skillId')
   @StoreOwnerOnly()
   @ApiOperation({ summary: 'Sửa / ngừng dùng kỹ năng' })
@@ -232,6 +250,17 @@ export class StoresCareerController {
     @GetUser() user: any,
   ) {
     return this.progress.promote(profileId, dto, user.userId);
+  }
+
+  @Post('employees/:profileId/career/transfer')
+  @StoreOwnerOnly()
+  @ApiOperation({ summary: 'Chuyển nhân viên sang bộ phận khác (không xét điều kiện thăng tiến)' })
+  transfer(
+    @Param('profileId', uuid) profileId: string,
+    @Body() dto: TransferEmployeeDto,
+    @GetUser() user: any,
+  ) {
+    return this.progress.transfer(profileId, dto, user.userId);
   }
 
   @Post('employees/:profileId/career/skills/:skillId/evaluations')

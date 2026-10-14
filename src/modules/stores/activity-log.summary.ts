@@ -62,6 +62,7 @@ export const ACTIVITY_ACTIONS = {
 
   CAREER_ADVANCED: 'career.advanced',
   CAREER_SKILL_ACHIEVED: 'career.skill_achieved',
+  CAREER_TRANSFERRED: 'career.transferred',
   CAREER_STRUCTURE_CHANGED: 'career.structure_changed',
 
   WORK_SHIFT_DELETED: 'work_shift.deleted',
@@ -156,6 +157,8 @@ const PARAM_RULES: Record<string, ParamRule> = {
   ladderName: text(80),
   rungName: text(80),
   skillName: text(80),
+  departmentName: text(80),
+  positionName: text(80),
   targetName: text(80),
   careerEntity: oneOf('department', 'position', 'skill'),
   change: oneOf('created', 'updated', 'deleted', 'duplicated', 'deactivated'),
@@ -388,6 +391,10 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
       return `${actor} chuyển ${subject} lên bậc ${
         p.rungName ? String(p.rungName) : 'mới'
       }${p.ladderName ? ` (lộ trình ${String(p.ladderName)})` : ''}`;
+    case A.CAREER_TRANSFERRED:
+      return `${actor} chuyển ${subject} sang bộ phận ${
+        p.departmentName ? String(p.departmentName) : 'mới'
+      }${p.positionName ? ` (vị trí ${String(p.positionName)})` : ''}`;
     case A.CAREER_SKILL_ACHIEVED:
       return `${actor} xác nhận ${subject} đạt kỹ năng ${
         p.skillName ? String(p.skillName) : 'mới'

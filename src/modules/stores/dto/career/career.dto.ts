@@ -267,6 +267,22 @@ export class PromoteEmployeeDto extends ClientRequestField {
   force?: boolean;
 }
 
+/** Chuyển ngang sang bộ phận khác (không xét điều kiện thăng tiến). */
+export class TransferEmployeeDto extends ClientRequestField {
+  @IsUUID()
+  toDepartmentId: string;
+
+  /** Vị trí trong bộ phận đích; bỏ trống = vào bộ phận, chưa xếp vị trí. */
+  @IsOptional()
+  @IsUUID()
+  toPositionId?: string | null;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(CAREER_NOTE_MAX)
+  note?: string | null;
+}
+
 export class RecordSkillEvaluationDto extends ClientRequestField {
   @IsEnum(SkillEvaluationResult)
   result: SkillEvaluationResult;

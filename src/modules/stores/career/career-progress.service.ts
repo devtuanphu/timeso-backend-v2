@@ -283,6 +283,142 @@ export class CareerProgressService {
   }
 
   // -------------------------------------------------------------------------
+  // Chuyển bộ phận
+  // -------------------------------------------------------------------------
+
+  /**
+   * Chủ cửa hàng chuyển ngang một nhân viên sang bộ phận khác — không phải
+   * thăng tiến nên không xét điều kiện / tính kề. Vị trí đích tuỳ chọn (phải
+   * thuộc bộ phận đích); bỏ trống thì vào bộ phận, chưa xếp vị trí.
+   *
+   * Tiến độ kỹ năng của bộ phận cũ được giữ nguyên làm lịch sử; kỹ năng của
+   * bộ phận mới mở khoá tính từ lúc chuyển (mốc là sự kiện bộ phận ghi ở đây).
+   */
+  async transfer(
+    profileId: string,
+    dto: {
+      toDepartmentId: string;
+      toPositionId?: string | null;
+      note?: string | null;
+      clientRequestId: string;
+    },
+    actorAccountId: string | null,
+  ) {
+    const note = trimNote(dto.note);
+    const toPositionId = dto.toPositionId ?? null;
+
+    const run = () =>
+      this.dataSource.transaction(async (m) => {
+        const { profile, graph } = await this.lockProfile(m, profileId);
+        const prior = await this.priorEvent(m, profile.id, dto.clientRequestId);
+        if (prior) {
+          await this.assertSameTransfer(m, prior, dto.toDepartmentId, toPositionId);
+          return { replayed: true as const, event: prior, notice: null };
+        }
+        this.assertEmployed(profile);
+
+        const department = graph.departments.get(dto.toDepartmentId);
+        if (!department || department.isSystem) throw new NotFoundException('Không tìm thấy bộ phận');
+        if (profile.departmentId === department.id) {
+          throw new BadRequestException({
+            code: CAREER_ERRORS.ALREADY_IN_POSITION,
+            message: 'Nhân viên đã thuộc bộ phận này',
+          });
+        }
+        let positionName: string | null = null;
+        if (toPositionId) {
+          const position = graph.positions.get(toPositionId);
+          if (!position || position.rank === null || position.departmentId !== department.id) {
+            throw new NotFoundException('Không tìm thấy vị trí trong bộ phận này');
+          }
+          positionName = position.name;
+        }
+
+        const fromDepartmentId = profile.departmentId ?? null;
+        const fromPositionId = profile.storeRoleId ?? null;
+        await m.update(
+          EmployeeProfile,
+          { id: profile.id },
+          { storeRoleId: toPositionId as any, departmentId: department.id },
+        );
+
+        // Sự kiện bộ phận là mốc "vào bộ phận" (mở khoá kỹ năng), sự kiện vị
+        // trí là mốc cộng dồn điều kiện vị trí. Rời vị trí mà không vào vị trí
+        // mới thì không có sự kiện vị trí (ck_employee_career_events_shape bắt
+        // buộc to_target_id); mốc vào vị trí luôn lấy sự kiện gần nhất của
+        // đúng vị trí hiện tại nên không cần. Mã chống lặp gắn vào sự kiện bộ
+        // phận (luôn có); criteriaSnapshot null phân biệt nó với một lần
+        // promote() lên bộ phận (luôn có snapshot).
+        const now = new Date();
+        const base = {
+          employeeProfileId: profile.id,
+          ladderId: null,
+          toRungId: null,
+          effectiveAt: now,
+          decidedByAccountId: actorAccountId,
+          criteriaSnapshot: null,
+          note,
+        };
+        const event = await m.save(
+          EmployeeCareerEvent,
+          m.create(EmployeeCareerEvent, {
+            ...base,
+            subjectType: 'department',
+            fromTargetId: fromDepartmentId,
+            toTargetId: department.id,
+            clientRequestId: dto.clientRequestId,
+          } as any),
+        );
+        if (toPositionId) {
+          await m.save(
+            EmployeeCareerEvent,
+            m.create(EmployeeCareerEvent, {
+              ...base,
+              subjectType: 'position',
+              fromTargetId: fromPositionId,
+              toTargetId: toPositionId,
+              clientRequestId: null,
+            } as any),
+          );
+        }
+
+        if (this.activityLogService) {
+          await this.activityLogService.record(m, {
+            storeId: profile.storeId,
+            actorAccountId,
+            subjectEmployeeProfileId: profile.id,
+            action: ACTIVITY_ACTIONS.CAREER_TRANSFERRED,
+            resourceType: 'career_event',
+            resourceId: event.id,
+            params: { departmentName: department.name, positionName },
+            idempotencyKey: `${ACTIVITY_ACTIONS.CAREER_TRANSFERRED}:${event.id}`,
+          });
+        }
+
+        const notice: Notice = {
+          accountId: profile.accountId,
+          title: 'Bạn đã chuyển sang bộ phận mới',
+          content: positionName ? `${department.name}: ${positionName}` : department.name,
+          metadata: { profileId: profile.id, subjectType: 'department', targetId: department.id },
+        };
+        return { replayed: false as const, event, notice };
+      });
+
+    const result = await this.withReplay(run, async () => {
+      const replay = await this.replayEvent(profileId, dto.clientRequestId);
+      await this.assertSameTransfer(
+        this.dataSource.manager,
+        replay.event,
+        dto.toDepartmentId,
+        toPositionId,
+      );
+      return replay;
+    });
+    await this.notify(result.notice);
+    return { replayed: result.replayed, event: this.eventView(result.event) };
+  }
+
+  // -------------------------------------------------------------------------
   // Kỹ năng
   // -------------------------------------------------------------------------
 
@@ -590,12 +726,43 @@ export class CareerProgressService {
     event: EmployeeCareerEvent,
     dto: { toPositionId?: string; toDepartmentId?: string },
   ) {
+    // Sự kiện bộ phận của transfer() không có snapshot: mã đó không phải của
+    // một lần promote.
     const same = dto.toPositionId
       ? event.subjectType === 'position' && event.toTargetId === dto.toPositionId
-      : (event.subjectType === 'department' && event.toTargetId === dto.toDepartmentId) ||
+      : (event.subjectType === 'department' &&
+          event.criteriaSnapshot !== null &&
+          event.toTargetId === dto.toDepartmentId) ||
         // Lên bộ phận có vị trí = vào vị trí thấp nhất của nó.
         event.subjectType === 'position';
     if (!same) throw requestReused();
+  }
+
+  /**
+   * Sự kiện cũ phải là đúng lần chuyển này: sự kiện bộ phận không snapshot
+   * (promote luôn có) tới đúng bộ phận, và vị trí ghi cùng lúc khớp vị trí đích.
+   */
+  private async assertSameTransfer(
+    m: EntityManager,
+    event: EmployeeCareerEvent,
+    toDepartmentId: string,
+    toPositionId: string | null,
+  ) {
+    if (
+      event.subjectType !== 'department' ||
+      event.criteriaSnapshot !== null ||
+      event.toTargetId !== toDepartmentId
+    ) {
+      throw requestReused();
+    }
+    const [position]: Array<{ to_target_id: string | null }> = await m.query(
+      `SELECT to_target_id FROM employee_career_events
+        WHERE employee_profile_id = $1 AND subject_type = 'position'
+          AND effective_at = $2 AND deleted_at IS NULL
+        LIMIT 1`,
+      [event.employeeProfileId, event.effectiveAt],
+    );
+    if ((position?.to_target_id ?? null) !== toPositionId) throw requestReused();
   }
 
   private assertSameEvaluation(
