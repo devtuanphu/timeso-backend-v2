@@ -3018,6 +3018,38 @@ export class StoresService {
    * contracts and assets stay as they were). Shift assignments cancelled at
    * termination are NOT brought back; the owner re-assigns them.
    */
+  /**
+   * Vị trí / bộ phận của người được khôi phục có thể đã đổi trong lúc họ nghỉ:
+   * chặn xoá vị trí / bộ phận chỉ đếm người ĐANG làm, nên chủ xoá được vị trí
+   * mà một hồ sơ đã nghỉ vẫn trỏ tới. Khôi phục nguyên trạng thì hồ sơ trỏ vào
+   * một vị trí không còn: lộ trình coi như "chưa có vị trí" (bước kế nhảy về
+   * bậc 1) và chi tiết NV hiện "Chưa có vị trí" — trông như bị đổi vị trí.
+   *
+   * Nên: vị trí đã xoá / ngừng dùng → bỏ vị trí; vị trí còn → bộ phận đi theo
+   * vị trí (vị trí có thể đã được chuyển bộ phận); bộ phận đã xoá → bỏ bộ phận.
+   * Chủ xếp lại bằng "Chuyển bộ phận". Không ghi sự kiện: không phải một lần
+   * lên / chuyển, chỉ là bỏ tham chiếu treo.
+   */
+  private async reconcileRestoredPlacement(manager: EntityManager, profile: EmployeeProfile) {
+    if (profile.storeRoleId) {
+      const role = await manager.findOne(StoreRole, {
+        where: { id: profile.storeRoleId, storeId: profile.storeId },
+        select: ['id', 'isActive', 'departmentId'],
+      });
+      if (!role || role.isActive === false) {
+        profile.storeRoleId = null as any;
+      } else if (role.departmentId) {
+        profile.departmentId = role.departmentId;
+      }
+    }
+    if (profile.departmentId) {
+      const exists = await manager.exists(StoreDepartment, {
+        where: { id: profile.departmentId, storeId: profile.storeId },
+      });
+      if (!exists) profile.departmentId = null as any;
+    }
+  }
+
   async restoreEmployee(profileId: string, ownerAccountId: string) {
     const profileBeforeLock = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -3077,6 +3109,7 @@ export class StoresService {
       profile.terminationReasonId = null;
       profile.leftAt = null;
       profile.deletedAt = null;
+      await this.reconcileRestoredPlacement(manager, profile);
       await manager.save(EmployeeProfile, profile);
       await this.logActivity(manager, {
         storeId: profile.storeId,
