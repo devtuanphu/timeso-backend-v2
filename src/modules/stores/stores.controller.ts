@@ -16,6 +16,7 @@ import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
 import { CreateManualEmployeeDto } from './dto/create-manual-employee.dto';
+import { UpdateEmployeeByOwnerDto } from './dto/update-employee.dto';
 import { StoreDiscoveryQueryDto } from './dto/store-discovery.dto';
 import { AddExistingEmployeeDto, ExistingEmployeeCandidateQueryDto, LinkExistingEmployeeDto } from './dto/add-existing-employee.dto';
 import { CreateStoreDto } from './dto/create-store.dto';
@@ -1152,6 +1153,21 @@ export class StoresController {
       data.backImage = identityImageUrl(files.backImage[0].filename);
 
     return this.storesService.updateMyPersonalInfoInStore(user.userId, data);
+  }
+
+  @StoreOwnerOnly()
+  @Patch('employees/:profileId')
+  @ApiOperation({
+    summary: 'Chủ cửa hàng sửa thông tin nhân viên',
+    description:
+      'Thông tin tài khoản (họ tên, giới tính, ngày sinh, email, địa chỉ, tình trạng hôn nhân, CCCD, ngân hàng — không gồm số điện thoại) và hồ sơ tại cửa hàng (hình thức làm việc, ca mặc định). Không gửi = giữ nguyên, null / "" = xoá.',
+  })
+  async updateEmployee(
+    @GetUser() user: any,
+    @Param('profileId', new ParseUUIDPipe()) profileId: string,
+    @Body() dto: UpdateEmployeeByOwnerDto,
+  ) {
+    return this.storesService.updateEmployeeByOwner(profileId, dto, user.userId);
   }
 
   @StoreOwnerOnly()

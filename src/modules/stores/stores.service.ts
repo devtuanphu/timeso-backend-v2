@@ -3,7 +3,12 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, In, MoreThanOrEqual, Between, Not, IsNull, DataSource, EntityManager, Brackets, SelectQueryBuilder } from 'typeorm';
 import { isUUID } from 'class-validator';
 import { UpdateServiceItemRecipeDto } from './dto/service-item-recipe.dto';
-import { computeProbationEndsAt, recordEntryCareerEvents } from './career-ladder.lifecycle';
+import {
+  changeEmploymentType,
+  computeProbationEndsAt,
+  recordEntryCareerEvents,
+} from './career-ladder.lifecycle';
+import { UpdateEmployeeByOwnerDto } from './dto/update-employee.dto';
 import { defaultStaffPermissions } from './store-permission-defaults';
 import {
   appUpdateRequired,
@@ -2202,6 +2207,187 @@ export class StoresService {
         storeName: store.name,
       },
     };
+  }
+
+  /**
+   * Chủ cửa hàng sửa thông tin một nhân viên của cửa hàng mình (route có
+   * @StoreOwnerOnly + StoreResourceAccessGuard định vị cửa hàng qua hồ sơ).
+   *
+   * - Trường tài khoản (họ tên, giới tính, ngày sinh, email, địa chỉ, tình
+   *   trạng hôn nhân, CCCD, ngân hàng) là của TÀI KHOẢN nhân viên — dùng chung
+   *   mọi cửa hàng họ làm và là thứ họ thấy trong app nhân viên. Không có số
+   *   điện thoại: đó là tài khoản đăng nhập.
+   * - Hình thức làm việc đi qua changeEmploymentType (trạng thái thử việc + sự
+   *   kiện lộ trình), ca mặc định chỉ nhận ca còn dùng của chính cửa hàng.
+   *
+   * Một transaction, hồ sơ khoá FOR UPDATE (cùng khoá với advance()): đổi hình
+   * thức làm việc không chen giữa một lần duyệt lên bậc. Nhật ký chỉ ghi tên
+   * các nhóm trường đã đổi, không ghi giá trị (CCCD, ngân hàng là dữ liệu nhạy cảm).
+   */
+  async updateEmployeeByOwner(
+    profileId: string,
+    dto: UpdateEmployeeByOwnerDto,
+    ownerAccountId: string,
+  ) {
+    const has = (key: keyof UpdateEmployeeByOwnerDto) => dto[key] !== undefined;
+    return this.dataSource.transaction(async (manager) => {
+      const profile = await manager.findOne(EmployeeProfile, {
+        where: { id: profileId },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+      const account = await manager.findOne(Account, { where: { id: profile.accountId } });
+      if (!account) throw new NotFoundException('Không tìm thấy tài khoản nhân viên');
+
+      const changed: string[] = [];
+
+      // 1. Tài khoản
+      const accountUpdate: Partial<Account> = {};
+      // Cột `date` có thể đọc ra là chuỗi hoặc Date (nửa đêm giờ máy chủ):
+      // so theo YYYY-MM-DD lấy bằng giờ địa phương — toISOString() sẽ lùi
+      // một ngày ở múi +07.
+      const ymd = (d: Date) =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const plain = (v: unknown) => (v instanceof Date ? ymd(v) : v === undefined ? null : v);
+      const setAccount = <K extends keyof Account>(key: K, value: Account[K], label: string) => {
+        if (plain(account[key]) === plain(value)) return;
+        accountUpdate[key] = value;
+        changed.push(label);
+      };
+      if (has('fullName')) setAccount('fullName', dto.fullName as string, 'Họ tên');
+      if (has('gender')) setAccount('gender', dto.gender as string, 'Giới tính');
+      if (has('birthday')) {
+        const birthday = dto.birthday ? dto.birthday.slice(0, 10) : null;
+        const current = account.birthday ? String(plain(account.birthday)).slice(0, 10) : null;
+        if (current !== birthday) {
+          accountUpdate.birthday = birthday as any;
+          changed.push('Ngày sinh');
+        }
+      }
+      if (has('address')) setAccount('address', (dto.address ?? null) as any, 'Địa chỉ');
+      if (has('maritalStatus')) {
+        setAccount('maritalStatus', (dto.maritalStatus ?? null) as any, 'Tình trạng hôn nhân');
+      }
+      if (has('email')) {
+        const email = dto.email ? dto.email.toLowerCase() : null;
+        if (email && email !== (account.email ?? '').toLowerCase()) {
+          const taken = await manager
+            .createQueryBuilder(Account, 'a')
+            .where('LOWER(a.email) = :email', { email })
+            .andWhere('a.id <> :id', { id: account.id })
+            .getExists();
+          if (taken) {
+            throw new ConflictException({
+              code: 'EMAIL_TAKEN',
+              message: 'Email này đã được dùng cho một tài khoản khác',
+            });
+          }
+        }
+        setAccount('email', email as any, 'Email');
+      }
+      if (Object.keys(accountUpdate).length) {
+        await manager.update(Account, { id: account.id }, accountUpdate as any);
+      }
+
+      // 2. Giấy tờ (CCCD) — chỉ số giấy tờ; ảnh do nhân viên tự cập nhật.
+      if (has('identityCardNumber')) {
+        const documentNumber = dto.identityCardNumber ?? null;
+        const identity = await manager.findOne(AccountIdentityDocument, {
+          where: { accountId: account.id },
+        });
+        if ((identity?.documentNumber ?? null) !== documentNumber) {
+          if (identity) {
+            await manager.update(AccountIdentityDocument, { id: identity.id }, {
+              documentNumber: documentNumber as any,
+            });
+          } else if (documentNumber) {
+            await manager.save(
+              AccountIdentityDocument,
+              manager.create(AccountIdentityDocument, {
+                accountId: account.id,
+                docType: 'CCCD',
+                verifiedStatus: VerifiedStatus.VERIFIED,
+                documentNumber,
+              } as any),
+            );
+          }
+          changed.push('CCCD');
+        }
+      }
+
+      // 3. Ngân hàng
+      if (has('bankName') || has('bankNumber')) {
+        const finance = await manager.findOne(AccountFinance, { where: { accountId: account.id } });
+        const financeUpdate: Record<string, string | null> = {};
+        if (has('bankName') && (finance?.bankName ?? null) !== (dto.bankName ?? null)) {
+          financeUpdate.bankName = dto.bankName ?? null;
+        }
+        if (has('bankNumber') && (finance?.bankNumber ?? null) !== (dto.bankNumber ?? null)) {
+          financeUpdate.bankNumber = dto.bankNumber ?? null;
+        }
+        if (Object.keys(financeUpdate).length) {
+          if (finance) {
+            await manager.update(AccountFinance, { accountId: account.id }, financeUpdate as any);
+          } else {
+            await manager.save(
+              AccountFinance,
+              manager.create(AccountFinance, { accountId: account.id, ...financeUpdate } as any),
+            );
+          }
+          changed.push('Ngân hàng');
+        }
+      }
+
+      // 4. Hồ sơ tại cửa hàng
+      let profileChanged = false;
+      if (has('workShiftId') && (profile.workShiftId ?? null) !== (dto.workShiftId ?? null)) {
+        if (dto.workShiftId) {
+          const shift = await manager.findOne(WorkShift, {
+            where: { id: dto.workShiftId, storeId: profile.storeId },
+            select: ['id', 'isActive'],
+          });
+          if (!shift) throw this.invalidStoreReference();
+          if (!shift.isActive) {
+            throw new BadRequestException({
+              code: WORK_SHIFT_INACTIVE_CODE,
+              message: WORK_SHIFT_INACTIVE_MESSAGE,
+            });
+          }
+        }
+        profile.workShiftId = (dto.workShiftId ?? null) as any;
+        profileChanged = true;
+        changed.push('Ca làm việc');
+      }
+      if (has('employeeTypeId') && (profile.employeeTypeId ?? null) !== (dto.employeeTypeId ?? null)) {
+        if (dto.employeeTypeId) {
+          const exists = await manager.exists(StoreEmployeeType, {
+            where: { id: dto.employeeTypeId, storeId: profile.storeId },
+          });
+          if (!exists) throw this.invalidStoreReference();
+        }
+        await changeEmploymentType(manager, profile, dto.employeeTypeId ?? null, {
+          decidedByAccountId: ownerAccountId,
+          note: 'Chủ cửa hàng sửa hình thức làm việc',
+        });
+        profileChanged = true;
+        changed.push('Hình thức làm việc');
+      }
+      if (profileChanged) await manager.save(EmployeeProfile, profile);
+
+      if (changed.length) {
+        await this.logActivity(manager, {
+          storeId: profile.storeId,
+          actorAccountId: ownerAccountId,
+          subjectEmployeeProfileId: profile.id,
+          action: ACTIVITY_ACTIONS.EMPLOYEE_UPDATED,
+          resourceType: 'employee',
+          resourceId: profile.id,
+          params: { changedFields: changed.join(', ') },
+          idempotencyKey: null,
+        });
+      }
+      return { id: profile.id, changed };
+    });
   }
 
   async updateMyPersonalInfoInStore(

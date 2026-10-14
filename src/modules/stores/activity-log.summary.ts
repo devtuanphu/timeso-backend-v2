@@ -56,6 +56,7 @@ export const ACTIVITY_ACTIONS = {
   EMPLOYEE_ADDED: 'employee.added',
   EMPLOYEE_REHIRED: 'employee.rehired',
   EMPLOYEE_REMOVED: 'employee.removed',
+  EMPLOYEE_UPDATED: 'employee.updated',
 
   ASSET_ASSIGNED: 'asset.assigned',
   ASSET_RETURNED: 'asset.returned',
@@ -158,6 +159,7 @@ const PARAM_RULES: Record<string, ParamRule> = {
   rungName: text(80),
   skillName: text(80),
   departmentName: text(80),
+  changedFields: text(160),
   positionName: text(80),
   targetName: text(80),
   careerEntity: oneOf('department', 'position', 'skill'),
@@ -375,6 +377,10 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
         : `${actor} tuyển lại ${subject}`;
     case A.EMPLOYEE_REMOVED:
       return `${actor} cho ${subject} thôi việc`;
+    case A.EMPLOYEE_UPDATED:
+      return `${actor} cập nhật thông tin của ${subject}${
+        p.changedFields ? ` (${String(p.changedFields)})` : ''
+      }`;
     case A.ASSET_ASSIGNED:
       return `${actor} cấp ${
         Number(p.quantity) > 1 ? `${p.quantity} ` : ''

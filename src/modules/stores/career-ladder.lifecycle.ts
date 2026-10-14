@@ -1,7 +1,8 @@
 import { EntityManager, In, MoreThanOrEqual } from 'typeorm';
 
 import { EmployeeCareerEvent } from './entities/employee-career-event.entity';
-import { EmployeeProfile } from './entities/employee-profile.entity';
+import { EmployeeProfile, EmploymentStatus } from './entities/employee-profile.entity';
+import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
 import { StoreLadderRung } from './entities/store-ladder-rung.entity';
@@ -174,4 +175,79 @@ export async function recordEntryCareerEvents(
     written += 1;
   }
   return written;
+}
+
+/**
+ * Chủ cửa hàng đổi tay hình thức làm việc (loại nhân viên) của một hồ sơ —
+ * sửa thông tin nhân viên, không phải "lên bậc": không xét điều kiện, không
+ * bắt đi theo cạnh của lộ trình (sửa nhầm Chính thức → Thử việc cũng được).
+ *
+ * Ghi giống CareerLadderService.advance() cho lộ trình employment_type để hai
+ * đường không lệch nhau: thử việc ↔ trạng thái PROBATION / ACTIVE và hạn thử
+ * việc tính lại từ bây giờ; có lộ trình đang bật và loại mới là một bậc của
+ * nó thì ghi một sự kiện (bậc cũ → bậc mới), để "thời gian ở bậc" đếm từ lúc
+ * đổi. Chỉ đổi trạng thái khi đang Thử việc / Chính thức — người đang nghỉ
+ * phép, đã nghỉ việc hay chờ duyệt giữ nguyên trạng thái.
+ *
+ * Gọi trong transaction của người gọi, với hồ sơ đã khoá; người gọi lưu hồ sơ.
+ * Trả về sự kiện đã ghi (nếu có).
+ */
+export async function changeEmploymentType(
+  manager: EntityManager,
+  profile: EmployeeProfile,
+  nextTypeId: string | null,
+  options: { decidedByAccountId: string | null; note: string },
+): Promise<EmployeeCareerEvent | null> {
+  const previousTypeId = profile.employeeTypeId ?? null;
+  if (previousTypeId === nextTypeId) return null;
+
+  const ladder = await manager.findOne(StoreLadder, {
+    where: {
+      storeId: profile.storeId,
+      dimension: LadderDimension.EMPLOYMENT_TYPE,
+      isActive: true,
+    },
+  });
+  const rungOf = (targetId: string | null) =>
+    ladder && targetId
+      ? manager.findOne(StoreLadderRung, { where: { ladderId: ladder.id, targetId } })
+      : Promise.resolve(null);
+  const [fromRung, toRung] = await Promise.all([rungOf(previousTypeId), rungOf(nextTypeId)]);
+
+  // Cột nullable trong DB nhưng khai `string` trên entity.
+  profile.employeeTypeId = nextTypeId as any;
+
+  const employed =
+    profile.employmentStatus === EmploymentStatus.ACTIVE ||
+    profile.employmentStatus === EmploymentStatus.PROBATION;
+  if (employed) {
+    const type = nextTypeId
+      ? await manager.findOne(StoreEmployeeType, { where: { id: nextTypeId } })
+      : null;
+    if (type?.isProbation) {
+      profile.employmentStatus = EmploymentStatus.PROBATION;
+      profile.probationEndsAt = toRung
+        ? await computeProbationEndsAt(manager, toRung.id, new Date())
+        : null;
+    } else {
+      profile.employmentStatus = EmploymentStatus.ACTIVE;
+      profile.probationEndsAt = null;
+    }
+  }
+
+  if (!ladder || !toRung || !nextTypeId) return null;
+  return manager.save(
+    EmployeeCareerEvent,
+    manager.create(EmployeeCareerEvent, {
+      employeeProfileId: profile.id,
+      ladderId: ladder.id,
+      fromRungId: fromRung?.id ?? null,
+      toRungId: toRung.id,
+      ...legacyEventSubject(ladder.dimension, previousTypeId, nextTypeId),
+      effectiveAt: new Date(),
+      decidedByAccountId: options.decidedByAccountId,
+      criteriaSnapshot: null,
+      note: options.note,
+    }),
+  );
 }
