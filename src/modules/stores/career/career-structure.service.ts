@@ -205,7 +205,6 @@ export class CareerStructureService {
       }
       return map;
     };
-    const deptReqs = reqsBy((r) => r.departmentId);
     const posReqs = reqsBy((r) => r.positionId);
     const skillReqs = reqsBy((r) => r.skillId);
 
@@ -243,7 +242,9 @@ export class CareerStructureService {
         sortOrder: d.sortOrder,
         isSystem: d.isSystem,
         ...preview(byDept.get(d.id)),
-        requirements: deptReqs.get(d.id) ?? [],
+        // Bộ phận không còn điều kiện thăng tiến (thuộc vị trí). Giữ trường
+        // rỗng cho app chủ cũ: thẻ bộ phận chỉ hiện ô điều kiện khi có mục.
+        requirements: [],
       })),
       positions: [...positions].sort(byOrder((p) => p.rank)).map((p) => ({
         id: p.id,
@@ -309,7 +310,8 @@ export class CareerStructureService {
       this.assertTier(parent, dto.tier);
       const name = dto.name.trim();
       await this.assertDepartmentNameFree(m, storeId, name);
-      const requirements = normalizeRequirements('department', dto.requirements);
+      // `requirements` của bộ phận bị bỏ qua: điều kiện thăng tiến thuộc vị
+      // trí. App chủ cũ vẫn gửi trường này nên không từ chối.
 
       const department = await m.save(
         StoreDepartment,
@@ -323,7 +325,6 @@ export class CareerStructureService {
           isSystem: false,
         }),
       );
-      await this.writeRequirements(m, storeId, { departmentId: department.id }, requirements);
       await this.logChange(m, storeId, actorAccountId, 'department', 'created', department);
       return department;
     });
@@ -349,8 +350,7 @@ export class CareerStructureService {
         // không có điều kiện — không ai "lên" Cấp 1.
         const movesSystem =
           (dto.tier !== undefined && dto.tier !== department.tier) ||
-          (dto.parentId !== undefined && dto.parentId !== department.parentId) ||
-          (dto.requirements !== undefined && dto.requirements.length > 0);
+          (dto.parentId !== undefined && dto.parentId !== department.parentId);
         if (movesSystem) {
           throw new BadRequestException({
             code: CAREER_ERRORS.SYSTEM_DEPARTMENT,
@@ -399,14 +399,7 @@ export class CareerStructureService {
       }
       if (dto.description !== undefined) department.description = trimOrNull(dto.description);
       const saved = await m.save(StoreDepartment, department);
-      if (!department.isSystem && dto.requirements !== undefined) {
-        await this.writeRequirements(
-          m,
-          storeId,
-          { departmentId: department.id },
-          normalizeRequirements('department', dto.requirements),
-        );
-      }
+      // `dto.requirements` bị bỏ qua (xem createDepartment).
       await this.logChange(m, storeId, actorAccountId, 'department', 'updated', saved);
       return saved;
     });
@@ -558,7 +551,6 @@ export class CareerStructureService {
         );
         skillMap.set(s.id, clone.id);
       }
-      await cloneReqs((r) => r.departmentId === source.id, { departmentId: copy.id }, skillMap);
       for (const s of skills) {
         await cloneReqs((r) => r.skillId === s.id, { skillId: skillMap.get(s.id) }, skillMap);
       }

@@ -251,7 +251,12 @@ export class CareerEvaluationService {
       departments: new Map(departments.map((d) => [d.id, d])),
       positions: new Map(positions.map((p) => [p.id, p])),
       skills: new Map(skills.map((s) => [s.id, s])),
-      requirements,
+      // Điều kiện thăng tiến chỉ thuộc VỊ TRÍ (và điều kiện đạt của kỹ năng).
+      // Điều kiện cũ gắn với bộ phận (ca / giờ mỗi tháng) không còn được xét:
+      // nó chỉ áp lúc chuyển VÀO bộ phận nên nhân viên trong bộ phận không
+      // thấy, chủ đặt xong tưởng app NV "lúc hiện lúc không". Dữ liệu cũ giữ
+      // nguyên trong DB, chỉ bỏ qua ở đây.
+      requirements: requirements.filter((r) => !r.departmentId),
     };
   }
 
@@ -541,15 +546,6 @@ export class CareerEvaluationService {
     const adjacent = this.positionAdjacent(graph, profile, target);
 
     const items = await this.measureEntry(ctx, graph, this.requirementsOf(graph, { positionId: target.id }));
-    if (!sameDepartment && profile.departmentId) {
-      items.push(
-        ...(await this.measureEntry(
-          ctx,
-          graph,
-          this.requirementsOf(graph, { departmentId: target.departmentId as string }),
-        )),
-      );
-    }
     // D8: rời bộ phận hiện tại (khác bộ phận) hoặc lên vị trí cao hơn trong
     // nó đều cần đủ kỹ năng bắt buộc của bộ phận hiện tại.
     await this.addImplicitSkills(ctx, graph, items, !!currentLive || !sameDepartment);
@@ -586,7 +582,9 @@ export class CareerEvaluationService {
             ? top?.id === currentLive.id
             : this.positionsOf(graph, profile.departmentId).length === 0)));
 
-    const items = await this.measureEntry(ctx, graph, this.requirementsOf(graph, { departmentId: target.id }));
+    // Bộ phận không có điều kiện riêng: vào bộ phận (chưa có vị trí) chỉ cần
+    // đủ kỹ năng bắt buộc của bộ phận đang ở.
+    const items: MeasuredRequirement[] = [];
     await this.addImplicitSkills(ctx, graph, items, true);
     const evaluation = evaluationOf(items, adjacent);
     return {

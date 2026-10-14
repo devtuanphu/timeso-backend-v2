@@ -34,10 +34,9 @@ export const REQUIREMENT_CODES_BY_SUBJECT: Record<
   CareerSubject,
   CareerRequirementCode[]
 > = {
-  department: [
-    CareerRequirementCode.MONTHLY_SHIFTS,
-    CareerRequirementCode.MONTHLY_HOURS,
-  ],
+  // Bộ phận không còn điều kiện thăng tiến (thuộc vị trí). Mã ca / giờ mỗi
+  // tháng vẫn giữ để đọc dữ liệu cũ, không nhận mới.
+  department: [],
   position: [
     CareerRequirementCode.WORK_HOURS,
     CareerRequirementCode.COMPLETED_SHIFTS,
