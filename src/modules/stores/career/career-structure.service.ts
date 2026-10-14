@@ -426,26 +426,24 @@ export class CareerStructureService {
                   SELECT r.id FROM store_roles r WHERE r.department_id = $2 AND r.deleted_at IS NULL))`,
         [storeId, department.id, EMPLOYED_STATUSES],
       );
-      const [{ achievers }] = await m.query(
-        `SELECT count(*)::int AS achievers
-           FROM employee_skill_progress g
-           JOIN store_skills k ON k.id = g.skill_id
-          WHERE g.store_id = $1 AND g.deleted_at IS NULL AND g.status = $3
-            AND k.department_id = $2 AND k.deleted_at IS NULL`,
-        [storeId, department.id, SkillProgressStatus.ACHIEVED],
-      );
-      if (children > 0 || employees > 0 || achievers > 0) {
-        const reasons = [
-          children > 0 ? `${children} bộ phận con` : null,
-          employees > 0 ? `${employees} nhân viên` : null,
-          achievers > 0 ? `${achievers} lượt đạt kỹ năng` : null,
+      // Không chặn theo lượt đạt kỹ năng: kỹ năng đã có người đạt không xoá
+      // được, không chuyển bộ phận được — chặn ở đây là ngõ cụt (bộ phận từng
+      // đào tạo ai thì không bao giờ xoá được). Xoá bộ phận cho kỹ năng nghỉ
+      // hưu (xoá mềm) và GIỮ các dòng "đã đạt" (retireSkills), nên lịch sử
+      // của nhân viên vẫn còn — đúng mục đích của quy tắc chỉ-ngừng-dùng (D10).
+      // Chỉ chặn điều chủ xử lý được: bộ phận con và nhân viên đang làm.
+      if (children > 0 || employees > 0) {
+        const steps = [
+          children > 0
+            ? `${children} bộ phận con (đổi bộ phận quản lý của chúng hoặc xoá chúng)`
+            : null,
+          employees > 0 ? `${employees} nhân viên (chuyển họ sang bộ phận khác)` : null,
         ].filter(Boolean);
         throw new ConflictException({
           code: CAREER_ERRORS.DEPARTMENT_IN_USE,
-          message: `Bộ phận còn ${reasons.join(', ')}. Chuyển hoặc xoá chúng trước.`,
+          message: `Bộ phận còn ${steps.join(' và ')} trước khi xoá.`,
           children,
           employees,
-          skillAchievers: achievers,
         });
       }
 

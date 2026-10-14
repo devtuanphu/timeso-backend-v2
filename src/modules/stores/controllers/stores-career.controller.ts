@@ -117,7 +117,9 @@ export class StoresCareerController {
 
   @Delete(':storeId/career/departments/:departmentId')
   @StoreOwnerOnly()
-  @ApiOperation({ summary: 'Xoá bộ phận (chặn khi còn bộ phận con / nhân viên / người đạt kỹ năng)' })
+  @ApiOperation({
+    summary: 'Xoá bộ phận kèm vị trí, kỹ năng (chặn khi còn bộ phận con / nhân viên; giữ lịch sử đạt kỹ năng)',
+  })
   deleteDepartment(
     @Param('storeId', uuid) storeId: string,
     @Param('departmentId', uuid) departmentId: string,
