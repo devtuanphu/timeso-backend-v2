@@ -3006,10 +3006,58 @@ export class StoresService {
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
     await this.assertOwnerStoreAccess(profile.storeId, ownerAccountId);
 
-    // Scoped to the verified store so the row cannot have moved in between.
-    return this.profileRepository.delete({
-      id: profileId,
-      storeId: profile.storeId,
+    return this.dataSource.transaction(async (manager) => {
+      const locked = await manager
+        .getRepository(EmployeeProfile)
+        .createQueryBuilder('profile')
+        .withDeleted()
+        .where('profile.id = :profileId', { profileId })
+        .andWhere('profile.store_id = :storeId', { storeId: profile.storeId })
+        .setLock('pessimistic_write')
+        .getOne();
+      if (!locked) throw new NotFoundException('Không tìm thấy nhân viên');
+      // Chỉ xoá vĩnh viễn hồ sơ đã xoá mềm: bước xoá mềm mới huỷ ca sắp tới,
+      // đóng yêu cầu đang chờ và rút khỏi nhóm chat. Xoá thẳng hồ sơ đang làm
+      // sẽ bỏ qua toàn bộ phần dọn đó.
+      if (!locked.deletedAt) {
+        throw new ConflictException({
+          code: 'EMPLOYEE_NOT_REMOVED',
+          message: 'Hãy xoá nhân viên khỏi cửa hàng trước khi xoá vĩnh viễn',
+        });
+      }
+
+      // Các khoá ngoại tới hồ sơ là NO ACTION: còn một dòng là DELETE hồng
+      // (500) và hồ sơ ở lại. Dữ liệu của chính người này xoá theo hồ sơ; chỗ
+      // họ chỉ được nhắc tới thì bỏ tham chiếu để giữ dữ liệu của cửa hàng.
+      await manager.delete(InventoryReport, { reporterId: profileId });
+      await manager.delete(KpiApprovalRequest, { employeeProfileId: profileId });
+      await manager.delete(ShiftSwap, { requestedByEmployeeId: profileId });
+      await manager.delete(ChatGroupMember, { employeeProfileId: profileId });
+      await manager.update(
+        Asset,
+        { responsibleEmployeeId: profileId },
+        { responsibleEmployeeId: null as any },
+      );
+      await manager.update(
+        KpiApprovalRequest,
+        { reviewerId: profileId },
+        { reviewerId: null as any },
+      );
+      await manager.update(
+        ShiftSwap,
+        { toEmployeeId: profileId },
+        { toEmployeeId: null as any },
+      );
+      await manager.update(
+        StockTransaction,
+        { employeeId: profileId },
+        { employeeId: null as any },
+      );
+
+      return manager.delete(EmployeeProfile, {
+        id: profileId,
+        storeId: profile.storeId,
+      });
     });
   }
 
