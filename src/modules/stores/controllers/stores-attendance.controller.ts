@@ -236,6 +236,15 @@ export class StoresAttendanceController {
             `[CheckIn] Unable to schedule shift-end workflow for ${id}: ${error instanceof Error ? error.message : String(error)}`,
           ),
         );
+      // Màn nhân viên của chủ (ca / đi trễ) đổi ngay khi chấm công vào; trước
+      // đây chỉ cập nhật sau job của chấm công ra.
+      void this.storesService
+        .refreshMonthlySummaryOfAssignment(id)
+        .catch((error) =>
+          this.logger.error(
+            `[CheckIn] Unable to refresh monthly summary for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+          ),
+        );
     }
     return result;
   }

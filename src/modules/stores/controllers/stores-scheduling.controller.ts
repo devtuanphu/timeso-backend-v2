@@ -33,6 +33,7 @@ import {
   WorkShiftResponseDto,
   EmployeeScheduleDetailsDto,
 } from '../dto/store-response.dto';
+import { UpdateAssignmentTimeDto } from '../dto/update-assignment-time.dto';
 import {
   CreateShiftScheduleDto,
   ShiftEmployeeOptionsDto,
@@ -510,6 +511,25 @@ export class StoresSchedulingController {
       assignmentId,
       body.status,
       body.note,
+      user.userId,
+    );
+  }
+
+  @StoreOwnerOnly()
+  @Put('shift-assignments/:assignmentId/time')
+  @ApiOperation({
+    summary: 'Đổi giờ ca của một nhân viên',
+    description:
+      'Chỉ ca chưa chấm công vào. Khung ca còn người khác thì tách nhân viên này sang khung mới cùng ngày; nhân viên nhận thông báo đổi giờ.',
+  })
+  async updateAssignmentTime(
+    @Param('assignmentId') assignmentId: string,
+    @Body() body: UpdateAssignmentTimeDto,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.updateAssignmentTime(
+      assignmentId,
+      body,
       user.userId,
     );
   }

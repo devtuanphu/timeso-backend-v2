@@ -5,6 +5,7 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import {
+  Between,
   In,
   MoreThanOrEqual,
   LessThanOrEqual,
@@ -90,7 +91,16 @@ import {
   StorePayrollRule,
   PayrollRuleCategory,
   PayrollCalcType,
+  PayrollRuleCode,
+  MANUAL_PAYROLL_RULE_CODES,
+  BONUS_PAYROLL_RULE_CODES,
+  FINE_PAYROLL_RULE_CODES,
+  legacyRuleCodeOf,
 } from '../entities/store-payroll-rule.entity';
+import { CreatePayrollRecordDto } from '../dto/payroll-record.dto';
+
+/** Mã khoản tự thêm, dạng chuỗi (code của rule là string, không phải enum). */
+const CUSTOM_RULE_CODE: string = PayrollRuleCode.CUSTOM;
 import {
   StorePayrollIncrementRule,
   IncrementRuleType,
@@ -115,7 +125,10 @@ import {
   describeEarnedBase,
   describePayslipTotals,
   EarnedBreakdown,
+  payRatesOf,
 } from '../payroll-calculation.utils';
+import { effectiveWindowOf } from '../attendance-time.utils';
+import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
 import {
   parseVnMonthInput,
   shiftVnMonth,
@@ -248,7 +261,17 @@ export class StoresPayrollPart {
   }
 
   // --- Payroll Settings ---
-  async getPayrollSetting(this: StoresService, storeId: string) {
+  /**
+   * `rulesVersion: 2` (màn thiết lập mới): mọi khoản thưởng / vi phạm chưa xoá,
+   * kể cả khoản đang tắt, cùng các cột v2. Không có (app cũ): như trước, chỉ
+   * khoản cũ đang bật — app cũ không biết đọc cách tính v2 (hệ số sẽ bị hiểu
+   * là số tiền).
+   */
+  async getPayrollSetting(
+    this: StoresService,
+    storeId: string,
+    options: { rulesVersion?: number } = {},
+  ) {
     let setting = await this.payrollSettingRepository.findOne({
       where: { storeId },
     });
@@ -260,9 +283,13 @@ export class StoresPayrollPart {
       await this.payrollSettingRepository.save(setting);
     }
 
-    const rules = await this.payrollRuleRepository.find({
-      where: { storeId, isActive: true },
-    });
+    const v2 = options.rulesVersion === 2;
+    const rules = (
+      await this.payrollRuleRepository.find({
+        where: v2 ? { storeId } : { storeId, isActive: true },
+        order: { createdAt: 'ASC' },
+      })
+    ).filter((rule) => v2 || !rule.calcMode);
     const incrementRules = await this.payrollIncrementRuleRepository.find({
       where: { storeId, isActive: true },
     });
@@ -304,67 +331,16 @@ export class StoresPayrollPart {
     }
     await this.payrollSettingRepository.save(setting);
 
-    // 2. Sync Rules (Bonuses, Fines, Benefits)
-    const incomingRules = [
-      ...(data.bonuses || []).map((r) => ({
-        ...r,
-        category: PayrollRuleCategory.BONUS,
-      })),
-      ...(data.fines || []).map((r) => ({
-        ...r,
-        category: PayrollRuleCategory.FINE,
-      })),
-      ...(data.benefits || []).map((r) => ({
-        ...r,
-        category: PayrollRuleCategory.BENEFIT,
-      })),
-    ];
-
-    const currentRules = await this.payrollRuleRepository.find({
-      where: { storeId },
+    // 2. Sync Rules (Bonuses, Fines, Benefits). One writer per store: two
+    // saves at once would both insert a missing rule (and pay it twice).
+    const rulesChanged = await this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `payroll-rules:${storeId}`,
+      ]);
+      return data.rulesVersion === 2
+        ? this.syncPayrollRulesV2(manager, storeId, data)
+        : this.syncPayrollRulesLegacy(manager, storeId, data);
     });
-    const rulesToSave: StorePayrollRule[] = [];
-
-    for (const ruleData of incomingRules) {
-      let rule: StorePayrollRule | undefined;
-
-      if (ruleData.id) {
-        rule = currentRules.find((r) => r.id === ruleData.id);
-      } else {
-        rule = currentRules.find(
-          (r) =>
-            r.name === ruleData.name &&
-            r.category === ruleData.category &&
-            r.ruleType === ruleData.ruleType,
-        );
-      }
-
-      const payload = {
-        ...ruleData,
-        calcType: ruleData.calcType as PayrollCalcType,
-        storeId,
-      };
-
-      if (rule) {
-        Object.assign(rule, payload);
-      } else {
-        rule = this.payrollRuleRepository.create(payload);
-      }
-      rulesToSave.push(rule);
-    }
-
-    // Remove rules not in payload
-    const incomingIds = rulesToSave.map((r) => r.id).filter((id) => !!id);
-    const toRemoveIds = currentRules
-      .filter((r) => !incomingIds.includes(r.id))
-      .map((r) => r.id);
-
-    if (toRemoveIds.length > 0) {
-      await this.payrollRuleRepository.delete({ id: In(toRemoveIds) });
-    }
-    if (rulesToSave.length > 0) {
-      await this.payrollRuleRepository.save(rulesToSave);
-    }
 
     // 3. Sync Increment Rules
     if (data.incrementRules) {
@@ -427,7 +403,330 @@ export class StoresPayrollPart {
       }
     }
 
-    return this.getPayrollSetting(storeId);
+    // Khoản thưởng / vi phạm đổi: phiếu lương tháng này (chưa chốt) tính lại
+    // ngay, như khi lưu mẫu bảng lương.
+    let recalculationFailed = false;
+    if (rulesChanged) {
+      const payroll = await this.dataSource
+        .getRepository(MonthlyPayroll)
+        .findOne({ where: { storeId, month: toMonthMarker(vnMonthOf()) } });
+      if (payroll) {
+        try {
+          await this.recalculatePayroll(storeId);
+        } catch (error) {
+          recalculationFailed = true;
+          this.logger?.warn(
+            `Payroll rules saved but recalculation failed for ${storeId}: ${String(error)}`,
+          );
+        }
+      }
+    }
+    const saved = await this.getPayrollSetting(storeId, {
+      rulesVersion: data.rulesVersion,
+    });
+    return recalculationFailed ? { ...saved, recalculationFailed } : saved;
+  }
+
+  /**
+   * App cũ: chỉ trong phạm vi khoản cũ ĐANG BẬT (calc_mode null) — đúng những
+   * gì nó đọc được. Khoản v2 và khoản đang tắt không bao giờ bị nó sửa / xoá.
+   */
+  async syncPayrollRulesLegacy(
+    this: StoresService,
+    manager: EntityManager,
+    storeId: string,
+    data: UpdatePayrollSettingDto,
+  ): Promise<boolean> {
+    const repo = manager.getRepository(StorePayrollRule);
+    const incomingRules = [
+      ...(data.bonuses || []).map((r) => ({ ...r, category: PayrollRuleCategory.BONUS })),
+      ...(data.fines || []).map((r) => ({ ...r, category: PayrollRuleCategory.FINE })),
+      ...(data.benefits || []).map((r) => ({ ...r, category: PayrollRuleCategory.BENEFIT })),
+    ];
+    const currentRules = (await repo.find({ where: { storeId, isActive: true } })).filter(
+      (rule) => !rule.calcMode,
+    );
+    // Khoản v2 đang bật (app cũ không thấy): app cũ thêm dòng cùng loại (vd.
+    // một khoản phạt đi muộn nữa) sẽ phạt / thưởng hai lần — bỏ qua dòng đó.
+    const activeV2 = (await repo.find({ where: { storeId, isActive: true } })).filter(
+      (rule) => !!rule.calcMode,
+    );
+    const rulesToSave: StorePayrollRule[] = [];
+    for (const ruleData of incomingRules) {
+      const legacyCode = legacyRuleCodeOf(ruleData.ruleType);
+      if (
+        !ruleData.id &&
+        legacyCode !== CUSTOM_RULE_CODE &&
+        activeV2.some((r) => r.category === ruleData.category && r.code === legacyCode)
+      ) {
+        continue;
+      }
+      const rule = ruleData.id
+        ? currentRules.find((r) => r.id === ruleData.id)
+        : currentRules.find(
+            (r) =>
+              r.name === ruleData.name &&
+              r.category === ruleData.category &&
+              r.ruleType === ruleData.ruleType,
+          );
+      const payload = {
+        name: ruleData.name,
+        ruleType: ruleData.ruleType,
+        calcType: ruleData.calcType as PayrollCalcType,
+        value: ruleData.value,
+        category: ruleData.category,
+        storeId,
+      };
+      rulesToSave.push(rule ? Object.assign(rule, payload) : repo.create(payload));
+    }
+    const keep = new Set(rulesToSave.map((r) => r.id).filter(Boolean));
+    const toRemove = currentRules.filter((r) => !keep.has(r.id)).map((r) => r.id);
+    if (toRemove.length) await repo.delete({ id: In(toRemove) });
+    if (rulesToSave.length) await repo.save(rulesToSave);
+    return true;
+  }
+
+  /**
+   * Màn thiết lập mới gửi đủ danh sách (cả khoản đang tắt). Khoản có sẵn (mã
+   * khác CUSTOM) mỗi loại chỉ một dòng: dòng cũ cùng mã được sửa tại chỗ thành
+   * v2 thay vì thêm dòng thứ hai (trả hai lần). Khoản không còn trong danh sách
+   * xoá mềm, để ghi nhận cũ và phiếu lương đã chốt vẫn đọc được tên.
+   */
+  async syncPayrollRulesV2(
+    this: StoresService,
+    manager: EntityManager,
+    storeId: string,
+    data: UpdatePayrollSettingDto,
+  ): Promise<boolean> {
+    const repo = manager.getRepository(StorePayrollRule);
+    const incoming = [
+      ...(data.bonuses || []).map((r) => ({ ...r, category: PayrollRuleCategory.BONUS })),
+      ...(data.fines || []).map((r) => ({ ...r, category: PayrollRuleCategory.FINE })),
+      ...(data.benefits || []).map((r) => ({ ...r, category: PayrollRuleCategory.BENEFIT })),
+    ];
+    // Chỉ đối chiếu nhóm có trong body: thiếu mảng phúc lợi không được xoá hết
+    // phúc lợi.
+    const present = new Set<string>(
+      [
+        data.bonuses !== undefined ? PayrollRuleCategory.BONUS : null,
+        data.fines !== undefined ? PayrollRuleCategory.FINE : null,
+        data.benefits !== undefined ? PayrollRuleCategory.BENEFIT : null,
+      ].filter((c): c is PayrollRuleCategory => c !== null),
+    );
+    const seenPresets = new Set<string>();
+    for (const r of incoming) {
+      if (r.category === PayrollRuleCategory.BENEFIT) continue;
+      const code = r.code || PayrollRuleCode.CUSTOM;
+      const allowed =
+        r.category === PayrollRuleCategory.BONUS
+          ? BONUS_PAYROLL_RULE_CODES
+          : FINE_PAYROLL_RULE_CODES;
+      if (!allowed.has(code)) {
+        throw new BadRequestException(`Khoản "${r.name}" không thuộc nhóm này`);
+      }
+      // Trùng chỉ tính giữa các khoản đang bật (dòng cũ đã tắt cùng loại vẫn
+      // được giữ lại).
+      if (code !== CUSTOM_RULE_CODE && r.isActive !== false) {
+        const key = `${r.category}:${code}`;
+        if (seenPresets.has(key)) {
+          throw new BadRequestException(`Khoản "${r.name}" bị trùng`);
+        }
+        seenPresets.add(key);
+      }
+      if (r.calcMode) {
+        const coef = String(r.calcMode).startsWith('COEF_');
+        if (coef && r.value > 100) {
+          throw new BadRequestException(`Hệ số của "${r.name}" tối đa là 100`);
+        }
+        if (!coef && r.value > 100_000_000) {
+          throw new BadRequestException(`Số tiền của "${r.name}" quá lớn`);
+        }
+        if (String(r.calcMode).startsWith('MILESTONE_') && !(Number(r.threshold) > 0)) {
+          throw new BadRequestException(`Hãy nhập mốc giờ / ca cho "${r.name}"`);
+        }
+      }
+    }
+
+    const current = await repo.find({ where: { storeId } });
+    const used = new Set<string>();
+    const toSave: StorePayrollRule[] = [];
+    for (const r of incoming) {
+      const code =
+        r.category === PayrollRuleCategory.BENEFIT ? null : r.code || PayrollRuleCode.CUSTOM;
+      const free = (rule: StorePayrollRule) => !used.has(rule.id);
+      let rule =
+        (r.id && current.find((x) => x.id === r.id && free(x))) ||
+        (!r.id && code && code !== CUSTOM_RULE_CODE
+          ? current.find((x) => free(x) && x.category === r.category && x.code === code)
+          : undefined) ||
+        (!r.id
+          ? current.find(
+              (x) =>
+                free(x) &&
+                !x.calcMode &&
+                x.name === r.name &&
+                x.category === r.category &&
+                x.ruleType === r.ruleType,
+            )
+          : undefined) ||
+        undefined;
+      const payload: Partial<StorePayrollRule> = {
+        storeId,
+        category: r.category,
+        name: r.name.trim(),
+        ruleType: r.ruleType || code || 'CUSTOM',
+        calcType: (r.calcType as PayrollCalcType) || PayrollCalcType.AMOUNT,
+        value: r.value,
+        isActive: r.isActive !== false,
+        isCustom: code === PayrollRuleCode.CUSTOM,
+        code,
+        calcMode: r.calcMode ?? null,
+        threshold: r.threshold ?? null,
+        description: r.description?.trim() || null,
+      };
+      if (rule) Object.assign(rule, payload);
+      else rule = repo.create(payload);
+      if (rule.id) used.add(rule.id);
+      toSave.push(rule);
+    }
+    const toRemove = current
+      .filter((x) => !used.has(x.id) && present.has(x.category))
+      .map((x) => x.id);
+    if (toRemove.length) await repo.softDelete({ id: In(toRemove) });
+    if (toSave.length) await repo.save(toSave);
+    return true;
+  }
+
+  // --- Ghi nhận thưởng / vi phạm thủ công (employee_payroll_records) ---
+
+  async listPayrollRecords(
+    this: StoresService,
+    profileId: string,
+    monthKey?: string,
+  ) {
+    const profile = await this.profileRepository.findOne({
+      where: { id: profileId },
+      withDeleted: true,
+    });
+    if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
+    const month =
+      (monthKey && /^\d{4}-\d{2}$/.test(monthKey)
+        ? vnMonthOfDateString(`${monthKey}-01`)
+        : null) ?? vnMonthOf(new Date());
+    const rows = await this.dataSource.getRepository(EmployeePayrollRecord).find({
+      where: {
+        employeeProfileId: profileId,
+        workDate: Between(month.key, month.lastDate),
+      },
+      relations: ['rule'],
+      withDeleted: false,
+      order: { workDate: 'DESC', createdAt: 'DESC' },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      ruleId: r.ruleId,
+      ruleName: r.rule?.name || r.ruleName,
+      category: r.category,
+      calcMode: r.rule?.calcMode ?? null,
+      workDate: String(r.workDate).slice(0, 10),
+      quantity: Number(r.quantity),
+      note: r.note,
+      createdAt: r.createdAt,
+    }));
+  }
+
+  /** Phiếu lương tháng đó của nhân viên đã duyệt / đã trả thì không đổi được. */
+  async assertPayslipOpen(
+    this: StoresService,
+    employeeProfileId: string,
+    workDate: string,
+  ) {
+    const month = vnMonthOfDateString(workDate);
+    if (!month) throw new BadRequestException('Ngày không hợp lệ');
+    const payslip = await this.employeeSalaryRepository.findOne({
+      where: { employeeProfileId, month: toMonthMarker(month) },
+    });
+    if (payslip && this.isProtectedPayslip(payslip)) {
+      throw new ConflictException({
+        code: 'PAYSLIP_FINALIZED',
+        message: 'Phiếu lương tháng này đã chốt, không ghi nhận thêm được',
+      });
+    }
+  }
+
+  async createPayrollRecord(
+    this: StoresService,
+    profileId: string,
+    dto: CreatePayrollRecordDto,
+    ownerAccountId: string,
+  ) {
+    const profile = await this.profileRepository.findOne({ where: { id: profileId } });
+    if (!profile?.storeId || !isShiftEligibleEmploymentStatus(profile.employmentStatus)) {
+      throw new NotFoundException('Không tìm thấy nhân viên đang làm');
+    }
+    const rule = await this.payrollRuleRepository.findOne({
+      where: { id: dto.ruleId, storeId: profile.storeId },
+    });
+    if (
+      !rule ||
+      !rule.isActive ||
+      !rule.calcMode ||
+      !MANUAL_PAYROLL_RULE_CODES.has(rule.code ?? '') ||
+      (rule.category !== PayrollRuleCategory.BONUS &&
+        rule.category !== PayrollRuleCategory.FINE)
+    ) {
+      throw new BadRequestException('Khoản này không ghi nhận thủ công được');
+    }
+    const workDate = dto.workDate;
+    // Chỉ ngày có thật trong tháng này, không sau hôm nay: tháng trước tính lại
+    // theo hợp đồng / khoản hiện tại sẽ làm đổi lương cũ; ngày tương lai tạo
+    // bảng lương tháng sau.
+    const parsed = new Date(`${workDate}T00:00:00Z`);
+    const today = vnDateString();
+    if (
+      Number.isNaN(parsed.getTime()) ||
+      parsed.toISOString().slice(0, 10) !== workDate ||
+      workDate.slice(0, 7) !== today.slice(0, 7) ||
+      workDate > today
+    ) {
+      throw new BadRequestException('Chỉ ghi nhận được cho một ngày từ đầu tháng này đến hôm nay');
+    }
+    await this.assertPayslipOpen(profile.id, workDate);
+    const repo = this.dataSource.getRepository(EmployeePayrollRecord);
+    const saved = await repo.save(
+      repo.create({
+        storeId: profile.storeId,
+        employeeProfileId: profile.id,
+        ruleId: rule.id,
+        ruleName: rule.name,
+        category: rule.category,
+        workDate,
+        quantity: Math.round(Number(dto.quantity) * 100) / 100,
+        note: dto.note?.trim() || null,
+        createdByAccountId: ownerAccountId,
+      }),
+    );
+    await this.recomputeEmployeePayslipForWorkDate({
+      employeeProfileId: profile.id,
+      storeId: profile.storeId,
+      workDate,
+    });
+    return { id: saved.id };
+  }
+
+  async deletePayrollRecord(this: StoresService, recordId: string) {
+    const repo = this.dataSource.getRepository(EmployeePayrollRecord);
+    const record = await repo.findOne({ where: { id: recordId } });
+    if (!record) throw new NotFoundException('Không tìm thấy ghi nhận');
+    const workDate = String(record.workDate).slice(0, 10);
+    await this.assertPayslipOpen(record.employeeProfileId, workDate);
+    await repo.softDelete({ id: record.id });
+    await this.recomputeEmployeePayslipForWorkDate({
+      employeeProfileId: record.employeeProfileId,
+      storeId: record.storeId,
+      workDate,
+    });
+    return { deleted: true };
   }
 
   // Helper method to create or update monthly summary
@@ -932,6 +1231,9 @@ export class StoresPayrollPart {
     const assignments = await repository
       .createQueryBuilder('sa')
       .leftJoinAndSelect('sa.shiftSlot', 'slot')
+      // Template times: a slot without its own start / end uses them (the
+      // effective window of the v2 overtime / night / absent minutes).
+      .leftJoinAndSelect('slot.workShift', 'slotWorkShift')
       .innerJoin('slot.cycle', 'cycle')
       .where('sa.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('cycle.storeId = :storeId', { storeId })
@@ -962,12 +1264,16 @@ export class StoresPayrollPart {
 
     return assignments.map((a) => {
       const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+      const window = effectiveWindowOf(a);
       return {
         id: a.id,
         workDate,
         status: a.status,
         attendanceStatus: a.attendanceStatus ?? null,
         checkInTime: a.checkInTime ?? null,
+        checkOutTime: a.checkOutTime ?? null,
+        windowStart: window.start,
+        windowEnd: window.end,
         workedMinutes: a.workedMinutes ?? null,
         lateMinutes: a.lateMinutes ?? null,
         earlyMinutes: a.earlyMinutes ?? null,
@@ -1223,6 +1529,21 @@ export class StoresPayrollPart {
     );
     const todayVn = vnDateString(p.now ?? new Date());
     const facts = summarizeMonthlyAttendance(assignments, todayVn);
+    // v2 rules: the month's manual records ("ghi nhận") per rule, and the
+    // employee's own pay per hour / shift for coefficient rules.
+    if (p.contract && (p.rules ?? []).some((rule) => rule.calcMode)) {
+      facts.ruleQuantities = await this.sumPayrollRecordQuantities(
+        p.employeeProfileId,
+        p.month,
+        p.manager,
+      );
+      facts.payRates = payRatesOf({
+        paymentType: p.contract.paymentType,
+        rate: p.rate,
+        standardWorkingDays: p.standardWorkingDays,
+        facts,
+      });
+    }
     const advancePayment = await this.sumApprovedAdvances(
       p.existingSalaryId,
       p.manager,
@@ -1286,6 +1607,31 @@ export class StoresPayrollPart {
       payslip,
       currentStintEarned: split?.currentStintEarned ?? null,
     };
+  }
+
+  /** Tổng số lượng ghi nhận trong tháng của nhân viên, theo từng khoản. */
+  async sumPayrollRecordQuantities(
+    this: StoresService,
+    employeeProfileId: string,
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<Record<string, number>> {
+    const rows: Array<{ ruleId: string; total: string }> = await (
+      manager ?? this.dataSource.manager
+    )
+      .getRepository(EmployeePayrollRecord)
+      .createQueryBuilder('r')
+      .select('r.ruleId', 'ruleId')
+      .addSelect('COALESCE(SUM(r.quantity), 0)', 'total')
+      .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
+      .andWhere('r.ruleId IS NOT NULL')
+      .andWhere('r.workDate >= :start', { start: month.key })
+      .andWhere('r.workDate < :end', { end: month.endExclusiveDate })
+      .groupBy('r.ruleId')
+      .getRawMany();
+    const out: Record<string, number> = {};
+    for (const row of rows) out[row.ruleId] = Number(row.total) || 0;
+    return out;
   }
 
   // --- Store Payroll Payment History ---
@@ -3893,7 +4239,7 @@ export class StoresPayrollPart {
     ) {
       return 'skipped';
     }
-    return this.dataSource.transaction(async (manager) => {
+    const outcome = await this.dataSource.transaction(async (manager) => {
       const payroll = await this.findOrCreateMonthlyPayroll(
         input.storeId,
         month,
@@ -3947,6 +4293,36 @@ export class StoresPayrollPart {
       await this.refreshMonthlyPayrollTotals(manager, payroll.id);
       return outcome;
     });
+    // Ca vừa bị đánh dấu nghỉ không phép: bảng tổng hợp của màn nhân viên
+    // cũng phải đổi ngay (không đợi lần chấm công ra kế tiếp).
+    await this.refreshEmployeeMonthlySummary(employee.id, month).catch((error) =>
+      this.logger.error(
+        `[MonthlySummary] refresh after recompute failed for ${employee.id}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      ),
+    );
+    return outcome;
+  }
+
+  /** Bảng tổng hợp tháng của người làm lượt ca này (tháng của ngày làm). */
+  async refreshMonthlySummaryOfAssignment(
+    this: StoresService,
+    assignmentId: string,
+  ): Promise<void> {
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      where: { id: assignmentId },
+      relations: ['shiftSlot'],
+    });
+    if (!assignment?.employeeId) return;
+    const workDate =
+      typeof assignment.shiftSlot?.workDate === 'string'
+        ? assignment.shiftSlot.workDate.slice(0, 10)
+        : null;
+    await this.refreshEmployeeMonthlySummary(
+      assignment.employeeId,
+      vnMonthOfDateString(workDate) ?? vnMonthOf(new Date()),
+    );
   }
 
   /**
@@ -4160,11 +4536,94 @@ export class StoresPayrollPart {
     }
     if (outer) return;
 
+    await this.writeEmployeeMonthlySummary({
+      employeeProfileId: assignment.employeeId,
+      joinedAt: assignment.employee?.joinedAt ?? null,
+      month,
+      facts,
+      monthAssignments,
+      earnedBaseSalary: payslip.earnedBaseSalary,
+      currentStintEarned,
+      activeContract,
+    });
+  }
+
+  /**
+   * Bảng tổng hợp tháng của danh sách nhân viên (ca / đi trễ / về sớm / nghỉ
+   * không phép / lương tạm tính) tính lại từ chấm công hiện tại, không đụng
+   * phiếu lương. Trước đây chỉ job sau chấm công RA ghi bảng này, nên ngay
+   * sau chấm công VÀO hay khi ca bị đánh dấu nghỉ không phép, màn nhân viên
+   * của chủ vẫn hiện số cũ.
+   */
+  async refreshEmployeeMonthlySummary(
+    this: StoresService,
+    employeeProfileId: string,
+    month?: VnMonth | null,
+  ): Promise<void> {
+    const employee = await this.profileRepository.findOne({
+      where: { id: employeeProfileId },
+      relations: ['contracts'],
+    });
+    if (!employee?.storeId) return;
+    const targetMonth = month ?? vnMonthOf(new Date());
+    const activeContract =
+      employee.contracts?.find((contract) => contract.isActive) ?? null;
+    const standardWorkingDays = await this.getStandardWorkingDays(
+      employee.storeId,
+      targetMonth,
+    );
+    const rate = activeContract
+      ? (await this.resolveRateForMonth(employee.id, activeContract, targetMonth))
+          .rate
+      : 0;
+    const rules = activeContract
+      ? await this.payrollRuleRepository.find({
+          where: { storeId: employee.storeId, isActive: true },
+        })
+      : [];
+    const composed = await this.computeEmployeePayslip({
+      employeeProfileId: employee.id,
+      storeId: employee.storeId,
+      month: targetMonth,
+      contract: activeContract,
+      rate,
+      rules,
+      standardWorkingDays,
+      now: new Date(),
+      stint: employee,
+    });
+    await this.writeEmployeeMonthlySummary({
+      employeeProfileId: employee.id,
+      joinedAt: employee.joinedAt ?? null,
+      month: targetMonth,
+      facts: composed.facts,
+      monthAssignments: composed.assignments,
+      earnedBaseSalary: composed.payslip.earnedBaseSalary,
+      currentStintEarned: composed.currentStintEarned,
+      activeContract,
+    });
+  }
+
+  private async writeEmployeeMonthlySummary(
+    this: StoresService,
+    p: {
+      employeeProfileId: string;
+      joinedAt: Date | null;
+      month: VnMonth;
+      facts: MonthlyAttendanceFacts;
+      monthAssignments: PayrollAssignmentFact[];
+      earnedBaseSalary: number;
+      currentStintEarned: number | null | undefined;
+      activeContract: EmployeeContract | null;
+    },
+  ): Promise<void> {
+    const { facts, monthAssignments, month, activeContract } = p;
+
     // The payslip above keeps every assignment of the month, so a same-month
     // rehire is paid for both stints, each at its own contract's pricing. The display summary below covers only
     // the current stint (from the VN date of `joinedAt`). Known edge: a shift
     // worked earlier on the rehire day itself is counted in the new stint.
-    const since = stintStartVnDate(assignment.employee?.joinedAt);
+    const since = stintStartVnDate(p.joinedAt);
     const stintFacts = since
       ? summarizeMonthlyAttendance(
           monthAssignments.filter(
@@ -4179,7 +4638,7 @@ export class StoresPayrollPart {
       .select('COUNT(assignment.id)', 'completedShifts')
       .addSelect('COALESCE(SUM(assignment.workedMinutes), 0)', 'workedMinutes')
       .where('assignment.employeeId = :employeeId', {
-        employeeId: assignment.employeeId,
+        employeeId: p.employeeProfileId,
       })
       .andWhere('assignment.status = :status', {
         status: ShiftAssignmentStatus.COMPLETED,
@@ -4206,7 +4665,7 @@ export class StoresPayrollPart {
       : 0;
     await this.monthlySummaryRepository.upsert(
       {
-        employeeProfileId: assignment.employeeId,
+        employeeProfileId: p.employeeProfileId,
         month: toMonthMarker(month),
         totalShifts: stintFacts.totalAssignedShifts,
         completedShifts: stintFacts.completedShifts,
@@ -4217,7 +4676,7 @@ export class StoresPayrollPart {
         unauthorizedLeavesCount: stintFacts.absentCount,
         // After a same-month rehire the payslip pays both stints, but the
         // employee list shows what the current stint earned.
-        estimatedSalary: currentStintEarned ?? payslip.earnedBaseSalary,
+        estimatedSalary: p.currentStintEarned ?? p.earnedBaseSalary,
         baseSalary: Number(activeContract?.salaryAmount) || 0,
         performanceScore,
         totalCompletedShifts: Number(cumulative?.completedShifts || 0),

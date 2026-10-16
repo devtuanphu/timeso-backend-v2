@@ -2,6 +2,7 @@ import { NotFoundException } from '@nestjs/common';
 import { DataSource, EntityTarget, ObjectLiteral } from 'typeorm';
 
 import { Asset } from '../entities/asset.entity';
+import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
 import { BonusWorkRequest } from '../entities/bonus-work-request.entity';
 import { ContractTemplate } from '../entities/contract-template.entity';
 import { DailyEmployeeReport } from '../entities/daily-employee-report.entity';
@@ -114,6 +115,7 @@ export const RESOURCE_SCOPES: Record<string, ResourceScope> = {
   orders: { entity: Order },
   'payment-accounts': { entity: StorePaymentAccount },
   'payroll-payments': { entity: StorePayrollPaymentHistory },
+  'payroll-records': { entity: EmployeePayrollRecord },
   payrolls: { entity: MonthlyPayroll },
   products: { entity: Product },
   roles: { entity: StoreRole },

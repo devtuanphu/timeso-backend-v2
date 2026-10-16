@@ -21,6 +21,7 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { StoresService } from '../stores.service';
+import { CreatePayrollRecordDto } from '../dto/payroll-record.dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { StoreAccessGuard } from '../guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../guards/store-resource-access.guard';
@@ -81,8 +82,18 @@ export class StoresPayrollController {
   @StoreOwnerOnly()
   @Get(':id/payroll-settings')
   @ApiOperation({ summary: 'Lấy cấu hình tính lương' })
-  async getPayrollSetting(@Param('id') id: string) {
-    return this.storesService.getPayrollSetting(id);
+  @ApiQuery({
+    name: 'rulesVersion',
+    required: false,
+    description: '2 = mọi khoản thưởng / vi phạm v2, kể cả khoản đang tắt',
+  })
+  async getPayrollSetting(
+    @Param('id') id: string,
+    @Query('rulesVersion') rulesVersion?: string,
+  ) {
+    return this.storesService.getPayrollSetting(id, {
+      rulesVersion: rulesVersion === '2' ? 2 : undefined,
+    });
   }
 
   @StoreOwnerOnly()
@@ -93,6 +104,36 @@ export class StoresPayrollController {
     @Body() body: UpdatePayrollSettingDto,
   ) {
     return this.storesService.upsertPayrollSetting(id, body);
+  }
+
+  // Ghi nhận thưởng / vi phạm thủ công cho từng nhân viên
+  @StoreOwnerOnly()
+  @Get('employees/:profileId/payroll-records')
+  @ApiOperation({ summary: 'Các lần ghi nhận thưởng / vi phạm của nhân viên trong tháng' })
+  @ApiQuery({ name: 'month', required: false, description: 'YYYY-MM (mặc định tháng này)' })
+  async listPayrollRecords(
+    @Param('profileId') profileId: string,
+    @Query('month') month?: string,
+  ) {
+    return this.storesService.listPayrollRecords(profileId, month);
+  }
+
+  @StoreOwnerOnly()
+  @Post('employees/:profileId/payroll-records')
+  @ApiOperation({ summary: 'Ghi nhận một khoản thưởng / vi phạm cho nhân viên' })
+  async createPayrollRecord(
+    @Param('profileId') profileId: string,
+    @Body() body: CreatePayrollRecordDto,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.createPayrollRecord(profileId, body, user.userId);
+  }
+
+  @StoreOwnerOnly()
+  @Delete('payroll-records/:recordId')
+  @ApiOperation({ summary: 'Xoá một lần ghi nhận thưởng / vi phạm' })
+  async deletePayrollRecord(@Param('recordId') recordId: string) {
+    return this.storesService.deletePayrollRecord(recordId);
   }
 
   // Payslip template: the rows every employee's payslip shows

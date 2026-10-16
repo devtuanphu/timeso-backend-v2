@@ -1536,6 +1536,9 @@ export class ShiftAggregationService {
     let penalty = 0;
     for (const rule of rules) {
       if (rule.category !== PayrollRuleCategory.FINE) continue;
+      // Khoản v2 (calc_mode) tính theo tháng ở phiếu lương (hệ số × lương giờ,
+      // mốc...): không ước tính lại theo từng ca bằng công thức cũ ở đây.
+      if (rule.calcMode) continue;
       if (rule.ruleType === 'LATE' && lateCount > 0) {
         penalty +=
           rule.calcType === PayrollCalcType.AMOUNT

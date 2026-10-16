@@ -6,9 +6,11 @@ import {
   BadRequestException,
   ForbiddenException,
   NotFoundException,
+  ConflictException,
 } from '@nestjs/common';
 
 import { StoresService } from '../../../../src/modules/stores/stores.service';
+import { EmployeeProfile } from '../../../../src/modules/stores/entities/employee-profile.entity';
 import { AdvanceRequestStatus } from '../../../../src/modules/stores/entities/salary-advance-request.entity';
 
 jest.mock('uuid', () => ({ v4: () => 'test-id' }));
@@ -154,19 +156,54 @@ describe('cancelSalaryAdvanceRequest', () => {
 });
 
 describe('permanentDeleteEmployee', () => {
+  // Runs in a transaction on the locked row: only a soft-deleted profile, and
+  // the NO ACTION references are cleared before the row is deleted.
+  const withTransaction = (t: ReturnType<typeof buildService>, deletedAt: Date | null) => {
+    const manager = {
+      getRepository: jest.fn(() => ({
+        createQueryBuilder: jest.fn(() => {
+          const qb: any = {
+            withDeleted: jest.fn(() => qb),
+            where: jest.fn(() => qb),
+            andWhere: jest.fn(() => qb),
+            setLock: jest.fn(() => qb),
+            getOne: jest.fn().mockResolvedValue({ id: 'p-1', storeId: STORE, deletedAt }),
+          };
+          return qb;
+        }),
+      })),
+      delete: jest.fn().mockResolvedValue({ affected: 1 }),
+      update: jest.fn().mockResolvedValue({ affected: 0 }),
+    };
+    t.service.dataSource = { transaction: jest.fn((cb: any) => cb(manager)) };
+    return manager;
+  };
+
   it('lets the owner hard-delete a (soft-deleted) profile of their store', async () => {
     const t = buildService();
     t.profileRepository.findOne.mockResolvedValue({ id: 'p-1', storeId: STORE });
+    const manager = withTransaction(t, new Date());
 
     await t.service.permanentDeleteEmployee('p-1', OWNER);
 
     expect(t.profileRepository.findOne).toHaveBeenCalledWith(
       expect.objectContaining({ withDeleted: true }),
     );
-    expect(t.profileRepository.delete).toHaveBeenCalledWith({
+    expect(manager.delete).toHaveBeenCalledWith(EmployeeProfile, {
       id: 'p-1',
       storeId: STORE,
     });
+  });
+
+  it('refuses a profile that was not removed (soft-deleted) first', async () => {
+    const t = buildService();
+    t.profileRepository.findOne.mockResolvedValue({ id: 'p-1', storeId: STORE });
+    const manager = withTransaction(t, null);
+
+    await expect(t.service.permanentDeleteEmployee('p-1', OWNER)).rejects.toThrow(
+      ConflictException,
+    );
+    expect(manager.delete).not.toHaveBeenCalled();
   });
 
   // Previously the only check was the caller's own password.

@@ -20,9 +20,10 @@ import { addDays } from './shift-schedule.utils';
 /**
  * - assigned: chủ xếp ca cho nhân viên;
  * - approved: chủ duyệt ca nhân viên đã đăng ký;
- * - created: chủ vừa mở ca mới, còn chỗ để nhân viên đăng ký.
+ * - created: chủ vừa mở ca mới, còn chỗ để nhân viên đăng ký;
+ * - time_changed: chủ đổi giờ ca của nhân viên (Lịch làm → Chỉnh sửa ca).
  */
-export type ShiftNotificationKind = 'assigned' | 'approved' | 'created';
+export type ShiftNotificationKind = 'assigned' | 'approved' | 'created' | 'time_changed';
 
 export interface ShiftForNotification {
   workDate: string; // YYYY-MM-DD
@@ -59,6 +60,15 @@ export function buildShiftNotification(
         ? ` (${clock(shift.startTime)}–${clock(shift.endTime)})`
         : '';
     const what = `${shift.shiftName || 'Ca làm'} ${when(shift.workDate)}${range}`;
+    if (kind === 'time_changed') {
+      return {
+        title: 'Ca làm của bạn đã đổi giờ',
+        content:
+          shift.startTime && shift.endTime
+            ? `Chủ cửa hàng đã đổi ${shift.shiftName || 'ca làm'} ${when(shift.workDate)} sang ${clock(shift.startTime)}–${endClock(shift.endTime)}.`
+            : `Chủ cửa hàng đã đổi giờ ${shift.shiftName || 'ca làm'} ${when(shift.workDate)}.`,
+      };
+    }
     if (kind === 'created') {
       return {
         title: 'Có ca mới để đăng ký',
@@ -91,6 +101,12 @@ export function buildShiftNotification(
     return {
       title: 'Có ca mới để đăng ký',
       content: `Cửa hàng vừa mở ${sorted.length} ca mới, ${span}. Vào đăng ký ngay nhé!`,
+    };
+  }
+  if (kind === 'time_changed') {
+    return {
+      title: 'Ca làm của bạn đã đổi giờ',
+      content: `Chủ cửa hàng đã đổi giờ ${sorted.length} ca, ${span}.`,
     };
   }
   return kind === 'assigned'

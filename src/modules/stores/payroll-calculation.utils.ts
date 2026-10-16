@@ -58,6 +58,15 @@ export interface PayrollAssignmentFact {
    * shift) covers the shift: it is authorized leave, never an absence.
    */
   leaveCovered?: boolean;
+  /** Check-out instant (COMPLETED shifts). */
+  checkOutTime?: Date | string | null;
+  /**
+   * The shift's effective window (slot / template time, moved by approved
+   * late-arrival / early-leave requests). Feeds overtime, night and absent
+   * minutes of the v2 bonus / violation rules.
+   */
+  windowStart?: Date | string | null;
+  windowEnd?: Date | string | null;
 }
 
 export interface MonthlyAttendanceFacts {
@@ -74,12 +83,28 @@ export interface MonthlyAttendanceFacts {
   absentCount: number;
   totalLateMinutes: number;
   totalEarlyMinutes: number;
+  /** v2 rules (Thiết lập tính lương): see summarizeMonthlyAttendance. */
+  overtimeMinutes?: number;
+  overtimeShifts?: number;
+  nightMinutes?: number;
+  nightShifts?: number;
+  punctualMinutes?: number;
+  punctualShifts?: number;
+  missedPunchCount?: number;
+  absentMinutes?: number;
+  /** Month's manual records ("ghi nhận") summed per rule id. */
+  ruleQuantities?: Record<string, number>;
+  /** The employee's own pay per hour / per shift, for coefficient rules. */
+  payRates?: { hourly: number; perShift: number };
 }
 
 export type PayrollRuleInput = Pick<
   StorePayrollRule,
   'category' | 'ruleType' | 'calcType' | 'value'
->;
+> &
+  Partial<
+    Pick<StorePayrollRule, 'id' | 'name' | 'code' | 'calcMode' | 'threshold'>
+  >;
 
 const toFiniteNumber = (value: unknown): number => {
   const n = Number(value);
@@ -100,6 +125,14 @@ export function summarizeMonthlyAttendance(
   let absentCount = 0;
   let totalLateMinutes = 0;
   let totalEarlyMinutes = 0;
+  let overtimeMinutes = 0;
+  let overtimeShifts = 0;
+  let nightMinutes = 0;
+  let nightShifts = 0;
+  let punctualMinutes = 0;
+  let punctualShifts = 0;
+  let missedPunchCount = 0;
+  let absentMinutes = 0;
   const workedDates = new Set<string>();
 
   for (const a of assignments) {
@@ -109,6 +142,9 @@ export function summarizeMonthlyAttendance(
     if (early > 0) earlyCount += 1;
     totalLateMinutes += late;
     totalEarlyMinutes += early;
+    if (a.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT) {
+      missedPunchCount += 1;
+    }
 
     const workDate = workDateOf(a.workDate);
     if (a.status === ShiftAssignmentStatus.COMPLETED) {
@@ -116,6 +152,19 @@ export function summarizeMonthlyAttendance(
       const worked = toFiniteNumber(a.workedMinutes);
       if (worked > 0) workedMinutes += worked;
       if (workDate) workedDates.add(workDate);
+      if (late === 0 && early === 0 && worked > 0) {
+        punctualShifts += 1;
+        punctualMinutes += worked;
+      }
+      const extra = shiftExtraMinutes(a, worked);
+      if (extra.overtime > 0) {
+        overtimeShifts += 1;
+        overtimeMinutes += extra.overtime;
+      }
+      if (extra.night > 0) {
+        nightShifts += 1;
+        nightMinutes += extra.night;
+      }
     }
 
     // Approved but never checked in: absent once marked ABSENT at shift end,
@@ -129,6 +178,7 @@ export function summarizeMonthlyAttendance(
         (workDate !== '' && workDate < todayVn))
     ) {
       absentCount += 1;
+      absentMinutes += windowMinutes(a);
     }
   }
 
@@ -143,7 +193,86 @@ export function summarizeMonthlyAttendance(
     absentCount,
     totalLateMinutes,
     totalEarlyMinutes,
+    overtimeMinutes,
+    overtimeShifts,
+    nightMinutes,
+    nightShifts,
+    punctualMinutes,
+    punctualShifts,
+    missedPunchCount,
+    absentMinutes,
   };
+}
+
+const instantMs = (value: unknown): number | null => {
+  if (!value) return null;
+  const ms = new Date(value as string | Date).getTime();
+  return Number.isFinite(ms) ? ms : null;
+};
+
+/** Scheduled length of a shift's effective window, in whole minutes. */
+const windowMinutes = (a: PayrollAssignmentFact): number => {
+  const start = instantMs(a.windowStart);
+  const end = instantMs(a.windowEnd);
+  return start != null && end != null && end > start
+    ? Math.round((end - start) / 60000)
+    : 0;
+};
+
+const overlapMs = (a0: number, a1: number, b0: number, b1: number): number =>
+  Math.max(0, Math.min(a1, b1) - Math.max(a0, b0));
+
+/** Night work window, Vietnam time: 22:00 → 06:00 the next day. */
+const NIGHT_START_HOUR = 22;
+const NIGHT_END_HOUR = 6;
+const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Minutes of [from, to) that fall in a 22:00–06:00 (VN) night. */
+export function nightOverlapMinutes(from: number, to: number): number {
+  if (!(to > from)) return 0;
+  // Vietnam midnight before `from`, one day earlier to catch a night that
+  // started the evening before.
+  const vnMidnight = Math.floor((from + VN_OFFSET_MS) / DAY_MS) * DAY_MS - VN_OFFSET_MS;
+  let total = 0;
+  for (let day = vnMidnight - DAY_MS; day < to; day += DAY_MS) {
+    const nightStart = day + NIGHT_START_HOUR * 60 * 60 * 1000;
+    const nightEnd = day + DAY_MS + NIGHT_END_HOUR * 60 * 60 * 1000;
+    total += overlapMs(from, to, nightStart, nightEnd);
+  }
+  return Math.round(total / 60000);
+}
+
+/**
+ * Overtime and night minutes of one COMPLETED shift, never more than what the
+ * shift was credited (`workedMinutes`), so nothing unpaid is rewarded twice:
+ * - overtime: time after the effective end, capped by the credited minutes
+ *   beyond the time worked inside the window (an early arrival paid in ACTUAL
+ *   mode is not overtime);
+ * - night: the part of check-in (not before the window start) → check-out
+ *   inside 22:00–06:00.
+ */
+export function shiftExtraMinutes(
+  a: PayrollAssignmentFact,
+  worked: number,
+): { overtime: number; night: number } {
+  const checkIn = instantMs(a.checkInTime);
+  const checkOut = instantMs(a.checkOutTime);
+  if (checkIn == null || checkOut == null || !(checkOut > checkIn) || worked <= 0) {
+    return { overtime: 0, night: 0 };
+  }
+  const start = instantMs(a.windowStart);
+  const end = instantMs(a.windowEnd);
+  let overtime = 0;
+  if (start != null && end != null && end > start) {
+    const inside = Math.round(overlapMs(checkIn, checkOut, start, end) / 60000);
+    const afterEnd = Math.round(Math.max(0, checkOut - end) / 60000);
+    overtime = Math.max(0, Math.min(afterEnd, worked - inside));
+  }
+  // Phần đến sớm trước giờ bắt đầu thường không được trả: không tính giờ đêm.
+  const nightFrom = start != null && start > checkIn ? start : checkIn;
+  const night = Math.min(worked, nightOverlapMinutes(nightFrom, checkOut));
+  return { overtime, night };
 }
 
 /** Unknown or missing payment type is paid as MONTH. */
@@ -358,74 +487,34 @@ export function describeEarnedBase(input: {
 export type RuleAdjustmentFacts = Pick<
   MonthlyAttendanceFacts,
   'lateCount' | 'earlyCount' | 'absentCount' | 'completedShifts'
->;
+> &
+  Partial<
+    Pick<
+      MonthlyAttendanceFacts,
+      | 'workedMinutes'
+      | 'totalLateMinutes'
+      | 'totalEarlyMinutes'
+      | 'overtimeMinutes'
+      | 'overtimeShifts'
+      | 'nightMinutes'
+      | 'nightShifts'
+      | 'punctualMinutes'
+      | 'punctualShifts'
+      | 'missedPunchCount'
+      | 'absentMinutes'
+      | 'ruleQuantities'
+      | 'payRates'
+    >
+  >;
 
 /** A bonus is only ever paid for a month with at least one COMPLETED shift. */
 const hasCompletedWork = (facts: RuleAdjustmentFacts): boolean =>
   toFiniteNumber(facts.completedShifts) > 0;
 
-/**
- * Bonus and penalty from the store's active rules.
- * - FINE LATE / EARLY: AMOUNT value × count; PERCENTAGE earned × value% × count.
- * - FINE ABSENT: AMOUNT only, value × count.
- * - BONUS ATTENDANCE: value when at least one shift was COMPLETED in the
- *   month and there was no late arrival and no absence.
- * - BONUS with no rule type or GENERAL: value, once at least one shift was
- *   COMPLETED in the month (nothing is paid for a month with no work).
- */
-export function computeRuleAdjustments(
-  rules: PayrollRuleInput[],
-  facts: RuleAdjustmentFacts,
-  earnedBase: number,
-): { bonus: number; penalty: number } {
-  let bonus = 0;
-  let penalty = 0;
-
-  const countedFine = (rule: PayrollRuleInput, count: number): number => {
-    if (count <= 0) return 0;
-    const value = toFiniteNumber(rule.value);
-    if (rule.calcType === PayrollCalcType.AMOUNT) return value * count;
-    if (rule.calcType === PayrollCalcType.PERCENTAGE) {
-      return ((earnedBase * value) / 100) * count;
-    }
-    return 0;
-  };
-
-  for (const rule of rules ?? []) {
-    if (rule.category === PayrollRuleCategory.FINE) {
-      if (rule.ruleType === 'LATE') penalty += countedFine(rule, facts.lateCount);
-      if (rule.ruleType === 'EARLY') {
-        penalty += countedFine(rule, facts.earlyCount);
-      }
-      if (
-        rule.ruleType === 'ABSENT' &&
-        facts.absentCount > 0 &&
-        rule.calcType === PayrollCalcType.AMOUNT
-      ) {
-        penalty += toFiniteNumber(rule.value) * facts.absentCount;
-      }
-    } else if (rule.category === PayrollRuleCategory.BONUS) {
-      if (!hasCompletedWork(facts)) continue;
-      if (
-        rule.ruleType === 'ATTENDANCE' &&
-        facts.lateCount === 0 &&
-        facts.absentCount === 0
-      ) {
-        bonus += toFiniteNumber(rule.value);
-      }
-      if (!rule.ruleType || rule.ruleType === 'GENERAL') {
-        bonus += toFiniteNumber(rule.value);
-      }
-    }
-  }
-
-  return { bonus: Math.round(bonus), penalty: Math.round(penalty) };
-}
-
 /** One automatic bonus/fine line of a payslip, for the salary screen. */
 export interface PayslipAdjustmentLine {
   kind: 'BONUS' | 'FINE';
-  /** LATE / EARLY / ABSENT / ATTENDANCE / GENERAL. */
+  /** LATE / EARLY / ABSENT / ATTENDANCE / GENERAL, or the v2 rule code. */
   ruleType: string;
   label: string;
   /** Occurrences the line was multiplied by (1 for flat bonuses). */
@@ -442,30 +531,147 @@ const ADJUSTMENT_LABELS: Record<string, string> = {
   GENERAL: 'Thưởng',
 };
 
+type RuleWithName = PayrollRuleInput & { name?: string | null };
+type RawRuleLine = PayslipAdjustmentLine & { exact: number };
+
+/** "2,5" — hours with at most one decimal, Vietnamese comma. */
+const formatQuantity = (value: number): string => {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded)
+    ? String(rounded)
+    : rounded.toFixed(1).replace('.', ',');
+};
+
 /**
- * The lines behind computeRuleAdjustments, with the same rules and the same
- * totals: rounded lines are reconciled so BONUS lines sum exactly to `bonus`
- * and FINE lines to `penalty`. It does not change how pay is computed.
+ * Hours H and shifts S a v2 rule is measured on, by its code. Manual codes
+ * (and an unknown code) read the month's recorded quantity for the rule.
+ * Chuyên cần is earned only by a month with completed work and no absence.
  */
-export function computeRuleAdjustmentBreakdown(
-  rules: Array<PayrollRuleInput & { name?: string | null }>,
+function v2RuleBasis(
+  rule: RuleWithName,
+  facts: RuleAdjustmentFacts,
+): { hours: number; shifts: number } {
+  const n = (value: unknown) => toFiniteNumber(value);
+  switch (rule.code) {
+    case 'OVERTIME':
+      return { hours: n(facts.overtimeMinutes) / 60, shifts: n(facts.overtimeShifts) };
+    case 'ATTENDANCE':
+      return hasCompletedWork(facts) && n(facts.absentCount) === 0
+        ? { hours: n(facts.workedMinutes) / 60, shifts: n(facts.completedShifts) }
+        : { hours: 0, shifts: 0 };
+    case 'PUNCTUALITY':
+      return { hours: n(facts.punctualMinutes) / 60, shifts: n(facts.punctualShifts) };
+    case 'NIGHT_SHIFT':
+      return { hours: n(facts.nightMinutes) / 60, shifts: n(facts.nightShifts) };
+    case 'LATE':
+      return { hours: n(facts.totalLateMinutes) / 60, shifts: n(facts.lateCount) };
+    case 'EARLY':
+      return { hours: n(facts.totalEarlyMinutes) / 60, shifts: n(facts.earlyCount) };
+    case 'MISSED_PUNCH':
+      return { hours: 0, shifts: n(facts.missedPunchCount) };
+    case 'ABSENT':
+      return { hours: n(facts.absentMinutes) / 60, shifts: n(facts.absentCount) };
+    default: {
+      const recorded = rule.id ? n(facts.ruleQuantities?.[rule.id]) : 0;
+      return { hours: recorded, shifts: recorded };
+    }
+  }
+}
+
+/** Exact amount and display of one v2 rule (calc_mode set). */
+function v2RuleLine(
+  rule: RuleWithName,
+  facts: RuleAdjustmentFacts,
+): { exact: number; count: number; label: string } {
+  const value = toFiniteNumber(rule.value);
+  const { hours, shifts } = v2RuleBasis(rule, facts);
+  const hourly = toFiniteNumber(facts.payRates?.hourly);
+  const perShift = toFiniteNumber(facts.payRates?.perShift);
+  const threshold = toFiniteNumber(rule.threshold);
+  const name =
+    (typeof rule.name === 'string' && rule.name.trim()) ||
+    (rule.category === PayrollRuleCategory.FINE ? 'Vi phạm' : 'Thưởng');
+  switch (rule.calcMode) {
+    case 'COEF_PER_HOUR':
+      return {
+        exact: value * hourly * hours,
+        count: 1,
+        label: `${name} (${formatQuantity(hours)} giờ)`,
+      };
+    case 'AMOUNT_PER_HOUR':
+      return {
+        exact: value * hours,
+        count: 1,
+        label: `${name} (${formatQuantity(hours)} giờ)`,
+      };
+    case 'COEF_PER_SHIFT':
+    case 'AMOUNT_PER_SHIFT': {
+      const per = rule.calcMode === 'COEF_PER_SHIFT' ? value * perShift : value;
+      const whole = Number.isInteger(shifts);
+      return {
+        exact: per * shifts,
+        count: whole ? shifts : 1,
+        label: whole ? name : `${name} (${formatQuantity(shifts)} ca)`,
+      };
+    }
+    case 'MILESTONE_HOURS':
+      return {
+        exact: threshold > 0 && hours >= threshold ? value : 0,
+        count: 1,
+        label: `${name} (đạt ${formatQuantity(threshold)} giờ)`,
+      };
+    case 'MILESTONE_SHIFTS':
+      return {
+        exact: threshold > 0 && shifts >= threshold ? value : 0,
+        count: 1,
+        label: `${name} (đạt ${formatQuantity(threshold)} ca)`,
+      };
+    default:
+      return { exact: 0, count: 0, label: name };
+  }
+}
+
+/**
+ * Every bonus / fine line of the store's active rules, unrounded. The single
+ * source of computeRuleAdjustments (totals) and computeRuleAdjustmentBreakdown
+ * (lines), so the two can never drift apart.
+ *
+ * Legacy rules (calc_mode null) keep their original maths:
+ * - FINE LATE / EARLY: AMOUNT value × count; PERCENTAGE earned × value% × count.
+ * - FINE ABSENT: AMOUNT only, value × count.
+ * - BONUS ATTENDANCE: value when at least one shift was COMPLETED in the
+ *   month and there was no late arrival and no absence.
+ * - BONUS with no rule type or GENERAL: value, once at least one shift was
+ *   COMPLETED in the month (nothing is paid for a month with no work).
+ * v2 rules: see v2RuleLine.
+ */
+function ruleRawLines(
+  rules: RuleWithName[],
   facts: RuleAdjustmentFacts,
   earnedBase: number,
-): PayslipAdjustmentLine[] {
-  const raw: Array<PayslipAdjustmentLine & { exact: number }> = [];
+): RawRuleLine[] {
+  const raw: RawRuleLine[] = [];
   const push = (
     kind: 'BONUS' | 'FINE',
-    rule: PayrollRuleInput & { name?: string | null },
+    rule: RuleWithName,
     ruleType: string,
     count: number,
     exact: number,
+    label?: string,
   ) => {
     if (!(exact !== 0) || !Number.isFinite(exact)) return;
-    const label =
-      (typeof rule.name === 'string' && rule.name.trim()) ||
-      ADJUSTMENT_LABELS[ruleType] ||
-      (kind === 'BONUS' ? 'Thưởng' : 'Phạt');
-    raw.push({ kind, ruleType, label, count, amount: 0, exact });
+    raw.push({
+      kind,
+      ruleType,
+      label:
+        label ||
+        (typeof rule.name === 'string' && rule.name.trim()) ||
+        ADJUSTMENT_LABELS[ruleType] ||
+        (kind === 'BONUS' ? 'Thưởng' : 'Phạt'),
+      count,
+      amount: 0,
+      exact,
+    });
   };
   const countedFine = (rule: PayrollRuleInput, count: number): number => {
     if (count <= 0) return 0;
@@ -478,7 +684,19 @@ export function computeRuleAdjustmentBreakdown(
   };
 
   for (const rule of rules ?? []) {
-    if (rule.category === PayrollRuleCategory.FINE) {
+    if (
+      rule.category !== PayrollRuleCategory.FINE &&
+      rule.category !== PayrollRuleCategory.BONUS
+    ) {
+      continue;
+    }
+    const kind = rule.category === PayrollRuleCategory.FINE ? 'FINE' : 'BONUS';
+    if (rule.calcMode) {
+      const line = v2RuleLine(rule, facts);
+      push(kind, rule, rule.code || 'CUSTOM', line.count, line.exact, line.label);
+      continue;
+    }
+    if (kind === 'FINE') {
       if (rule.ruleType === 'LATE') {
         push('FINE', rule, 'LATE', facts.lateCount, countedFine(rule, facts.lateCount));
       }
@@ -498,7 +716,7 @@ export function computeRuleAdjustmentBreakdown(
           toFiniteNumber(rule.value) * facts.absentCount,
         );
       }
-    } else if (rule.category === PayrollRuleCategory.BONUS) {
+    } else {
       if (!hasCompletedWork(facts)) continue;
       if (
         rule.ruleType === 'ATTENDANCE' &&
@@ -512,7 +730,35 @@ export function computeRuleAdjustmentBreakdown(
       }
     }
   }
+  return raw;
+}
 
+/** Bonus and penalty from the store's active rules (see ruleRawLines). */
+export function computeRuleAdjustments(
+  rules: PayrollRuleInput[],
+  facts: RuleAdjustmentFacts,
+  earnedBase: number,
+): { bonus: number; penalty: number } {
+  let bonus = 0;
+  let penalty = 0;
+  for (const line of ruleRawLines(rules, facts, earnedBase)) {
+    if (line.kind === 'BONUS') bonus += line.exact;
+    else penalty += line.exact;
+  }
+  return { bonus: Math.round(bonus), penalty: Math.round(penalty) };
+}
+
+/**
+ * The lines behind computeRuleAdjustments, with the same rules and the same
+ * totals: rounded lines are reconciled so BONUS lines sum exactly to `bonus`
+ * and FINE lines to `penalty`. It does not change how pay is computed.
+ */
+export function computeRuleAdjustmentBreakdown(
+  rules: RuleWithName[],
+  facts: RuleAdjustmentFacts,
+  earnedBase: number,
+): PayslipAdjustmentLine[] {
+  const raw = ruleRawLines(rules, facts, earnedBase);
   const totals = computeRuleAdjustments(rules, facts, earnedBase);
   for (const kind of ['BONUS', 'FINE'] as const) {
     const lines = raw.filter((line) => line.kind === kind);
@@ -530,6 +776,41 @@ export function computeRuleAdjustmentBreakdown(
   return raw
     .filter((line) => line.amount !== 0)
     .map(({ exact: _exact, ...line }) => line);
+}
+
+/**
+ * The employee's pay per hour and per shift, for coefficient rules (hệ số ×
+ * giờ / ca). An hourly or per-shift contract converts with the month's
+ * average credited shift length (8 h when nothing was worked yet); day, week
+ * and month contracts pay one shift per worked day and 8 hours per shift.
+ */
+export function payRatesOf(input: {
+  paymentType: PaymentType | string | null | undefined;
+  rate: number;
+  standardWorkingDays: number;
+  facts: Pick<MonthlyAttendanceFacts, 'workedMinutes' | 'completedShifts'>;
+}): { hourly: number; perShift: number } {
+  const rate = toFiniteNumber(input.rate);
+  const shifts = toFiniteNumber(input.facts.completedShifts);
+  const minutes = toFiniteNumber(input.facts.workedMinutes);
+  const shiftHours = shifts > 0 && minutes > 0 ? minutes / 60 / shifts : 8;
+  switch (resolvePayrollPaymentType(input.paymentType)) {
+    case PaymentType.HOUR:
+      return { hourly: rate, perShift: rate * shiftHours };
+    case PaymentType.SHIFT:
+      return { hourly: rate / shiftHours, perShift: rate };
+    case PaymentType.DAY:
+      return { hourly: rate / 8, perShift: rate };
+    case PaymentType.WEEK: {
+      const perDay = rate / WORKING_DAYS_PER_WEEK;
+      return { hourly: perDay / 8, perShift: perDay };
+    }
+    default: {
+      const days = toFiniteNumber(input.standardWorkingDays) || 26;
+      const perDay = rate / days;
+      return { hourly: perDay / 8, perShift: perDay };
+    }
+  }
 }
 
 /** Sum of a contract's allowances, rounded to whole VND. */
