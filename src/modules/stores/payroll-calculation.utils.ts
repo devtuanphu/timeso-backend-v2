@@ -9,6 +9,11 @@ import {
   StorePayrollRule,
 } from './entities/store-payroll-rule.entity';
 import { WORKING_DAYS_PER_WEEK } from './shift-earnings.utils';
+import {
+  evaluateRuleConfig,
+  normalizeRuleCalcConfig,
+  type RuleOccurrence,
+} from './payroll-rule-config.utils';
 import { PayslipBuiltinRow } from './entities/store-payslip-row.entity';
 import {
   countedPayslipDeductions,
@@ -94,8 +99,22 @@ export interface MonthlyAttendanceFacts {
   absentMinutes?: number;
   /** Month's manual records ("ghi nhận") summed per rule id. */
   ruleQuantities?: Record<string, number>;
-  /** The employee's own pay per hour / per shift, for coefficient rules. */
-  payRates?: { hourly: number; perShift: number };
+  /** The employee's own pay per hour / shift / day / month (rule bases). */
+  payRates?: { hourly: number; perShift: number; daily?: number; monthly?: number };
+  /**
+   * v3 rules (calc_config): every occurrence of an automatic code in the
+   * month (one late arrival with its minutes, one overtime shift…).
+   */
+  ruleOccurrences?: Record<string, RuleOccurrence[]>;
+  /** v3 rules: the month's manual records per rule id, one per record. */
+  recordOccurrences?: Record<string, RuleOccurrence[]>;
+  /** Total of the employee's COMPLETED orders in the month (Theo % doanh số). */
+  revenue?: number;
+  /**
+   * The month is over (Vietnam calendar). A "≤" milestone ("≤ 2 lần trễ →
+   * thưởng", "≤ 20 công → phạt") can only be decided then; undefined = over.
+   */
+  monthComplete?: boolean;
 }
 
 export type PayrollRuleInput = Pick<
@@ -103,7 +122,10 @@ export type PayrollRuleInput = Pick<
   'category' | 'ruleType' | 'calcType' | 'value'
 > &
   Partial<
-    Pick<StorePayrollRule, 'id' | 'name' | 'code' | 'calcMode' | 'threshold'>
+    Pick<
+      StorePayrollRule,
+      'id' | 'name' | 'code' | 'calcMode' | 'threshold' | 'calcConfig'
+    >
   >;
 
 const toFiniteNumber = (value: unknown): number => {
@@ -134,36 +156,51 @@ export function summarizeMonthlyAttendance(
   let missedPunchCount = 0;
   let absentMinutes = 0;
   const workedDates = new Set<string>();
+  // v3: each occurrence with its own minutes (Đi muộn 12 phút ngày 03…).
+  const occurrences: Record<string, RuleOccurrence[]> = {};
+  const occur = (code: string, date: string, minutes: number) =>
+    (occurrences[code] ??= []).push({ date, minutes, quantity: 1 });
 
   for (const a of assignments) {
     const late = toFiniteNumber(a.lateMinutes);
     const early = toFiniteNumber(a.earlyMinutes);
-    if (late > 0) lateCount += 1;
-    if (early > 0) earlyCount += 1;
+    const workDate = workDateOf(a.workDate);
+    if (late > 0) {
+      lateCount += 1;
+      occur('LATE', workDate, late);
+    }
+    if (early > 0) {
+      earlyCount += 1;
+      occur('EARLY', workDate, early);
+    }
     totalLateMinutes += late;
     totalEarlyMinutes += early;
     if (a.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT) {
       missedPunchCount += 1;
+      occur('MISSED_PUNCH', workDate, 0);
     }
 
-    const workDate = workDateOf(a.workDate);
     if (a.status === ShiftAssignmentStatus.COMPLETED) {
       completedShifts += 1;
       const worked = toFiniteNumber(a.workedMinutes);
       if (worked > 0) workedMinutes += worked;
       if (workDate) workedDates.add(workDate);
+      if (worked > 0) occur('ATTENDANCE', workDate, worked);
       if (late === 0 && early === 0 && worked > 0) {
         punctualShifts += 1;
         punctualMinutes += worked;
+        occur('PUNCTUALITY', workDate, worked);
       }
       const extra = shiftExtraMinutes(a, worked);
       if (extra.overtime > 0) {
         overtimeShifts += 1;
         overtimeMinutes += extra.overtime;
+        occur('OVERTIME', workDate, extra.overtime);
       }
       if (extra.night > 0) {
         nightShifts += 1;
         nightMinutes += extra.night;
+        occur('NIGHT_SHIFT', workDate, extra.night);
       }
     }
 
@@ -179,6 +216,7 @@ export function summarizeMonthlyAttendance(
     ) {
       absentCount += 1;
       absentMinutes += windowMinutes(a);
+      occur('ABSENT', workDate, windowMinutes(a));
     }
   }
 
@@ -201,6 +239,7 @@ export function summarizeMonthlyAttendance(
     punctualShifts,
     missedPunchCount,
     absentMinutes,
+    ruleOccurrences: occurrences,
   };
 }
 
@@ -504,6 +543,11 @@ export type RuleAdjustmentFacts = Pick<
       | 'absentMinutes'
       | 'ruleQuantities'
       | 'payRates'
+      | 'daysWorked'
+      | 'ruleOccurrences'
+      | 'recordOccurrences'
+      | 'revenue'
+      | 'monthComplete'
     >
   >;
 
@@ -632,6 +676,71 @@ function v2RuleLine(
 }
 
 /**
+ * Exact amount of one v3 rule (calc_config), on the month's occurrences of its
+ * code (or its manual records). Null when the stored config is unreadable:
+ * the rule then pays nothing rather than a guess.
+ * - Chuyên cần (except "Theo mốc điều kiện", whose threshold is the condition)
+ *   is earned only by a month with no absence, like v2.
+ */
+function v3RuleLine(
+  rule: RuleWithName,
+  facts: RuleAdjustmentFacts,
+  name: string,
+): { exact: number; count: number; label: string } | null {
+  const config = normalizeRuleCalcConfig(rule.calcConfig, name);
+  if (typeof config === 'string') return null;
+  const code = rule.code || 'CUSTOM';
+  const n = (value: unknown) => toFiniteNumber(value);
+  let occurrences: RuleOccurrence[] = facts.ruleOccurrences?.[code] ?? [];
+  if (!AUTO_RULE_CODES.has(code)) {
+    occurrences = rule.id ? (facts.recordOccurrences?.[rule.id] ?? []) : [];
+  }
+  // Chuyên cần: như v2, tháng có nghỉ không phép thì không có lần nào. Mốc
+  // theo số công / ca / giờ của tháng thì chính ngưỡng là điều kiện.
+  if (
+    code === 'ATTENDANCE' &&
+    (config.kind !== 'MILESTONE' || config.metric === 'OCCURRENCES') &&
+    n(facts.absentCount) > 0
+  ) {
+    occurrences = [];
+  }
+  if (config.kind === 'MILESTONE' && config.op === 'LTE' && facts.monthComplete === false) {
+    return null;
+  }
+  const hourly = n(facts.payRates?.hourly);
+  const daily = n(facts.payRates?.daily ?? facts.payRates?.perShift);
+  return evaluateRuleConfig({
+    code,
+    name,
+    config,
+    occurrences,
+    rates: {
+      hourly,
+      daily,
+      monthly: n(facts.payRates?.monthly),
+      revenue: n(facts.revenue),
+    },
+    monthly: {
+      workedDays: n(facts.daysWorked),
+      completedShifts: n(facts.completedShifts),
+      workedMinutes: n(facts.workedMinutes),
+    },
+  });
+}
+
+/** Codes whose occurrences the system detects (the others are recorded). */
+const AUTO_RULE_CODES: ReadonlySet<string> = new Set([
+  'OVERTIME',
+  'ATTENDANCE',
+  'PUNCTUALITY',
+  'NIGHT_SHIFT',
+  'LATE',
+  'EARLY',
+  'MISSED_PUNCH',
+  'ABSENT',
+]);
+
+/**
  * Every bonus / fine line of the store's active rules, unrounded. The single
  * source of computeRuleAdjustments (totals) and computeRuleAdjustmentBreakdown
  * (lines), so the two can never drift apart.
@@ -643,7 +752,9 @@ function v2RuleLine(
  *   month and there was no late arrival and no absence.
  * - BONUS with no rule type or GENERAL: value, once at least one shift was
  *   COMPLETED in the month (nothing is paid for a month with no work).
- * v2 rules: see v2RuleLine.
+ * v2 rules: see v2RuleLine. v3 rules (calc_config, takes precedence over
+ * calc_mode): see v3RuleLine; a v3 bonus also needs completed work in the
+ * month (a "≤ 0 lần đi muộn" milestone never pays a month nobody worked).
  */
 function ruleRawLines(
   rules: RuleWithName[],
@@ -691,6 +802,19 @@ function ruleRawLines(
       continue;
     }
     const kind = rule.category === PayrollRuleCategory.FINE ? 'FINE' : 'BONUS';
+    if (rule.calcConfig) {
+      // Khoản tự động không thưởng tháng chưa làm ca nào ("≤ 0 lần trễ");
+      // khoản chủ ghi nhận tay thì trả theo ghi nhận, như v2.
+      if (kind === 'BONUS' && AUTO_RULE_CODES.has(rule.code ?? '') && !hasCompletedWork(facts)) {
+        continue;
+      }
+      const name =
+        (typeof rule.name === 'string' && rule.name.trim()) ||
+        (kind === 'FINE' ? 'Vi phạm' : 'Thưởng');
+      const line = v3RuleLine(rule, facts, name);
+      if (line) push(kind, rule, rule.code || 'CUSTOM', line.count, line.exact, line.label);
+      continue;
+    }
     if (rule.calcMode) {
       const line = v2RuleLine(rule, facts);
       push(kind, rule, rule.code || 'CUSTOM', line.count, line.exact, line.label);
@@ -789,26 +913,34 @@ export function payRatesOf(input: {
   rate: number;
   standardWorkingDays: number;
   facts: Pick<MonthlyAttendanceFacts, 'workedMinutes' | 'completedShifts'>;
-}): { hourly: number; perShift: number } {
+}): { hourly: number; perShift: number; daily: number; monthly: number } {
   const rate = toFiniteNumber(input.rate);
   const shifts = toFiniteNumber(input.facts.completedShifts);
   const minutes = toFiniteNumber(input.facts.workedMinutes);
   const shiftHours = shifts > 0 && minutes > 0 ? minutes / 60 / shifts : 8;
+  const days = toFiniteNumber(input.standardWorkingDays) || 26;
+  // A day's pay is one shift's pay (one shift per worked day); a month's pay
+  // is the contract amount, or a day's pay × the standard working days.
+  const withDays = (hourly: number, perShift: number, monthly?: number) => ({
+    hourly,
+    perShift,
+    daily: perShift,
+    monthly: monthly ?? perShift * days,
+  });
   switch (resolvePayrollPaymentType(input.paymentType)) {
     case PaymentType.HOUR:
-      return { hourly: rate, perShift: rate * shiftHours };
+      return withDays(rate, rate * shiftHours);
     case PaymentType.SHIFT:
-      return { hourly: rate / shiftHours, perShift: rate };
+      return withDays(rate / shiftHours, rate);
     case PaymentType.DAY:
-      return { hourly: rate / 8, perShift: rate };
+      return withDays(rate / 8, rate);
     case PaymentType.WEEK: {
       const perDay = rate / WORKING_DAYS_PER_WEEK;
-      return { hourly: perDay / 8, perShift: perDay };
+      return withDays(perDay / 8, perDay);
     }
     default: {
-      const days = toFiniteNumber(input.standardWorkingDays) || 26;
       const perDay = rate / days;
-      return { hourly: perDay / 8, perShift: perDay };
+      return withDays(perDay / 8, perDay, rate);
     }
   }
 }

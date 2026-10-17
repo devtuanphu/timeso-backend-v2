@@ -85,14 +85,16 @@ export class StoresPayrollController {
   @ApiQuery({
     name: 'rulesVersion',
     required: false,
-    description: '2 = mọi khoản thưởng / vi phạm v2, kể cả khoản đang tắt',
+    description:
+      '2 / 3 = mọi khoản thưởng / vi phạm v2, kể cả khoản đang tắt (kèm calcConfig)',
   })
   async getPayrollSetting(
     @Param('id') id: string,
     @Query('rulesVersion') rulesVersion?: string,
   ) {
     return this.storesService.getPayrollSetting(id, {
-      rulesVersion: rulesVersion === '2' ? 2 : undefined,
+      rulesVersion:
+        rulesVersion === '2' ? 2 : rulesVersion === '3' ? 3 : undefined,
     });
   }
 

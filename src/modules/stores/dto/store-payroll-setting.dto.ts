@@ -1,6 +1,6 @@
 
 import { ApiProperty } from '@nestjs/swagger';
-import { IsBoolean, IsEnum, IsIn, IsNumber, IsOptional, IsString, IsArray, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { IsBoolean, IsEnum, IsIn, IsObject, IsNumber, IsOptional, IsString, IsArray, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PayrollCalculationMethod } from '../entities/store-payroll-setting.entity';
 import {
@@ -28,6 +28,9 @@ export class PayrollRuleDto {
   @ApiProperty({ required: false }) @IsOptional() @IsNumber() @Min(0) @Max(100000) threshold?: number;
   @ApiProperty({ required: false }) @IsOptional() @IsString() @MaxLength(300) description?: string;
   @ApiProperty({ required: false }) @IsOptional() @IsBoolean() isActive?: boolean;
+  // v3: cách tính chi tiết (kiểm và chuẩn hoá ở normalizeRuleCalcConfig); chỉ
+  // đọc khi body có rulesVersion = 3.
+  @ApiProperty({ required: false }) @IsOptional() @IsObject() calcConfig?: Record<string, unknown>;
 }
 
 export class IncrementRuleDto {
@@ -51,8 +54,9 @@ export class UpdatePayrollSettingDto {
    * 2 = app gửi đủ danh sách khoản thưởng / vi phạm v2 (cả khoản đang tắt).
    * Bỏ trống = app cũ: chỉ đụng tới khoản cũ đang bật, không bao giờ xoá khoản
    * v2 hay khoản đang tắt mà app cũ không nhìn thấy.
+   * 3 = như 2, kèm calcConfig của từng khoản (cách tính chi tiết).
    */
-  @ApiProperty({ required: false }) @IsOptional() @IsIn([2]) rulesVersion?: number;
+  @ApiProperty({ required: false }) @IsOptional() @IsIn([2, 3]) rulesVersion?: number;
 
   @ApiProperty({ enum: ['hour', 'shift', 'day', 'month', 'flexible'] }) @IsOptional() @IsString() calculationMethod?: string;
   @ApiProperty() @IsOptional() @IsString() priorityCalcType?: string;

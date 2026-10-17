@@ -146,4 +146,13 @@ export class StorePayrollRule extends BaseEntity {
 
   @Column({ type: 'text', nullable: true })
   description: string | null;
+
+  /**
+   * Cách tính v3 (Figma "Chọn cách tính": cố định, đơn giá, hệ số lương, %,
+   * khối lương, luỹ tiến, bậc thang, mốc điều kiện) — xem
+   * payroll-rule-config.utils.ts. Có thì được ưu tiên hơn calc_mode; calc_mode
+   * vẫn được ghi (cách tính gần đúng) để app cũ không coi dòng là khoản cũ.
+   */
+  @Column({ name: 'calc_config', type: 'jsonb', nullable: true })
+  calcConfig: Record<string, unknown> | null;
 }

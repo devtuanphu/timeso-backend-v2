@@ -101,6 +101,62 @@ import { CreatePayrollRecordDto } from '../dto/payroll-record.dto';
 
 /** Mã khoản tự thêm, dạng chuỗi (code của rule là string, không phải enum). */
 const CUSTOM_RULE_CODE: string = PayrollRuleCode.CUSTOM;
+
+/**
+ * Cách tính v2 gần đúng của một cấu hình v3, ghi kèm vào calc_mode / value /
+ * threshold: app cũ (v2) chỉ hiển thị được chừng đó, còn tiền luôn tính theo
+ * calc_config. Không bao giờ dùng để tính lương.
+ */
+function fallbackCalcModeOf(config: RuleCalcConfig, code: string): {
+  calcMode: string;
+  value: number;
+  threshold: number | null;
+} {
+  const amount = Number(config.amount) || 0;
+  const raw = ((): { calcMode: string; value: number; threshold: number | null } => {
+    switch (config.kind) {
+      case 'UNIT_PRICE':
+        if (config.unit === 'HOUR') return { calcMode: 'AMOUNT_PER_HOUR', value: amount, threshold: null };
+        if (config.unit === 'MINUTE') {
+          return { calcMode: 'AMOUNT_PER_HOUR', value: amount * 60, threshold: null };
+        }
+        return { calcMode: 'AMOUNT_PER_SHIFT', value: amount, threshold: null };
+      case 'SALARY_COEF':
+        return {
+          calcMode: config.base === 'DAILY' ? 'COEF_PER_SHIFT' : 'COEF_PER_HOUR',
+          // v2 đọc hệ số tăng ca / ca đêm là phần trả thêm.
+          value: salaryCoefExtra(code, Number(config.coef) || 0),
+          threshold: null,
+        };
+      case 'PERCENT':
+        return { calcMode: 'COEF_PER_SHIFT', value: (Number(config.percent) || 0) / 100, threshold: null };
+      case 'SALARY_BLOCK':
+        return { calcMode: 'COEF_PER_SHIFT', value: Number(config.dayFraction) || 0, threshold: null };
+      case 'TIERED': {
+        const first = config.tiers?.[0];
+        return first?.dayFraction
+          ? { calcMode: 'COEF_PER_SHIFT', value: Number(first.dayFraction), threshold: null }
+          : { calcMode: 'AMOUNT_PER_SHIFT', value: Number(first?.amount) || 0, threshold: null };
+      }
+      case 'MILESTONE':
+        return {
+          calcMode: config.metric === 'WORKED_HOURS' ? 'MILESTONE_HOURS' : 'MILESTONE_SHIFTS',
+          value: amount,
+          threshold: Math.max(1, Number(config.threshold) || 0),
+        };
+      default:
+        // FIXED / PROGRESSIVE
+        return { calcMode: 'AMOUNT_PER_SHIFT', value: amount, threshold: null };
+    }
+  })();
+  // App v2 chặn lưu cả màn khi một khoản đang bật có số ≤ 0 (và hệ số > 100):
+  // số gần đúng luôn nằm trong khoảng nó chấp nhận.
+  const coef = raw.calcMode.startsWith('COEF_');
+  const value = coef
+    ? Math.min(100, Math.max(0.01, Math.round(raw.value * 100) / 100))
+    : Math.min(100_000_000, Math.max(1, Math.round(raw.value)));
+  return { ...raw, value };
+}
 import {
   StorePayrollIncrementRule,
   IncrementRuleType,
@@ -129,6 +185,13 @@ import {
 } from '../payroll-calculation.utils';
 import { effectiveWindowOf } from '../attendance-time.utils';
 import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
+import { Order, OrderStatus } from '../entities/order.entity';
+import {
+  normalizeRuleCalcConfig,
+  salaryCoefExtra,
+  type RuleCalcConfig,
+  type RuleOccurrence,
+} from '../payroll-rule-config.utils';
 import {
   parseVnMonthInput,
   shiftVnMonth,
@@ -283,7 +346,7 @@ export class StoresPayrollPart {
       await this.payrollSettingRepository.save(setting);
     }
 
-    const v2 = options.rulesVersion === 2;
+    const v2 = (options.rulesVersion ?? 0) >= 2;
     const rules = (
       await this.payrollRuleRepository.find({
         where: v2 ? { storeId } : { storeId, isActive: true },
@@ -337,7 +400,7 @@ export class StoresPayrollPart {
       await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
         `payroll-rules:${storeId}`,
       ]);
-      return data.rulesVersion === 2
+      return data.rulesVersion === 2 || data.rulesVersion === 3
         ? this.syncPayrollRulesV2(manager, storeId, data)
         : this.syncPayrollRulesLegacy(manager, storeId, data);
     });
@@ -514,6 +577,8 @@ export class StoresPayrollPart {
       ].filter((c): c is PayrollRuleCategory => c !== null),
     );
     const seenPresets = new Set<string>();
+    const v3 = data.rulesVersion === 3;
+    const configs = new Map<(typeof incoming)[number], RuleCalcConfig>();
     for (const r of incoming) {
       if (r.category === PayrollRuleCategory.BENEFIT) continue;
       const code = r.code || PayrollRuleCode.CUSTOM;
@@ -532,6 +597,16 @@ export class StoresPayrollPart {
           throw new BadRequestException(`Khoản "${r.name}" bị trùng`);
         }
         seenPresets.add(key);
+      }
+      if (v3 && r.calcConfig) {
+        const config = normalizeRuleCalcConfig(r.calcConfig, r.name);
+        // Khoản đang tắt nhập dở không chặn việc lưu: chỉ không giữ cấu hình.
+        if (typeof config === 'string') {
+          if (r.isActive !== false) throw new BadRequestException(config);
+        } else {
+          configs.set(r, config);
+        }
+        continue;
       }
       if (r.calcMode) {
         const coef = String(r.calcMode).startsWith('COEF_');
@@ -570,19 +645,39 @@ export class StoresPayrollPart {
             )
           : undefined) ||
         undefined;
+      const config = configs.get(r) ?? null;
+      // v3: calc_mode / value / threshold mang cách tính gần đúng của config,
+      // để app cũ (v2) vẫn thấy một khoản v2 và không coi là khoản cũ.
+      const fallback = config ? fallbackCalcModeOf(config, code ?? CUSTOM_RULE_CODE) : null;
+      const calcMode = fallback?.calcMode ?? r.calcMode ?? null;
+      const value = fallback ? fallback.value : r.value;
+      const threshold = fallback ? fallback.threshold : (r.threshold ?? null);
+      // App v2 lưu lại: giữ config khi khoản không đổi cách tính; đổi thì
+      // khoản theo cách tính v2 mới chọn (bỏ config).
+      const keepConfig =
+        !v3 &&
+        !!rule?.calcConfig &&
+        rule.calcMode === calcMode &&
+        Number(rule.value) === Number(value) &&
+        Number(rule.threshold ?? 0) === Number(threshold ?? 0);
       const payload: Partial<StorePayrollRule> = {
         storeId,
         category: r.category,
         name: r.name.trim(),
         ruleType: r.ruleType || code || 'CUSTOM',
         calcType: (r.calcType as PayrollCalcType) || PayrollCalcType.AMOUNT,
-        value: r.value,
+        value,
         isActive: r.isActive !== false,
         isCustom: code === PayrollRuleCode.CUSTOM,
         code,
-        calcMode: r.calcMode ?? null,
-        threshold: r.threshold ?? null,
+        calcMode,
+        threshold,
         description: r.description?.trim() || null,
+        calcConfig: config
+          ? (config as unknown as Record<string, unknown>)
+          : keepConfig
+            ? rule!.calcConfig
+            : null,
       };
       if (rule) Object.assign(rule, payload);
       else rule = repo.create(payload);
@@ -628,6 +723,7 @@ export class StoresPayrollPart {
       ruleName: r.rule?.name || r.ruleName,
       category: r.category,
       calcMode: r.rule?.calcMode ?? null,
+      calcConfig: r.rule?.calcConfig ?? null,
       workDate: String(r.workDate).slice(0, 10),
       quantity: Number(r.quantity),
       note: r.note,
@@ -667,10 +763,14 @@ export class StoresPayrollPart {
     const rule = await this.payrollRuleRepository.findOne({
       where: { id: dto.ruleId, storeId: profile.storeId },
     });
+    const revenueBased =
+      rule?.calcConfig?.kind === 'PERCENT' && rule.calcConfig.base === 'REVENUE';
     if (
       !rule ||
       !rule.isActive ||
       !rule.calcMode ||
+      // Theo % doanh số tháng: tự tính từ đơn hàng, ghi nhận tay không có tác dụng.
+      revenueBased ||
       !MANUAL_PAYROLL_RULE_CODES.has(rule.code ?? '') ||
       (rule.category !== PayrollRuleCategory.BONUS &&
         rule.category !== PayrollRuleCategory.FINE)
@@ -1529,14 +1629,30 @@ export class StoresPayrollPart {
     );
     const todayVn = vnDateString(p.now ?? new Date());
     const facts = summarizeMonthlyAttendance(assignments, todayVn);
+    facts.monthComplete = todayVn >= p.month.endExclusiveDate;
     // v2 rules: the month's manual records ("ghi nhận") per rule, and the
     // employee's own pay per hour / shift for coefficient rules.
     if (p.contract && (p.rules ?? []).some((rule) => rule.calcMode)) {
-      facts.ruleQuantities = await this.sumPayrollRecordQuantities(
+      const records = await this.loadPayrollRecordOccurrences(
         p.employeeProfileId,
         p.month,
         p.manager,
       );
+      facts.recordOccurrences = records;
+      facts.ruleQuantities = Object.fromEntries(
+        Object.entries(records).map(([ruleId, list]) => [
+          ruleId,
+          list.reduce((sum, o) => sum + o.quantity, 0),
+        ]),
+      );
+      if ((p.rules ?? []).some((rule) => rule.calcConfig?.base === 'REVENUE')) {
+        facts.revenue = await this.sumEmployeeMonthlyRevenue(
+          p.employeeProfileId,
+          p.storeId,
+          p.month,
+          p.manager,
+        );
+      }
       facts.payRates = payRatesOf({
         paymentType: p.contract.paymentType,
         rate: p.rate,
@@ -1609,29 +1725,63 @@ export class StoresPayrollPart {
     };
   }
 
-  /** Tổng số lượng ghi nhận trong tháng của nhân viên, theo từng khoản. */
-  async sumPayrollRecordQuantities(
+  /** Các lần ghi nhận trong tháng của nhân viên, theo từng khoản. */
+  async loadPayrollRecordOccurrences(
     this: StoresService,
     employeeProfileId: string,
     month: VnMonth,
     manager?: EntityManager,
-  ): Promise<Record<string, number>> {
-    const rows: Array<{ ruleId: string; total: string }> = await (
-      manager ?? this.dataSource.manager
-    )
-      .getRepository(EmployeePayrollRecord)
-      .createQueryBuilder('r')
-      .select('r.ruleId', 'ruleId')
-      .addSelect('COALESCE(SUM(r.quantity), 0)', 'total')
-      .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
-      .andWhere('r.ruleId IS NOT NULL')
-      .andWhere('r.workDate >= :start', { start: month.key })
-      .andWhere('r.workDate < :end', { end: month.endExclusiveDate })
-      .groupBy('r.ruleId')
-      .getRawMany();
-    const out: Record<string, number> = {};
-    for (const row of rows) out[row.ruleId] = Number(row.total) || 0;
+  ): Promise<Record<string, RuleOccurrence[]>> {
+    const rows: Array<{ ruleId: string; workDate: string; quantity: string }> =
+      await (manager ?? this.dataSource.manager)
+        .getRepository(EmployeePayrollRecord)
+        .createQueryBuilder('r')
+        .select('r.ruleId', 'ruleId')
+        .addSelect(`to_char(r.workDate, 'YYYY-MM-DD')`, 'workDate')
+        .addSelect('r.quantity', 'quantity')
+        .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
+        .andWhere('r.ruleId IS NOT NULL')
+        .andWhere('r.workDate >= :start', { start: month.key })
+        .andWhere('r.workDate < :end', { end: month.endExclusiveDate })
+        .getRawMany();
+    const out: Record<string, RuleOccurrence[]> = {};
+    for (const row of rows) {
+      const quantity = Number(row.quantity) || 0;
+      if (!(quantity > 0)) continue;
+      (out[row.ruleId] ??= []).push({
+        date: String(row.workDate).slice(0, 10),
+        minutes: 0,
+        quantity,
+      });
+    }
     return out;
+  }
+
+  /**
+   * Doanh số tháng của nhân viên (Thưởng doanh số "Theo % doanh số tháng"):
+   * tổng tiền các đơn HOÀN THÀNH của cửa hàng gắn với nhân viên, tạo trong
+   * tháng (giờ VN).
+   */
+  async sumEmployeeMonthlyRevenue(
+    this: StoresService,
+    employeeProfileId: string,
+    storeId: string,
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<number> {
+    const row: { total?: string } | undefined = await (manager ?? this.dataSource.manager)
+      .getRepository(Order)
+      .createQueryBuilder('o')
+      .select('COALESCE(SUM(o."totalAmount"), 0)', 'total')
+      .where('o.store_id = :storeId', { storeId })
+      .andWhere('o.employee_id = :employeeProfileId', { employeeProfileId })
+      .andWhere('o.status = :completed', { completed: OrderStatus.COMPLETED })
+      .andWhere('o.created_at >= :start AND o.created_at < :end', {
+        start: new Date(`${month.key}T00:00:00+07:00`),
+        end: new Date(`${month.endExclusiveDate}T00:00:00+07:00`),
+      })
+      .getRawOne();
+    return Number(row?.total) || 0;
   }
 
   // --- Store Payroll Payment History ---
