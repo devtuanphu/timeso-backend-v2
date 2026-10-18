@@ -155,4 +155,11 @@ export class StorePayrollRule extends BaseEntity {
    */
   @Column({ name: 'calc_config', type: 'jsonb', nullable: true })
   calcConfig: Record<string, unknown> | null;
+
+  /**
+   * Phạm vi áp dụng: null / rỗng = toàn cửa hàng; có danh sách = chỉ những
+   * nhân viên (employee_profiles.id) đó, cùng mức của khoản.
+   */
+  @Column({ name: 'employee_profile_ids', type: 'uuid', array: true, nullable: true })
+  employeeProfileIds: string[] | null;
 }

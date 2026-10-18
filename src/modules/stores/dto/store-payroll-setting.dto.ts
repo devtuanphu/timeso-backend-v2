@@ -1,6 +1,6 @@
 
 import { ApiProperty } from '@nestjs/swagger';
-import { IsBoolean, IsEnum, IsIn, IsObject, IsNumber, IsOptional, IsString, IsArray, Max, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsBoolean, IsEnum, IsIn, IsObject, IsUUID, IsNumber, IsOptional, IsString, IsArray, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 import { PayrollCalculationMethod } from '../entities/store-payroll-setting.entity';
 import {
@@ -31,6 +31,8 @@ export class PayrollRuleDto {
   // v3: cách tính chi tiết (kiểm và chuẩn hoá ở normalizeRuleCalcConfig); chỉ
   // đọc khi body có rulesVersion = 3.
   @ApiProperty({ required: false }) @IsOptional() @IsObject() calcConfig?: Record<string, unknown>;
+  // v3: phạm vi áp dụng; rỗng / thiếu = toàn cửa hàng.
+  @ApiProperty({ required: false, type: [String] }) @IsOptional() @IsArray() @ArrayMaxSize(500) @IsUUID('4', { each: true }) employeeProfileIds?: string[];
 }
 
 export class IncrementRuleDto {

@@ -54,7 +54,7 @@ import {
   vnMonthOfDateString,
 } from '../../common/utils/vn-calendar';
 import { SalaryAdjustment } from './entities/salary-adjustment.entity';
-import { pickDayOwnerAssignmentIds } from './payroll-calculation.utils';
+import { pickDayOwnerAssignmentIds, rulesApplyingTo } from './payroll-calculation.utils';
 import { stintFloor, stintStartVnDate } from './employment-stint.utils';
 import {
   computeAttendanceDeltas,
@@ -1534,7 +1534,8 @@ export class ShiftAggregationService {
         : 0;
 
     let penalty = 0;
-    for (const rule of rules) {
+    // Khoản chỉ áp dụng cho một số nhân viên: không ước tính cho người khác.
+    for (const rule of rulesApplyingTo(rules, a.employeeId)) {
       if (rule.category !== PayrollRuleCategory.FINE) continue;
       // Khoản v2 (calc_mode) tính theo tháng ở phiếu lương (hệ số × lương giờ,
       // mốc...): không ước tính lại theo từng ca bằng công thức cũ ở đây.

@@ -158,13 +158,21 @@ export function summarizeMonthlyAttendance(
   const workedDates = new Set<string>();
   // v3: each occurrence with its own minutes (Đi muộn 12 phút ngày 03…).
   const occurrences: Record<string, RuleOccurrence[]> = {};
+  // shiftMinutes: giờ theo lịch của ca đó (gốc "giờ của ca hôm đó").
+  let shiftMinutesOfA = 0;
   const occur = (code: string, date: string, minutes: number) =>
-    (occurrences[code] ??= []).push({ date, minutes, quantity: 1 });
+    (occurrences[code] ??= []).push({
+      date,
+      minutes,
+      quantity: 1,
+      shiftMinutes: shiftMinutesOfA,
+    });
 
   for (const a of assignments) {
     const late = toFiniteNumber(a.lateMinutes);
     const early = toFiniteNumber(a.earlyMinutes);
     const workDate = workDateOf(a.workDate);
+    shiftMinutesOfA = windowMinutes(a);
     if (late > 0) {
       lateCount += 1;
       occur('LATE', workDate, late);
@@ -248,6 +256,41 @@ const instantMs = (value: unknown): number | null => {
   const ms = new Date(value as string | Date).getTime();
   return Number.isFinite(ms) ? ms : null;
 };
+
+/**
+ * Phút theo lịch của các ca trong ngày (giờ VN), cho gốc "giờ của ca hôm đó"
+ * của khoản ghi nhận tay: ca đã duyệt / đã làm của ngày được ghi nhận.
+ */
+export function scheduledMinutesByDate(
+  assignments: PayrollAssignmentFact[],
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const a of assignments) {
+    if (
+      a.status !== ShiftAssignmentStatus.APPROVED &&
+      a.status !== ShiftAssignmentStatus.COMPLETED
+    ) {
+      continue;
+    }
+    const date = workDateOf(a.workDate);
+    if (date) out[date] = (out[date] ?? 0) + windowMinutes(a);
+  }
+  return out;
+}
+
+/**
+ * Khoản áp dụng cho một nhân viên: khoản toàn cửa hàng (không có danh sách)
+ * hoặc khoản có tên nhân viên đó trong phạm vi áp dụng.
+ */
+export function rulesApplyingTo<
+  T extends { employeeProfileIds?: string[] | null },
+>(rules: T[] | null | undefined, employeeProfileId: string): T[] {
+  return (rules ?? []).filter(
+    (rule) =>
+      !rule.employeeProfileIds?.length ||
+      rule.employeeProfileIds.includes(employeeProfileId),
+  );
+}
 
 /** Scheduled length of a shift's effective window, in whole minutes. */
 const windowMinutes = (a: PayrollAssignmentFact): number => {
@@ -558,6 +601,8 @@ const hasCompletedWork = (facts: RuleAdjustmentFacts): boolean =>
 /** One automatic bonus/fine line of a payslip, for the salary screen. */
 export interface PayslipAdjustmentLine {
   kind: 'BONUS' | 'FINE';
+  /** The rule the line comes from (null for rows without an id). */
+  ruleId?: string | null;
   /** LATE / EARLY / ABSENT / ATTENDANCE / GENERAL, or the v2 rule code. */
   ruleType: string;
   label: string;
@@ -773,6 +818,7 @@ function ruleRawLines(
     if (!(exact !== 0) || !Number.isFinite(exact)) return;
     raw.push({
       kind,
+      ruleId: rule.id ?? null,
       ruleType,
       label:
         label ||

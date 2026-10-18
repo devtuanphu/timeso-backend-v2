@@ -113,6 +113,22 @@ export class EmployeeSalary extends BaseEntity {
   otherDeductions: number; // Khấu trừ khác
 
   /**
+   * {khoá dòng: số tiền} của các dòng thưởng / vi phạm lần tính gần nhất, để
+   * báo nhân viên và chủ ngay khi một khoản đổi. NULL = phiếu có từ trước khi
+   * có tính năng: lần tính đầu chỉ ghi mốc, không báo.
+   */
+  @Column({
+    name: 'adjustment_snapshot',
+    type: 'jsonb',
+    nullable: true,
+    default: () => "'{}'::jsonb",
+  })
+  adjustmentSnapshot: Record<
+    string,
+    { amount: number; label: string; kind: 'BONUS' | 'FINE' }
+  > | null;
+
+  /**
    * The store's payslip template this payslip was computed with
    * (payslip-rows.utils PayslipRowsSnapshot): renamed / removed built-in rows
    * and the extra PLUS / MINUS lines. Null: the default payslip.

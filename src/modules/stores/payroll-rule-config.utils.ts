@@ -18,8 +18,12 @@ export type RuleCalcKind =
 
 /** Đơn vị đo một lần phát sinh. */
 export type RuleUnit = 'MINUTE' | 'HOUR' | 'SHIFT' | 'OCCURRENCE' | 'DAY';
-/** Gốc lương / doanh số của hệ số và phần trăm. */
-export type RuleBase = 'HOURLY' | 'DAILY' | 'MONTHLY' | 'REVENUE';
+/**
+ * Gốc lương / doanh số của hệ số và phần trăm. SHIFT_HOURS (chỉ hệ số): hệ số
+ * × số giờ của ca hôm phát sinh × lương giờ — vd nghỉ không phép ca 5 tiếng,
+ * hệ số 3 → trừ 15 giờ lương.
+ */
+export type RuleBase = 'HOURLY' | 'DAILY' | 'MONTHLY' | 'REVENUE' | 'SHIFT_HOURS';
 export type RuleMetric = 'WORKED_DAYS' | 'COMPLETED_SHIFTS' | 'WORKED_HOURS' | 'OCCURRENCES';
 
 export interface RuleTier {
@@ -70,6 +74,11 @@ export interface RuleOccurrence {
   minutes: number;
   /** Số lượng chủ ghi nhận (khoản thủ công); 1 với khoản tự động. */
   quantity: number;
+  /**
+   * Số phút theo lịch của ca hôm phát sinh (ghi nhận tay: tổng ca của nhân
+   * viên ngày đó). Gốc "giờ của ca hôm đó" của hệ số lương.
+   */
+  shiftMinutes?: number;
 }
 
 /** Khoản đo bằng số phút của từng lần (miễn trừ, bậc phút, luỹ tiến phút…). */
@@ -169,7 +178,7 @@ export function normalizeRuleCalcConfig(
       error = money('amount', true) ?? optionalUnit('SHIFT');
       break;
     case 'SALARY_COEF':
-      error = positive('coef', 100, 'hệ số') ?? base(['HOURLY', 'DAILY']);
+      error = positive('coef', 100, 'hệ số') ?? base(['HOURLY', 'DAILY', 'SHIFT_HOURS']);
       break;
     case 'PERCENT':
       error = positive('percent', 100, 'tỉ lệ %') ?? base(['HOURLY', 'DAILY', 'MONTHLY', 'REVENUE']);
@@ -368,6 +377,20 @@ export function evaluateRuleConfig(input: {
       };
     }
     case 'SALARY_COEF': {
+      if (config.base === 'SHIFT_HOURS') {
+        // Hệ số nhân thẳng (không trừ 1 như tăng ca / ca đêm theo lương giờ):
+        // "giờ của ca" không phải giờ đã được trả thêm.
+        const hours = list.reduce(
+          (s, o) => s + ((o.shiftMinutes ?? 0) / 60) * (recorded ? o.quantity : 1),
+          0,
+        );
+        return {
+          exact: (config.coef ?? 0) * rates.hourly * hours,
+          count: recorded ? occurrences : list.length,
+          // "Phạt nghỉ không phép (15 giờ lương)": số giờ lương = hệ số × giờ ca.
+          label: `${name} (${fmt((config.coef ?? 0) * hours)} giờ lương)`,
+        };
+      }
       const coef = salaryCoefExtra(code, config.coef ?? 0);
       if (config.base === 'DAILY') {
         const days = recorded ? occurrences : distinctDays(list);

@@ -238,8 +238,17 @@ export class StoresAttendanceController {
         );
       // Màn nhân viên của chủ (ca / đi trễ) đổi ngay khi chấm công vào; trước
       // đây chỉ cập nhật sau job của chấm công ra.
+      // Phiếu lương cũng tính lại ngay (đi muộn bị trừ và báo nhân viên / chủ
+      // ngay lúc chấm công vào); hàm này làm mới cả bảng tổng hợp tháng.
       void this.storesService
-        .refreshMonthlySummaryOfAssignment(id)
+        .recomputePayslipOfAssignment(id)
+        .catch((error) => {
+          this.logger.error(
+            `[CheckIn] Unable to recompute payslip for ${id}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          // Phiếu lương lỗi thì bảng tổng hợp vẫn phải đổi như trước.
+          return this.storesService.refreshMonthlySummaryOfAssignment(id);
+        })
         .catch((error) =>
           this.logger.error(
             `[CheckIn] Unable to refresh monthly summary for ${id}: ${error instanceof Error ? error.message : String(error)}`,

@@ -157,6 +157,36 @@ function fallbackCalcModeOf(config: RuleCalcConfig, code: string): {
     : Math.min(100_000_000, Math.max(1, Math.round(raw.value)));
   return { ...raw, value };
 }
+/** Một dòng thưởng / vi phạm vừa đổi so với lần tính trước. */
+export interface PayrollAdjustmentChange {
+  kind: 'BONUS' | 'FINE';
+  label: string;
+  /** Chênh lệch (đồng, dương): số tiền vừa phát sinh thêm hoặc bớt đi. */
+  delta: number;
+  /** Tổng của dòng trong tháng sau lần tính này. */
+  total: number;
+}
+
+type AdjustmentSnapshot = Record<
+  string,
+  { amount: number; label: string; kind: 'BONUS' | 'FINE'; count?: number }
+>;
+
+/**
+ * Dòng thưởng / vi phạm thật sự được tính vào phiếu: mẫu phiếu bỏ hàng
+ * "Thưởng" / "Khấu trừ" thì tổng tương ứng là 0 — không báo khoản không tính.
+ */
+const effectiveAdjustmentLines = (
+  lines: PayslipAdjustmentLine[],
+  payslip: Pick<PayslipComputation, 'bonus' | 'penalty'>,
+) =>
+  lines.filter((line) => (line.kind === 'BONUS' ? payslip.bonus : payslip.penalty) !== 0);
+
+/** Khoá ổn định của một dòng (nhãn có thể đổi theo số giờ). */
+const adjustmentKey = (line: PayslipAdjustmentLine) =>
+  `${line.kind}:${line.ruleId ?? line.ruleType}`;
+
+const vnMoney = (value: number) => Math.round(value).toLocaleString('vi-VN');
 import {
   StorePayrollIncrementRule,
   IncrementRuleType,
@@ -182,10 +212,17 @@ import {
   describePayslipTotals,
   EarnedBreakdown,
   payRatesOf,
+  rulesApplyingTo,
+  scheduledMinutesByDate,
 } from '../payroll-calculation.utils';
 import { effectiveWindowOf } from '../attendance-time.utils';
 import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
 import { Order, OrderStatus } from '../entities/order.entity';
+import {
+  NotificationPriority,
+  NotificationType,
+} from '../../notifications/entities/notification.entity';
+import type { NotificationsService } from '../../notifications/notifications.service';
 import {
   normalizeRuleCalcConfig,
   salaryCoefExtra,
@@ -622,6 +659,18 @@ export class StoresPayrollPart {
       }
     }
 
+    // Phạm vi áp dụng (v3): chỉ nhân viên của chính cửa hàng này.
+    const scopeIds = v3
+      ? [...new Set(incoming.flatMap((r) => r.employeeProfileIds ?? []))]
+      : [];
+    if (scopeIds.length) {
+      const found = await manager
+        .getRepository(EmployeeProfile)
+        .find({ where: { id: In(scopeIds), storeId }, select: ['id'], withDeleted: true });
+      if (found.length !== scopeIds.length) {
+        throw new BadRequestException('Có nhân viên trong phạm vi áp dụng không thuộc cửa hàng');
+      }
+    }
     const current = await repo.find({ where: { storeId } });
     const used = new Set<string>();
     const toSave: StorePayrollRule[] = [];
@@ -678,6 +727,15 @@ export class StoresPayrollPart {
           : keepConfig
             ? rule!.calcConfig
             : null,
+        // Phạm vi: chỉ đổi khi body gửi trường này ([] = toàn cửa hàng). Thiếu
+        // trường (app v2, và bản v3 đầu tiên — build 28 — chưa có phạm vi) thì
+        // giữ phạm vi đang có: xoá đi sẽ biến khoản riêng thành khoản chung.
+        employeeProfileIds:
+          v3 && r.employeeProfileIds !== undefined
+            ? r.employeeProfileIds?.length
+              ? [...new Set(r.employeeProfileIds)]
+              : null
+            : (rule?.employeeProfileIds ?? null),
       };
       if (rule) Object.assign(rule, payload);
       else rule = repo.create(payload);
@@ -776,6 +834,10 @@ export class StoresPayrollPart {
         rule.category !== PayrollRuleCategory.FINE)
     ) {
       throw new BadRequestException('Khoản này không ghi nhận thủ công được');
+    }
+    // Khoản chỉ áp dụng cho một số nhân viên: không ghi nhận cho người khác.
+    if (rule.employeeProfileIds?.length && !rule.employeeProfileIds.includes(profile.id)) {
+      throw new BadRequestException('Khoản này không áp dụng cho nhân viên này');
     }
     const workDate = dto.workDate;
     // Chỉ ngày có thật trong tháng này, không sau hôm nay: tháng trước tính lại
@@ -1096,6 +1158,7 @@ export class StoresPayrollPart {
 
         const contract = employee.contracts?.find((c) => c.isActive) ?? null;
         let payslip: PayslipComputation | null = null;
+        let rebuiltLines: PayslipAdjustmentLine[] = [];
         if (contract) {
           const { rate, adjustment } = await this.resolveRateForMonth(
             employee.id,
@@ -1110,7 +1173,7 @@ export class StoresPayrollPart {
               .getRepository(EmployeeContract)
               .update(contract.id, { salaryAmount: rate });
           }
-          ({ payslip } = await this.computeEmployeePayslip({
+          const composed = await this.computeEmployeePayslip({
             manager,
             employeeProfileId: employee.id,
             storeId,
@@ -1124,7 +1187,16 @@ export class StoresPayrollPart {
             now,
             stint: employee,
             payslipRows: payslipTemplate,
-          }));
+          });
+          payslip = composed.payslip;
+          rebuiltLines = effectiveAdjustmentLines(
+            computeRuleAdjustmentBreakdown(
+              composed.rules,
+              composed.facts,
+              composed.payslip.earnedBaseSalary,
+            ),
+            composed.payslip,
+          );
         }
 
         counts[
@@ -1137,6 +1209,11 @@ export class StoresPayrollPart {
             existing,
           })
         ] += 1;
+        // Tính lại cả cửa hàng (chủ đổi thiết lập / mẫu phiếu): chỉ cập nhật
+        // ảnh chụp, không báo — không phải nhân viên vừa phát sinh khoản nào.
+        if (payslip) {
+          await this.recordAdjustmentSnapshot(manager, employee.id, month, rebuiltLines);
+        }
       }
 
       const totals = await this.refreshMonthlyPayrollTotals(
@@ -1615,6 +1692,8 @@ export class StoresPayrollPart {
     facts: MonthlyAttendanceFacts;
     assignments: PayrollAssignmentFact[];
     payslip: PayslipComputation;
+    /** The rules that apply to this employee (scope filtered). */
+    rules: StorePayrollRule[];
     /**
      * Earned base of the current stint only, when the month also holds a
      * previous stint's shifts (same-month rehire); null otherwise.
@@ -1630,14 +1709,26 @@ export class StoresPayrollPart {
     const todayVn = vnDateString(p.now ?? new Date());
     const facts = summarizeMonthlyAttendance(assignments, todayVn);
     facts.monthComplete = todayVn >= p.month.endExclusiveDate;
+    // Phạm vi áp dụng: khoản riêng của nhân viên khác không tính cho người này.
+    const rules = rulesApplyingTo(p.rules, p.employeeProfileId);
     // v2 rules: the month's manual records ("ghi nhận") per rule, and the
     // employee's own pay per hour / shift for coefficient rules.
-    if (p.contract && (p.rules ?? []).some((rule) => rule.calcMode)) {
+    if (p.contract && rules.some((rule) => rule.calcMode)) {
       const records = await this.loadPayrollRecordOccurrences(
         p.employeeProfileId,
         p.month,
         p.manager,
       );
+      // "Giờ của ca hôm đó" của một ghi nhận: ca theo lịch ngày được ghi nhận;
+      // ngày không có ca thì một ca trung bình của tháng.
+      const byDate = scheduledMinutesByDate(assignments);
+      const avgShift =
+        facts.completedShifts > 0 && facts.workedMinutes > 0
+          ? facts.workedMinutes / facts.completedShifts
+          : 480;
+      for (const list of Object.values(records)) {
+        for (const o of list) o.shiftMinutes = byDate[o.date] || avgShift;
+      }
       facts.recordOccurrences = records;
       facts.ruleQuantities = Object.fromEntries(
         Object.entries(records).map(([ruleId, list]) => [
@@ -1645,7 +1736,7 @@ export class StoresPayrollPart {
           list.reduce((sum, o) => sum + o.quantity, 0),
         ]),
       );
-      if ((p.rules ?? []).some((rule) => rule.calcConfig?.base === 'REVENUE')) {
+      if (rules.some((rule) => rule.calcConfig?.base === 'REVENUE')) {
         facts.revenue = await this.sumEmployeeMonthlyRevenue(
           p.employeeProfileId,
           p.storeId,
@@ -1703,7 +1794,7 @@ export class StoresPayrollPart {
       paymentType: p.contract?.paymentType ?? null,
       rate: p.contract ? p.rate : 0,
       allowances: p.contract?.allowances ?? null,
-      rules: p.contract ? p.rules : [],
+      rules: p.contract ? rules : [],
       facts,
       standardWorkingDays: p.standardWorkingDays,
       calendarDays: p.month.calendarDays,
@@ -1721,8 +1812,163 @@ export class StoresPayrollPart {
       facts,
       assignments,
       payslip,
+      rules: p.contract ? rules : [],
       currentStintEarned: split?.currentStintEarned ?? null,
     };
+  }
+
+  /**
+   * Ghi ảnh chụp các dòng thưởng / vi phạm của phiếu lương tháng và trả về
+   * các dòng vừa đổi so với lần trước. Gọi trong transaction đang giữ khoá
+   * phiếu, ngay sau khi ghi phiếu. Phiếu đã chốt: không làm gì. Phiếu có từ
+   * trước khi có tính năng (ảnh chụp NULL) chỉ ghi mốc, không trả thay đổi.
+   */
+  async recordAdjustmentSnapshot(
+    this: StoresService,
+    manager: EntityManager,
+    employeeProfileId: string,
+    month: VnMonth,
+    lines: PayslipAdjustmentLine[],
+  ): Promise<PayrollAdjustmentChange[]> {
+    // Phần phụ (chỉ phục vụ thông báo): lỗi ở đây không được làm hỏng phiếu
+    // lương vừa ghi trong cùng transaction — savepoint riêng, lỗi thì bỏ qua.
+    const savepoint = 'payroll_adjustment_snapshot';
+    try {
+      await manager.query(`SAVEPOINT ${savepoint}`);
+      const repo = manager.getRepository(EmployeeSalary);
+      const row = await repo.findOne({
+        where: { employeeProfileId, month: toMonthMarker(month) },
+        withDeleted: true,
+      });
+      const changes: PayrollAdjustmentChange[] = [];
+      if (row && !this.isProtectedPayslip(row)) {
+        const next: AdjustmentSnapshot = {};
+        for (const line of lines) {
+          next[adjustmentKey(line)] = {
+            amount: line.amount,
+            label: line.label,
+            kind: line.kind,
+            count: line.count,
+          };
+        }
+        const prev = row.adjustmentSnapshot as AdjustmentSnapshot | null;
+        await repo.update(row.id, { adjustmentSnapshot: next });
+        if (prev) {
+          for (const key of new Set([...Object.keys(prev), ...Object.keys(next)])) {
+            const before = prev[key];
+            const after = next[key];
+            const delta = (after?.amount ?? 0) - (Number(before?.amount) || 0);
+            if (delta === 0) continue;
+            // Chỉ báo khi có lần phát sinh mới / bớt (dòng mới, dòng mất, số
+            // lần hoặc số giờ trong nhãn đổi). Số tiền trôi theo lương giờ
+            // trung bình của tháng sau mỗi ca, hay ±1đ làm tròn: không báo.
+            const occurrenceChanged =
+              !before ||
+              !after ||
+              before.count !== after.count ||
+              before.label !== after.label;
+            if (!occurrenceChanged) continue;
+            const ref = after ?? before!;
+            changes.push({ kind: ref.kind, label: ref.label, delta, total: after?.amount ?? 0 });
+          }
+        }
+      }
+      await manager.query(`RELEASE SAVEPOINT ${savepoint}`);
+      return changes;
+    } catch (error) {
+      try {
+        await manager.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      } catch {
+        // Không có savepoint (vd. manager giả trong test): không còn gì để huỷ.
+      }
+      this.logger?.warn(
+        `[PayrollNotify] snapshot skipped for ${employeeProfileId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      return [];
+    }
+  }
+
+  /**
+   * Báo nhân viên và chủ từng dòng thưởng / vi phạm vừa đổi (đi muộn vừa ghi
+   * nhận, nghỉ không phép vừa bị đánh dấu, chủ vừa ghi nhận thưởng…). Gọi
+   * sau khi commit. Lỗi gửi chỉ ghi log: phiếu lương đã đúng.
+   */
+  async notifyAdjustmentChanges(
+    this: StoresService,
+    input: {
+      employeeProfileId: string;
+      storeId: string;
+      month: VnMonth;
+      workDate?: string | null;
+      changes: PayrollAdjustmentChange[];
+    },
+  ): Promise<void> {
+    if (!input.changes.length) return;
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { id: input.employeeProfileId },
+        relations: ['account'],
+      });
+      const store = await this.storeRepository.findOne({ where: { id: input.storeId } });
+      const day = input.workDate
+        ? `${input.workDate.slice(8, 10)}/${input.workDate.slice(5, 7)}`
+        : null;
+      const name = profile?.account?.fullName || 'Nhân viên';
+      for (const change of input.changes) {
+        const fine = change.kind === 'FINE';
+        const head = fine ? 'Vi phạm' : 'Thưởng';
+        const sign = fine ? '−' : '+';
+        const added = change.delta > 0;
+        const amount = `${added ? sign : fine ? '+' : '−'}${vnMoney(Math.abs(change.delta))}đ`;
+        const total = change.total ? `${sign}${vnMoney(change.total)}đ` : '0đ';
+        const content = `${added ? '' : 'Điều chỉnh '}${amount}${day ? ` · ngày ${day}` : ''}. Tạm tính tháng ${input.month.month}: ${total}.`;
+        const metadata = {
+          type: 'PAYROLL_ADJUSTMENT',
+          employeeProfileId: input.employeeProfileId,
+          month: input.month.label,
+          ...(input.workDate ? { workDate: input.workDate } : {}),
+        };
+        const send = async (data: Parameters<NotificationsService['create']>[0]) => {
+          try {
+            await this.notificationsService.create(data);
+          } catch (error) {
+            // Một thông báo lỗi không chặn các thông báo còn lại (không log số tiền).
+            this.logger.warn(
+              `[PayrollNotify] send failed for ${input.employeeProfileId}: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        };
+        if (profile?.accountId) {
+          await send({
+            accountId: profile.accountId,
+            storeId: input.storeId,
+            title: `${head}: ${change.label}`,
+            content,
+            type: NotificationType.SYSTEM,
+            priority: NotificationPriority.NORMAL,
+            actionUrl: '/(salary)',
+            metadata,
+          });
+        }
+        if (store?.ownerAccountId && store.ownerAccountId !== profile?.accountId) {
+          await send({
+            accountId: store.ownerAccountId,
+            storeId: input.storeId,
+            title: `${name} · ${head}: ${change.label}`,
+            content,
+            type: NotificationType.SYSTEM,
+            priority: NotificationPriority.NORMAL,
+            actionUrl: `/(employee)/${input.employeeProfileId}`,
+            metadata,
+          });
+        }
+      }
+    } catch (error) {
+      // Không ghi số tiền vào log.
+      this.logger.warn(
+        `[PayrollNotify] failed for ${input.employeeProfileId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /** Các lần ghi nhận trong tháng của nhân viên, theo từng khoản. */
@@ -2871,23 +3117,24 @@ export class StoresPayrollPart {
           where: { storeId, isActive: true },
         })
       : [];
-    const { facts, payslip, currentStintEarned } =
-      await this.computeEmployeePayslip({
-        employeeProfileId,
-        storeId,
-        month,
-        contract: activeContract,
-        rate,
-        rules,
-        standardWorkingDays,
-        existingSalaryId: existing?.id ?? null,
-        otherDeductions: existing?.otherDeductions,
-        stint: profile ?? undefined,
-      });
+    const composed = await this.computeEmployeePayslip({
+      employeeProfileId,
+      storeId,
+      month,
+      contract: activeContract,
+      rate,
+      rules,
+      standardWorkingDays,
+      existingSalaryId: existing?.id ?? null,
+      otherDeductions: existing?.otherDeductions,
+      stint: profile ?? undefined,
+    });
+    const { facts, payslip, currentStintEarned } = composed;
     return {
       facts,
       payslip,
-      rules,
+      // Chỉ khoản áp dụng cho nhân viên này (dòng chi tiết khớp tổng).
+      rules: composed.rules,
       standardWorkingDays,
       calendarDays: month.calendarDays,
       // Same-month rehire: the earned base was priced per stint.
@@ -4389,6 +4636,7 @@ export class StoresPayrollPart {
     ) {
       return 'skipped';
     }
+    let changes: PayrollAdjustmentChange[] = [];
     const outcome = await this.dataSource.transaction(async (manager) => {
       const payroll = await this.findOrCreateMonthlyPayroll(
         input.storeId,
@@ -4402,6 +4650,7 @@ export class StoresPayrollPart {
       );
       const contract = employee.contracts?.find((c) => c.isActive) ?? null;
       let payslip: PayslipComputation | null = null;
+      let lines: PayslipAdjustmentLine[] = [];
       if (contract && !(existing && this.isProtectedPayslip(existing))) {
         const { rate } = await this.resolveRateForMonth(
           employee.id,
@@ -4417,7 +4666,9 @@ export class StoresPayrollPart {
           month,
           manager,
         );
-        ({ payslip } = await this.computeEmployeePayslip({
+        let composedRules: StorePayrollRule[] = [];
+        let composedFacts: MonthlyAttendanceFacts | null = null;
+        ({ payslip, rules: composedRules, facts: composedFacts } = await this.computeEmployeePayslip({
           manager,
           employeeProfileId: employee.id,
           storeId: input.storeId,
@@ -4431,6 +4682,10 @@ export class StoresPayrollPart {
           now: new Date(),
           stint: employee,
         }));
+        lines = effectiveAdjustmentLines(
+          computeRuleAdjustmentBreakdown(composedRules, composedFacts, payslip.earnedBaseSalary),
+          payslip,
+        );
       }
       const outcome = await this.upsertEmployeePayslip(manager, {
         employeeProfileId: employee.id,
@@ -4441,7 +4696,19 @@ export class StoresPayrollPart {
         existing,
       });
       await this.refreshMonthlyPayrollTotals(manager, payroll.id);
+      // Khoản thưởng / vi phạm vừa đổi (nghỉ không phép vừa đánh dấu, đi muộn
+      // lúc chấm công vào, chủ vừa ghi nhận…): báo ngay sau khi commit.
+      changes = payslip
+        ? await this.recordAdjustmentSnapshot(manager, employee.id, month, lines)
+        : [];
       return outcome;
+    });
+    await this.notifyAdjustmentChanges({
+      employeeProfileId: employee.id,
+      storeId: input.storeId,
+      month,
+      workDate: input.workDate,
+      changes,
     });
     // Ca vừa bị đánh dấu nghỉ không phép: bảng tổng hợp của màn nhân viên
     // cũng phải đổi ngay (không đợi lần chấm công ra kế tiếp).
@@ -4453,6 +4720,37 @@ export class StoresPayrollPart {
       ),
     );
     return outcome;
+  }
+
+  /**
+   * Chấm công vào: tính lại phiếu lương tháng của ca ngay (đi muộn bị trừ và
+   * báo ngay, không đợi chấm công ra).
+   */
+  async recomputePayslipOfAssignment(
+    this: StoresService,
+    assignmentId: string,
+  ): Promise<void> {
+    const assignment = await this.shiftAssignmentRepository.findOne({
+      where: { id: assignmentId },
+      relations: ['shiftSlot', 'shiftSlot.cycle'],
+    });
+    const storeId = assignment?.shiftSlot?.cycle?.storeId;
+    const workDate =
+      typeof assignment?.shiftSlot?.workDate === 'string'
+        ? assignment.shiftSlot.workDate.slice(0, 10)
+        : null;
+    if (!assignment?.employeeId || !storeId || !workDate) {
+      await this.refreshMonthlySummaryOfAssignment(assignmentId);
+      return;
+    }
+    const outcome = await this.recomputeEmployeePayslipForWorkDate({
+      employeeProfileId: assignment.employeeId,
+      storeId,
+      workDate,
+    });
+    // Không tính phiếu (vd. hồ sơ không còn trong danh sách xếp ca): bảng tổng
+    // hợp của màn nhân viên vẫn phải đổi như trước khi có bước này.
+    if (outcome === 'skipped') await this.refreshMonthlySummaryOfAssignment(assignmentId);
   }
 
   /** Bảng tổng hợp tháng của người làm lượt ca này (tháng của ngày làm). */
@@ -4587,6 +4885,7 @@ export class StoresPayrollPart {
     let payslip: PayslipComputation;
     let monthAssignments: PayrollAssignmentFact[];
     let currentStintEarned: number | null | undefined;
+    let checkoutChanges: PayrollAdjustmentChange[] = [];
     // Nothing to price without a contract; the summary is the caller's.
     if (outer && !activeContract) return;
     if (!activeContract) {
@@ -4677,6 +4976,23 @@ export class StoresPayrollPart {
             allowances: activeContract.allowances ?? null,
           });
           await this.refreshMonthlyPayrollTotals(manager, payroll.id);
+          // Trong transaction của người gọi (outer) thì không ghi ảnh chụp: thông
+          // báo chỉ gửi được sau commit, lần tính kế tiếp sẽ báo phần chênh.
+          if (!outer) {
+            checkoutChanges = await this.recordAdjustmentSnapshot(
+              manager,
+              assignment.employeeId,
+              month,
+              effectiveAdjustmentLines(
+                computeRuleAdjustmentBreakdown(
+                  composed.rules,
+                  composed.facts,
+                  composed.payslip.earnedBaseSalary,
+                ),
+                composed.payslip,
+              ),
+            );
+          }
           return composed;
         };
         return outer
@@ -4685,6 +5001,15 @@ export class StoresPayrollPart {
       })());
     }
     if (outer) return;
+
+    // Tăng ca / ca đêm / về sớm / quên chấm công… của ca vừa kết thúc.
+    await this.notifyAdjustmentChanges({
+      employeeProfileId: assignment.employeeId,
+      storeId,
+      month,
+      workDate,
+      changes: checkoutChanges,
+    });
 
     await this.writeEmployeeMonthlySummary({
       employeeProfileId: assignment.employeeId,
