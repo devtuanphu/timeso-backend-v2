@@ -86,6 +86,12 @@ export const CAREER_LIMITS = {
   requirementsPerSubject: 10,
   /** Tối đa nhân viên trả về trong danh sách "tuỳ chọn" của màn vị trí. */
   optionalCandidates: 200,
+  /**
+   * Xếp hạng cùng vị trí (trang chủ NV) đo tiến độ từng người cùng vị trí:
+   * đông hơn thế thì không xếp hạng (ẩn ô) để một lần mở trang chủ không đo
+   * cả trăm người.
+   */
+  positionRankMeasured: 40,
   maxRequirementValue: 100000,
 } as const;
 

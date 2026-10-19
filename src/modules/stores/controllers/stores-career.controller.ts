@@ -240,7 +240,7 @@ export class StoresCareerController {
   })
   async getEmployeeCareer(@Param('profileId', uuid) profileId: string, @GetUser() user: any) {
     await this.careerLadderService.assertCanViewOwnCareer(profileId, user.userId);
-    return this.evaluation.getEmployeeCareer(profileId);
+    return this.evaluation.getEmployeeCareer(profileId, { withPositionRank: true });
   }
 
   @Post('employees/:profileId/career/promotions')

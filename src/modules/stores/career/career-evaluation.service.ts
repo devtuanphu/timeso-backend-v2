@@ -108,6 +108,16 @@ const evaluationOf = (items: MeasuredRequirement[], adjacent = true): Evaluation
   };
 };
 
+/** Tổng phần đã đi được của các điều kiện lên bước kế (xếp hạng cùng vị trí). */
+const careerScore = (target: PromotionTarget | null): number =>
+  (target?.items ?? []).reduce((sum, i) => {
+    if (i.met) return sum + 1;
+    if (i.current === null || !i.target || i.target <= 0) return sum;
+    return sum + Math.min(Math.max(i.current / i.target, 0), 1);
+  }, 0);
+/** Giờ làm là số thực: chênh nhỏ hơn mức này coi như bằng điểm. */
+const SCORE_EPSILON = 1e-6;
+
 const later = (...dates: Array<Date | null | undefined>): Date | null => {
   let best: Date | null = null;
   for (const d of dates) {
@@ -649,8 +659,12 @@ export class CareerEvaluationService {
   // Màn hình
   // -------------------------------------------------------------------------
 
-  /** Lộ trình của một nhân viên (app chủ: chi tiết NV; app NV: trang chủ). */
-  async getEmployeeCareer(profileId: string) {
+  /**
+   * Lộ trình của một nhân viên (app chủ: chi tiết NV; app NV: trang chủ).
+   * `withPositionRank` chỉ bật ở route /career: xếp hạng phải đo cả vị trí,
+   * các route tổng hợp (/career-summary, /progression…) không dùng tới.
+   */
+  async getEmployeeCareer(profileId: string, opts: { withPositionRank?: boolean } = {}) {
     const m = this.dataSource.manager;
     const profile = await m.findOne(EmployeeProfile, { where: { id: profileId } });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
@@ -663,6 +677,10 @@ export class CareerEvaluationService {
     const position = profile.storeRoleId ? graph.positions.get(profile.storeRoleId) : undefined;
     const skills = await this.skillStates(ctx, graph);
     const next = isEmployedStatus(profile.employmentStatus) ? await this.nextTarget(ctx, graph) : null;
+    const positionRank =
+      opts.withPositionRank && position && position.rank !== null && next
+        ? await this.positionRank(m, graph, profile, next)
+        : null;
     return {
       v2Enabled: true as const,
       department: department
@@ -681,7 +699,44 @@ export class CareerEvaluationService {
       positionEnteredAt: await ctx.positionEnteredAt(),
       next,
       skills,
+      /** Xếp hạng trong số NV đang làm cùng vị trí (trang chủ app NV). */
+      positionRank,
+      /** Trạng thái làm việc (thử việc / chính thức…): ô "Giai đoạn" khi
+       * cửa hàng chưa có lộ trình hình thức làm việc. */
+      employmentStatus: profile.employmentStatus,
     };
+  }
+
+  /**
+   * Hạng của nhân viên trong số người đang làm cùng vị trí, theo tiến độ lên
+   * bước kế: mỗi điều kiện góp phần đã đi được (giờ/ca: hiện tại ÷ mục tiêu,
+   * chặn ở 1; điều kiện có/không: 0 hoặc 1), nên 79/80 giờ đứng trước 10/80
+   * giờ dù cả hai đều "chưa đạt". Điểm bằng nhau thì cùng hạng (1, 2, 2, 4).
+   * Vị trí đỉnh (không có bước kế) không xếp hạng. Vị trí quá đông thì không
+   * đo (mỗi người một lượt đo) — trả null, app ẩn ô xếp hạng.
+   */
+  private async positionRank(
+    m: EntityManager,
+    graph: CareerGraph,
+    profile: EmployeeProfile,
+    own: PromotionTarget,
+  ): Promise<{ rank: number; total: number } | null> {
+    if (!profile.storeRoleId) return null;
+    const colleagues = () =>
+      m
+        .getRepository(EmployeeProfile)
+        .createQueryBuilder('p')
+        .where('p.storeId = :storeId', { storeId: profile.storeId })
+        .andWhere('p.storeRoleId = :roleId', { roleId: profile.storeRoleId })
+        .andWhere('p.employmentStatus IN (:...statuses)', { statuses: [...EMPLOYED_STATUSES] });
+    if ((await colleagues().getCount()) > CAREER_LIMITS.positionRankMeasured) return null;
+    const others = (await colleagues().getMany()).filter((p) => p.id !== profile.id);
+    const mine = careerScore(own);
+    const scores = await Promise.all(
+      others.map(async (p) => careerScore(await this.nextTarget(this.context(m, p), graph))),
+    );
+    const ahead = scores.filter((s) => s > mine + SCORE_EPSILON).length;
+    return { rank: ahead + 1, total: others.length + 1 };
   }
 
   /**
