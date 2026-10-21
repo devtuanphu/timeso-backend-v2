@@ -164,6 +164,11 @@ export class CreateSkillDto extends RequirementsField {
   @IsUUID()
   departmentId: string;
 
+  /** Vị trí (cùng bộ phận) phải học kỹ năng này; bỏ trống / null = chung. */
+  @IsOptional()
+  @IsUUID()
+  positionId?: string | null;
+
   @IsString()
   @MinLength(1)
   @MaxLength(CAREER_NAME_MAX)
@@ -193,6 +198,11 @@ export class UpdateSkillDto extends RequirementsField {
   @IsOptional()
   @IsUUID()
   departmentId?: string;
+
+  /** Không gửi = giữ nguyên; null = thành kỹ năng chung của bộ phận. */
+  @IsOptional()
+  @IsUUID()
+  positionId?: string | null;
 
   @IsOptional()
   @IsString()

@@ -17,7 +17,9 @@ export enum SkillConfirmation {
 /**
  * Kỹ năng. Lộ trình v2: thuộc một bộ phận, mở khoá tuần tự theo `sequence`
  * (KN bắt buộc đứng trước phải đạt), Bắt buộc / Tuỳ chọn. Kỹ năng bị xoá mềm
- * được đặt sequence = null.
+ * được đặt sequence = null. `positionId`: null = kỹ năng chung của bộ phận;
+ * có = chỉ nhân viên đang giữ vị trí đó (cùng bộ phận) phải học. Thứ tự vẫn
+ * đánh chung một dãy trong bộ phận.
  */
 @Entity('store_skills')
 @Unique('ux_store_skills_department_sequence', ['departmentId', 'sequence'], {
@@ -42,6 +44,10 @@ export class StoreSkill extends BaseEntity {
 
   @Column({ name: 'department_id', type: 'uuid', nullable: true })
   departmentId: string | null;
+
+  /** Không khai quan hệ: FK ghép (store_id, position_id) do migration tạo. */
+  @Column({ name: 'position_id', type: 'uuid', nullable: true })
+  positionId: string | null;
 
   @Column({ type: 'int', nullable: true })
   sequence: number | null;

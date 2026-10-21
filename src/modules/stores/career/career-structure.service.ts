@@ -82,6 +82,8 @@ export interface PositionView {
 export interface SkillView {
   id: string;
   departmentId: string | null;
+  /** null = kỹ năng chung của bộ phận; có = riêng nhân viên giữ vị trí đó. */
+  positionId: string | null;
   sequence: number | null;
   name: string;
   description: string | null;
@@ -258,6 +260,7 @@ export class CareerStructureService {
       skills: [...skills].sort(byOrder((s) => s.sequence)).map((s) => ({
         id: s.id,
         departmentId: s.departmentId,
+        positionId: s.positionId ?? null,
         sequence: s.sequence,
         name: s.name,
         description: s.description ?? null,
@@ -531,6 +534,19 @@ export class CareerStructureService {
         }
       };
 
+      // Vị trí trước: kỹ năng riêng của vị trí phải trỏ sang vị trí bản sao.
+      const positions = await m.find(StoreRole, { where: { storeId, departmentId: source.id } });
+      const positionMap = new Map<string, string>();
+      for (const p of positions) {
+        const clone = await this.insertRole(m, storeId, {
+          departmentId: copy.id,
+          rank: p.rank,
+          name: p.name,
+          description: p.description ?? null,
+        });
+        positionMap.set(p.id, clone.id);
+      }
+
       const skills = await m.find(StoreSkill, { where: { storeId, departmentId: source.id } });
       const skillMap = new Map<string, string>();
       for (const s of skills) {
@@ -539,6 +555,7 @@ export class CareerStructureService {
           m.create(StoreSkill, {
             storeId,
             departmentId: copy.id,
+            positionId: s.positionId ? (positionMap.get(s.positionId) ?? null) : null,
             sequence: s.sequence,
             name: s.name,
             description: s.description,
@@ -553,15 +570,12 @@ export class CareerStructureService {
         await cloneReqs((r) => r.skillId === s.id, { skillId: skillMap.get(s.id) }, skillMap);
       }
 
-      const positions = await m.find(StoreRole, { where: { storeId, departmentId: source.id } });
       for (const p of positions) {
-        const clone = await this.insertRole(m, storeId, {
-          departmentId: copy.id,
-          rank: p.rank,
-          name: p.name,
-          description: p.description ?? null,
-        });
-        await cloneReqs((r) => r.positionId === p.id, { positionId: clone.id }, skillMap);
+        await cloneReqs(
+          (r) => r.positionId === p.id,
+          { positionId: positionMap.get(p.id) },
+          skillMap,
+        );
       }
 
       await this.logChange(m, storeId, actorAccountId, 'department', 'duplicated', copy);
@@ -640,6 +654,7 @@ export class CareerStructureService {
             employeesAffected: holders,
           });
         }
+        await this.assertNoPositionSkills(m, role.id, 'đổi bộ phận');
         const department = await this.memberDepartment(m, storeId, targetDepartmentId, 'vị trí');
         const target = await this.orderedIds(m, 'position', department.id);
         if (target.length >= ORDER.position.limit) {
@@ -699,6 +714,7 @@ export class CareerStructureService {
           employeesAffected: holders,
         });
       }
+      await this.assertNoPositionSkills(m, role.id, 'xoá');
       const now = new Date();
       const remaining = role.departmentId
         ? (await this.orderedIds(m, 'position', role.departmentId)).filter((id) => id !== role.id)
@@ -726,6 +742,7 @@ export class CareerStructureService {
     storeId: string,
     dto: {
       departmentId: string;
+      positionId?: string | null;
       name: string;
       description?: string | null;
       sequence?: number;
@@ -737,6 +754,7 @@ export class CareerStructureService {
   ) {
     return this.write(storeId, async (m) => {
       const department = await this.memberDepartment(m, storeId, dto.departmentId, 'kỹ năng');
+      const positionId = await this.skillPosition(m, storeId, department.id, dto.positionId);
       const name = dto.name.trim();
       await this.assertNameFreeInDepartment(m, 'skill', department.id, name);
       const requirements = normalizeRequirements('skill', dto.requirements);
@@ -749,6 +767,7 @@ export class CareerStructureService {
         m.create(StoreSkill, {
           storeId,
           departmentId: department.id,
+          positionId,
           sequence: null,
           name,
           description: trimOrNull(dto.description) as string,
@@ -769,6 +788,7 @@ export class CareerStructureService {
     skillId: string,
     dto: {
       departmentId?: string;
+      positionId?: string | null;
       name?: string;
       description?: string | null;
       sequence?: number;
@@ -826,6 +846,18 @@ export class CareerStructureService {
       }
 
       const changes: Partial<StoreSkill> = {};
+      // Vị trí luôn cùng bộ phận với kỹ năng: đổi bộ phận mà không chọn lại
+      // vị trí thì kỹ năng thành kỹ năng chung của bộ phận mới.
+      const movedDepartment = targetDepartmentId !== skill.departmentId;
+      if (dto.positionId !== undefined || movedDepartment) {
+        const positionId = await this.skillPosition(
+          m,
+          storeId,
+          targetDepartmentId,
+          dto.positionId !== undefined ? dto.positionId : null,
+        );
+        if (positionId !== (skill.positionId ?? null)) changes.positionId = positionId;
+      }
       if (dto.name !== undefined) {
         const name = dto.name.trim();
         if (targetDepartmentId === skill.departmentId) {
@@ -947,6 +979,44 @@ export class CareerStructureService {
     const role = await m.findOne(StoreRole, { where: { id, storeId } });
     if (!role) throw notFound('vị trí');
     return role;
+  }
+
+  /**
+   * Vị trí của kỹ năng: null = kỹ năng chung. Phải là vị trí còn dùng của
+   * chính bộ phận kỹ năng thuộc về (kỹ năng riêng của vị trí bộ phận khác thì
+   * không ai trong bộ phận này học được).
+   */
+  private async skillPosition(
+    m: EntityManager,
+    storeId: string,
+    departmentId: string,
+    positionId: string | null | undefined,
+  ): Promise<string | null> {
+    if (!positionId) return null;
+    const role = await this.position(m, storeId, positionId);
+    if (role.departmentId !== departmentId || role.rank === null || !role.isActive) {
+      throw new BadRequestException({
+        code: CAREER_ERRORS.PARENT_INVALID,
+        message: 'Vị trí không thuộc bộ phận đã chọn',
+      });
+    }
+    return role.id;
+  }
+
+  /** Vị trí còn kỹ năng riêng thì không xoá / chuyển bộ phận được. */
+  private async assertNoPositionSkills(m: EntityManager, positionId: string, action: string) {
+    const [{ skills }] = await m.query(
+      `SELECT count(*)::int AS skills FROM store_skills
+        WHERE position_id = $1 AND deleted_at IS NULL`,
+      [positionId],
+    );
+    if (skills > 0) {
+      throw new ConflictException({
+        code: CAREER_ERRORS.POSITION_IN_USE,
+        message: `Vị trí còn ${skills} kỹ năng riêng. Đổi các kỹ năng đó sang vị trí khác hoặc thành kỹ năng chung trước khi ${action}.`,
+        skillsAffected: skills,
+      });
+    }
   }
 
   private async skill(m: EntityManager, storeId: string, id: string) {

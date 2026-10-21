@@ -20,7 +20,7 @@ export enum CareerRequirementCode {
   COMPLETED_SHIFTS = 'completed_shifts',
   /** Vị trí: đã đạt một kỹ năng cụ thể (ref_skill_id). */
   SKILL_ACHIEVED = 'skill_achieved',
-  /** Vị trí: đã đạt mọi kỹ năng bắt buộc của bộ phận hiện tại. */
+  /** Vị trí: đã đạt mọi kỹ năng bắt buộc (chung của bộ phận + riêng của vị trí hiện tại). */
   ALL_REQUIRED_SKILLS = 'all_required_skills',
   /** Kỹ năng: giờ làm ca từ lúc kỹ năng mở khoá, khi đang ở bộ phận đó. */
   PRACTICE_HOURS = 'practice_hours',

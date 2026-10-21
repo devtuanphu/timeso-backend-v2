@@ -635,7 +635,7 @@ export class CareerProgressService {
         code: CAREER_ERRORS.SKILL_LOCKED,
         message: state
           ? 'Kỹ năng chưa mở khoá: cần đạt các kỹ năng bắt buộc đứng trước'
-          : 'Kỹ năng không thuộc bộ phận hiện tại của nhân viên',
+          : 'Kỹ năng không thuộc bộ phận / vị trí hiện tại của nhân viên',
       });
     }
     return { skill, state };

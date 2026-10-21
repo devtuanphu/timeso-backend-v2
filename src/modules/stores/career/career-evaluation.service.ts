@@ -231,13 +231,15 @@ class ProfileContext {
  * - điều kiện là điều kiện để VÀO đích; "ca/tháng", "giờ/tháng" của bộ phận đo
  *   trên tháng VN gần nhất đã kết thúc (D4); giờ / ca của vị trí cộng dồn từ
  *   lúc nhận vị trí hiện tại;
- * - kỹ năng S mở khoá khi mọi kỹ năng BẮT BUỘC đứng trước trong bộ phận đã
- *   đạt; mốc mở khoá = muộn nhất của (vào bộ phận, tạo kỹ năng, đạt kỹ năng bắt
+ * - kỹ năng của một nhân viên = kỹ năng chung của bộ phận (không gắn vị trí)
+ *   + kỹ năng riêng của vị trí đang giữ; kỹ năng S mở khoá khi mọi kỹ năng
+ *   BẮT BUỘC đứng trước trong dãy đó đã đạt; mốc mở khoá = muộn nhất của (vào
+ *   bộ phận — hoặc vào vị trí với kỹ năng riêng, tạo kỹ năng, đạt kỹ năng bắt
  *   buộc liền trước) — tính từ dữ liệu, không cần ghi;
  * - lên vị trí P (D8): phải "kề" (cùng bộ phận: rank kế tiếp; khác bộ phận: bộ
  *   phận của P là tổ tiên, đang ở rank cao nhất, P là rank 1) và đạt điều kiện
- *   của P (+ của bộ phận đích khi đổi bộ phận) + mọi kỹ năng bắt buộc của bộ
- *   phận hiện tại.
+ *   của P (+ của bộ phận đích khi đổi bộ phận) + mọi kỹ năng bắt buộc (chung
+ *   của bộ phận hiện tại + riêng của vị trí hiện tại).
  */
 @Injectable()
 export class CareerEvaluationService {
@@ -286,12 +288,29 @@ export class CareerEvaluationService {
       .sort((a, b) => (a.rank as number) - (b.rank as number));
   }
 
-  /** Kỹ năng còn dùng của một bộ phận, theo thứ tự. */
-  skillsOf(graph: CareerGraph, departmentId: string | null) {
+  /**
+   * Kỹ năng còn dùng mà người ở `positionId` của bộ phận phải học, theo thứ
+   * tự: kỹ năng chung (không gắn vị trí) + kỹ năng riêng của vị trí đó.
+   * Chưa có vị trí (null) thì chỉ kỹ năng chung.
+   */
+  skillsOf(graph: CareerGraph, departmentId: string | null, positionId: string | null) {
     if (!departmentId) return [];
     return [...graph.skills.values()]
-      .filter((s) => s.departmentId === departmentId && s.sequence !== null)
+      .filter(
+        (s) =>
+          s.departmentId === departmentId &&
+          s.sequence !== null &&
+          (!s.positionId || s.positionId === positionId),
+      )
       .sort((a, b) => (a.sequence as number) - (b.sequence as number));
+  }
+
+  /** Vị trí còn dùng, cùng bộ phận, mà nhân viên đang giữ (null nếu không có). */
+  livePositionId(graph: CareerGraph, profile: EmployeeProfile): string | null {
+    const position = profile.storeRoleId ? graph.positions.get(profile.storeRoleId) : undefined;
+    return position && position.rank !== null && position.departmentId === profile.departmentId
+      ? position.id
+      : null;
   }
 
   /** `ancestorId` là tổ tiên (không tính chính nó) của `departmentId`. */
@@ -340,9 +359,10 @@ export class CareerEvaluationService {
     };
   }
 
-  /** Mọi kỹ năng bắt buộc (còn dùng) của một bộ phận đã đạt chưa. */
+  /** Mọi kỹ năng bắt buộc (chung của bộ phận + riêng của vị trí đang giữ) đã đạt chưa. */
   private async requiredSkillsMet(ctx: ProfileContext, graph: CareerGraph, departmentId: string | null) {
-    const required = this.skillsOf(graph, departmentId).filter(
+    const positionId = this.livePositionId(graph, ctx.profile);
+    const required = this.skillsOf(graph, departmentId, positionId).filter(
       (s) => s.level === SkillLevel.REQUIRED,
     );
     const achieved = new Set(
@@ -416,17 +436,21 @@ export class CareerEvaluationService {
   // Kỹ năng
   // -------------------------------------------------------------------------
 
-  /** Trạng thái các kỹ năng của bộ phận hiện tại, theo thứ tự. */
+  /** Trạng thái các kỹ năng (chung của bộ phận + riêng của vị trí hiện tại), theo thứ tự. */
   async skillStates(ctx: ProfileContext, graph: CareerGraph): Promise<SkillState[]> {
     const departmentId = ctx.profile.departmentId;
     if (!departmentId) return [];
+    const positionId = this.livePositionId(graph, ctx.profile);
     const rows = new Map((await ctx.progressRows()).map((g) => [g.skillId, g]));
     const enteredDepartment = await ctx.departmentEnteredAt();
+    // Kỹ năng riêng của vị trí bắt đầu tính từ lúc nhận vị trí, không phải lúc
+    // vào bộ phận (mới lên vị trí thì giờ / lần làm cũ không được tính).
+    const enteredPosition = positionId ? await ctx.positionEnteredAt() : null;
 
     const states: SkillState[] = [];
     let gateOpen = true;
     let lastRequiredAchievedAt: Date | null = null;
-    for (const skill of this.skillsOf(graph, departmentId)) {
+    for (const skill of this.skillsOf(graph, departmentId, positionId)) {
       const row = rows.get(skill.id);
       const base = {
         skillId: skill.id,
@@ -457,7 +481,8 @@ export class CareerEvaluationService {
         continue;
       }
 
-      const unlockedAt = later(enteredDepartment, skill.createdAt, lastRequiredAchievedAt);
+      const entered = skill.positionId ? enteredPosition : enteredDepartment;
+      const unlockedAt = later(entered, skill.createdAt, lastRequiredAchievedAt);
       const evaluation = await this.evaluateSkill(ctx, graph, skill, unlockedAt);
       const passCount = await ctx.passCount(skill.id, unlockedAt);
       states.push({
@@ -481,7 +506,10 @@ export class CareerEvaluationService {
     skill: StoreSkill,
     unlockedAt: Date | null,
   ): Promise<Evaluation> {
-    const inDepartment = ctx.profile.departmentId === skill.departmentId;
+    // Kỹ năng riêng của vị trí: chỉ giờ làm khi đang giữ đúng vị trí đó.
+    const inDepartment =
+      ctx.profile.departmentId === skill.departmentId &&
+      (!skill.positionId || ctx.profile.storeRoleId === skill.positionId);
     const items: MeasuredRequirement[] = [];
     for (const r of this.requirementsOf(graph, { skillId: skill.id })) {
       const target = r.value === null ? null : Number(r.value);
@@ -625,9 +653,12 @@ export class CareerEvaluationService {
     const { total, met } = await this.requiredSkillsMet(ctx, graph, ctx.profile.departmentId);
     if (total === 0) return;
     const department = graph.departments.get(ctx.profile.departmentId);
+    const positionId = this.livePositionId(graph, ctx.profile);
+    const position = positionId ? graph.positions.get(positionId) : undefined;
+    const scope = [position?.name, department?.name].filter(Boolean).join(' · ') || 'bộ phận';
     items.push(
       this.measured(CareerRequirementCode.ALL_REQUIRED_SKILLS, total, met, met >= total, {
-        label: `Đạt đủ kỹ năng bắt buộc của ${department?.name ?? 'bộ phận'}`,
+        label: `Đạt đủ kỹ năng bắt buộc của ${scope}`,
         implicit: true,
       }),
     );
@@ -859,6 +890,11 @@ export class CareerEvaluationService {
         positionName: position && position.rank !== null ? position.name : null,
         departmentName: department?.name ?? null,
         inSkillDepartment: !!skill.departmentId && p.departmentId === skill.departmentId,
+        /** Kỹ năng chung: mọi người trong bộ phận; riêng: chỉ người giữ vị trí đó. */
+        inSkillPosition:
+          !!skill.departmentId &&
+          p.departmentId === skill.departmentId &&
+          (!skill.positionId || p.storeRoleId === skill.positionId),
       };
     };
 
@@ -880,6 +916,7 @@ export class CareerEvaluationService {
       }
       // Kỹ năng đã ngừng dùng không còn mở cho ai: chỉ còn danh sách đã đạt.
       if (!skill.isActive || !skill.departmentId || p.departmentId !== skill.departmentId) continue;
+      if (skill.positionId && p.storeRoleId !== skill.positionId) continue;
       const states = await this.skillStates(this.context(m, p), graph);
       const state = states.find((s) => s.skillId === skill.id);
       if (!state) continue;
@@ -901,6 +938,7 @@ export class CareerEvaluationService {
         id: skill.id,
         name: skill.name,
         departmentId: skill.departmentId,
+        positionId: skill.positionId ?? null,
         sequence: skill.sequence,
         level: skill.level,
         confirmation: skill.confirmation,
