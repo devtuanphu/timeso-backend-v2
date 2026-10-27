@@ -57,6 +57,14 @@ export class StoreLadderRung extends BaseEntity {
   @Column({ name: 'resets_ladder_id', type: 'uuid', nullable: true })
   resetsLadderId: string | null;
 
+  /**
+   * Người duyệt kết quả (giai đoạn nhân sự): NULL / rỗng = chủ cửa hàng; có
+   * danh sách = các nhân viên này được báo khi có người đủ điều kiện. Việc bấm
+   * duyệt vẫn do chủ (advance chỉ dành cho chủ).
+   */
+  @Column({ name: 'reviewer_profile_ids', type: 'uuid', array: true, nullable: true })
+  reviewerProfileIds: string[] | null;
+
   @OneToMany(() => StoreRungCriteria, (criteria) => criteria.rung)
   criteria: StoreRungCriteria[];
 }

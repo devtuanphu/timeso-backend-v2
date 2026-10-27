@@ -115,6 +115,11 @@ export class EmployeeWorkAssignmentDto {
   @IsUUID()
   employeeTypeId?: string;
 
+  /** Hình thức làm việc (Toàn thời gian, Bán thời gian…) — chỉ phân loại. */
+  @IsOptional()
+  @IsUUID()
+  workTypeId?: string;
+
   @IsOptional()
   @IsUUID()
   workShiftId?: string;

@@ -18,6 +18,7 @@ import {
 import { stintFloor, stintStartVnDate } from './employment-stint.utils';
 import { ActivityLogService } from './activity-log.service';
 import { ACTIVITY_ACTIONS } from './activity-log.summary';
+import { SaveStageDto } from './dto/career-stage.dto';
 
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import {
@@ -37,6 +38,7 @@ import {
 } from './entities/employee-career-event.entity';
 import { EmployeeCapabilityEntry } from './entities/employee-capability-entry.entity';
 import {
+  EMPLOYED_STATUSES,
   EmployeeProfile,
   EmploymentStatus,
   isEmployedStatus,
@@ -340,7 +342,7 @@ export class CareerLadderService {
     });
     const rungIds = rungs.map((r) => r.id);
 
-    const [criteria, edges, names] = await Promise.all([
+    const [criteria, edges, names, descriptions, reviewers] = await Promise.all([
       rungIds.length
         ? this.criteriaRepository.find({
             where: { rungId: In(rungIds) },
@@ -351,6 +353,11 @@ export class CareerLadderService {
       this.targetNames(
         ladder.dimension,
         rungs.map((r) => r.targetId),
+      ),
+      this.stageDescriptions(ladder, rungs),
+      this.reviewerNames(
+        ladder.storeId,
+        rungs.flatMap((r) => r.reviewerProfileIds ?? []),
       ),
     ]);
 
@@ -369,7 +376,13 @@ export class CareerLadderService {
         level: rung.level,
         targetId: rung.targetId,
         targetName: names.get(rung.targetId) ?? null,
+        description: descriptions.get(rung.targetId) ?? null,
         approval: rung.approval,
+        // Người duyệt kết quả: rỗng = chủ cửa hàng. Người đã nghỉ / bị xoá
+        // không còn hiện, cũng không được báo.
+        reviewers: (rung.reviewerProfileIds ?? [])
+          .filter((id) => reviewers.has(id))
+          .map((id) => ({ profileId: id, name: reviewers.get(id) as string })),
         suggestedSalary:
           rung.suggestedSalary === null ? null : Number(rung.suggestedSalary),
         resetsLadderId: rung.resetsLadderId,
@@ -386,6 +399,43 @@ export class CareerLadderService {
           .map((c) => this.describeCriteria(c)),
       })),
     };
+  }
+
+  /** Mô tả giai đoạn nằm ở danh mục loại nhân viên; các chiều khác không có. */
+  private async stageDescriptions(
+    ladder: StoreLadder,
+    rungs: StoreLadderRung[],
+  ): Promise<Map<string, string>> {
+    if (ladder.dimension !== LadderDimension.EMPLOYMENT_TYPE || !rungs.length) {
+      return new Map();
+    }
+    const rows = await this.dataSource.getRepository(StoreEmployeeType).find({
+      where: { id: In(rungs.map((r) => r.targetId)) },
+      select: ['id', 'description'],
+    });
+    return new Map(
+      rows.filter((t) => t.description).map((t) => [t.id, t.description]),
+    );
+  }
+
+  /** Tên của những người duyệt còn đang làm ở cửa hàng. */
+  private async reviewerNames(
+    storeId: string,
+    profileIds: string[],
+  ): Promise<Map<string, string>> {
+    const ids = [...new Set(profileIds)];
+    if (!ids.length) return new Map();
+    const rows = await this.profileRepository.find({
+      where: {
+        id: In(ids),
+        storeId,
+        employmentStatus: In([...EMPLOYED_STATUSES]),
+      },
+      relations: ['account'],
+    });
+    return new Map(
+      rows.map((p) => [p.id, p.account?.fullName?.trim() || 'Nhân viên']),
+    );
   }
 
   private describeCriteria(c: StoreRungCriteria) {
@@ -585,11 +635,18 @@ export class CareerLadderService {
       approval: RungApproval;
       suggestedSalary: number | null;
       resetsLadderId: string | null;
+      reviewerProfileIds: string[] | null;
     }>,
   ) {
     const { rung, ladder } = await this.ownedRung(storeId, rungId);
     if (data.resetsLadderId) {
       await this.ownedLadder(storeId, data.resetsLadderId);
+    }
+    if (data.reviewerProfileIds !== undefined) {
+      rung.reviewerProfileIds = await this.validReviewers(
+        storeId,
+        data.reviewerProfileIds,
+      );
     }
     Object.assign(rung, {
       ...(data.level !== undefined ? { level: data.level } : {}),
@@ -603,6 +660,421 @@ export class CareerLadderService {
     });
     await this.rungRepository.save(rung);
     return this.describeLadder(ladder);
+  }
+
+  // ---------------------------------------------------------------------
+  // Giai đoạn nhân sự (lộ trình employment_type) — lưu trọn một lần
+  // ---------------------------------------------------------------------
+
+  /**
+   * Tạo (rungId null) hoặc sửa một giai đoạn: tên / mô tả ở danh mục loại
+   * nhân viên, giai đoạn trước / sau ở cạnh, điều kiện chuyển và tiêu chí ở
+   * store_rung_criteria của chính giai đoạn (criteriaSourceId), người duyệt ở
+   * bậc. Một transaction, khoá hàng lộ trình: làm thành nhiều lần gọi từ app
+   * thì hỏng giữa chừng để lại giai đoạn dở, và hai máy lưu cùng lúc sẽ ghi đè
+   * cạnh của nhau.
+   *
+   * Trường không gửi thì giữ nguyên (khi sửa) — một client gửi thiếu trường
+   * không được lặng lẽ xoá cạnh, điều kiện hay mô tả. Gửi mảng rỗng / null
+   * / 0 mới là xoá.
+   */
+  async saveStage(storeId: string, rungId: string | null, input: SaveStageDto) {
+    const name = input.name.trim();
+    const reviewerIds =
+      input.reviewerProfileIds === undefined
+        ? undefined
+        : await this.validReviewers(storeId, input.reviewerProfileIds);
+
+    const ladderId = await this.dataSource.transaction(async (manager) => {
+      const ladder = await this.lockStageLadder(manager, storeId);
+
+      let rung: StoreLadderRung;
+      let type: StoreEmployeeType;
+      if (rungId) {
+        const found = await manager.findOne(StoreLadderRung, {
+          where: { id: rungId, ladderId: ladder.id },
+        });
+        if (!found) throw new NotFoundException('Không tìm thấy giai đoạn');
+        rung = found;
+        const owned = await manager.findOne(StoreEmployeeType, {
+          where: { id: rung.targetId, storeId },
+        });
+        if (!owned) throw new NotFoundException('Không tìm thấy giai đoạn');
+        type = owned;
+      } else {
+        type = manager.create(StoreEmployeeType, { storeId, isActive: true });
+        rung = manager.create(StoreLadderRung, {
+          ladderId: ladder.id,
+          approval: RungApproval.OWNER,
+          suggestedSalary: null,
+          resetsLadderId: null,
+        });
+      }
+
+      const clash = await manager
+        .getRepository(StoreEmployeeType)
+        .createQueryBuilder('t')
+        .where('t.store_id = :storeId', { storeId })
+        .andWhere('t.is_active')
+        .andWhere('lower(t.name) = lower(:name)', { name })
+        .andWhere(type.id ? 't.id <> :id' : '1=1', { id: type.id })
+        .getOne();
+      if (clash) throw new BadRequestException('Đã có giai đoạn cùng tên');
+
+      type.name = name;
+      if (input.description !== undefined || !type.id) {
+        type.description = (input.description?.trim() || null) as string;
+      }
+      type = await manager.save(StoreEmployeeType, type);
+
+      if (!rung.id) {
+        const top = await manager
+          .getRepository(StoreLadderRung)
+          .createQueryBuilder('r')
+          .select('COALESCE(MAX(r.level), 0)', 'max')
+          .where('r.ladder_id = :ladderId', { ladderId: ladder.id })
+          .getRawOne<{ max: number }>();
+        rung.targetId = type.id;
+        rung.level = Number(top?.max ?? 0) + 1;
+      }
+      if (reviewerIds !== undefined) rung.reviewerProfileIds = reviewerIds;
+      rung = await manager.save(StoreLadderRung, rung);
+
+      await this.replaceStageEdges(
+        manager,
+        ladder.id,
+        rung.id,
+        input.previousRungIds,
+        input.nextRungIds,
+      );
+      await this.replaceStageCriteria(manager, rung.id, input);
+      return ladder.id;
+    });
+
+    const ladder = await this.ownedLadder(storeId, ladderId);
+    return this.describeLadder(ladder);
+  }
+
+  /** Thứ tự hiển thị các giai đoạn: `rungIds` phải đủ mọi giai đoạn của lộ trình. */
+  async reorderStages(storeId: string, rungIds: string[]) {
+    const ladderId = await this.dataSource.transaction(async (manager) => {
+      const ladder = await this.lockStageLadder(manager, storeId);
+      const rungs = await manager.find(StoreLadderRung, {
+        where: { ladderId: ladder.id },
+        select: ['id', 'level'],
+      });
+      const ids = new Set(rungs.map((r) => r.id));
+      if (rungIds.length !== ids.size || rungIds.some((id) => !ids.has(id))) {
+        throw new BadRequestException(
+          'Danh sách giai đoạn đã thay đổi, vui lòng tải lại',
+        );
+      }
+      for (const [index, id] of rungIds.entries()) {
+        await manager.update(StoreLadderRung, { id }, { level: index + 1 });
+      }
+      return ladder.id;
+    });
+    return this.describeLadder(await this.ownedLadder(storeId, ladderId));
+  }
+
+  /**
+   * Lộ trình giai đoạn của cửa hàng, khoá để ghi; chưa có thì tạo. Cửa hàng
+   * mở sau migration lộ trình không được tạo sẵn lộ trình này.
+   */
+  private async lockStageLadder(manager: EntityManager, storeId: string) {
+    // Tuần tự hoá việc tạo theo cửa hàng: không phải DB nào cũng có unique
+    // (store, dimension) — DB dựng bằng synchronize thì không.
+    await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+      `stage-ladder:${storeId}`,
+    ]);
+    const exists = await manager.exists(StoreLadder, {
+      where: { storeId, dimension: LadderDimension.EMPLOYMENT_TYPE },
+    });
+    if (!exists) {
+      await manager.save(
+        StoreLadder,
+        manager.create(StoreLadder, {
+          storeId,
+          dimension: LadderDimension.EMPLOYMENT_TYPE,
+          name: 'Lộ trình nhân sự',
+          isActive: true,
+        }),
+      );
+    }
+    const ladder = await manager.findOne(StoreLadder, {
+      where: { storeId, dimension: LadderDimension.EMPLOYMENT_TYPE },
+      lock: { mode: 'pessimistic_write' },
+    });
+    if (!ladder) throw new NotFoundException('Không tìm thấy lộ trình');
+    if (!ladder.isActive) {
+      ladder.isActive = true;
+      await manager.save(StoreLadder, ladder);
+    }
+    return ladder;
+  }
+
+  /**
+   * Cạnh vào / ra của một giai đoạn. Không có giai đoạn trước = điểm vào. Một
+   * giai đoạn vừa mất mọi đường vào (bị gỡ khỏi "tiếp theo" của giai đoạn
+   * này) thành điểm vào, để không ai bị kẹt ở một giai đoạn không tới được.
+   */
+  private async replaceStageEdges(
+    manager: EntityManager,
+    ladderId: string,
+    rungId: string,
+    previousInput: string[] | undefined,
+    nextInput: string[] | undefined,
+  ) {
+    const existing = await manager.find(StoreLadderEdge, { where: { ladderId } });
+    const liveRungIds = new Set(
+      (await manager.find(StoreLadderRung, { where: { ladderId }, select: ['id'] })).map(
+        (r) => r.id,
+      ),
+    );
+    // Không gửi = giữ cạnh đang có (bỏ cạnh trỏ tới bậc đã gỡ).
+    const previousIds = [
+      ...new Set(
+        previousInput ??
+          existing
+            .filter((e) => e.toRungId === rungId && e.fromRungId)
+            .map((e) => e.fromRungId as string)
+            .filter((id) => liveRungIds.has(id)),
+      ),
+    ];
+    const nextIds = [
+      ...new Set(
+        nextInput ??
+          existing
+            .filter((e) => e.fromRungId === rungId)
+            .map((e) => e.toRungId)
+            .filter((id) => liveRungIds.has(id)),
+      ),
+    ];
+    if (previousIds.some((id) => nextIds.includes(id))) {
+      throw new BadRequestException(
+        'Một giai đoạn không thể vừa là giai đoạn trước vừa là giai đoạn tiếp theo',
+      );
+    }
+    const others = [...previousIds, ...nextIds];
+    if (others.includes(rungId)) {
+      throw new BadRequestException('Giai đoạn không thể nối vào chính nó');
+    }
+    if (others.length) {
+      const live = await manager.count(StoreLadderRung, {
+        where: { id: In(others), ladderId },
+      });
+      if (live !== others.length) {
+        throw new BadRequestException(
+          'Chỉ nối được các giai đoạn trong cùng lộ trình',
+        );
+      }
+    }
+
+    const kept = existing.filter(
+      (e) => e.fromRungId !== rungId && e.toRungId !== rungId,
+    );
+    const proposed = kept
+      .map((e) => ({ from: e.fromRungId, to: e.toRungId }))
+      .concat(previousIds.map((from) => ({ from, to: rungId })))
+      .concat(nextIds.map((to) => ({ from: rungId, to })));
+    if (this.hasCycle(proposed)) {
+      throw new BadRequestException(
+        'Cấu hình này tạo thành vòng lặp giữa các giai đoạn',
+      );
+    }
+
+    const removed = existing.filter(
+      (e) => e.fromRungId === rungId || e.toRungId === rungId,
+    );
+    if (removed.length) {
+      await manager.delete(StoreLadderEdge, { id: In(removed.map((e) => e.id)) });
+    }
+    const rows: Array<{ fromRungId: string | null; toRungId: string }> = [
+      ...previousIds.map((from) => ({ fromRungId: from, toRungId: rungId })),
+      ...nextIds.map((to) => ({ fromRungId: rungId, toRungId: to })),
+    ];
+    if (!previousIds.length) rows.push({ fromRungId: null, toRungId: rungId });
+
+    // Giai đoạn kế cũ không còn đường vào nào thì thành điểm vào.
+    const orphanCandidates = removed
+      .filter((e) => e.fromRungId === rungId && !nextIds.includes(e.toRungId))
+      .map((e) => e.toRungId);
+    for (const id of new Set(orphanCandidates)) {
+      if (!liveRungIds.has(id)) continue;
+      const reached = kept.some(
+        (e) => e.toRungId === id && (e.fromRungId === null || liveRungIds.has(e.fromRungId)),
+      );
+      if (!reached) rows.push({ fromRungId: null, toRungId: id });
+    }
+
+    if (rows.length) {
+      await manager.save(
+        StoreLadderEdge,
+        rows.map((row) => manager.create(StoreLadderEdge, { ladderId, ...row })),
+      );
+    }
+  }
+
+  /**
+   * Điều kiện chuyển (ngày / ca / giờ) và tiêu chí chấm tay của giai đoạn.
+   * Loại điều kiện màn này không sửa được (tỉ lệ đúng giờ, lộ trình khác…)
+   * thì giữ nguyên, xếp sau.
+   */
+  private async replaceStageCriteria(
+    manager: EntityManager,
+    rungId: string,
+    input: SaveStageDto,
+  ) {
+    const managedCodes: string[] = [
+      CriteriaCode.DAYS_IN_RUNG,
+      CriteriaCode.COMPLETED_SHIFTS,
+      CriteriaCode.WORK_HOURS,
+    ];
+    const existing = await manager.find(StoreRungCriteria, {
+      where: { rungId },
+      order: { sortOrder: 'ASC' },
+    });
+    const isManaged = (c: StoreRungCriteria) =>
+      c.kind === CriteriaKind.CHECKLIST ||
+      ((c.kind === CriteriaKind.TENURE || c.kind === CriteriaKind.METRIC) &&
+        managedCodes.includes(c.code ?? ''));
+    const others = existing.filter((c) => !isManaged(c));
+    const checklistById = new Map(
+      existing
+        .filter((c) => c.kind === CriteriaKind.CHECKLIST)
+        .map((c) => [c.id, c]),
+    );
+
+    const number = (value: number) =>
+      Number.isInteger(value) ? String(value) : String(value).replace('.', ',');
+    const thresholds: Array<{
+      kind: CriteriaKind;
+      code: CriteriaCode;
+      value: number | null | undefined;
+      unit: string;
+      label: (v: string) => string;
+    }> = [
+      {
+        kind: CriteriaKind.TENURE,
+        code: CriteriaCode.DAYS_IN_RUNG,
+        value: input.minDays,
+        unit: 'ngày',
+        label: (v) => `Số ngày ở giai đoạn ≥ ${v} ngày`,
+      },
+      {
+        kind: CriteriaKind.METRIC,
+        code: CriteriaCode.COMPLETED_SHIFTS,
+        value: input.minShifts,
+        unit: 'ca',
+        label: (v) => `Số ca đã hoàn thành ≥ ${v} ca`,
+      },
+      {
+        kind: CriteriaKind.METRIC,
+        code: CriteriaCode.WORK_HOURS,
+        value: input.minHours,
+        unit: 'giờ',
+        label: (v) => `Số giờ làm ≥ ${v} giờ`,
+      },
+    ];
+
+    const rows: StoreRungCriteria[] = [];
+    const keptIds = new Set<string>();
+    for (const t of thresholds) {
+      if (t.value === undefined) {
+        const current = existing.find(
+          (c) => c.kind === t.kind && c.code === t.code && !keptIds.has(c.id),
+        );
+        if (current) {
+          keptIds.add(current.id);
+          rows.push(current);
+        }
+        continue;
+      }
+      const value = Number(t.value);
+      if (!t.value || !Number.isFinite(value) || value <= 0) continue;
+      rows.push(
+        manager.create(StoreRungCriteria, {
+          rungId,
+          kind: t.kind,
+          code: t.code,
+          operator: CriteriaOperator.GTE,
+          value,
+          label: t.label(number(value)),
+          unit: t.unit,
+          isRequired: true,
+        }),
+      );
+    }
+    const checklist =
+      input.checklist ??
+      [...checklistById.values()].map((c) => ({ id: c.id, label: c.label }));
+    for (const item of checklist) {
+      const label = item.label.trim();
+      const reuse = item.id ? checklistById.get(item.id) : undefined;
+      if (reuse && !keptIds.has(reuse.id)) {
+        keptIds.add(reuse.id);
+        reuse.label = label;
+        reuse.isRequired = true;
+        rows.push(reuse);
+      } else {
+        rows.push(
+          manager.create(StoreRungCriteria, {
+            rungId,
+            kind: CriteriaKind.CHECKLIST,
+            code: null,
+            operator: null,
+            value: null,
+            label,
+            unit: null,
+            isRequired: true,
+          }),
+        );
+      }
+    }
+
+    const drop = existing.filter((c) => isManaged(c) && !keptIds.has(c.id));
+    if (drop.length) {
+      await manager.delete(StoreRungCriteria, { id: In(drop.map((c) => c.id)) });
+    }
+    const ordered = [...rows, ...others];
+    ordered.forEach((c, index) => (c.sortOrder = index));
+    if (ordered.length) await manager.save(StoreRungCriteria, ordered);
+  }
+
+  /**
+   * Người duyệt phải là nhân viên đang làm ở chính cửa hàng này. Rỗng / null
+   * = chủ cửa hàng (lưu null).
+   */
+  private async validReviewers(
+    storeId: string,
+    input: unknown,
+  ): Promise<string[] | null> {
+    if (input === null) return null;
+    if (!Array.isArray(input) || input.some((id) => typeof id !== 'string')) {
+      throw new BadRequestException('Danh sách người duyệt không hợp lệ');
+    }
+    const ids = [...new Set(input as string[])];
+    if (!ids.length) return null;
+    if (ids.length > 20) {
+      throw new BadRequestException('Chọn tối đa 20 người duyệt');
+    }
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (ids.some((id) => !uuid.test(id))) {
+      throw new BadRequestException('Danh sách người duyệt không hợp lệ');
+    }
+    const found = await this.profileRepository.count({
+      where: {
+        id: In(ids),
+        storeId,
+        employmentStatus: In([...EMPLOYED_STATUSES]),
+      },
+    });
+    if (found !== ids.length) {
+      throw new BadRequestException(
+        'Người duyệt phải là nhân viên đang làm tại cửa hàng',
+      );
+    }
+    return ids;
   }
 
   async deleteRung(storeId: string, rungId: string) {
@@ -1033,7 +1505,13 @@ export class CareerLadderService {
 
     return Promise.all(
       rungs.map(async (rung) => {
-        const evaluation = await this.evaluateRung(profile, rung, ladder);
+        const evaluation = await this.evaluateRung(
+          profile,
+          rung,
+          ladder,
+          undefined,
+          this.criteriaSourceId(ladder, current, rung),
+        );
         return {
           targetId: rung.targetId,
           targetName: names.get(rung.targetId) ?? null,
@@ -1063,11 +1541,19 @@ export class CareerLadderService {
     rung: StoreLadderRung,
     ladder: StoreLadder,
     checklistResults?: Record<string, boolean>,
+    /**
+     * Bậc giữ bộ điều kiện (xem criteriaSourceId). Bỏ trống = chính `rung`;
+     * null = không có điều kiện nào.
+     */
+    criteriaRungId?: string | null,
   ): Promise<RungEvaluation> {
-    const criteria = await this.criteriaRepository.find({
-      where: { rungId: rung.id },
-      order: { sortOrder: 'ASC' },
-    });
+    const sourceId = criteriaRungId === undefined ? rung.id : criteriaRungId;
+    const criteria = sourceId
+      ? await this.criteriaRepository.find({
+          where: { rungId: sourceId },
+          order: { sortOrder: 'ASC' },
+        })
+      : [];
 
     const items: EvaluatedCriteria[] = [];
     for (const c of criteria) {
@@ -1087,6 +1573,25 @@ export class CareerLadderService {
           : Math.round((metRequired.length / required.length) * 100),
       items,
     };
+  }
+
+  /**
+   * Bậc giữ điều kiện của bước `current` → `candidate`.
+   *
+   * Lộ trình giai đoạn (Học việc → Thử việc → Chính thức): điều kiện là của
+   * giai đoạn đang đứng — "ở Học việc đủ 30 ngày, 20 ca thì qua" — nên đọc từ
+   * `current`, và mọi nhánh rời giai đoạn đó dùng chung một bộ. Chưa ở giai
+   * đoạn nào thì không có điều kiện (xếp giai đoạn đầu là việc của chủ).
+   * Lộ trình vị trí / kỹ năng cũ giữ cách cũ: điều kiện nằm trên bậc đích.
+   */
+  private criteriaSourceId(
+    ladder: StoreLadder,
+    current: StoreLadderRung | null,
+    candidate: StoreLadderRung,
+  ): string | null {
+    return ladder.dimension === LadderDimension.EMPLOYMENT_TYPE
+      ? (current?.id ?? null)
+      : candidate.id;
   }
 
   private compare(
@@ -1395,6 +1900,7 @@ export class CareerLadderService {
         rung,
         ladder,
         options.checklistResults,
+        this.criteriaSourceId(ladder, fromRung, rung),
       );
       if (!evaluation.passed && !options.force) {
         throw new BadRequestException({
@@ -1856,6 +2362,16 @@ export class CareerLadderService {
       });
 
       for (const profile of profiles) {
+        // Lộ trình giai đoạn: người chưa được xếp giai đoạn nào không có điều
+        // kiện để đo (criteriaSourceId), nên "đủ điều kiện" là vô nghĩa —
+        // không nhắc, không tự xếp.
+        const stage =
+          ladder.dimension === LadderDimension.EMPLOYMENT_TYPE
+            ? await this.currentRung(profile, ladder)
+            : null;
+        if (ladder.dimension === LadderDimension.EMPLOYMENT_TYPE && !stage) {
+          continue;
+        }
         checked += 1;
         let candidates: Awaited<ReturnType<typeof this.nextRungs>>;
         try {
@@ -1891,7 +2407,16 @@ export class CareerLadderService {
             break;
           }
 
-          if (await this.notifyOwnerOfEligibility(profile, ladder, candidate)) {
+          // Người duyệt kết quả là của giai đoạn đang được hoàn thành.
+          const reviewerRungId = stage?.id ?? candidate.rungId;
+          if (
+            await this.notifyOwnerOfEligibility(
+              profile,
+              ladder,
+              candidate,
+              reviewerRungId,
+            )
+          ) {
             notified += 1;
           }
         }
@@ -1905,6 +2430,7 @@ export class CareerLadderService {
     profile: EmployeeProfile,
     ladder: StoreLadder,
     candidate: { targetName: string | null },
+    reviewerRungId: string,
   ): Promise<boolean> {
     const setting = await this.probationSettingRepository.findOne({
       where: { storeId: profile.storeId },
@@ -1920,6 +2446,7 @@ export class CareerLadderService {
     const ownerAccountId = store?.[0]?.owner_account_id;
     if (!ownerAccountId) return false;
 
+    let sent = false;
     try {
       await this.notificationsService.create({
         accountId: ownerAccountId,
@@ -1930,11 +2457,52 @@ export class CareerLadderService {
         actionUrl: `/(employee)/${profile.id}/promotion-detail`,
         metadata: { storeId: profile.storeId, profileId: profile.id },
       } as any);
-      return true;
+      sent = true;
     } catch (error) {
       this.logger.warn(`Không gửi được thông báo cho chủ: ${error}`);
-      return false;
     }
+
+    // Người duyệt kết quả của giai đoạn cũng được báo; bấm duyệt vẫn là việc
+    // của chủ, nên thông báo không mở màn duyệt nào ở app nhân viên.
+    const rung = await this.rungRepository.findOne({
+      where: { id: reviewerRungId },
+      select: ['id', 'reviewerProfileIds'],
+    });
+    const reviewerIds = (rung?.reviewerProfileIds ?? []).filter(
+      (id) => id !== profile.id,
+    );
+    if (!reviewerIds.length) return sent;
+    const reviewers = await this.profileRepository.find({
+      where: {
+        id: In(reviewerIds),
+        storeId: profile.storeId,
+        employmentStatus: In([...EMPLOYED_STATUSES]),
+      },
+      select: ['id', 'accountId'],
+    });
+    const subject = await this.profileRepository.findOne({
+      where: { id: profile.id },
+      relations: ['account'],
+    });
+    const who = subject?.account?.fullName?.trim() || 'Một nhân viên';
+    const accountIds = new Set(
+      reviewers.map((r) => r.accountId).filter((id) => id !== ownerAccountId),
+    );
+    for (const accountId of accountIds) {
+      try {
+        await this.notificationsService.create({
+          accountId,
+          type: NotificationType.SYSTEM,
+          title: 'Có nhân viên cần bạn đánh giá',
+          content: `${who} đã đủ điều kiện lên ${candidate.targetName ?? 'giai đoạn kế'}. Bạn là người duyệt kết quả giai đoạn này.`,
+          metadata: { storeId: profile.storeId, profileId: profile.id },
+        } as any);
+        sent = true;
+      } catch (error) {
+        this.logger.warn(`Không gửi được thông báo cho người duyệt: ${error}`);
+      }
+    }
+    return sent;
   }
 
   // ---------------------------------------------------------------------
@@ -2024,7 +2592,13 @@ export class CareerLadderService {
         if (isPast || isCurrent) {
           progress = 100;
         } else if (reachable.has(rung.id)) {
-          const evaluation = await this.evaluateRung(profile, rung, ladder);
+          const evaluation = await this.evaluateRung(
+            profile,
+            rung,
+            ladder,
+            undefined,
+            this.criteriaSourceId(ladder, current, rung),
+          );
           progress = evaluation.progress;
           requirements = evaluation.items.map((i) => ({
             text: i.label,

@@ -40,56 +40,57 @@ export function ladderProfileColumn(
  * When probation on `probationRungId` ends for someone who entered it at
  * `enteredAt`.
  *
- * The migrated ladders put "days in rung" on the rung people move *to*
- * (Chính thức), not on the probation rung, so reading only the probation
- * rung gave no deadline and probation never ended. The deadline is the
- * smallest required `days_in_rung` among the rungs reachable from it, else
- * the probation rung's own value. No positive value means no deadline.
+ * Điều kiện của lộ trình giai đoạn là của chính giai đoạn đang đứng
+ * (CareerLadderService.criteriaSourceId), nên hạn thử việc là `days_in_rung`
+ * bắt buộc của chính bậc thử việc. Dữ liệu cũ đặt "số ngày" trên bậc người ta
+ * đi tới (Chính thức); migration_career_stages.sql dời chúng về, còn ở đây
+ * vẫn đọc các bậc kế như phương án dự phòng khi bậc chưa có giá trị riêng.
+ * Không có giá trị dương thì không có hạn.
  */
 export async function computeProbationEndsAt(
   manager: EntityManager,
   probationRungId: string,
   enteredAt: Date,
 ): Promise<Date | null> {
-  const edges = await manager.find(StoreLadderEdge, {
-    where: { fromRungId: probationRungId },
-    select: ['id', 'toRungId'],
+  const own = await manager.findOne(StoreRungCriteria, {
+    where: {
+      rungId: probationRungId,
+      kind: CriteriaKind.TENURE,
+      code: CriteriaCode.DAYS_IN_RUNG,
+      isRequired: true,
+    },
   });
-  const nextRungIds = [
-    ...new Set(
-      edges
-        .map((edge) => edge.toRungId)
-        .filter((id) => id && id !== probationRungId),
-    ),
-  ];
+  let days: number | null =
+    own && Number.isFinite(Number(own.value)) ? Number(own.value) : null;
 
-  let days: number | null = null;
-  if (nextRungIds.length) {
-    const required = await manager.find(StoreRungCriteria, {
-      where: {
-        rungId: In(nextRungIds),
-        kind: CriteriaKind.TENURE,
-        code: CriteriaCode.DAYS_IN_RUNG,
-        isRequired: true,
-      },
-    });
-    const values = required
-      .map((criteria) => Number(criteria.value))
-      .filter((value) => Number.isFinite(value));
-    if (values.length) days = Math.min(...values);
-  }
   if (days === null) {
-    const own = await manager.findOne(StoreRungCriteria, {
-      where: {
-        rungId: probationRungId,
-        kind: CriteriaKind.TENURE,
-        code: CriteriaCode.DAYS_IN_RUNG,
-      },
+    const edges = await manager.find(StoreLadderEdge, {
+      where: { fromRungId: probationRungId },
+      select: ['id', 'toRungId'],
     });
-    const value = Number(own?.value ?? 0);
-    days = Number.isFinite(value) ? value : 0;
+    const nextRungIds = [
+      ...new Set(
+        edges
+          .map((edge) => edge.toRungId)
+          .filter((id) => id && id !== probationRungId),
+      ),
+    ];
+    if (nextRungIds.length) {
+      const required = await manager.find(StoreRungCriteria, {
+        where: {
+          rungId: In(nextRungIds),
+          kind: CriteriaKind.TENURE,
+          code: CriteriaCode.DAYS_IN_RUNG,
+          isRequired: true,
+        },
+      });
+      const values = required
+        .map((criteria) => Number(criteria.value))
+        .filter((value) => Number.isFinite(value));
+      if (values.length) days = Math.min(...values);
+    }
   }
-  return days > 0 ? new Date(enteredAt.getTime() + days * DAY_MS) : null;
+  return days !== null && days > 0 ? new Date(enteredAt.getTime() + days * DAY_MS) : null;
 }
 
 /**

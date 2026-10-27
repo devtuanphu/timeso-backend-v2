@@ -32,11 +32,30 @@ describe('computeProbationEndsAt', () => {
     findOne: jest.fn(async () => opts.own ?? null),
   });
 
-  it('uses the smallest required days_in_rung on the next rungs', async () => {
+  it("uses the probation rung's own required days_in_rung", async () => {
     const m = manager({
       edges: [{ toRungId: 'official' }, { toRungId: 'senior' }],
       nextCriteria: [{ value: '60.00' }, { value: 45 }],
       own: { value: 7 },
+    });
+    await expect(computeProbationEndsAt(m as any, 'probation', HIRED)).resolves.toEqual(
+      new Date(HIRED.getTime() + 7 * DAY),
+    );
+    expect(m.findOne).toHaveBeenCalledWith(StoreRungCriteria, {
+      where: {
+        rungId: 'probation',
+        kind: CriteriaKind.TENURE,
+        code: CriteriaCode.DAYS_IN_RUNG,
+        isRequired: true,
+      },
+    });
+    expect(m.find).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the smallest required days_in_rung on the next rungs (legacy data)', async () => {
+    const m = manager({
+      edges: [{ toRungId: 'official' }, { toRungId: 'senior' }],
+      nextCriteria: [{ value: '60.00' }, { value: 45 }],
     });
     await expect(computeProbationEndsAt(m as any, 'probation', HIRED)).resolves.toEqual(
       new Date(HIRED.getTime() + 45 * DAY),
@@ -49,14 +68,6 @@ describe('computeProbationEndsAt', () => {
         isRequired: true,
       },
     });
-    expect(m.findOne).not.toHaveBeenCalled();
-  });
-
-  it("falls back to the probation rung's own value", async () => {
-    const m = manager({ edges: [{ toRungId: 'official' }], own: { value: 30 } });
-    await expect(computeProbationEndsAt(m as any, 'probation', HIRED)).resolves.toEqual(
-      new Date(HIRED.getTime() + 30 * DAY),
-    );
   });
 
   it('gives no deadline without a positive value', async () => {

@@ -90,11 +90,17 @@ export class UpdateEmployeeByOwnerDto {
 
   // --- Hồ sơ tại cửa hàng ------------------------------------------------------
 
-  /** Hình thức làm việc (loại nhân viên); null = bỏ chọn. */
+  /** Giai đoạn (loại nhân viên: Học việc, Thử việc…); null = bỏ chọn. */
   @ApiPropertyOptional({ nullable: true })
   @ValidateIf((o) => o.employeeTypeId !== null && o.employeeTypeId !== undefined)
   @IsUUID()
   employeeTypeId?: string | null;
+
+  /** Hình thức làm việc (Toàn thời gian, Bán thời gian…); null = bỏ chọn. */
+  @ApiPropertyOptional({ nullable: true })
+  @ValidateIf((o) => o.workTypeId !== null && o.workTypeId !== undefined)
+  @IsUUID()
+  workTypeId?: string | null;
 
   /** Ca làm việc mặc định; null = bỏ chọn. */
   @ApiPropertyOptional({ nullable: true })

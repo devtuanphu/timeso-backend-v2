@@ -27,6 +27,7 @@ import { ShiftChangeRequest, ShiftChangeRequestStatus } from './entities/shift-c
 import { BonusWorkRequest } from './entities/bonus-work-request.entity';
 import { Store, StoreStatus } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
+import { StoreWorkType } from './entities/store-work-type.entity';
 import { StoreLadder, LadderDimension } from './entities/store-ladder.entity';
 import { StoreLadderRung } from './entities/store-ladder-rung.entity';
 import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
@@ -385,7 +386,7 @@ export class StoresService {
     @InjectRepository(EmployeeTerminationReason)
     private readonly terminationReasonRepository: Repository<EmployeeTerminationReason>,
     @InjectRepository(StoreProbationSetting)
-    private readonly probationSettingRepository: Repository<StoreProbationSetting>,
+    readonly probationSettingRepository: Repository<StoreProbationSetting>,
     @InjectRepository(StoreSkill)
     private readonly skillRepository: Repository<StoreSkill>,
     @InjectRepository(StorePayrollPaymentHistory)
@@ -1596,6 +1597,7 @@ export class StoresService {
     const checks: Array<[string | undefined, any]> = [
       [data.storeRoleId, StoreRole],
       [data.employeeTypeId, StoreEmployeeType],
+      [data.workTypeId, StoreWorkType],
       [data.workShiftId, WorkShift],
       [data.skillId, StoreSkill],
     ];
@@ -1693,8 +1695,8 @@ export class StoresService {
       };
     }
 
-    // "Days in rung" usually sits on the rung after probation (Chính thức),
-    // not on the probation rung itself; see computeProbationEndsAt.
+    // Hạn thử việc = "số ngày ở giai đoạn" của chính bậc thử việc; xem
+    // computeProbationEndsAt.
     let probationEndsAt: Date | undefined;
     if (rungId) {
       probationEndsAt =
@@ -1801,6 +1803,7 @@ export class StoresService {
         // Cột nullable trong DB nhưng khai `string` trên entity, nên NULL phải
         // đi vào dưới dạng undefined để TypeORM bỏ qua trường.
         employeeTypeId: employeeTypeId ?? undefined,
+        workTypeId: data.workTypeId ?? undefined,
         workShiftId: data.workShiftId,
         skillId: hireSkillId ?? undefined,
         departmentId: departmentId ?? undefined,
@@ -1829,6 +1832,7 @@ export class StoresService {
               departmentId,
               // Nullable column typed `string` on the entity.
               employeeTypeId: (employeeTypeId ?? null) as any,
+              workTypeId: data.workTypeId ?? null,
               probationEndsAt: probationEndsAt ?? null,
               capabilityPoints: 0,
               workingStatus: WorkingStatus.OFF,
@@ -2077,6 +2081,7 @@ export class StoresService {
         'account.finance',
         'storeRole',
         'employeeType',
+        'workType',
         'department',
         'workShift',
         'contracts',
@@ -2367,8 +2372,19 @@ export class StoresService {
         }
         await changeEmploymentType(manager, profile, dto.employeeTypeId ?? null, {
           decidedByAccountId: ownerAccountId,
-          note: 'Chủ cửa hàng sửa hình thức làm việc',
+          note: 'Chủ cửa hàng sửa giai đoạn',
         });
+        profileChanged = true;
+        changed.push('Giai đoạn');
+      }
+      if (has('workTypeId') && (profile.workTypeId ?? null) !== (dto.workTypeId ?? null)) {
+        if (dto.workTypeId) {
+          const exists = await manager.exists(StoreWorkType, {
+            where: { id: dto.workTypeId, storeId: profile.storeId },
+          });
+          if (!exists) throw this.invalidStoreReference();
+        }
+        profile.workTypeId = dto.workTypeId ?? null;
         profileChanged = true;
         changed.push('Hình thức làm việc');
       }
@@ -2705,6 +2721,7 @@ export class StoresService {
         relations: [
           'account',
           'employeeType',
+          'workType',
           'storeRole',
           'contracts',
           'workShift',

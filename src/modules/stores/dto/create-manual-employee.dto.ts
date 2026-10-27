@@ -80,6 +80,11 @@ export class CreateManualEmployeeDto {
   @IsOptional()
   employeeTypeId?: string;
 
+  /** Hình thức làm việc (Toàn thời gian, Bán thời gian…) — chỉ phân loại. */
+  @IsUUID()
+  @IsOptional()
+  workTypeId?: string;
+
   @IsString()
   @IsOptional()
   workShiftId?: string;

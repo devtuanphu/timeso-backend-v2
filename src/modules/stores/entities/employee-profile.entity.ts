@@ -11,6 +11,7 @@ import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
 import { Account } from '../../accounts/entities/account.entity';
 import { StoreEmployeeType } from './store-employee-type.entity';
+import { StoreWorkType } from './store-work-type.entity';
 import { StoreRole } from './store-role.entity';
 import { EmployeeContract } from './employee-contract.entity';
 import { WorkShift } from './work-shift.entity';
@@ -97,6 +98,14 @@ export class EmployeeProfile extends BaseEntity {
   @ManyToOne(() => StoreEmployeeType, { onDelete: 'SET NULL' })
   @JoinColumn({ name: 'employee_type_id' })
   employeeType: StoreEmployeeType;
+
+  /** Hình thức làm việc (Toàn thời gian, Bán thời gian…) — chỉ phân loại. */
+  @Column({ name: 'work_type_id', type: 'uuid', nullable: true })
+  workTypeId: string | null;
+
+  @ManyToOne(() => StoreWorkType, { onDelete: 'SET NULL' })
+  @JoinColumn({ name: 'work_type_id' })
+  workType: StoreWorkType | null;
 
   @Column({ name: 'store_role_id', nullable: true })
   storeRoleId: string;

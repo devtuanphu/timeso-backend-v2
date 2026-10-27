@@ -212,6 +212,7 @@ import {
   describePayslipTotals,
   EarnedBreakdown,
   payRatesOf,
+  dayPayOf,
   rulesApplyingTo,
   scheduledMinutesByDate,
 } from '../payroll-calculation.utils';
@@ -1750,7 +1751,20 @@ export class StoresPayrollPart {
         standardWorkingDays: p.standardWorkingDays,
         facts,
       });
+      // "x ngày lương" = lương của chính ngày phát sinh (ca mỗi ngày khác nhau).
+      facts.dayPay = dayPayOf({
+        paymentType: p.contract.paymentType,
+        rates: facts.payRates,
+        assignments,
+      });
     }
+    facts.stageCompletion = await this.loadStageCompletion(
+      p.employeeProfileId,
+      p.storeId,
+      p.month,
+      stintFloor(p.stint?.joinedAt),
+      p.manager,
+    );
     const advancePayment = await this.sumApprovedAdvances(
       p.existingSalaryId,
       p.manager,
@@ -2028,6 +2042,47 @@ export class StoresPayrollPart {
       })
       .getRawOne();
     return Number(row?.total) || 0;
+  }
+
+  /**
+   * Thưởng hoàn thành giai đoạn: chỉ khi cửa hàng bật chính sách, đếm những
+   * lần nhân viên được duyệt lên giai đoạn kế trong tháng (giờ VN) của đợt
+   * làm hiện tại. Chỉ tính bước đi qua advance() — có ảnh chụp điều kiện và
+   * xuất phát từ một giai đoạn; chủ sửa tay giai đoạn ở hồ sơ hay xếp giai
+   * đoạn đầu lúc tuyển không phải "hoàn thành".
+   */
+  async loadStageCompletion(
+    this: StoresService,
+    employeeProfileId: string,
+    storeId: string,
+    month: VnMonth,
+    floor: Date | null,
+    manager?: EntityManager,
+  ): Promise<{ count: number; amount: number } | undefined> {
+    const setting = await this.probationSettingRepository.findOne({
+      where: { storeId, isActive: true },
+    });
+    const amount = setting?.enableCompletionBonus
+      ? Number(setting.completionBonus) || 0
+      : 0;
+    if (amount <= 0) return undefined;
+    const db = manager ?? this.dataSource.manager;
+    const start = new Date(`${month.key}T00:00:00+07:00`);
+    const from = floor && floor.getTime() > start.getTime() ? floor : start;
+    const rows: Array<{ count: string }> = await db.query(
+      `SELECT COUNT(*) AS count
+         FROM employee_career_events e
+         JOIN store_ladders l ON l.id = e.ladder_id
+        WHERE e.employee_profile_id = $1
+          AND l.dimension = 'employment_type'
+          AND e.from_rung_id IS NOT NULL
+          AND e.criteria_snapshot IS NOT NULL
+          AND e.deleted_at IS NULL
+          AND e.effective_at >= $2 AND e.effective_at < $3`,
+      [employeeProfileId, from, new Date(`${month.endExclusiveDate}T00:00:00+07:00`)],
+    );
+    const count = Number(rows[0]?.count) || 0;
+    return count > 0 ? { count, amount } : undefined;
   }
 
   // --- Store Payroll Payment History ---

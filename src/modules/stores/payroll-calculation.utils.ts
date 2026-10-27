@@ -12,6 +12,7 @@ import { WORKING_DAYS_PER_WEEK } from './shift-earnings.utils';
 import {
   evaluateRuleConfig,
   normalizeRuleCalcConfig,
+  type DayPay,
   type RuleOccurrence,
 } from './payroll-rule-config.utils';
 import { PayslipBuiltinRow } from './entities/store-payslip-row.entity';
@@ -101,6 +102,13 @@ export interface MonthlyAttendanceFacts {
   ruleQuantities?: Record<string, number>;
   /** The employee's own pay per hour / shift / day / month (rule bases). */
   payRates?: { hourly: number; perShift: number; daily?: number; monthly?: number };
+  /** v3 "x ngày lương": the pay of each work date (see dayPayOf). */
+  dayPay?: DayPay;
+  /**
+   * Thưởng hoàn thành giai đoạn (chính sách của cửa hàng): số lần được duyệt
+   * lên giai đoạn kế trong tháng và mức thưởng mỗi lần.
+   */
+  stageCompletion?: { count: number; amount: number };
   /**
    * v3 rules (calc_config): every occurrence of an automatic code in the
    * month (one late arrival with its minutes, one overtime shift…).
@@ -586,6 +594,8 @@ export type RuleAdjustmentFacts = Pick<
       | 'absentMinutes'
       | 'ruleQuantities'
       | 'payRates'
+      | 'dayPay'
+      | 'stageCompletion'
       | 'daysWorked'
       | 'ruleOccurrences'
       | 'recordOccurrences'
@@ -764,6 +774,7 @@ function v3RuleLine(
       daily,
       monthly: n(facts.payRates?.monthly),
       revenue: n(facts.revenue),
+      dayPay: facts.dayPay,
     },
     monthly: {
       workedDays: n(facts.daysWorked),
@@ -900,6 +911,19 @@ function ruleRawLines(
       }
     }
   }
+  const stage = facts.stageCompletion;
+  const stageExact = stage ? stage.count * toFiniteNumber(stage.amount) : 0;
+  if (stage && stage.count > 0 && stageExact > 0 && Number.isFinite(stageExact)) {
+    raw.push({
+      kind: 'BONUS',
+      ruleId: null,
+      ruleType: 'STAGE_COMPLETION',
+      label: 'Thưởng hoàn thành giai đoạn',
+      count: stage.count,
+      amount: 0,
+      exact: stageExact,
+    });
+  }
   return raw;
 }
 
@@ -989,6 +1013,46 @@ export function payRatesOf(input: {
       return withDays(perDay / 8, perDay, rate);
     }
   }
+}
+
+/**
+ * Pay of each work date, for the "x ngày lương" of bonus / fine rules: a
+ * day's shifts differ, so its pay does too. Hourly pay: hourly × the date's
+ * scheduled hours (APPROVED / COMPLETED shifts), shared by minutes; per-shift
+ * pay: one shift's pay × the date's shifts, shared per shift. Day / week /
+ * month pay is the same every day: undefined (rules use the daily rate).
+ */
+export function dayPayOf(input: {
+  paymentType: PaymentType | string | null | undefined;
+  rates: { hourly: number; perShift: number };
+  assignments: PayrollAssignmentFact[];
+}): DayPay | undefined {
+  const type = resolvePayrollPaymentType(input.paymentType);
+  if (type !== PaymentType.HOUR && type !== PaymentType.SHIFT) return undefined;
+  const byDate: Record<string, number> = {};
+  const unitsByDate: Record<string, number> = {};
+  if (type === PaymentType.HOUR) {
+    const hourly = toFiniteNumber(input.rates.hourly);
+    for (const [date, minutes] of Object.entries(scheduledMinutesByDate(input.assignments))) {
+      byDate[date] = (hourly * minutes) / 60;
+      unitsByDate[date] = minutes;
+    }
+    return { byDate, unitsByDate, unit: 'MINUTE' };
+  }
+  const perShift = toFiniteNumber(input.rates.perShift);
+  for (const a of input.assignments) {
+    if (
+      a.status !== ShiftAssignmentStatus.APPROVED &&
+      a.status !== ShiftAssignmentStatus.COMPLETED
+    ) {
+      continue;
+    }
+    const date = workDateOf(a.workDate);
+    if (!date) continue;
+    byDate[date] = (byDate[date] ?? 0) + perShift;
+    unitsByDate[date] = (unitsByDate[date] ?? 0) + 1;
+  }
+  return { byDate, unitsByDate, unit: 'SHIFT' };
 }
 
 /** Sum of a contract's allowances, rounded to whole VND. */

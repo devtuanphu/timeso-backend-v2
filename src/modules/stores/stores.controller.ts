@@ -16,6 +16,7 @@ import { GetUser } from '../auth/decorators/get-user.decorator';
 import { AccountsService } from '../accounts/accounts.service';
 import { MailService } from '../mail/mail.service';
 import { CreateManualEmployeeDto } from './dto/create-manual-employee.dto';
+import { ReorderStagesDto, SaveStageDto } from './dto/career-stage.dto';
 import { UpdateEmployeeByOwnerDto } from './dto/update-employee.dto';
 import { StoreDiscoveryQueryDto } from './dto/store-discovery.dto';
 import { AddExistingEmployeeDto, ExistingEmployeeCandidateQueryDto, LinkExistingEmployeeDto } from './dto/add-existing-employee.dto';
@@ -1335,6 +1336,43 @@ export class StoresController {
   ) {
     await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
     return this.careerLadderService.createLadder(storeId, body);
+  }
+
+  @StoreOwnerOnly()
+  @Post(':id/stages')
+  @ApiOperation({ summary: 'Tạo giai đoạn nhân sự (kèm điều kiện, giai đoạn trước/sau, người duyệt)' })
+  async createStage(
+    @Param('id', ParseUUIDPipe) storeId: string,
+    @Body() body: SaveStageDto,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.saveStage(storeId, null, body);
+  }
+
+  @StoreOwnerOnly()
+  @Put(':id/stages/:rungId')
+  @ApiOperation({ summary: 'Sửa trọn một giai đoạn nhân sự' })
+  async updateStage(
+    @Param('id', ParseUUIDPipe) storeId: string,
+    @Param('rungId', ParseUUIDPipe) rungId: string,
+    @Body() body: SaveStageDto,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.saveStage(storeId, rungId, body);
+  }
+
+  @StoreOwnerOnly()
+  @Put(':id/stage-order')
+  @ApiOperation({ summary: 'Sắp xếp thứ tự hiển thị các giai đoạn' })
+  async reorderStages(
+    @Param('id', ParseUUIDPipe) storeId: string,
+    @Body() body: ReorderStagesDto,
+    @GetUser() user: any,
+  ) {
+    await this.storesService.assertOwnerStoreAccess(storeId, user.userId);
+    return this.careerLadderService.reorderStages(storeId, body.rungIds);
   }
 
   @StoreOwnerOnly()

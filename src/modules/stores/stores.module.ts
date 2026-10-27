@@ -3,6 +3,7 @@ import { getAppScheduleOptions } from '../../app-runtime.config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
+import { StoreWorkType } from './entities/store-work-type.entity';
 import { StoreLadder } from './entities/store-ladder.entity';
 import { StoreLadderRung } from './entities/store-ladder-rung.entity';
 import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
@@ -135,6 +136,8 @@ import { StoresRequestsController } from './controllers/stores-requests.controll
 import { StoresAttendanceController } from './controllers/stores-attendance.controller';
 import { StoresSchedulingController } from './controllers/stores-scheduling.controller';
 import { StoresCareerController } from './controllers/stores-career.controller';
+import { StoresWorkTypesController } from './controllers/stores-work-types.controller';
+import { WorkTypesService } from './work-types.service';
 import { CareerStructureService } from './career/career-structure.service';
 import { CareerEvaluationService } from './career/career-evaluation.service';
 import { CareerProgressService } from './career/career-progress.service';
@@ -150,6 +153,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     TypeOrmModule.forFeature([
       Store,
       StoreEmployeeType,
+      StoreWorkType,
       StoreLadder,
       StoreDepartment,
       CareerRequirement,
@@ -268,9 +272,11 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     StoreActivityController,
     CustomShiftRequestController,
     StoresCareerController,
+    StoresWorkTypesController,
   ],
   providers: [
     StoresService,
+    WorkTypesService,
     CareerLadderService,
     CareerStructureService,
     CareerEvaluationService,

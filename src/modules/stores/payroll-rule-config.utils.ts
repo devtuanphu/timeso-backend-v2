@@ -286,9 +286,28 @@ export function normalizeRuleCalcConfig(
 /** Lương / doanh số dùng làm gốc (đồng). */
 export interface RuleRates {
   hourly: number;
+  /** Ngày lương trung bình (ngày không có ca, khoản không gắn với một ngày). */
   daily: number;
   monthly: number;
   revenue: number;
+  /**
+   * Lương của chính ngày phát sinh ("x ngày lương" = x × lương ngày đó):
+   * lương giờ × giờ các ca trong ngày, lương ca × số ca trong ngày. Không có
+   * (hoặc ngày không có ca) thì dùng `daily`.
+   */
+  dayPay?: DayPay;
+}
+
+/**
+ * Lương từng ngày và cách chia cho từng ca của ngày đó: một lần phát sinh
+ * theo ca (nghỉ, trễ… của MỘT ca) chỉ lấy phần lương của ca đó, để ngày 3 ca
+ * nghỉ cả 3 bị trừ đúng 1 ngày lương, không phải 3.
+ */
+export interface DayPay {
+  byDate: Record<string, number>;
+  /** Tổng "đơn vị" của ngày: phút theo lịch (lương giờ) hoặc số ca (lương ca). */
+  unitsByDate: Record<string, number>;
+  unit: 'MINUTE' | 'SHIFT';
 }
 
 const distinctDays = (list: RuleOccurrence[]) => new Set(list.map((o) => o.date)).size;
@@ -359,6 +378,30 @@ export function evaluateRuleConfig(input: {
     unit === 'DAY' && !recorded ? distinctDays(list) : list.reduce((s, o) => s + measure(o, unit), 0);
   const occurrences = manual ? list.reduce((s, o) => s + o.quantity, 0) : list.length;
   const none = { exact: 0, count: 0, label: name };
+  /** Lương của ngày `date`: ca khác nhau mỗi ngày thì lương ngày khác nhau. */
+  const dayPay = (date: string) => {
+    const value = rates.dayPay?.byDate[date];
+    return value !== undefined && value > 0 ? value : rates.daily;
+  };
+  /**
+   * "1 ngày lương" của một lần: ghi nhận tay → trọn lương ngày được ghi;
+   * lần theo ca (nghỉ, trễ, quên chấm công…) → phần lương của chính ca đó
+   * trong ngày (ngày một ca: trọn ngày lương).
+   */
+  const dayPayOf = (o: RuleOccurrence) => {
+    const full = dayPay(o.date);
+    if (recorded || !rates.dayPay) return full;
+    const units = rates.dayPay.unitsByDate[o.date] ?? 0;
+    const own = rates.dayPay.unit === 'SHIFT' ? 1 : (o.shiftMinutes ?? 0);
+    if (!(units > 0 && own > 0 && rates.dayPay.byDate[o.date])) return full;
+    return (full * Math.min(own, units)) / units;
+  };
+  /** Σ lương ngày của từng lần (ghi nhận tay: × số lượng). */
+  const sumDayPay = (items: RuleOccurrence[]) =>
+    items.reduce((s, o) => s + dayPayOf(o) * (recorded ? o.quantity : 1), 0);
+  /** Σ lương ngày của các ngày khác nhau (mỗi ngày tính một lần). */
+  const sumDistinctDayPay = (items: RuleOccurrence[]) =>
+    [...new Set(items.map((o) => o.date))].reduce((s, date) => s + dayPay(date), 0);
 
   switch (config.kind) {
     case 'FIXED': {
@@ -394,7 +437,8 @@ export function evaluateRuleConfig(input: {
       const coef = salaryCoefExtra(code, config.coef ?? 0);
       if (config.base === 'DAILY') {
         const days = recorded ? occurrences : distinctDays(list);
-        return { exact: coef * rates.daily * days, count: days, label: name };
+        const pay = recorded ? sumDayPay(list) : sumDistinctDayPay(list);
+        return { exact: coef * pay, count: days, label: name };
       }
       const hours = total('HOUR');
       return {
@@ -413,15 +457,17 @@ export function evaluateRuleConfig(input: {
         const baseAmount = config.base === 'REVENUE' ? rates.revenue : rates.monthly;
         return { exact: pct * baseAmount, count: 1, label: name };
       }
-      const rate = config.base === 'HOURLY' ? rates.hourly : rates.daily;
-      return { exact: pct * rate * occurrences, count: occurrences, label: name };
+      if (config.base === 'DAILY') {
+        return { exact: pct * sumDayPay(list), count: occurrences, label: name };
+      }
+      return { exact: pct * rates.hourly * occurrences, count: occurrences, label: name };
     }
     case 'SALARY_BLOCK': {
       const hit = minuteBased
         ? list.filter((o) => o.minutes >= (config.triggerMinutes ?? 0))
         : list;
       const times = manual ? hit.reduce((s, o) => s + o.quantity, 0) : hit.length;
-      return { exact: (config.dayFraction ?? 0) * rates.daily * times, count: times, label: name };
+      return { exact: (config.dayFraction ?? 0) * sumDayPay(hit), count: times, label: name };
     }
     case 'PROGRESSIVE': {
       const unit = config.unit ?? 'MINUTE';
@@ -442,15 +488,17 @@ export function evaluateRuleConfig(input: {
       const tiers = config.tiers ?? [];
       const pick = (value: number) =>
         tiers.find((t) => value >= t.from && (t.to === null || value <= t.to)) ?? null;
-      const valueOf = (t: RuleTier) =>
-        t.dayFraction ? t.dayFraction * rates.daily : (t.amount ?? 0);
+      // Bậc theo từng lần: "x ngày lương" theo lương ngày của lần đó; bậc theo
+      // tổng số lần trong tháng không gắn với ngày nào → ngày lương trung bình.
+      const valueOf = (t: RuleTier, o?: RuleOccurrence) =>
+        t.dayFraction ? t.dayFraction * (o ? dayPayOf(o) : rates.daily) : (t.amount ?? 0);
       if (minuteBased) {
         let exact = 0;
         let hits = 0;
         for (const o of list) {
           const tier = pick(o.minutes);
           if (!tier) continue;
-          exact += valueOf(tier);
+          exact += valueOf(tier, o);
           hits += 1;
         }
         return { exact, count: hits, label: name };

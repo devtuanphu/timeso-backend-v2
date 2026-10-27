@@ -245,6 +245,7 @@ describe('F. monthly summary after a same-month rehire', () => {
       { id: 'new', workDate: '2026-09-12', status: ShiftAssignmentStatus.COMPLETED, workedMinutes: 240 },
     ]);
     service.sumApprovedAdvances = jest.fn().mockResolvedValue(0);
+    service.loadStageCompletion = jest.fn().mockResolvedValue(undefined);
 
     const result = await service.computeEmployeePayslip({
       employeeProfileId: PROFILE,
