@@ -47,6 +47,8 @@ export interface PayrollAssignmentFact {
   id: string;
   /** Vietnam calendar date of the shift, 'YYYY-MM-DD'. */
   workDate: string;
+  /** The shift template (ca sáng, ca tối…), for the store's wage rates. */
+  workShiftId?: string | null;
   status: ShiftAssignmentStatus;
   attendanceStatus?: AttendanceStatus | null;
   checkInTime?: Date | string | null;
@@ -1321,6 +1323,12 @@ export function computeStintSplitEarnedBase(input: {
   prior: StintPricing | null;
   standardWorkingDays: number;
   calendarDays: number;
+  /**
+   * Prices the current stint's shifts instead of `current` (the store's wage
+   * rates by shift / position / time of day, see wage-rates.utils). The
+   * previous stint keeps its own pricing.
+   */
+  priceCurrent?: ((rows: PayrollAssignmentFact[]) => number) | null;
 }): {
   earnedBase: number;
   currentStintEarned: number;
@@ -1356,10 +1364,10 @@ export function computeStintSplitEarnedBase(input: {
     priorCompleted.filter((a) => a.shiftEarnings == null),
   );
   const priorStintEarned = stored + repriced;
-  const currentStintEarned = price(
-    input.current,
-    input.assignments.filter((a) => !isPrior(a)),
-  );
+  const currentRows = input.assignments.filter((a) => !isPrior(a));
+  const currentStintEarned = input.priceCurrent
+    ? input.priceCurrent(currentRows)
+    : price(input.current, currentRows);
   return {
     earnedBase: priorStintEarned + currentStintEarned,
     currentStintEarned,

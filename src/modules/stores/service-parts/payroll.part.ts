@@ -217,6 +217,20 @@ import {
   scheduledMinutesByDate,
 } from '../payroll-calculation.utils';
 import { effectiveWindowOf } from '../attendance-time.utils';
+import { StoreWageRate } from '../entities/store-wage-rate.entity';
+import { WorkShift } from '../entities/work-shift.entity';
+import { StoreRole } from '../entities/store-role.entity';
+import { SaveWageRatesDto } from '../dto/wage-rates.dto';
+import {
+  minuteOfDay,
+  wageEarnedOf,
+  wageIntervalOf,
+  wageRateForShift,
+  wageRuleOf,
+  wageRulesApply,
+  wageUnitOf,
+  type WageRateRule,
+} from '../wage-rates.utils';
 import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
 import { Order, OrderStatus } from '../entities/order.entity';
 import {
@@ -1446,6 +1460,7 @@ export class StoresPayrollPart {
       return {
         id: a.id,
         workDate,
+        workShiftId: a.shiftSlot?.workShiftId ?? null,
         status: a.status,
         attendanceStatus: a.attendanceStatus ?? null,
         checkInTime: a.checkInTime ?? null,
@@ -1659,6 +1674,299 @@ export class StoresPayrollPart {
   }
 
   /**
+   * Đơn giá lương theo ca / vị trí / khung giờ của cửa hàng, kèm các ca và vị
+   * trí đang dùng để app chọn.
+   */
+  async getWageRates(this: StoresService, storeId: string) {
+    const [rates, shifts, roles] = await Promise.all([
+      this.dataSource.getRepository(StoreWageRate).find({
+        where: { storeId },
+        order: { sortOrder: 'ASC', createdAt: 'ASC' },
+      }),
+      this.dataSource.getRepository(WorkShift).find({
+        where: { storeId, isActive: true },
+        order: { startTime: 'ASC' },
+      }),
+      this.dataSource.getRepository(StoreRole).find({
+        where: { storeId, isActive: true },
+        order: { name: 'ASC' },
+      }),
+    ]);
+    return {
+      rates: rates.map((r) => ({ id: r.id, ...wageRuleOf(r), name: r.name ?? null })),
+      shifts: shifts.map((s) => ({
+        id: s.id,
+        name: s.shiftName,
+        startTime: String(s.startTime ?? '').slice(0, 5),
+        endTime: String(s.endTime ?? '').slice(0, 5),
+      })),
+      roles: roles.map((r) => ({ id: r.id, name: r.name })),
+    };
+  }
+
+  /**
+   * Thay cả danh sách đơn giá, rồi tính lại phiếu lương tháng này (chưa chốt)
+   * như khi lưu mẫu bảng lương. Phiếu đã chốt / đã duyệt giữ nguyên.
+   */
+  async saveWageRates(this: StoresService, storeId: string, body: SaveWageRatesDto) {
+    const input = Array.isArray(body?.rates) ? body.rates : [];
+    const rates = input.map((rate, index) => {
+      const label = `Đơn giá ${index + 1}`;
+      const unit = rate.unit === 'SHIFT' ? 'SHIFT' : 'HOUR';
+      const workShiftIds = Array.from(new Set(rate.workShiftIds ?? []));
+      const roleIds = Array.from(new Set(rate.roleIds ?? []));
+      const timeFrom = rate.timeFrom ?? null;
+      const timeTo = rate.timeTo ?? null;
+      if ((timeFrom == null) !== (timeTo == null)) {
+        throw new BadRequestException(`${label}: khung giờ cần cả giờ bắt đầu và giờ kết thúc`);
+      }
+      if (timeFrom != null && minuteOfDay(timeFrom) === minuteOfDay(timeTo)) {
+        throw new BadRequestException(`${label}: giờ bắt đầu và kết thúc khung giờ trùng nhau`);
+      }
+      if (timeFrom != null && unit === 'SHIFT') {
+        throw new BadRequestException(`${label}: đơn giá theo ca không đặt khung giờ`);
+      }
+      // Đơn giá không điều kiện sẽ thay lương hợp đồng của MỌI nhân viên
+      // cùng hình thức — chủ muốn vậy thì sửa hợp đồng, không đặt ở đây.
+      if (!workShiftIds.length && !roleIds.length && timeFrom == null) {
+        throw new BadRequestException(
+          `${label}: chọn ít nhất một điều kiện — ca, vị trí hoặc khung giờ`,
+        );
+      }
+      return {
+        name: String(rate.name ?? '').trim() || null,
+        unit: unit as 'HOUR' | 'SHIFT',
+        amount: Math.round(Number(rate.amount)),
+        workShiftIds,
+        roleIds,
+        timeFrom,
+        timeTo,
+      };
+    });
+    // Hai đơn giá cùng điều kiện thì đơn giá nào áp là tuỳ số tiền — chủ không
+    // đoán được, nên không cho lưu.
+    const keys = new Set<string>();
+    for (const rate of rates) {
+      const key = [
+        rate.unit,
+        [...rate.workShiftIds].sort().join(','),
+        [...rate.roleIds].sort().join(','),
+        rate.timeFrom ?? '',
+        rate.timeTo ?? '',
+      ].join('|');
+      if (keys.has(key)) {
+        throw new BadRequestException('Có hai đơn giá trùng hết điều kiện, hãy gộp lại');
+      }
+      keys.add(key);
+    }
+
+    await this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `wage-rates:${storeId}`,
+      ]);
+      // Chỉ nhận ca / vị trí của chính cửa hàng (kể cả đã xoá, để đơn giá cũ
+      // còn trỏ tới chúng vẫn lưu lại được).
+      const shiftIds = Array.from(new Set(rates.flatMap((r) => r.workShiftIds)));
+      const roleIds = Array.from(new Set(rates.flatMap((r) => r.roleIds)));
+      if (shiftIds.length) {
+        const owned = await manager.getRepository(WorkShift).count({
+          where: { storeId, id: In(shiftIds) },
+          withDeleted: true,
+        });
+        if (owned !== shiftIds.length) {
+          throw new BadRequestException('Có ca không thuộc cửa hàng này');
+        }
+      }
+      if (roleIds.length) {
+        const owned = await manager.getRepository(StoreRole).count({
+          where: { storeId, id: In(roleIds) },
+          withDeleted: true,
+        });
+        if (owned !== roleIds.length) {
+          throw new BadRequestException('Có vị trí không thuộc cửa hàng này');
+        }
+      }
+      const repository = manager.getRepository(StoreWageRate);
+      await repository.delete({ storeId });
+      if (rates.length) {
+        await repository.save(
+          rates.map((rate, index) =>
+            repository.create({ storeId, ...rate, sortOrder: index }),
+          ),
+        );
+      }
+    });
+
+    const payroll = await this.dataSource
+      .getRepository(MonthlyPayroll)
+      .findOne({ where: { storeId, month: toMonthMarker(vnMonthOf()) } });
+    let recalculationFailed = false;
+    // Số tiền từng ca đã lưu lúc ra ca (lịch của chủ, thẻ thu nhập của nhân
+    // viên đọc số này) phải theo đơn giá mới, không thì lệch phiếu lương.
+    try {
+      await this.repriceStoredShiftEarnings(storeId, vnMonthOf());
+    } catch (error) {
+      recalculationFailed = true;
+      this.logger?.warn(
+        `Wage rates saved but shift earnings repricing failed for ${storeId}: ${String(error)}`,
+      );
+    }
+    if (payroll) {
+      try {
+        await this.recalculatePayroll(storeId);
+      } catch (error) {
+        recalculationFailed = true;
+        this.logger?.warn(
+          `Wage rates saved but recalculation failed for ${storeId}: ${String(error)}`,
+        );
+      }
+    }
+    const saved = await this.getWageRates(storeId);
+    return recalculationFailed ? { ...saved, recalculationFailed } : saved;
+  }
+
+  /**
+   * Tính lại `shiftEarnings` đã lưu của các ca đã làm trong tháng, cho nhân
+   * viên lương giờ / lương ca, theo đơn giá hiện tại — đúng phép tính lúc ra
+   * ca (processCheckoutPayroll). Ca của lượt làm trước (tái tuyển trong
+   * tháng) giữ số đã lưu, như computeStintSplitEarnedBase.
+   */
+  async repriceStoredShiftEarnings(
+    this: StoresService,
+    storeId: string,
+    month: VnMonth,
+  ): Promise<number> {
+    const rows = await this.dataSource
+      .getRepository(ShiftAssignment)
+      .createQueryBuilder('sa')
+      .leftJoinAndSelect('sa.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'slotWorkShift')
+      .innerJoin('slot.cycle', 'cycle')
+      .leftJoinAndSelect('sa.employee', 'employee')
+      .leftJoinAndSelect('employee.contracts', 'contract')
+      .where('cycle.storeId = :storeId', { storeId })
+      .andWhere('sa.status = :status', { status: ShiftAssignmentStatus.COMPLETED })
+      .andWhere('sa.shiftEarnings IS NOT NULL')
+      .andWhere('slot.workDate >= :monthStart', { monthStart: month.key })
+      .andWhere('slot.workDate < :monthEnd', { monthEnd: month.endExclusiveDate })
+      .getMany();
+    const byEmployee = new Map<string, ShiftAssignment[]>();
+    for (const row of rows) {
+      const list = byEmployee.get(row.employeeId) ?? [];
+      list.push(row);
+      byEmployee.set(row.employeeId, list);
+    }
+    let changed = 0;
+    for (const [employeeId, list] of byEmployee) {
+      const employee = list[0].employee;
+      const contract = employee?.contracts?.find((c) => c.isActive) ?? null;
+      // Lương ngày / tuần / tháng không dùng đơn giá: số đã lưu giữ nguyên.
+      if (!contract || !wageUnitOf(contract.paymentType)) continue;
+      const { rate } = await this.resolveRateForMonth(employeeId, contract, month);
+      const wage = await this.loadWagePricing(storeId, employeeId, contract.paymentType);
+      const stintStart = stintStartVnDate(employee?.joinedAt);
+      for (const a of list) {
+        const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
+        if (stintStart && workDate && workDate < stintStart) continue;
+        const window = effectiveWindowOf(a);
+        const shiftRate = wage
+          ? wageRateForShift({
+              rules: wage.rules,
+              unit: wage.unit,
+              fallbackRate: Number(rate) || 0,
+              shift: {
+                workShiftId: a.shiftSlot?.workShiftId ?? null,
+                roleId: wage.roleId,
+                ...wageIntervalOf({
+                  checkInTime: a.checkInTime,
+                  checkOutTime: a.checkOutTime,
+                  windowStart: window.start,
+                  windowEnd: window.end,
+                  workedMinutes: a.workedMinutes,
+                }),
+              },
+            })
+          : Number(rate) || 0;
+        const amount = calculateShiftEarnings({
+          paymentType: contract.paymentType,
+          baseSalary: shiftRate,
+          hours: Number(a.workedMinutes || 0) / 60,
+          referenceDate: workDate ? vnMiddayInstant(workDate) : new Date(),
+        });
+        if (amount != null && Number(a.shiftEarnings) !== amount) {
+          await this.dataSource
+            .getRepository(ShiftAssignment)
+            .update(a.id, { shiftEarnings: amount });
+          changed += 1;
+        }
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Đơn giá áp cho một nhân viên: null khi hình thức trả lương không dùng đơn
+   * giá (ngày / tuần / tháng) hoặc cửa hàng chưa đặt đơn giá cho đơn vị đó —
+   * khi đó lương tính y như trước.
+   */
+  async loadWagePricing(
+    this: StoresService,
+    storeId: string,
+    employeeProfileId: string,
+    paymentType: PaymentType | string | null | undefined,
+    manager?: EntityManager,
+  ): Promise<{ rules: WageRateRule[]; roleId: string | null; unit: 'HOUR' | 'SHIFT' } | null> {
+    const unit = wageUnitOf(paymentType);
+    if (!unit) return null;
+    const em = manager ?? this.dataSource.manager;
+    const rows = await em.getRepository(StoreWageRate).find({ where: { storeId, unit } });
+    if (!rows.length) return null;
+    const profile = await em.getRepository(EmployeeProfile).findOne({
+      where: { id: employeeProfileId },
+      select: ['id', 'storeRoleId'],
+    });
+    return { rules: rows.map(wageRuleOf), roleId: profile?.storeRoleId ?? null, unit };
+  }
+
+  /**
+   * Đơn giá (đồng / giờ bình quân, hoặc đồng / ca) của MỘT ca cho các số tiền
+   * hiển thị theo ca (ước tính khi đăng ký, tiền đang chạy, lịch của chủ, số
+   * lưu lúc ra ca). Không có đơn giá nào áp: `contractRate`.
+   */
+  async wageRateOfShift(
+    this: StoresService,
+    p: {
+      storeId: string;
+      employeeProfileId: string;
+      paymentType: PaymentType | string | null | undefined;
+      contractRate: number;
+      workShiftId: string | null | undefined;
+      from: Date | string | null | undefined;
+      to: Date | string | null | undefined;
+      manager?: EntityManager;
+    },
+  ): Promise<number> {
+    const pricing = await this.loadWagePricing(
+      p.storeId,
+      p.employeeProfileId,
+      p.paymentType,
+      p.manager,
+    ).catch(() => null);
+    if (!pricing) return Number(p.contractRate) || 0;
+    return wageRateForShift({
+      rules: pricing.rules,
+      unit: pricing.unit,
+      fallbackRate: Number(p.contractRate) || 0,
+      shift: {
+        workShiftId: p.workShiftId ?? null,
+        roleId: pricing.roleId,
+        from: p.from ?? null,
+        to: p.to ?? null,
+      },
+    });
+  }
+
+  /**
    * The single payslip composer used by generation, recalculation, check-out
    * and the live estimate. Read-only: it performs no writes.
    */
@@ -1700,6 +2008,11 @@ export class StoresPayrollPart {
      * previous stint's shifts (same-month rehire); null otherwise.
      */
     currentStintEarned: number | null;
+    /**
+     * Đơn giá bình quân thực trả (đồng / giờ hoặc / ca) khi ca nào đó khớp
+     * đơn giá theo ca / vị trí / khung giờ; null = lương hợp đồng.
+     */
+    wageRate: number | null;
   }> {
     const assignments = await this.loadMonthlyAssignments(
       p.employeeProfileId,
@@ -1710,6 +2023,57 @@ export class StoresPayrollPart {
     const todayVn = vnDateString(p.now ?? new Date());
     const facts = summarizeMonthlyAttendance(assignments, todayVn);
     facts.monthComplete = todayVn >= p.month.endExclusiveDate;
+    // Đơn giá theo ca / vị trí / khung giờ (lương giờ, lương ca): mỗi ca đã
+    // làm được định giá riêng. Null = cửa hàng chưa đặt đơn giá cho hình thức
+    // này, lương tính y như trước.
+    const wage = p.contract
+      ? await this.loadWagePricing(
+          p.storeId,
+          p.employeeProfileId,
+          p.contract.paymentType,
+          p.manager,
+        )
+      : null;
+    const wagePrice = wage
+      ? (rows: PayrollAssignmentFact[]) =>
+          wageEarnedOf({
+            rules: wage.rules,
+            unit: wage.unit,
+            fallbackRate: p.rate,
+            shifts: rows
+              .filter((a) => a.status === ShiftAssignmentStatus.COMPLETED)
+              .map((a) => ({
+                workShiftId: a.workShiftId ?? null,
+                roleId: wage.roleId,
+                ...wageIntervalOf(a),
+                workedMinutes: Number(a.workedMinutes) || 0,
+              })),
+          })
+      : null;
+    // Lương giờ / ca của khoản hệ số ("x giờ lương"): đơn giá bình quân thực
+    // trả trong tháng khi có đơn giá, không thì lương hợp đồng.
+    let pricedRate = p.rate;
+    // Đơn giá bình quân thực trả, khi có ca khớp đơn giá; null = lương hợp
+    // đồng (không đơn giá nào khớp thì giữ đúng p.rate, không lệch làm tròn).
+    let wageRate: number | null = null;
+    const wageMatched =
+      !!wage &&
+      wageRulesApply(
+        wage.rules,
+        wage.unit,
+        assignments
+          .filter((a) => a.status === ShiftAssignmentStatus.COMPLETED)
+          .map((a) => ({ workShiftId: a.workShiftId ?? null, roleId: wage.roleId })),
+      );
+    if (wagePrice && wageMatched) {
+      const earnedAll = wagePrice(assignments);
+      if (wage?.unit === 'HOUR' && facts.workedMinutes > 0) {
+        pricedRate = (earnedAll * 60) / facts.workedMinutes;
+      } else if (wage?.unit === 'SHIFT' && facts.completedShifts > 0) {
+        pricedRate = earnedAll / facts.completedShifts;
+      }
+      wageRate = pricedRate;
+    }
     // Phạm vi áp dụng: khoản riêng của nhân viên khác không tính cho người này.
     const rules = rulesApplyingTo(p.rules, p.employeeProfileId);
     // v2 rules: the month's manual records ("ghi nhận") per rule, and the
@@ -1747,7 +2111,7 @@ export class StoresPayrollPart {
       }
       facts.payRates = payRatesOf({
         paymentType: p.contract.paymentType,
-        rate: p.rate,
+        rate: pricedRate,
         standardWorkingDays: p.standardWorkingDays,
         facts,
       });
@@ -1802,9 +2166,11 @@ export class StoresPayrollPart {
         : null,
       standardWorkingDays: p.standardWorkingDays,
       calendarDays: p.month.calendarDays,
+      priceCurrent: wagePrice,
     });
     const payslip = computePayslip({
-      earnedBaseSalary: split?.earnedBase ?? null,
+      earnedBaseSalary:
+        split?.earnedBase ?? (wagePrice ? wagePrice(assignments) : null),
       paymentType: p.contract?.paymentType ?? null,
       rate: p.contract ? p.rate : 0,
       allowances: p.contract?.allowances ?? null,
@@ -1828,6 +2194,7 @@ export class StoresPayrollPart {
       payslip,
       rules: p.contract ? rules : [],
       currentStintEarned: split?.currentStintEarned ?? null,
+      wageRate,
     };
   }
 
@@ -3023,14 +3390,17 @@ export class StoresPayrollPart {
     const amount = Number(row.earnedBaseSalary);
     // Nothing priced: no rate and no earned amount.
     if (!(rate > 0) && !(amount > 0)) return null;
+    // Đơn giá theo ca / vị trí / khung giờ: hiện đơn giá bình quân thực trả,
+    // không phải lương hợp đồng, và không hiện công thức "đơn giá × số lượng".
+    const wageRate = live?.wageRate ?? null;
     const breakdown = describeEarnedBase({
       paymentType: row.paymentType,
-      rate: row.baseSalary,
+      rate: wageRate != null ? Math.round(wageRate) : row.baseSalary,
       facts: live?.facts ?? null,
       standardWorkingDays: live?.standardWorkingDays ?? 0,
       calendarDays: month.calendarDays,
       amount: row.earnedBaseSalary,
-      mixedRates: live?.mixedRates ?? false,
+      mixedRates: (live?.mixedRates ?? false) || wageRate != null,
     });
     return breakdown.reproducible
       ? breakdown
@@ -3049,12 +3419,14 @@ export class StoresPayrollPart {
     }
     return describeEarnedBase({
       paymentType: payslip.paymentType,
-      rate: payslip.baseSalary,
+      rate: live.wageRate != null ? Math.round(live.wageRate) : payslip.baseSalary,
       facts: live.facts,
       standardWorkingDays: live.standardWorkingDays,
       calendarDays: live.calendarDays,
       amount: payslip.earnedBaseSalary,
-      mixedRates: live.mixedRates,
+      // Nhiều đơn giá trong tháng: số lượng × đơn giá bình quân không ra
+      // đúng từng đồng, nên app không hiện công thức.
+      mixedRates: live.mixedRates || live.wageRate != null,
     });
   }
 
@@ -3195,6 +3567,7 @@ export class StoresPayrollPart {
       // Same-month rehire: the earned base was priced per stint.
       mixedRates: currentStintEarned != null,
       contract: activeContract,
+      wageRate: composed.wageRate,
     };
   }
 
@@ -4853,6 +5226,8 @@ export class StoresPayrollPart {
       relations: [
         'shiftSlot',
         'shiftSlot.cycle',
+        // Giờ của ca mẫu: cửa sổ ca cho đơn giá theo khung giờ.
+        'shiftSlot.workShift',
         'employee',
         'employee.contracts',
       ],
@@ -4988,22 +5363,48 @@ export class StoresPayrollPart {
           if (stintStart && workDate !== null && workDate < stintStart) {
             targets.length = 0;
           } else if (!loadedIds.has(assignment.id)) {
+            const window = effectiveWindowOf(assignment);
             targets.push({
               id: assignment.id,
               workDate: workDate ?? '',
+              workShiftId: assignment.shiftSlot?.workShiftId ?? null,
               status: assignment.status,
+              checkInTime: assignment.checkInTime ?? null,
+              checkOutTime: assignment.checkOutTime ?? null,
+              windowStart: window.start,
+              windowEnd: window.end,
               workedMinutes: assignment.workedMinutes,
               shiftEarnings: assignment.shiftEarnings,
             });
           }
 
+          // Đơn giá theo ca / vị trí / khung giờ: số lưu của ca dùng đúng đơn
+          // giá phiếu lương dùng cho ca đó.
+          const wage = await this.loadWagePricing(
+            storeId,
+            assignment.employeeId,
+            activeContract.paymentType,
+            manager,
+          );
           for (const target of targets) {
+            const shiftRate = wage
+              ? wageRateForShift({
+                  rules: wage.rules,
+                  unit: wage.unit,
+                  fallbackRate: rate,
+                  shift: {
+                    workShiftId: target.workShiftId ?? null,
+                    roleId: wage.roleId,
+                    ...wageIntervalOf(target),
+                  },
+                })
+              : rate;
             // Shared with the shift-estimate path. A null result means no rule
             // covers this payment type; the stored figure is then left
             // untouched.
             const shiftEarnings = calculateShiftEarnings({
               paymentType: activeContract.paymentType,
-              baseSalary: rate,
+              baseSalary: shiftRate,
               hours: Number(target.workedMinutes || 0) / 60,
               referenceDate: workDate
                 ? vnMiddayInstant(workDate)

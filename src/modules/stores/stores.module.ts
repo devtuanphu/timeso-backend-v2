@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { Store } from './entities/store.entity';
 import { StoreEmployeeType } from './entities/store-employee-type.entity';
 import { StoreWorkType } from './entities/store-work-type.entity';
+import { StoreWageRate } from './entities/store-wage-rate.entity';
 import { StoreLadder } from './entities/store-ladder.entity';
 import { StoreLadderRung } from './entities/store-ladder-rung.entity';
 import { StoreLadderEdge } from './entities/store-ladder-edge.entity';
@@ -154,6 +155,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
       Store,
       StoreEmployeeType,
       StoreWorkType,
+      StoreWageRate,
       StoreLadder,
       StoreDepartment,
       CareerRequirement,

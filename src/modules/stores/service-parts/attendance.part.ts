@@ -2269,15 +2269,27 @@ export class StoresAttendancePart {
       const workDate = String(active.shiftSlot?.workDate ?? '').slice(0, 10);
       const month = vnMonthOfDateString(workDate) ?? vnMonthOf(new Date());
       if (contract) {
-        const { rate } = await this.resolveRateForMonth(
+        const { rate: contractRate } = await this.resolveRateForMonth(
           employeeProfileId,
           contract,
           month,
         );
+        // Đơn giá theo ca / vị trí / khung giờ: bình quân trên giờ theo lịch
+        // của ca (con số chạy ở app là ước tính; phiếu lương chia đúng khung).
+        const shiftWindow = effectiveWindowOf(active);
+        const rate = await this.wageRateOfShift({
+          storeId,
+          employeeProfileId,
+          paymentType: contract.paymentType,
+          contractRate: Number(contractRate) || 0,
+          workShiftId: active.shiftSlot?.workShiftId ?? null,
+          from: shiftWindow.start,
+          to: shiftWindow.end,
+        });
         if (contract.paymentType === PaymentType.HOUR) {
           ratePerMinute = Number(rate) > 0 ? Number(rate) / 60 : 0;
         } else {
-          const window = effectiveWindowOf(active);
+          const window = shiftWindow;
           const hours =
             window.start && window.end
               ? (window.end.getTime() - window.start.getTime()) / 3_600_000

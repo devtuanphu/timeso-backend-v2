@@ -96,6 +96,8 @@ import {
 } from '../../notifications/entities/notification.entity';
 import { ACTIVITY_ACTIONS, toActivityDate } from '../activity-log.summary';
 import { calculateShiftEarnings } from '../shift-earnings.utils';
+import { wageRateForShift } from '../wage-rates.utils';
+import { effectiveWindowOf } from '../attendance-time.utils';
 import { countWorkingDaysInMonth } from '../working-days.utils';
 import {
   vnDateString,
@@ -3527,6 +3529,15 @@ export class StoresSchedulingPart {
       return days;
     };
 
+    const wagePricing =
+      activeContract && employeeProfileId
+        ? await this.loadWagePricing(
+            storeId,
+            employeeProfileId,
+            activeContract.paymentType,
+          ).catch(() => null)
+        : null;
+
     // Estimated salary for a single slot from contract rate + slot duration.
     const slotSalary = (slot: ShiftSlot): number => {
       if (!activeContract || !activeContract.salaryAmount) return 0;
@@ -3537,7 +3548,21 @@ export class StoresSchedulingPart {
       let end = new Date(`1970-01-01T${endTime}Z`).getTime();
       if (end < start) end += 24 * 60 * 60 * 1000;
       const durationHours = (end - start) / 3600000;
-      const base = Number(activeContract.salaryAmount);
+      // Đơn giá theo ca / vị trí / khung giờ: ca tối có thể khác ca sáng.
+      const window = effectiveWindowOf({ shiftSlot: slot });
+      const base = wagePricing
+        ? wageRateForShift({
+            rules: wagePricing.rules,
+            unit: wagePricing.unit,
+            fallbackRate: Number(activeContract.salaryAmount),
+            shift: {
+              workShiftId: slot.workShiftId ?? null,
+              roleId: wagePricing.roleId,
+              from: window.start,
+              to: window.end,
+            },
+          })
+        : Number(activeContract.salaryAmount);
 
       // Shared with the payroll path so the quoted estimate and the amount
       // actually persisted at check-out can never diverge again. `?? 0`

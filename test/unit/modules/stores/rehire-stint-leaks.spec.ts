@@ -246,6 +246,7 @@ describe('F. monthly summary after a same-month rehire', () => {
     ]);
     service.sumApprovedAdvances = jest.fn().mockResolvedValue(0);
     service.loadStageCompletion = jest.fn().mockResolvedValue(undefined);
+    service.loadWagePricing = jest.fn().mockResolvedValue(null);
 
     const result = await service.computeEmployeePayslip({
       employeeProfileId: PROFILE,

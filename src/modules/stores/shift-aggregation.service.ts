@@ -368,6 +368,14 @@ const changedPlannedHours = (
     ? effect.plannedHours
     : undefined;
 
+import { StoreWageRate } from './entities/store-wage-rate.entity';
+import {
+  wageIntervalOf,
+  wageRateForShift,
+  wageRuleOf,
+  wageUnitOf,
+  type WageRateRule,
+} from './wage-rates.utils';
 @Injectable()
 export class ShiftAggregationService {
   constructor(
@@ -397,6 +405,8 @@ export class ShiftAggregationService {
     private readonly salaryAdjustmentRepo?: Repository<SalaryAdjustment>,
     @InjectRepository(BonusWorkRequest)
     private readonly bonusWorkRequestRepo?: Repository<BonusWorkRequest>,
+    @InjectRepository(StoreWageRate)
+    private readonly wageRateRepo?: Repository<StoreWageRate>,
   ) { }
 
   // ── 1. List Shift Slots ────────────────────────────────────────────────────
@@ -461,6 +471,7 @@ export class ShiftAggregationService {
 
     const rules = await this.loadActivePayrollRules(storeId);
     const daysOff = await this.loadDaysOff(storeId);
+    const wageRules = await this.loadWageRules(storeId);
     // Derived staffing/type filters require hydrated slot data. Bound the
     // hydration workload and reject larger ranges instead of silently omitting
     // slots after an arbitrary cap.
@@ -493,7 +504,7 @@ export class ShiftAggregationService {
     );
     const slots = rawSlots
       .map((slot) =>
-        this.mapSlotToResponse(slot, rules, daysOff, leavesByEmployee, effects),
+        this.mapSlotToResponse(slot, rules, daysOff, leavesByEmployee, effects, wageRules),
       )
       .filter((s) => !staffingStatus || s.staffingStatus === staffingStatus)
       .filter((s) => !type || s.shiftType === type);
@@ -537,6 +548,7 @@ export class ShiftAggregationService {
 
     const rules = await this.loadActivePayrollRules(storeId);
     const daysOff = await this.loadDaysOff(storeId);
+    const wageRules = await this.loadWageRules(storeId);
     // Same approved-request effects as the calendar (onLeave, "!", hours).
     const effects = await this.loadShiftRequestEffects(
       storeId,
@@ -550,6 +562,7 @@ export class ShiftAggregationService {
       daysOff,
       await this.loadApprovedLeavesForSlots([slot]),
       effects,
+      wageRules,
     ) as ShiftDetailResponse;
     response.shiftName = slot.workShift?.shiftName || 'Ca làm việc';
     response.date = this.formatDateVn(slot.workDate);
@@ -686,6 +699,7 @@ export class ShiftAggregationService {
       throw new BadRequestException('Năm hoặc tháng không hợp lệ');
     }
     const daysOff = await this.loadDaysOff(storeId);
+    const wageRules = await this.loadWageRules(storeId);
     const lastDay = new Date(year, month, 0).getDate();
     const from = `${year}-${String(month).padStart(2, '0')}-01`;
     const to = `${year}-${String(month).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
@@ -747,6 +761,7 @@ export class ShiftAggregationService {
             slot,
             daysOff,
             changedPlannedHours(effects.get(a.id)),
+            wageRules,
           ),
         0,
       );
@@ -999,6 +1014,7 @@ export class ShiftAggregationService {
 
     if (!emp) return null;
     const daysOff = await this.loadDaysOff(storeId);
+    const wageRules = await this.loadWageRules(storeId);
 
     // A rehired employee's grid (staff calendar and income cards, owner
     // per-employee grid) shows only the current stint: shifts from the VN
@@ -1056,7 +1072,7 @@ export class ShiftAggregationService {
       const dateStr = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
       return approvedLeaves.some((leave) => leaveCoversShift(leave, dateStr, a.id));
     };
-    const earned = await this.computeEarnedSalaries(assignments, daysOff);
+    const earned = await this.computeEarnedSalaries(assignments, daysOff, wageRules);
 
     // Approved late arrival / early leave / overtime: the times in force.
     const requestEffects = await this.loadShiftRequestEffects(
@@ -1092,7 +1108,13 @@ export class ShiftAggregationService {
         ? 0
         : completed
           ? (earnedSalary ?? 0)
-          : this.estimateAssignmentSalary(a, undefined, daysOff, planned ?? undefined);
+          : this.estimateAssignmentSalary(
+              a,
+              undefined,
+              daysOff,
+              planned ?? undefined,
+              wageRules,
+            );
       const scheduledStart =
         a.shiftSlot?.startTime || a.shiftSlot?.workShift?.startTime || '';
       const scheduledEnd =
@@ -1261,6 +1283,8 @@ export class ShiftAggregationService {
     daysOff?: WeekDay[] | null,
     /** Hours planned now (approved late / early / overtime); default: the slot. */
     plannedHours?: number,
+    /** The store's wage rates by shift / position / time of day. */
+    wageRules: WageRateRule[] = [],
   ): number {
     // Chỉ tính lương khi nhân viên đã đăng ký xong VÀ được duyệt.
     // PENDING (chờ owner duyệt) chưa được cộng vào lương dự kiến.
@@ -1279,7 +1303,26 @@ export class ShiftAggregationService {
       (c: any) => c.isActive,
     );
     const base = Number(contract?.salaryAmount) || 0;
-    if (!base) return 0;
+    // Đơn giá theo ca / vị trí / khung giờ, trên giờ theo lịch của ca (giờ
+    // đã duyệt đi muộn / về sớm / tăng ca nếu có).
+    const unit = wageUnitOf(contract?.paymentType);
+    const rate =
+      unit && wageRules.length
+        ? wageRateForShift({
+            rules: wageRules,
+            unit,
+            fallbackRate: base,
+            shift: {
+              workShiftId: s?.workShiftId ?? null,
+              roleId: (a.employee as any)?.storeRoleId ?? null,
+              ...(() => {
+                const w = effectiveWindowOf({ ...a, shiftSlot: s ?? a.shiftSlot });
+                return { from: w.start, to: w.end };
+              })(),
+            },
+          })
+        : base;
+    if (!rate) return 0;
 
     // Same per-shift formula as the check-out path (shift-earnings.utils):
     // MONTH is the monthly salary over the store's standard working days of
@@ -1288,7 +1331,7 @@ export class ShiftAggregationService {
     return (
       calculateShiftEarnings({
         paymentType: contract.paymentType,
-        baseSalary: base,
+        baseSalary: rate,
         hours: plannedHours ?? this.slotDurationHours(s),
         referenceDate: vnMiddayInstant(workDate),
         workingDaysInMonth: this.workingDaysFor(workDate, daysOff),
@@ -1356,6 +1399,7 @@ export class ShiftAggregationService {
   private async computeEarnedSalaries(
     assignments: ShiftAssignment[],
     daysOff: WeekDay[] | null,
+    wageRules: WageRateRule[] = [],
   ): Promise<Map<string, { amount: number; pending: boolean }>> {
     const result = new Map<string, { amount: number; pending: boolean }>();
     const completed = assignments.filter(
@@ -1407,7 +1451,29 @@ export class ShiftAggregationService {
       const workDate = String(a.shiftSlot?.workDate ?? '').slice(0, 10);
       const monthKey = vnMonthOfDateString(workDate)?.key;
       const adjusted = monthKey ? rateByMonth.get(monthKey) : undefined;
-      const rate = adjusted ?? (Number(contract?.salaryAmount) || 0);
+      const contractRate = adjusted ?? (Number(contract?.salaryAmount) || 0);
+      // Đơn giá theo ca / vị trí / khung giờ, như số lưu lúc ra ca.
+      const unit = wageUnitOf(contract?.paymentType);
+      const window = effectiveWindowOf(a);
+      const rate =
+        unit && wageRules.length
+          ? wageRateForShift({
+              rules: wageRules,
+              unit,
+              fallbackRate: contractRate,
+              shift: {
+                workShiftId: a.shiftSlot?.workShiftId ?? null,
+                roleId: (a.employee as any)?.storeRoleId ?? null,
+                ...wageIntervalOf({
+                  checkInTime: a.checkInTime,
+                  checkOutTime: a.checkOutTime,
+                  windowStart: window.start,
+                  windowEnd: window.end,
+                  workedMinutes: a.workedMinutes,
+                }),
+              },
+            })
+          : contractRate;
       const amount = contract
         ? (calculateShiftEarnings({
             paymentType: contract.paymentType,
@@ -1424,6 +1490,17 @@ export class ShiftAggregationService {
   }
 
   /** The store's weekly days off (null when it has no shift config). */
+  /** Đơn giá theo ca / vị trí / khung giờ của cửa hàng (lỗi đọc: không áp). */
+  private async loadWageRules(storeId: string): Promise<WageRateRule[]> {
+    if (!this.wageRateRepo) return [];
+    try {
+      const rows = await this.wageRateRepo.find({ where: { storeId } });
+      return rows.map(wageRuleOf);
+    } catch {
+      return [];
+    }
+  }
+
   private async loadDaysOff(storeId: string): Promise<WeekDay[] | null> {
     const config = await this.shiftConfigRepo.findOne({
       where: { storeId },
@@ -1694,12 +1771,19 @@ export class ShiftAggregationService {
     daysOff?: WeekDay[] | null,
     leavesByEmployee: Map<string, EmployeeLeaveRequest[]> = new Map(),
     effects: Map<string, ShiftRequestEffects> = new Map(),
+    wageRules: WageRateRule[] = [],
   ): ShiftSlotResponse {
     // Approved absence: nothing planned; otherwise the hours in force.
     const plannedSalary = (a: ShiftAssignment) => {
       const effect = effects.get(a.id);
       if (effect?.onLeave) return 0;
-      return this.estimateAssignmentSalary(a, slot, daysOff, changedPlannedHours(effect));
+      return this.estimateAssignmentSalary(
+        a,
+        slot,
+        daysOff,
+        changedPlannedHours(effect),
+        wageRules,
+      );
     };
     const activeAssignments = (slot.assignments || []).filter(
       (a) => a.status !== ShiftAssignmentStatus.CANCELLED,
@@ -1888,6 +1972,7 @@ export class ShiftAggregationService {
 
   private async calcSummary(storeId: string, from: string, to: string) {
     const daysOff = await this.loadDaysOff(storeId);
+    const wageRules = await this.loadWageRules(storeId);
     const [assignments, slotResult, leaveRows] = await Promise.all([
       this.shiftAssignmentRepo
         .createQueryBuilder('sa')
@@ -1966,6 +2051,7 @@ export class ShiftAggregationService {
         undefined,
         daysOff,
         changedPlannedHours(effect),
+        wageRules,
       );
       totalHours +=
         a.workedMinutes && a.workedMinutes > 0

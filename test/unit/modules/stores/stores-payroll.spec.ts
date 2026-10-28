@@ -2233,6 +2233,8 @@ describe('StoresService - salary screen: current month live, past months stored 
     h.repo(ShiftAssignment).createQueryBuilder.mockImplementation(() =>
       listQuery(rows),
     );
+    // No wage rates (đơn giá theo ca / vị trí): the contract prices the month.
+    (h.service as any).loadWagePricing = jest.fn().mockResolvedValue(null);
     return h;
   }
 

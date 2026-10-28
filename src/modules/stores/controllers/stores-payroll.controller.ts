@@ -6,6 +6,7 @@ import {
   Delete,
   Patch,
   Body,
+  ParseUUIDPipe,
   UseGuards,
   Param,
   Query,
@@ -55,6 +56,7 @@ import {
 import { ConfigStatus } from '../entities/salary-config.entity';
 import { UpdatePayrollSettingDto } from '../dto/store-payroll-setting.dto';
 import { SavePayslipRowsDto } from '../dto/payslip-rows.dto';
+import { SaveWageRatesDto } from '../dto/wage-rates.dto';
 
 /**
  * StoresPayrollController: routes split out of StoresController by domain. Same prefix,
@@ -156,6 +158,26 @@ export class StoresPayrollController {
     @Body() body: SavePayslipRowsDto,
   ) {
     return this.storesService.savePayslipRows(id, body);
+  }
+
+  // Đơn giá lương theo ca / vị trí / khung giờ
+  @StoreOwnerOnly()
+  @Get(':id/wage-rates')
+  @ApiOperation({ summary: 'Đơn giá lương theo ca / vị trí / khung giờ (kèm ca và vị trí để chọn)' })
+  async getWageRates(@Param('id', ParseUUIDPipe) id: string) {
+    return this.storesService.getWageRates(id);
+  }
+
+  @StoreOwnerOnly()
+  @Put(':id/wage-rates')
+  @ApiOperation({
+    summary: 'Thay danh sách đơn giá lương, tính lại phiếu lương tháng này',
+  })
+  async saveWageRates(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() body: SaveWageRatesDto,
+  ) {
+    return this.storesService.saveWageRates(id, body);
   }
 
   // Monthly Payrolls
