@@ -16,6 +16,7 @@ import {
   Repository,
 } from 'typeorm';
 import { stintFloor, stintStartVnDate } from './employment-stint.utils';
+import { ymdOf } from './work-terms.utils';
 import { ActivityLogService } from './activity-log.service';
 import { ACTIVITY_ACTIONS } from './activity-log.summary';
 import { SaveStageDto } from './dto/career-stage.dto';
@@ -1639,9 +1640,15 @@ export class CareerLadderService {
     }
 
     if (c.kind === CriteriaKind.TENURE) {
-      const enteredAt = await this.rungEnteredAt(profile.id, ladder.id);
+      // Thâm niên ở bậc không tính những ngày trước ngày chính thức vào làm
+      // (nhân viên được thêm vào app sớm hơn ngày bắt đầu làm).
+      const rungAt = await this.rungEnteredAt(profile.id, ladder.id);
+      const startDate = ymdOf(profile.officialStartDate);
+      const startAt = startDate ? new Date(Date.parse(`${startDate}T00:00:00+07:00`)) : null;
+      const enteredAt =
+        rungAt && startAt && startAt.getTime() > rungAt.getTime() ? startAt : rungAt;
       const days = enteredAt
-        ? Math.floor((Date.now() - enteredAt.getTime()) / 86_400_000)
+        ? Math.max(0, Math.floor((Date.now() - enteredAt.getTime()) / 86_400_000))
         : 0;
       return {
         ...base,

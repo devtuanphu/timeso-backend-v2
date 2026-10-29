@@ -9,13 +9,16 @@
  * - `terminationReasonId` / `terminationReason`: the owner's classification of
  *   a termination (normally null for an employed self, stripped defensively).
  *
- * The profile/contract/account entities carry no owner-note or reviewer-note
- * column; if one is added, list it here.
+ * - `ownerNote`: the owner's note on the employee's wishes. The column is
+ *   also `select: false`, so other profile reads never carry it.
+ *
+ * List any other owner-note or reviewer-note column here when one is added.
  */
 export const OWNER_PRIVATE_EMPLOYEE_PROFILE_FIELDS = [
   'capabilityPoints',
   'terminationReasonId',
   'terminationReason',
+  'ownerNote',
 ] as const;
 
 /** Removes owner-private fields from an employee-detail response for a self read. */

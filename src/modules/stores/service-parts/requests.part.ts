@@ -81,6 +81,7 @@ import {
   OVERTIME_SHIFT_MISMATCH,
   CLEARED_SHIFT_REQUEST_EFFECTS,
 } from './shared';
+import { swapTargetNotStarted } from '../work-terms.utils';
 import type { StoresService } from '../stores.service';
 
 /**
@@ -347,6 +348,16 @@ export class StoresRequestsPart {
           throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
         }
         if (status === 'APPROVED' && swap.fromAssignment) {
+          // Người nhận ca chưa tới ngày chính thức vào làm (work-terms.utils.ts),
+          // đọc dưới khoá cửa hàng.
+          const receiver = await manager.findOne(EmployeeProfile, {
+            where: { id: swap.toEmployeeId },
+            select: ['id', 'officialStartDate'],
+          });
+          const notStarted = receiver
+            ? swapTargetNotStarted(receiver, swap.fromAssignment.shiftSlot?.workDate)
+            : null;
+          if (notStarted) throw new BadRequestException(notStarted);
           const result = await manager.update(
             ShiftAssignment,
             {

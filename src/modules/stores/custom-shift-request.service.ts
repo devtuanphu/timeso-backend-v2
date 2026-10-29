@@ -42,6 +42,8 @@ import {
 } from './custom-shift-request.utils';
 import { OWNER_APPROVAL_ROUTE } from './owner-notification.utils';
 import { lockStoreShiftAvailability } from './shift-availability-lock';
+import { loadBookedWorkDates, workTermError } from './work-terms.query';
+import { hasWorkTerms, workTermViolation, workTermsOf } from './work-terms.utils';
 import {
   ShiftRecurrenceEndType,
   ShiftRecurrenceFrequency,
@@ -143,6 +145,26 @@ export class CustomShiftRequestService {
     let saved: CustomShiftRequest;
     try {
       saved = await this.dataSource.transaction(async (manager) => {
+        // Điều kiện làm việc riêng (work-terms.utils.ts), như khi tự đăng ký
+        // ca: ngày vào làm, nghỉ cố định, số ngày tuần / tháng tính dồn qua
+        // các ngày xin. Lúc chủ duyệt thì chỉ còn chặn ngày vào làm.
+        const terms = workTermsOf(profile);
+        if (hasWorkTerms(terms)) {
+          await lockStoreShiftAvailability(manager, storeId);
+          const dates = expandCustomShiftDates(
+            normalized.startDate,
+            normalized.endDate,
+            normalized.daysOfWeek,
+          );
+          const booked =
+            (await loadBookedWorkDates(manager, storeId, [profile.id], dates)).get(profile.id) ??
+            new Set<string>();
+          for (const date of [...dates].sort()) {
+            const violation = workTermViolation(terms, date, booked);
+            if (violation) throw workTermError(violation);
+            booked.add(date);
+          }
+        }
         const row = await manager.save(
           CustomShiftRequest,
           manager.create(CustomShiftRequest, {

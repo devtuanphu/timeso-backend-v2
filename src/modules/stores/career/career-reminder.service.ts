@@ -3,12 +3,7 @@ import { DataSource } from 'typeorm';
 
 import { NotificationsService } from '../../notifications/notifications.service';
 import { NotificationType } from '../../notifications/entities/notification.entity';
-import {
-  EMPLOYED_STATUSES,
-  EmployeeProfile,
-} from '../entities/employee-profile.entity';
 import { StoreCareerSetting } from '../entities/store-career-setting.entity';
-import { SkillConfirmation } from '../entities/store-skill.entity';
 import { CareerEvaluationService } from './career-evaluation.service';
 import { ReviewFrequency, reviewPeriodKey } from './career-time';
 
@@ -70,8 +65,9 @@ export class CareerReminderService {
           type: NotificationType.SYSTEM,
           title: 'Đến kỳ rà soát lộ trình thăng tiến',
           content: this.content(summary),
-          // App chủ: màn Thiết lập lộ trình thăng tiến.
-          actionUrl: '/manager/promotion-ladder',
+          // App chủ: màn lộ trình, mở thẳng danh sách "Chờ kiểm duyệt". App
+          // cũ không biết `tab=review` thì mở tab đầu như trước.
+          actionUrl: '/manager/promotion-ladder?tab=review',
           metadata: { storeId: store.store_id, period, ...summary },
         } as any);
         sent += 1;
@@ -94,27 +90,15 @@ export class CareerReminderService {
       : 'Rà soát bộ phận, vị trí và kỹ năng của cửa hàng.';
   }
 
-  /** Số việc chờ chủ: người đủ điều kiện bước kế, kỹ năng đủ điều kiện chờ xác nhận. */
+  /**
+   * Số việc chờ chủ: người đủ điều kiện bước kế, kỹ năng đủ điều kiện chờ xác
+   * nhận — đếm từ đúng danh sách của màn "Chờ kiểm duyệt".
+   */
   private async summarize(storeId: string) {
-    const m = this.dataSource.manager;
-    const graph = await this.evaluation.loadGraph(m, storeId);
-    const profiles = await m
-      .getRepository(EmployeeProfile)
-      .createQueryBuilder('p')
-      .where('p.storeId = :storeId', { storeId })
-      .andWhere('p.employmentStatus IN (:...statuses)', { statuses: [...EMPLOYED_STATUSES] })
-      .getMany();
-    let eligiblePromotions = 0;
-    let awaitingSkills = 0;
-    for (const profile of profiles) {
-      const ctx = this.evaluation.context(m, profile);
-      const next = await this.evaluation.nextTarget(ctx, graph);
-      if (next?.passed) eligiblePromotions += 1;
-      const skills = await this.evaluation.skillStates(ctx, graph);
-      awaitingSkills += skills.filter(
-        (s) => s.status === 'awaiting_confirmation' && s.confirmation === SkillConfirmation.MANAGER,
-      ).length;
-    }
-    return { eligiblePromotions, awaitingSkills };
+    const pending = await this.evaluation.getPendingReviews(storeId);
+    return {
+      eligiblePromotions: pending.promotions.length,
+      awaitingSkills: pending.skills.length,
+    };
   }
 }

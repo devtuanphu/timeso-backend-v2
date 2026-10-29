@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray,
   IsBoolean,
+  IsDateString,
   IsEnum,
   IsInt,
   IsNumber,
@@ -137,6 +138,15 @@ export class EmployeeWorkAssignmentDto {
   @ValidateNested()
   @Type(() => ExistingEmployeeContractDto)
   contract?: ExistingEmployeeContractDto;
+
+  /**
+   * Ngày chính thức vào làm (VN, 'YYYY-MM-DD'); không gửi thì lấy ngày bắt
+   * đầu của hợp đồng (ô "Ngày bắt đầu làm" của form thêm nhân viên, kể cả ở
+   * bản app cũ). Xem work-terms.utils.ts.
+   */
+  @IsOptional()
+  @IsDateString({ strict: true }, { message: 'Ngày vào làm không hợp lệ' })
+  officialStartDate?: string;
 }
 
 export class AddExistingEmployeeDto extends EmployeeWorkAssignmentDto {

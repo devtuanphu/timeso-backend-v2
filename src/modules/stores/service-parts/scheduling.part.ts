@@ -30,6 +30,18 @@ import {
   LeaveRequestStatus,
 } from '../entities/employee-leave-request.entity';
 import { stintFloor } from '../employment-stint.utils';
+import { loadBookedWorkDates, workTermError } from '../work-terms.query';
+import {
+  WORK_TERM_ERROR_CODES,
+  WorkTermViolation,
+  notStartedViolation,
+  workTermViolation,
+  workTermWarnings,
+  workTermsOf,
+  hasWorkTerms,
+  swapTargetNotStarted,
+  ymdOf,
+} from '../work-terms.utils';
 import {
   WorkCycle,
   ShiftSlot,
@@ -155,6 +167,17 @@ type ShiftEmployeeAvailability =
   | 'OTHER_SHIFT'
   | 'CONFLICT'
   | 'ON_LEAVE';
+
+/** Chủ xếp ca trước ngày chính thức vào làm của nhân viên. */
+const ownerNotStartedError = (startDate: string | null, name?: string | null) => {
+  const day = startDate
+    ? `${startDate.slice(8, 10)}/${startDate.slice(5, 7)}/${startDate.slice(0, 4)}`
+    : '';
+  return new BadRequestException({
+    code: WORK_TERM_ERROR_CODES.NOT_STARTED,
+    message: `${name || 'Nhân viên'} vào làm chính thức từ ${day}, chưa xếp ca trước ngày này được.`,
+  });
+};
 
 const MAX_GENERATED_SHIFT_ASSIGNMENTS = 10000;
 
@@ -1017,6 +1040,17 @@ export class StoresSchedulingPart {
       CONFLICT: 'Trùng ca',
       ON_LEAVE: 'Nghỉ phép',
     };
+    // Điều kiện làm việc riêng (work-terms.utils.ts). Chỉ đọc ngày đã có ca
+    // khi có người đặt giới hạn số ngày.
+    const limitedIds = employees
+      .filter((employee) => {
+        const terms = workTermsOf(employee);
+        return terms.workDaysPerWeek !== null || terms.workDaysPerMonth !== null;
+      })
+      .map((employee) => employee.id);
+    const bookedByEmployee = limitedIds.length
+      ? await loadBookedWorkDates(this.dataSource.manager, storeId, limitedIds, workDates)
+      : new Map<string, Set<string>>();
 
     const options = employees
       .map((employee) => {
@@ -1040,6 +1074,19 @@ export class StoresSchedulingPart {
               ? 'OTHER_SHIFT'
               : 'AVAILABLE';
 
+        // Trước ngày chính thức vào làm: không chọn được (commit cũng chặn).
+        // Giữ nguyên `availability` để app cũ không gặp giá trị lạ; app cũ
+        // vẫn đọc `selectable` / `statusLabel` nên vẫn thấy đúng.
+        const terms = workTermsOf(employee);
+        const notStarted = workDates
+          .map((workDate) => notStartedViolation(terms, workDate))
+          .find(Boolean);
+        const warnings = workTermWarnings(
+          terms,
+          workDates,
+          bookedByEmployee.get(employee.id) ?? new Set(),
+        );
+
         return {
           id: employee.id,
           name: employee.account?.fullName || 'Nhân viên',
@@ -1047,9 +1094,12 @@ export class StoresSchedulingPart {
           position: employee.storeRole?.name || null,
           employmentType: employee.employeeType?.name || null,
           availability,
-          statusLabel: statusLabels[availability],
+          statusLabel: notStarted ? notStarted.label : statusLabels[availability],
           selectable:
-            availability === 'AVAILABLE' || availability === 'OTHER_SHIFT',
+            !notStarted &&
+            (availability === 'AVAILABLE' || availability === 'OTHER_SHIFT'),
+          /** Mới (cộng thêm): nghỉ cố định / vượt số ngày — chủ vẫn xếp được. */
+          workTermWarnings: warnings,
           otherShifts: (otherShiftsByEmployee.get(employee.id) || []).sort(
             (left, right) =>
               left.workDate.localeCompare(right.workDate) ||
@@ -1095,12 +1145,29 @@ export class StoresSchedulingPart {
         storeId,
         employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
-      select: ['id', 'storeId', 'employmentStatus'],
+      select: {
+        id: true,
+        storeId: true,
+        employmentStatus: true,
+        officialStartDate: true,
+        account: { id: true, fullName: true },
+      },
+      relations: { account: true },
     });
     if (employees.length !== employeeIds.length) {
       throw new BadRequestException(
         'Một hoặc nhiều nhân viên không còn hoạt động tại cửa hàng này',
       );
+    }
+    // Ngày chính thức vào làm chặn cả chủ (work-terms.utils.ts).
+    for (const employee of employees) {
+      const terms = workTermsOf(employee);
+      if (workDates.some((workDate) => notStartedViolation(terms, workDate))) {
+        throw ownerNotStartedError(
+          terms.officialStartDate,
+          employee.account?.fullName,
+        );
+      }
     }
 
     const rangeStart = addDays(workDates[0], -1);
@@ -3829,6 +3896,28 @@ export class StoresSchedulingPart {
           throw new BadRequestException('Nhân viên đã đăng ký ca này');
         }
 
+        // Điều kiện làm việc riêng (work-terms.utils.ts): ngày vào làm chính
+        // thức chặn cả chủ; nghỉ cố định / giới hạn số ngày chỉ chặn nhân viên
+        // tự đăng ký — chủ xếp ca thì đã thấy cảnh báo ở danh sách chọn. Đếm
+        // ngày trong transaction đang giữ khoá cửa hàng nên hai lần đăng ký
+        // song song không cùng lọt qua giới hạn.
+        const terms = workTermsOf(employee);
+        const slotDate = ymdOf(slot.workDate);
+        if (slotDate && hasWorkTerms(terms)) {
+          if (authorizedOwnerAssign) {
+            const notStarted = notStartedViolation(terms, slotDate);
+            if (notStarted) throw ownerNotStartedError(terms.officialStartDate);
+          } else {
+            const booked = await loadBookedWorkDates(manager, storeId, [employeeId], [slotDate]);
+            const violation = workTermViolation(
+              terms,
+              slotDate,
+              booked.get(employeeId) ?? new Set(),
+            );
+            if (violation) throw workTermError(violation);
+          }
+        }
+
         // Create and save assignment
         const assignment = manager.create(ShiftAssignment, {
           shiftSlotId: slotId,
@@ -4284,12 +4373,15 @@ export class StoresSchedulingPart {
         storeId,
         employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
       },
-      select: ['id'],
+      select: ['id', 'officialStartDate'],
     });
     if (!target)
       throw new BadRequestException(
         'Nhân viên nhận ca không thuộc cửa hàng hoặc đã ngừng hoạt động',
       );
+    // Người nhận ca chưa tới ngày chính thức vào làm (work-terms.utils.ts).
+    const notStarted = swapTargetNotStarted(target, source.shiftSlot?.workDate);
+    if (notStarted) throw new BadRequestException(notStarted);
     if (source.status === ShiftAssignmentStatus.CANCELLED)
       throw new BadRequestException('Assignment đã bị hủy');
     const swap = this.shiftSwapRepository.create({
@@ -4400,7 +4492,7 @@ export class StoresSchedulingPart {
           storeId,
           employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
         },
-        select: ['id'],
+        select: ['id', 'officialStartDate'],
       });
       if (!lockedTarget) {
         throw new BadRequestException(
@@ -4408,6 +4500,13 @@ export class StoresSchedulingPart {
         );
       }
       if (nextStatus === ShiftSwapStatus.APPROVED) {
+        // Ngày vào làm có thể đã được đặt sau khi gửi yêu cầu: kiểm lại
+        // dưới khoá cửa hàng (cùng khoá với lúc chủ đổi ngày vào làm).
+        const notStarted = swapTargetNotStarted(
+          lockedTarget,
+          swap.fromAssignment?.shiftSlot?.workDate,
+        );
+        if (notStarted) throw new BadRequestException(notStarted);
         const assignmentResult = await manager.update(
           ShiftAssignment,
           {
@@ -4894,6 +4993,11 @@ export class StoresSchedulingPart {
           'Không tìm thấy ca làm việc nào phù hợp với thời gian và các ngày đã chọn.',
         );
       }
+      // Giới hạn số ngày tuần / tháng đếm theo thứ tự ngày: ngày sớm được
+      // đăng ký trước, phần vượt về cuối kỳ bị bỏ qua.
+      matchedSlots.sort((left, right) =>
+        String(ymdOf(left.workDate)).localeCompare(String(ymdOf(right.workDate))),
+      );
 
       return this.dataSource.transaction(async (manager) => {
         await lockStoreShiftAvailability(manager, data.storeId);
@@ -4917,6 +5021,25 @@ export class StoresSchedulingPart {
         ) {
           throw new ForbiddenException('Nhân viên không thuộc cửa hàng này');
         }
+
+        // Điều kiện làm việc riêng (work-terms.utils.ts): ngày bị chặn được
+        // bỏ qua như ca đã đầy; nếu không còn ngày nào thì báo đúng lý do.
+        const terms = workTermsOf(employee);
+        const applyTerms = hasWorkTerms(terms);
+        const bookedDates = applyTerms
+          ? ((
+              await loadBookedWorkDates(
+                manager,
+                data.storeId,
+                [employee.id],
+                matchedSlots
+                  .map((slot) => ymdOf(slot.workDate))
+                  .filter((date): date is string => !!date),
+              )
+            ).get(employee.id) ?? new Set<string>())
+          : new Set<string>();
+        let firstViolation: WorkTermViolation | null = null;
+        let skippedByWorkTerms = 0;
 
         const now = new Date();
 
@@ -4979,6 +5102,16 @@ export class StoresSchedulingPart {
             continue; // Already registered, skip
           }
 
+          const slotDate = ymdOf(lockedSlot.workDate);
+          if (applyTerms && slotDate) {
+            const violation = workTermViolation(terms, slotDate, bookedDates);
+            if (violation) {
+              firstViolation ??= violation;
+              skippedByWorkTerms++;
+              continue;
+            }
+          }
+
           // Create assignment
           const assignment = manager.create(ShiftAssignment, {
             shiftSlotId: lockedSlot.id,
@@ -4987,9 +5120,13 @@ export class StoresSchedulingPart {
             status: ShiftAssignmentStatus.PENDING,
           });
           await manager.save(assignment);
+          if (slotDate) bookedDates.add(slotDate);
           successCount++;
         }
 
+        if (successCount === 0 && firstViolation) {
+          throw workTermError(firstViolation);
+        }
         if (successCount === 0) {
           throw new BadRequestException(
             'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
@@ -5012,7 +5149,12 @@ export class StoresSchedulingPart {
           },
         });
 
-        return { successCount };
+        // `skippedByWorkTerms` (mới, cộng thêm, chỉ có khi > 0): số ca (slot)
+        // bỏ qua vì nghỉ cố định / đủ số ngày / chưa tới ngày vào làm.
+        return {
+          successCount,
+          ...(skippedByWorkTerms ? { skippedByWorkTerms } : {}),
+        };
       });
     }
 

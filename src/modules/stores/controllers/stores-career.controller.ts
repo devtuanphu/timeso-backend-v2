@@ -185,6 +185,15 @@ export class StoresCareerController {
     return this.evaluation.getPositionCandidates(storeId, positionId);
   }
 
+  @Get(':storeId/career/reviews')
+  @StoreOwnerOnly()
+  @ApiOperation({
+    summary: 'Việc chờ kiểm duyệt: NV đủ điều kiện lên bước kế, kỹ năng chờ xác nhận',
+  })
+  getPendingReviews(@Param('storeId', uuid) storeId: string) {
+    return this.evaluation.getPendingReviews(storeId);
+  }
+
   // ----- Kỹ năng -----------------------------------------------------------------
 
   @Post(':storeId/career/skills')

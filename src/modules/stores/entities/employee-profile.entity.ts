@@ -190,6 +190,34 @@ export class EmployeeProfile extends BaseEntity {
   })
   shiftPreferenceNote: string | null;
 
+  /**
+   * Ngày chính thức vào làm (VN, 'YYYY-MM-DD'), do chủ đặt; khác `joinedAt`
+   * (lúc được thêm vào app, mốc của "đợt làm"). Trước ngày này không đăng ký /
+   * xếp ca được. Null = không giới hạn. Luật ở work-terms.utils.ts.
+   */
+  @Column({ name: 'official_start_date', type: 'date', nullable: true })
+  officialStartDate: string | null;
+
+  /** Số ngày làm tối đa nhân viên tự đăng ký mỗi tuần (T2–CN); null = không giới hạn. */
+  @Column({ name: 'work_days_per_week', type: 'smallint', nullable: true })
+  workDaysPerWeek: number | null;
+
+  /** Số ngày làm tối đa nhân viên tự đăng ký mỗi tháng dương lịch; null = không giới hạn. */
+  @Column({ name: 'work_days_per_month', type: 'smallint', nullable: true })
+  workDaysPerMonth: number | null;
+
+  /** Ngày nghỉ cố định hằng tuần: 0 = Chủ nhật … 6 = Thứ 7. */
+  @Column({ name: 'fixed_days_off', type: 'smallint', array: true, default: () => "'{}'" })
+  fixedDaysOff: number[];
+
+  /**
+   * Ghi chú của chủ về mong muốn của nhân viên. Riêng của chủ: `select: false`
+   * để mọi truy vấn hồ sơ (kể cả các route nhân viên / đồng nghiệp đọc được)
+   * không mang theo; chỉ chi tiết nhân viên của chủ chọn thêm cột này.
+   */
+  @Column({ name: 'owner_note', type: 'text', nullable: true, select: false })
+  ownerNote?: string | null;
+
   @Column({
     name: 'reminder_settings',
     type: 'jsonb',

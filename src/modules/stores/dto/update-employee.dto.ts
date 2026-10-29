@@ -1,15 +1,21 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
   IsDateString,
   IsEmail,
   IsIn,
+  IsInt,
   IsNotEmpty,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateIf,
 } from 'class-validator';
 
@@ -107,4 +113,48 @@ export class UpdateEmployeeByOwnerDto {
   @ValidateIf((o) => o.workShiftId !== null && o.workShiftId !== undefined)
   @IsUUID()
   workShiftId?: string | null;
+
+  // --- Điều kiện làm việc (work-terms.utils.ts) --------------------------------
+
+  /** Ngày chính thức vào làm (VN); trước ngày này không đăng ký / xếp ca được. null = bỏ. */
+  @ApiPropertyOptional({ example: '2026-10-20', nullable: true })
+  @Transform(blankToNull)
+  @ValidateIf((o) => o.officialStartDate !== null && o.officialStartDate !== undefined)
+  @IsDateString({ strict: true }, { message: 'Ngày vào làm không hợp lệ' })
+  officialStartDate?: string | null;
+
+  /** Số ngày làm tối đa nhân viên tự đăng ký mỗi tuần (T2–CN); null = không giới hạn. */
+  @ApiPropertyOptional({ minimum: 1, maximum: 7, nullable: true })
+  @ValidateIf((o) => o.workDaysPerWeek !== null && o.workDaysPerWeek !== undefined)
+  @IsInt({ message: 'Số ngày mỗi tuần phải là số nguyên' })
+  @Min(1, { message: 'Số ngày mỗi tuần từ 1 đến 7' })
+  @Max(7, { message: 'Số ngày mỗi tuần từ 1 đến 7' })
+  workDaysPerWeek?: number | null;
+
+  /** Số ngày làm tối đa nhân viên tự đăng ký mỗi tháng; null = không giới hạn. */
+  @ApiPropertyOptional({ minimum: 1, maximum: 31, nullable: true })
+  @ValidateIf((o) => o.workDaysPerMonth !== null && o.workDaysPerMonth !== undefined)
+  @IsInt({ message: 'Số ngày mỗi tháng phải là số nguyên' })
+  @Min(1, { message: 'Số ngày mỗi tháng từ 1 đến 31' })
+  @Max(31, { message: 'Số ngày mỗi tháng từ 1 đến 31' })
+  workDaysPerMonth?: number | null;
+
+  /** Ngày nghỉ cố định hằng tuần: 0 = Chủ nhật … 6 = Thứ 7; [] = không có. */
+  @ApiPropertyOptional({ type: [Number], example: [4, 5] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(6, { message: 'Phải còn ít nhất một ngày làm trong tuần' })
+  @ArrayUnique()
+  @IsInt({ each: true })
+  @Min(0, { each: true })
+  @Max(6, { each: true })
+  fixedDaysOff?: number[];
+
+  /** Ghi chú mong muốn của nhân viên — chỉ chủ xem; null / "" = xoá. */
+  @ApiPropertyOptional({ nullable: true })
+  @Transform(blankToNull)
+  @ValidateIf((o) => o.ownerNote !== null && o.ownerNote !== undefined)
+  @IsString()
+  @MaxLength(1000, { message: 'Ghi chú tối đa 1000 ký tự' })
+  ownerNote?: string | null;
 }

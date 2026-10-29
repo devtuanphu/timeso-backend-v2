@@ -850,6 +850,91 @@ export class CareerEvaluationService {
   }
 
   /**
+   * Việc chờ chủ kiểm duyệt (màn "Chờ kiểm duyệt" và thông báo "Nhắc nhở kiểm
+   * duyệt"):
+   * - promotions: NV đang làm đủ điều kiện lên bước kế (vị trí / bộ phận);
+   * - skills: kỹ năng đủ điều kiện, cần quản lý xác nhận.
+   * Cùng luật với chi tiết NV (nextTarget, skillStates), nên con số trên thông
+   * báo, danh sách này và màn chi tiết luôn khớp nhau. Duyệt dùng chính các
+   * route promotions / skills/:skillId/confirm.
+   */
+  async getPendingReviews(storeId: string) {
+    const m = this.dataSource.manager;
+    const graph = await this.loadGraph(m, storeId);
+    const profiles = await m
+      .getRepository(EmployeeProfile)
+      .createQueryBuilder('p')
+      .leftJoinAndSelect('p.account', 'a')
+      .where('p.storeId = :storeId', { storeId })
+      .andWhere('p.employmentStatus IN (:...statuses)', { statuses: [...EMPLOYED_STATUSES] })
+      .orderBy('a.fullName', 'ASC', 'NULLS LAST')
+      .getMany();
+
+    const person = (p: EmployeeProfile) => {
+      const current = p.storeRoleId ? graph.positions.get(p.storeRoleId) : undefined;
+      const department = p.departmentId ? graph.departments.get(p.departmentId) : undefined;
+      return {
+        profileId: p.id,
+        name: p.account?.fullName ?? '',
+        avatar: p.account?.avatar ?? null,
+        currentPositionName: current && current.rank !== null ? current.name : null,
+        departmentName: department?.name ?? null,
+      };
+    };
+
+    const promotions: Array<
+      ReturnType<typeof person> & {
+        target: Pick<PromotionTarget, 'kind' | 'id' | 'name' | 'departmentName'>;
+        progress: number;
+        items: MeasuredRequirement[];
+      }
+    > = [];
+    const skills: Array<
+      ReturnType<typeof person> & {
+        skill: { id: string; name: string };
+        items: MeasuredRequirement[];
+      }
+    > = [];
+
+    for (const p of profiles) {
+      const ctx = this.context(m, p);
+      const next = await this.nextTarget(ctx, graph);
+      if (next?.passed) {
+        promotions.push({
+          ...person(p),
+          target: {
+            kind: next.kind,
+            id: next.id,
+            name: next.name,
+            departmentName: next.departmentName,
+          },
+          progress: next.progress,
+          items: next.items,
+        });
+      }
+      for (const state of await this.skillStates(ctx, graph)) {
+        if (
+          state.status === 'awaiting_confirmation' &&
+          state.confirmation === SkillConfirmation.MANAGER
+        ) {
+          skills.push({
+            ...person(p),
+            skill: { id: state.skillId, name: state.name },
+            items: state.evaluation?.items ?? [],
+          });
+        }
+      }
+    }
+
+    return {
+      reviewReminderEnabled: graph.setting?.reviewReminderEnabled ?? false,
+      reviewFrequency: graph.setting?.reviewFrequency ?? 'month',
+      promotions,
+      skills,
+    };
+  }
+
+  /**
    * Nhân viên theo một kỹ năng (tab Kỹ năng → "Xem nhân viên"):
    * - achieved: NV đang làm đã đạt (kể cả đã chuyển sang bộ phận khác);
    * - learning: NV của bộ phận kỹ năng, kỹ năng đang mở (đang học / chờ xác nhận);

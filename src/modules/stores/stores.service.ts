@@ -68,6 +68,7 @@ import { ChatGroupMember } from '../chat-groups/entities/chat-group-member.entit
 import { JobApplication, JobApplicationStatus } from './entities/job-application.entity';
 import { isSafeSelfieFilename, jobApplicationSelfieUrl } from './job-application-selfie.storage';
 import { currentStintContracts, currentStintSql, stintFloor, stintStartVnDate } from './employment-stint.utils';
+import { ymdOf } from './work-terms.utils';
 import { AttendanceLog } from './entities/attendance-log.entity';
 import { AttendanceStatus } from './entities/shift-management.entity';
 import { EmployeeAssetAssignment, AssetAssignmentStatus } from './entities/employee-asset-assignment.entity';
@@ -1637,6 +1638,8 @@ export class StoresService {
     manager: EntityManager,
     storeId: string,
     requestedTypeId?: string | null,
+    /** Mốc tính hạn thử việc: ngày vào làm chính thức nếu còn ở phía trước. */
+    probationFrom: Date = new Date(),
   ): Promise<{
     employeeTypeId: string | null;
     employmentStatus: EmploymentStatus;
@@ -1700,7 +1703,7 @@ export class StoresService {
     let probationEndsAt: Date | undefined;
     if (rungId) {
       probationEndsAt =
-        (await computeProbationEndsAt(manager, rungId, new Date())) ??
+        (await computeProbationEndsAt(manager, rungId, probationFrom)) ??
         undefined;
     }
 
@@ -1738,8 +1741,20 @@ export class StoresService {
     // Thử việc nay là một bậc trên lộ trình chứ không còn là một con số ngày
     // của cửa hàng: loại nhân viên được chọn tự nói nó có phải thử việc không,
     // và hạn lấy từ điều kiện days_in_rung của chính bậc đó.
+    // Ngày chính thức vào làm (work-terms.utils.ts): ô riêng, hoặc ngày bắt
+    // đầu của hợp đồng — form thêm nhân viên gọi ô đó là "Ngày bắt đầu làm".
+    const officialStartDate =
+      ymdOf(data.officialStartDate ?? null) ?? ymdOf(data.contract?.startDate ?? null);
+    const startInstant = officialStartDate
+      ? new Date(Date.parse(`${officialStartDate}T00:00:00+07:00`))
+      : null;
     const { employeeTypeId, employmentStatus, probationEndsAt } =
-      await this.resolveHireEmploymentType(manager, storeId, data.employeeTypeId);
+      await this.resolveHireEmploymentType(
+        manager,
+        storeId,
+        data.employeeTypeId,
+        startInstant && startInstant.getTime() > Date.now() ? startInstant : new Date(),
+      );
     if (revivesFormerStint) {
       // Must run before the new contract and the asset re-issue below: it
       // deactivates the old contract and returns old assets to stock, so
@@ -1808,6 +1823,7 @@ export class StoresService {
         skillId: hireSkillId ?? undefined,
         departmentId: departmentId ?? undefined,
         joinedAt: new Date(),
+        officialStartDate,
         employmentStatus,
         probationEndsAt,
         // Reviving a former employee's row has to undo what ended it. Saving
@@ -1839,6 +1855,11 @@ export class StoresService {
               preferredShiftTypes: null,
               shiftPreferenceNote: null,
               reminderSettings: null,
+              // Điều kiện làm việc của đợt làm trước không mang sang.
+              workDaysPerWeek: null,
+              workDaysPerMonth: null,
+              fixedDaysOff: [],
+              ownerNote: null,
             }
           : {}),
       }),
@@ -2146,9 +2167,17 @@ export class StoresService {
       .sort((a, b) => b.time.getTime() - a.time.getTime())
       .slice(0, 10);
 
+    // Cột select: false (ghi chú riêng của chủ); route trả cho chính nhân viên
+    // bỏ nó ở toSelfEmployeeDetail.
+    const note = await this.profileRepository.findOne({
+      where: { id: profileId },
+      select: { id: true, ownerNote: true },
+    });
+
     return {
       profile: {
         ...profile,
+        ownerNote: note?.ownerNote ?? null,
         totalShifts: summary?.totalShifts || 0,
         completedShifts: summary?.completedShifts || 0,
         onTimeArrivalsCount: summary?.onTimeArrivalsCount || 0,
@@ -2235,7 +2264,14 @@ export class StoresService {
     ownerAccountId: string,
   ) {
     const has = (key: keyof UpdateEmployeeByOwnerDto) => dto[key] !== undefined;
+    // Đổi ngày vào làm giữ khoá ca của cửa hàng (cùng khoá với đăng ký / xếp ca /
+    // duyệt đổi ca), lấy TRƯỚC khoá hồ sơ như lúc cho nghỉ việc: không có ca nào
+    // được thêm vào giữa lúc kiểm tra và lúc lưu ngày mới.
+    const storeOfProfile = has('officialStartDate')
+      ? await this.profileRepository.findOne({ where: { id: profileId }, select: ['id', 'storeId'] })
+      : null;
     return this.dataSource.transaction(async (manager) => {
+      if (storeOfProfile) await lockStoreShiftAvailability(manager, storeOfProfile.storeId);
       const profile = await manager.findOne(EmployeeProfile, {
         where: { id: profileId },
         lock: { mode: 'pessimistic_write' },
@@ -2345,6 +2381,7 @@ export class StoresService {
 
       // 4. Hồ sơ tại cửa hàng
       let profileChanged = false;
+      let typeChanged = false;
       if (has('workShiftId') && (profile.workShiftId ?? null) !== (dto.workShiftId ?? null)) {
         if (dto.workShiftId) {
           const shift = await manager.findOne(WorkShift, {
@@ -2375,6 +2412,7 @@ export class StoresService {
           note: 'Chủ cửa hàng sửa giai đoạn',
         });
         profileChanged = true;
+        typeChanged = true;
         changed.push('Giai đoạn');
       }
       if (has('workTypeId') && (profile.workTypeId ?? null) !== (dto.workTypeId ?? null)) {
@@ -2388,9 +2426,120 @@ export class StoresService {
         profileChanged = true;
         changed.push('Hình thức làm việc');
       }
+
+      // 5. Điều kiện làm việc (work-terms.utils.ts)
+      // Hạn thử việc chạy từ lúc vào làm thật: ngày chính thức vào làm, không
+      // sớm hơn lúc được thêm vào app — cùng mốc với lúc tuyển (hire dùng
+      // max(ngày vào làm, bây giờ)).
+      const joinedTime = profile.joinedAt ? new Date(profile.joinedAt).getTime() : NaN;
+      const probationBase = (ymd: string | null) => {
+        const start = ymd ? Date.parse(`${ymd}T00:00:00+07:00`) : NaN;
+        const candidates = [start, joinedTime].filter(Number.isFinite);
+        return candidates.length ? Math.max(...candidates) : null;
+      };
+      const shiftProbation = (ms: number) => {
+        if (
+          !ms ||
+          profile.employmentStatus !== EmploymentStatus.PROBATION ||
+          !profile.probationEndsAt
+        ) {
+          return;
+        }
+        profile.probationEndsAt = new Date(new Date(profile.probationEndsAt).getTime() + ms);
+      };
+      if (has('officialStartDate')) {
+        const next = dto.officialStartDate ? dto.officialStartDate.slice(0, 10) : null;
+        const current = ymdOf(profile.officialStartDate);
+        if (next !== current) {
+          if (next) {
+            // Ca chưa làm (chờ duyệt / đã duyệt) trước ngày mới sẽ thành ca
+            // "trước khi vào làm": phải huỷ trước. Ca đã làm xong là lịch sử,
+            // không chặn (vd làm thử vài buổi rồi mới ký chính thức).
+            const floor = stintFloor(profile.joinedAt);
+            const query = manager
+              .createQueryBuilder(ShiftAssignment, 'assignment')
+              .innerJoin('assignment.shiftSlot', 'slot')
+              .leftJoin('slot.cycle', 'cycle')
+              .where('assignment.employeeId = :profileId', { profileId: profile.id })
+              .andWhere('assignment.status IN (:...open)', {
+                open: [ShiftAssignmentStatus.PENDING, ShiftAssignmentStatus.APPROVED],
+              })
+              .andWhere("(cycle.id IS NULL OR cycle.status IN ('ACTIVE', 'EXPIRED'))")
+              .andWhere('slot.workDate < :next', { next });
+            if (floor) query.andWhere('assignment.createdAt >= :floor', { floor });
+            const earlier = await query.getCount();
+            if (earlier) {
+              throw new ConflictException({
+                code: 'SHIFTS_BEFORE_START_DATE',
+                message: `Nhân viên còn ${earlier} ca chưa làm trước ngày này. Huỷ các ca đó trước khi đổi ngày vào làm.`,
+              });
+            }
+          }
+          // Đổi giai đoạn trong cùng lần lưu thì hạn vừa tính lại ở trên, xử
+          // lý riêng bên dưới.
+          if (!typeChanged) {
+            const from = probationBase(current);
+            const to = probationBase(next);
+            if (from !== null && to !== null) shiftProbation(to - from);
+          }
+          profile.officialStartDate = next;
+          profileChanged = true;
+          changed.push('Ngày vào làm chính thức');
+        }
+      }
+      // Vừa đổi sang giai đoạn thử việc: changeEmploymentType tính hạn từ bây
+      // giờ; ngày vào làm còn ở phía trước thì dời tới ngày đó.
+      if (typeChanged) {
+        const start = probationBase(ymdOf(profile.officialStartDate));
+        if (start !== null && start > Date.now()) shiftProbation(start - Date.now());
+      }
+      if (has('workDaysPerWeek') || has('workDaysPerMonth') || has('fixedDaysOff')) {
+        const perWeek = has('workDaysPerWeek')
+          ? (dto.workDaysPerWeek ?? null)
+          : (profile.workDaysPerWeek ?? null);
+        const perMonth = has('workDaysPerMonth')
+          ? (dto.workDaysPerMonth ?? null)
+          : (profile.workDaysPerMonth ?? null);
+        const daysOff = has('fixedDaysOff')
+          ? [...new Set(dto.fixedDaysOff ?? [])].sort((a, b) => a - b)
+          : (profile.fixedDaysOff ?? []).map(Number);
+        if (perWeek !== null && perWeek > 7 - daysOff.length) {
+          throw new BadRequestException(
+            `Có ${daysOff.length} ngày nghỉ cố định nên mỗi tuần làm tối đa ${7 - daysOff.length} ngày`,
+          );
+        }
+        const same =
+          perWeek === (profile.workDaysPerWeek ?? null) &&
+          perMonth === (profile.workDaysPerMonth ?? null) &&
+          daysOff.join(',') ===
+            [...(profile.fixedDaysOff ?? [])].map(Number).sort((a, b) => a - b).join(',');
+        if (!same) {
+          profile.workDaysPerWeek = perWeek;
+          profile.workDaysPerMonth = perMonth;
+          profile.fixedDaysOff = daysOff;
+          profileChanged = true;
+          changed.push('Ngày làm việc');
+        }
+      }
+      if (has('ownerNote')) {
+        // Cột select: false — đọc riêng để so.
+        const stored = await manager.findOne(EmployeeProfile, {
+          where: { id: profile.id },
+          select: { id: true, ownerNote: true },
+        });
+        const note = dto.ownerNote ?? null;
+        if ((stored?.ownerNote ?? null) !== note) {
+          profile.ownerNote = note;
+          profileChanged = true;
+          changed.push('Ghi chú');
+        }
+      }
       if (profileChanged) await manager.save(EmployeeProfile, profile);
 
-      if (changed.length) {
+      // Nhân viên đọc được nhật ký về chính mình: không ghi "Ghi chú" (ghi chú
+      // riêng của chủ — chỉ việc nó vừa được sửa cũng không để lộ).
+      const logged = changed.filter((label) => label !== 'Ghi chú');
+      if (logged.length) {
         await this.logActivity(manager, {
           storeId: profile.storeId,
           actorAccountId: ownerAccountId,
@@ -2398,7 +2547,7 @@ export class StoresService {
           action: ACTIVITY_ACTIONS.EMPLOYEE_UPDATED,
           resourceType: 'employee',
           resourceId: profile.id,
-          params: { changedFields: changed.join(', ') },
+          params: { changedFields: logged.join(', ') },
           idempotencyKey: null,
         });
       }
@@ -2500,6 +2649,16 @@ export class StoresService {
     };
   }
 
+  /** Số tháng tròn từ ngày `startDate` (VN) tới hôm nay; chưa tới ngày thì 0. */
+  private tenureMonthsOf(startDate: string | null): number {
+    if (!startDate) return 0;
+    const today = vnDateString(new Date());
+    if (startDate >= today) return 0;
+    const [sy, sm, sd] = startDate.split('-').map(Number);
+    const [ty, tm, td] = today.split('-').map(Number);
+    return Math.max(0, (ty - sy) * 12 + (tm - sm) - (td < sd ? 1 : 0));
+  }
+
   async getEmployeePerformance(profileId: string) {
     // 0. Lấy thông tin profile và loại nhân viên hiện tại
     const profile = await this.profileRepository.findOne({
@@ -2516,8 +2675,12 @@ export class StoresService {
       relations: ['performances', 'performances.reviewerAccount'],
     });
 
-    // 3. Tính toán thâm niên
-    const tenureMonths = summary?.tenureMonths || 0;
+    // 3. Thâm niên: từ ngày chính thức vào làm (không có thì từ lúc vào đợt
+    // làm hiện tại) tới hôm nay, theo tháng tròn giờ VN. Cột tenureMonths của
+    // bảng tổng hợp tháng chưa từng được ghi nên không dùng.
+    const tenureMonths = this.tenureMonthsOf(
+      ymdOf(profile.officialStartDate) ?? stintStartVnDate(profile.joinedAt),
+    );
     const years = Math.floor(tenureMonths / 12);
     const months = tenureMonths % 12;
     let tenureDisplay = '';
