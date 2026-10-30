@@ -31,6 +31,8 @@ import {
 } from '../entities/employee-leave-request.entity';
 import { stintFloor } from '../employment-stint.utils';
 import { loadBookedWorkDates, workTermError } from '../work-terms.query';
+import { loadPersonalSchedules } from '../personal-schedule.query';
+import { personalScheduleWarnings } from '../personal-schedule.utils';
 import {
   WORK_TERM_ERROR_CODES,
   WorkTermViolation,
@@ -1051,6 +1053,12 @@ export class StoresSchedulingPart {
     const bookedByEmployee = limitedIds.length
       ? await loadBookedWorkDates(this.dataSource.manager, storeId, limitedIds, workDates)
       : new Map<string, Set<string>>();
+    // Lịch cá nhân (lịch trống / bận / học) nhân viên tự khai: chỉ cảnh báo.
+    const personalSchedules = await loadPersonalSchedules(
+      this.dataSource.manager,
+      storeId,
+      employees,
+    );
 
     const options = employees
       .map((employee) => {
@@ -1081,11 +1089,21 @@ export class StoresSchedulingPart {
         const notStarted = workDates
           .map((workDate) => notStartedViolation(terms, workDate))
           .find(Boolean);
-        const warnings = workTermWarnings(
-          terms,
-          workDates,
-          bookedByEmployee.get(employee.id) ?? new Set(),
-        );
+        // Cảnh báo lịch cá nhân đi chung mảng này để app chủ đã phát hành
+        // (chỉ đọc workTermWarnings) cũng hiện được.
+        const warnings = [
+          ...workTermWarnings(
+            terms,
+            workDates,
+            bookedByEmployee.get(employee.id) ?? new Set(),
+          ),
+          ...personalScheduleWarnings(
+            personalSchedules.get(employee.id) ?? [],
+            workDates,
+            data.startTime,
+            data.endTime,
+          ),
+        ];
 
         return {
           id: employee.id,
@@ -1098,7 +1116,10 @@ export class StoresSchedulingPart {
           selectable:
             !notStarted &&
             (availability === 'AVAILABLE' || availability === 'OTHER_SHIFT'),
-          /** Mới (cộng thêm): nghỉ cố định / vượt số ngày — chủ vẫn xếp được. */
+          /**
+           * Mới (cộng thêm): nghỉ cố định / vượt số ngày, trùng lịch bận / học,
+           * ngoài lịch trống — chủ vẫn xếp được.
+           */
           workTermWarnings: warnings,
           otherShifts: (otherShiftsByEmployee.get(employee.id) || []).sort(
             (left, right) =>

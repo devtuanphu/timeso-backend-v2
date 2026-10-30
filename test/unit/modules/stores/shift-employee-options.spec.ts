@@ -132,6 +132,10 @@ describe('Shift employee options', () => {
       createQueryBuilder: jest.fn(() => leaveQueryBuilder),
     };
     (service as any).__leaveQueryBuilder = leaveQueryBuilder;
+    // Lịch cá nhân (cảnh báo khi xếp ca): không ai khai lịch.
+    (service as any).dataSource = {
+      manager: { getRepository: () => ({ find: jest.fn(async () => []) }) },
+    };
     return service;
   };
 

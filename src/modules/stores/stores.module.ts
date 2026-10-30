@@ -132,6 +132,9 @@ import { StoreActivityController } from './store-activity.controller';
 import { CustomShiftRequestController } from './custom-shift-request.controller';
 import { CustomShiftRequestService } from './custom-shift-request.service';
 import { CustomShiftRequest } from './entities/custom-shift-request.entity';
+import { EmployeePersonalSchedule } from './entities/employee-personal-schedule.entity';
+import { PersonalScheduleController } from './personal-schedule.controller';
+import { PersonalScheduleService } from './personal-schedule.service';
 import { StoresPayrollController } from './controllers/stores-payroll.controller';
 import { StoresRequestsController } from './controllers/stores-requests.controller';
 import { StoresAttendanceController } from './controllers/stores-attendance.controller';
@@ -243,6 +246,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
       OwnerNotificationSetting,
       OwnerNotificationLog,
       CustomShiftRequest,
+      EmployeePersonalSchedule,
     ]),
 
     AccountsModule,
@@ -273,6 +277,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     JobApplicationController,
     StoreActivityController,
     CustomShiftRequestController,
+    PersonalScheduleController,
     StoresCareerController,
     StoresWorkTypesController,
   ],
@@ -303,6 +308,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     OwnerNotificationService,
     OwnerShiftAlertProcessor,
     CustomShiftRequestService,
+    PersonalScheduleService,
   ],
   exports: [
     StoresService,
