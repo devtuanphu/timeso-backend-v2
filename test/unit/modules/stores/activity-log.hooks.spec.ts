@@ -372,6 +372,22 @@ describe('activity log hooks', () => {
       create: jest.fn((value: any) => value),
       save: jest.fn(async (value: any) => value),
     };
+    // Đánh dấu đã trả + ghi lịch sử chạy trong một transaction (UPDATE có điều kiện).
+    const claim: any = {
+      update: () => claim,
+      set: () => claim,
+      where: () => claim,
+      andWhere: () => claim,
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+    service.dataSource = {
+      transaction: jest.fn((callback: any) =>
+        callback({
+          createQueryBuilder: () => claim,
+          getRepository: () => service.employeePaymentHistoryRepository,
+        }),
+      ),
+    };
 
     await service.payEmployeeSalary('sal-1', { paymentAccountId: 'pa-1' }, 'owner-1');
 

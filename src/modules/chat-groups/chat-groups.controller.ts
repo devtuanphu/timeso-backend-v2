@@ -10,8 +10,12 @@ import {
   Query,
   Request,
   Res,
+  BadRequestException,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { ChatGroupsService } from './chat-groups.service';
@@ -38,6 +42,7 @@ import {
 } from './dto/chat-v2.dto';
 import { ChatRuntimeHttpGuard } from './chat-runtime-http.guard';
 import { ChatAbuseProtectionService } from './chat-abuse-protection.service';
+import { groupAvatarMulterConfig } from './group-avatar-upload';
 
 @ApiTags('Chat Groups')
 @ApiBearerAuth()
@@ -141,6 +146,20 @@ export class ChatGroupsController {
     @Request() req,
   ) {
     return this.chatGroupsService.updateGroupSettings(id, dto, req.user.userId);
+  }
+
+  @Post(':id/avatar')
+  @ApiOperation({ summary: 'Đổi ảnh đại diện nhóm (admin nhóm), multipart field "file"' })
+  @UseInterceptors(FileInterceptor('file', groupAvatarMulterConfig))
+  async updateGroupAvatar(
+    @Param('id', ParseUUIDPipe) id: string,
+    @UploadedFile() file: Express.Multer.File | undefined,
+    @Request() req,
+  ) {
+    if (!file?.buffer?.length) {
+      throw new BadRequestException('Hãy chọn một ảnh JPG, PNG hoặc WEBP');
+    }
+    return this.chatGroupsService.updateGroupAvatar(id, file.buffer, req.user.userId);
   }
 
   @Delete(':id')

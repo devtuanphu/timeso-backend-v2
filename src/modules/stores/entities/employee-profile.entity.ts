@@ -218,6 +218,14 @@ export class EmployeeProfile extends BaseEntity {
   @Column({ name: 'owner_note', type: 'text', nullable: true, select: false })
   ownerNote?: string | null;
 
+  /**
+   * "Mong muốn được hỗ trợ" nhân viên ghi cho từng loại lịch cá nhân
+   * ({AVAILABLE|BUSY|STUDY: text}). `select: false`: chỉ chính nhân viên và
+   * chủ đọc (qua PersonalScheduleService), không theo mọi truy vấn hồ sơ.
+   */
+  @Column({ name: 'personal_schedule_wishes', type: 'jsonb', nullable: true, select: false })
+  personalScheduleWishes?: Partial<Record<'AVAILABLE' | 'BUSY' | 'STUDY', string>> | null;
+
   @Column({
     name: 'reminder_settings',
     type: 'jsonb',

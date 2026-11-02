@@ -31,6 +31,15 @@ export interface ChatTypingEvent {
   expiresAt: string;
 }
 
+/** Tên / ảnh nhóm vừa đổi: app làm mới danh sách nhóm và tiêu đề chat. */
+export interface ChatGroupUpdatedEvent {
+  version: 1;
+  groupId: string;
+  name: string;
+  avatar: string | null;
+  updatedAt: string;
+}
+
 export interface ChatEventPublisher {
   publishMessageCreated(
     event: ChatMessageCreatedEvent,
@@ -46,6 +55,10 @@ export interface ChatEventPublisher {
   ): Promise<void>;
   publishTyping(
     event: ChatTypingEvent,
+    recipientAccountIds: string[],
+  ): Promise<void>;
+  publishGroupUpdated(
+    event: ChatGroupUpdatedEvent,
     recipientAccountIds: string[],
   ): Promise<void>;
 }

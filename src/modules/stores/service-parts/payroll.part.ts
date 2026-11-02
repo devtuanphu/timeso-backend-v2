@@ -7,6 +7,7 @@ import {
 import {
   Between,
   In,
+  IsNull,
   MoreThanOrEqual,
   LessThanOrEqual,
   Not,
@@ -405,6 +406,7 @@ export class StoresPayrollPart {
         order: { createdAt: 'ASC' },
       })
     ).filter((rule) => v2 || !rule.calcMode);
+    await this.dropGoneScopeIds(rules);
     const incrementRules = await this.payrollIncrementRuleRepository.find({
       where: { storeId, isActive: true },
     });
@@ -602,6 +604,57 @@ export class StoresPayrollPart {
   }
 
   /**
+   * Hồ sơ nhân viên kèm quan hệ, kể cả khi người đó đã nghỉ (hồ sơ xoá mềm).
+   * Người đang làm đọc y như trước; chỉ khi không thấy mới đọc `withDeleted` —
+   * mà `withDeleted` bỏ lọc xoá mềm cho MỌI bảng join, nên hợp đồng đã xoá
+   * được loại lại bằng tay.
+   */
+  async findProfileIncludingRemoved(
+    this: StoresService,
+    profileId: string,
+    relations: string[],
+  ): Promise<EmployeeProfile | null> {
+    const active = await this.profileRepository.findOne({
+      where: { id: profileId },
+      relations,
+    });
+    if (active) return active;
+    const removed = await this.profileRepository.findOne({
+      where: { id: profileId },
+      relations,
+      withDeleted: true,
+    });
+    if (removed?.contracts) {
+      removed.contracts = removed.contracts.filter((contract) => !contract.deletedAt);
+    }
+    return removed;
+  }
+
+  /**
+   * Bỏ khỏi phạm vi áp dụng (chỉ trong dữ liệu trả về) id của hồ sơ đã xoá
+   * vĩnh viễn: app không có tên để hiện và chủ không bỏ chọn được. Khoản chỉ
+   * còn những người đó thì trả về đang tắt — nó không áp dụng cho ai, còn
+   * phạm vi rỗng lại nghĩa là toàn cửa hàng.
+   */
+  async dropGoneScopeIds(this: StoresService, rules: StorePayrollRule[]) {
+    const ids = [...new Set(rules.flatMap((rule) => rule.employeeProfileIds ?? []))];
+    if (!ids.length) return;
+    const found = await this.profileRepository.find({
+      where: { id: In(ids) },
+      select: ['id'],
+      withDeleted: true,
+    });
+    const existing = new Set(found.map((profile) => profile.id));
+    for (const rule of rules) {
+      if (!rule.employeeProfileIds?.length) continue;
+      const kept = rule.employeeProfileIds.filter((id) => existing.has(id));
+      if (kept.length === rule.employeeProfileIds.length) continue;
+      rule.employeeProfileIds = kept.length ? kept : null;
+      if (!kept.length) rule.isActive = false;
+    }
+  }
+
+  /**
    * Màn thiết lập mới gửi đủ danh sách (cả khoản đang tắt). Khoản có sẵn (mã
    * khác CUSTOM) mỗi loại chỉ một dòng: dòng cũ cùng mã được sửa tại chỗ thành
    * v2 thay vì thêm dòng thứ hai (trả hai lần). Khoản không còn trong danh sách
@@ -678,13 +731,20 @@ export class StoresPayrollPart {
     const scopeIds = v3
       ? [...new Set(incoming.flatMap((r) => r.employeeProfileIds ?? []))]
       : [];
+    // Hồ sơ đã xoá vĩnh viễn không còn dòng nào: id của nó nằm lại trong phạm
+    // vi khoản cũ (cột uuid[] không có khoá ngoại) và app gửi lại nguyên phạm
+    // vi mỗi lần lưu, nên bỏ qua id đó thay vì chặn cả lần lưu. Id của cửa
+    // hàng khác vẫn bị chặn.
+    let goneIds = new Set<string>();
     if (scopeIds.length) {
       const found = await manager
         .getRepository(EmployeeProfile)
-        .find({ where: { id: In(scopeIds), storeId }, select: ['id'], withDeleted: true });
-      if (found.length !== scopeIds.length) {
+        .find({ where: { id: In(scopeIds) }, select: ['id', 'storeId'], withDeleted: true });
+      if (found.some((profile) => profile.storeId !== storeId)) {
         throw new BadRequestException('Có nhân viên trong phạm vi áp dụng không thuộc cửa hàng');
       }
+      const existing = new Set(found.map((profile) => profile.id));
+      goneIds = new Set(scopeIds.filter((id) => !existing.has(id)));
     }
     const current = await repo.find({ where: { storeId } });
     const used = new Set<string>();
@@ -716,6 +776,13 @@ export class StoresPayrollPart {
       const calcMode = fallback?.calcMode ?? r.calcMode ?? null;
       const value = fallback ? fallback.value : r.value;
       const threshold = fallback ? fallback.threshold : (r.threshold ?? null);
+      const scope =
+        v3 && r.employeeProfileIds !== undefined
+          ? [...new Set(r.employeeProfileIds ?? [])].filter((id) => !goneIds.has(id))
+          : null;
+      // Phạm vi chỉ còn người đã xoá vĩnh viễn: tắt khoản, vì phạm vi rỗng là
+      // toàn cửa hàng và khoản riêng không được nới thành khoản chung.
+      const scopeEmptied = !!scope && !scope.length && !!r.employeeProfileIds?.length;
       // App v2 lưu lại: giữ config khi khoản không đổi cách tính; đổi thì
       // khoản theo cách tính v2 mới chọn (bỏ config).
       const keepConfig =
@@ -731,7 +798,7 @@ export class StoresPayrollPart {
         ruleType: r.ruleType || code || 'CUSTOM',
         calcType: (r.calcType as PayrollCalcType) || PayrollCalcType.AMOUNT,
         value,
-        isActive: r.isActive !== false,
+        isActive: r.isActive !== false && !scopeEmptied,
         isCustom: code === PayrollRuleCode.CUSTOM,
         code,
         calcMode,
@@ -745,12 +812,11 @@ export class StoresPayrollPart {
         // Phạm vi: chỉ đổi khi body gửi trường này ([] = toàn cửa hàng). Thiếu
         // trường (app v2, và bản v3 đầu tiên — build 28 — chưa có phạm vi) thì
         // giữ phạm vi đang có: xoá đi sẽ biến khoản riêng thành khoản chung.
-        employeeProfileIds:
-          v3 && r.employeeProfileIds !== undefined
-            ? r.employeeProfileIds?.length
-              ? [...new Set(r.employeeProfileIds)]
-              : null
-            : (rule?.employeeProfileIds ?? null),
+        employeeProfileIds: scope
+          ? scope.length
+            ? scope
+            : null
+          : (rule?.employeeProfileIds ?? null),
       };
       if (rule) Object.assign(rule, payload);
       else rule = repo.create(payload);
@@ -3706,8 +3772,8 @@ export class StoresPayrollPart {
       };
     }
 
-    // 2. Find all employee salaries linked to this payroll
-    const allSalaries = await this.employeeSalaryRepository.find({
+    // 2. Find all employee salaries linked to this payroll.
+    const loaded = await this.employeeSalaryRepository.find({
       where: { monthlyPayrollId: payroll.id },
       relations: [
         'employeeProfile',
@@ -3724,6 +3790,50 @@ export class StoresPayrollPart {
         },
       },
     });
+    // Người đã nghỉ (hồ sơ xoá mềm) vẫn có phiếu của những ngày còn làm, có
+    // thể còn tiền chưa trả: quan hệ ở trên ra null nên trước đây hiện "N/A".
+    // Nạp riêng những hồ sơ đó (kể cả đã xoá) để hiện đúng tên; người đang
+    // làm vẫn đọc như cũ (withDeleted bỏ lọc xoá mềm cho mọi bảng join).
+    const missingIds = [
+      ...new Set(
+        loaded
+          .filter((salary) => !salary.employeeProfile)
+          .map((salary) => salary.employeeProfileId),
+      ),
+    ];
+    if (missingIds.length) {
+      const removed = await this.profileRepository.find({
+        where: { id: In(missingIds) },
+        relations: ['account', 'employeeType', 'department', 'storeRole'],
+        withDeleted: true,
+      });
+      const byId = new Map(removed.map((profile) => [profile.id, profile]));
+      for (const salary of loaded) {
+        if (!salary.employeeProfile) {
+          salary.employeeProfile = byId.get(salary.employeeProfileId) as any;
+        }
+      }
+    }
+    // Phiếu của người đã nghỉ mà không còn gì (không công, không tiền, chưa
+    // trả) chỉ làm rối danh sách; phiếu còn số liệu thì giữ để chủ trả nốt.
+    const allSalaries = loaded
+      .map((salary) =>
+        Object.assign(salary, {
+          isFormerEmployee: !!salary.employeeProfile?.deletedAt,
+        }),
+      )
+      .filter(
+        (salary) =>
+          !salary.isFormerEmployee ||
+          !!salary.paidAt ||
+          [
+            salary.netSalary,
+            salary.totalIncome,
+            salary.totalDeductions,
+            salary.workingHours,
+            salary.workingDays,
+          ].some((value) => Number(value) !== 0),
+      );
 
     // 3. Aggregate counts by Employee Type
     const typeMap = new Map<string, number>();
@@ -4673,9 +4783,18 @@ export class StoresPayrollPart {
       );
     }
 
-    // 1. Lấy thông tin tài khoản ngân hàng của Store
+    const store = await this.storeRepository.findOne({
+      where: { id: salary.monthlyPayroll.storeId },
+    });
+    if (!store) {
+      throw new NotFoundException('Không tìm thấy cửa hàng');
+    }
+
+    // 1. Tài khoản ngân hàng phải của chính cửa hàng trả lương: trước đây chỉ
+    // tìm theo id, nên tên ngân hàng + 4 số cuối của cửa hàng khác lọt vào
+    // lịch sử trả lương.
     const account = await this.storePaymentAccountRepository.findOne({
-      where: { id: data.paymentAccountId },
+      where: { id: data.paymentAccountId, storeId: store.id },
     });
 
     if (!account) {
@@ -4684,35 +4803,43 @@ export class StoresPayrollPart {
       );
     }
 
-    const store = await this.storeRepository.findOne({
-      where: { id: salary.monthlyPayroll.storeId },
+    // 2–3. Đánh dấu đã trả và ghi lịch sử trong một transaction. Câu UPDATE có
+    // điều kiện "chưa trả" là chốt: hai lần bấm cùng lúc đều qua được bước
+    // kiểm ở trên, nhưng chỉ một lần đổi được trạng thái — lần còn lại dừng
+    // trước khi ghi lịch sử (trước đây ghi hai lần trả).
+    const paidAt = new Date();
+    const paymentHistory = await this.dataSource.transaction(async (manager) => {
+      const claimed = await manager
+        .createQueryBuilder()
+        .update(EmployeeSalary)
+        .set({
+          paymentStatus: PaymentStatus.PAID,
+          paidAt,
+          notes: data.notes || salary.notes,
+        })
+        .where('id = :id', { id: salary.id })
+        .andWhere('payment_status <> :paid', { paid: PaymentStatus.PAID })
+        .execute();
+      if (!claimed.affected) {
+        throw new BadRequestException(
+          'Phiếu lương này đã được thanh toán trước đó',
+        );
+      }
+      const history = manager.getRepository(EmployeePaymentHistory).create({
+        employeeProfileId: salary.employeeProfileId,
+        storeId: store.id,
+        storeName: store.name,
+        amount: salary.netSalary,
+        salaryMonth: salary.month,
+        paymentDate: paidAt,
+        paymentMethod: data.paymentMethod || 'Chuyển khoản',
+        referenceNumber: data.referenceNumber,
+        paymentAccountId: account.id,
+        paymentAccountInfo: `${account.bankName} - ****${account.accountNumber.slice(-4)}`,
+        notes: data.notes,
+      });
+      return manager.getRepository(EmployeePaymentHistory).save(history);
     });
-    if (!store) {
-      throw new NotFoundException('Không tìm thấy cửa hàng');
-    }
-
-    // 2. Cập nhật trạng thái phiếu lương
-    salary.paymentStatus = PaymentStatus.PAID;
-    salary.paidAt = new Date();
-    salary.notes = data.notes || salary.notes;
-    await this.employeeSalaryRepository.save(salary);
-
-    // 3. Tạo bản ghi lịch sử thanh toán cho nhân viên
-    const paymentHistory = this.employeePaymentHistoryRepository.create({
-      employeeProfileId: salary.employeeProfileId,
-      storeId: store.id,
-      storeName: store.name,
-      amount: salary.netSalary,
-      salaryMonth: salary.month,
-      paymentDate: new Date(),
-      paymentMethod: data.paymentMethod || 'Chuyển khoản',
-      referenceNumber: data.referenceNumber,
-      paymentAccountId: account.id,
-      paymentAccountInfo: `${account.bankName} - ****${account.accountNumber.slice(-4)}`,
-      notes: data.notes,
-    });
-
-    await this.employeePaymentHistoryRepository.save(paymentHistory);
 
     await this.logActivity(null, {
       storeId: store.id,
@@ -4740,16 +4867,14 @@ export class StoresPayrollPart {
     if (!parsedMonth) throw new BadRequestException('Tháng không hợp lệ');
     const monthStart = toMonthMarker(parsedMonth);
 
-    const profile = await this.profileRepository.findOne({
-      where: { id: employeeProfileId },
-      relations: [
-        'account',
-        'storeRole',
-        'employeeType',
-        'contracts',
-        'workShift',
-      ],
-    });
+    // Người đã nghỉ vẫn có phiếu cần xem / trả (quyền đã kiểm ở controller).
+    const profile = await this.findProfileIncludingRemoved(employeeProfileId, [
+      'account',
+      'storeRole',
+      'employeeType',
+      'contracts',
+      'workShift',
+    ]);
 
     if (!profile) {
       throw new NotFoundException('Không tìm thấy hồ sơ nhân viên');
@@ -4831,10 +4956,13 @@ export class StoresPayrollPart {
     this: StoresService,
     employeeProfileId: string,
   ) {
-    const profile = await this.profileRepository.findOne({
-      where: { id: employeeProfileId },
-      relations: ['account', 'storeRole', 'employeeType', 'contracts'],
-    });
+    // Người đã nghỉ vẫn có phiếu cần xem / trả (quyền đã kiểm ở controller).
+    const profile = await this.findProfileIncludingRemoved(employeeProfileId, [
+      'account',
+      'storeRole',
+      'employeeType',
+      'contracts',
+    ]);
 
     if (!profile) {
       throw new NotFoundException('Không tìm thấy hồ sơ nhân viên');

@@ -59,6 +59,7 @@ import {
   computeAttendanceDeltas,
   effectiveWindowOf,
   resolveShiftBoundaries,
+  withinGraceMinutes,
 } from '../attendance-time.utils';
 import {
   applyGrace,
@@ -813,6 +814,9 @@ export class StoresAttendancePart {
     // Checked in before the start (the app said "Đúng giờ" for it).
     let earlyArrivalMinutes = 0;
     let earlyMinutes = 0;
+    // Trễ / về sớm trong mức cho phép (lateMinutes / earlyMinutes là 0).
+    let lateGraceMinutes = 0;
+    let earlyGraceMinutes = 0;
     let warning = '';
     const shiftsCount = assignments.length;
 
@@ -823,10 +827,18 @@ export class StoresAttendancePart {
           lateMinutes = Number(a.lateMinutes) || 0;
           earlyArrivalMinutes =
             this.storedAttendanceDeltas(a).earlyArrivalMinutes;
+          lateGraceMinutes = withinGraceMinutes(
+            this.storedAttendanceDeltas(a),
+            a,
+          ).lateGraceMinutes;
         }
         if (a.checkOutTime) {
           checkOut = vnClockHHmm(new Date(a.checkOutTime));
           earlyMinutes = Number(a.earlyMinutes) || 0;
+          earlyGraceMinutes = withinGraceMinutes(
+            this.storedAttendanceDeltas(a),
+            a,
+          ).earlyGraceMinutes;
         }
         totalMinutes += Number(a.workedMinutes || 0);
 
@@ -876,6 +888,8 @@ export class StoresAttendancePart {
       lateMinutes,
       earlyArrivalMinutes,
       earlyMinutes,
+      lateGraceMinutes,
+      earlyGraceMinutes,
       shifts: shiftsCount,
       hours,
       minutes,
@@ -1194,6 +1208,7 @@ export class StoresAttendancePart {
         // Cùng cách tính với màn kết quả chấm công (computeAttendanceDeltas).
         earlyArrivalMinutes: deltas.earlyArrivalMinutes,
         overtimeMinutes: deltas.overtimeMinutes,
+        ...withinGraceMinutes(deltas, a),
         autoCheckedOut,
         autoCheckoutReason: a.autoCheckoutReason ?? null,
         // Tự kết thúc ca: giờ làm tính đến mốc này (giờ kết thúc ca).
@@ -1412,6 +1427,10 @@ export class StoresAttendancePart {
         // A duplicate submit shows the same "Sớm X" as the first response.
         earlyArrivalMinutes:
           this.storedAttendanceDeltas(assignment).earlyArrivalMinutes,
+        lateGraceMinutes: withinGraceMinutes(
+          this.storedAttendanceDeltas(assignment),
+          assignment,
+        ).lateGraceMinutes,
         attendanceStatus: assignment.attendanceStatus,
         checkInTime: assignment.checkInTime.toISOString(),
         gpsDistance: null,
@@ -1604,6 +1623,14 @@ export class StoresAttendancePart {
           end: null,
           checkIn: persistence.assignment.checkInTime,
         }).earlyArrivalMinutes,
+        lateGraceMinutes: withinGraceMinutes(
+          computeAttendanceDeltas({
+            start: shiftStart,
+            end: null,
+            checkIn: persistence.assignment.checkInTime,
+          }),
+          persistence.assignment,
+        ).lateGraceMinutes,
         attendanceStatus: persistence.assignment.attendanceStatus,
         checkInTime: persistence.assignment.checkInTime.toISOString(),
         gpsDistance: null,
@@ -1653,6 +1680,11 @@ export class StoresAttendancePart {
         end: null,
         checkIn: now,
       }).earlyArrivalMinutes,
+      // Trễ trong mức cho phép: lateMinutes là 0 nhưng không phải "đúng giờ".
+      lateGraceMinutes: withinGraceMinutes(
+        computeAttendanceDeltas({ start: shiftStart, end: null, checkIn: now }),
+        { lateMinutes },
+      ).lateGraceMinutes,
       attendanceStatus,
       checkInTime: now.toISOString(),
       gpsDistance: checkinDistance != null ? Math.round(checkinDistance) : null,
@@ -1696,6 +1728,10 @@ export class StoresAttendancePart {
         // A duplicate submit shows the same "Ra muộn X" as the first response.
         overtimeMinutes:
           this.storedAttendanceDeltas(assignment).overtimeMinutes,
+        earlyGraceMinutes: withinGraceMinutes(
+          this.storedAttendanceDeltas(assignment),
+          assignment,
+        ).earlyGraceMinutes,
         workedMinutes: assignment.workedMinutes,
         attendanceStatus: assignment.attendanceStatus,
         checkOutTime: assignment.checkOutTime.toISOString(),
@@ -1883,15 +1919,22 @@ export class StoresAttendancePart {
         earlyMinutes: persistence.assignment.earlyMinutes,
         // A duplicate submit shows the same result as the first one (0 when
         // the stored check-out was automatic).
-        overtimeMinutes: computeAttendanceDeltas({
-          start: null,
-          end: shiftEnd,
-          checkOut: persistence.assignment.checkOutTime,
-          autoCheckedOut: !!(
-            persistence.assignment.isAutoCheckout ||
-            persistence.assignment.autoCheckoutReason
-          ),
-        }).overtimeMinutes,
+        ...(() => {
+          const deltas = computeAttendanceDeltas({
+            start: null,
+            end: shiftEnd,
+            checkOut: persistence.assignment.checkOutTime,
+            autoCheckedOut: !!(
+              persistence.assignment.isAutoCheckout ||
+              persistence.assignment.autoCheckoutReason
+            ),
+          });
+          return {
+            overtimeMinutes: deltas.overtimeMinutes,
+            earlyGraceMinutes: withinGraceMinutes(deltas, persistence.assignment)
+              .earlyGraceMinutes,
+          };
+        })(),
         workedMinutes: persistence.assignment.workedMinutes,
         attendanceStatus: persistence.assignment.attendanceStatus,
         checkOutTime: persistence.assignment.checkOutTime.toISOString(),
@@ -1948,6 +1991,11 @@ export class StoresAttendancePart {
         end: shiftEnd,
         checkOut: now,
       }).overtimeMinutes,
+      // Về sớm trong mức cho phép: earlyMinutes là 0 nhưng không phải "đúng giờ".
+      earlyGraceMinutes: withinGraceMinutes(
+        computeAttendanceDeltas({ start: null, end: shiftEnd, checkOut: now }),
+        { earlyMinutes },
+      ).earlyGraceMinutes,
       workedMinutes,
       attendanceStatus,
       checkOutTime: now.toISOString(),
@@ -2415,6 +2463,7 @@ export class StoresAttendancePart {
         // check-out).
         earlyArrivalMinutes: deltas.earlyArrivalMinutes,
         overtimeMinutes: deltas.overtimeMinutes,
+        ...withinGraceMinutes(deltas, assignment),
         autoCheckoutReason: assignment.autoCheckoutReason ?? null,
         autoCheckedOut,
         // Auto check-out: the shift end the employee is paid up to.
@@ -2671,6 +2720,8 @@ export class StoresAttendancePart {
       earlyMinutes: 0,
       earlyArrivalMinutes: 0,
       overtimeMinutes: 0,
+      lateGraceMinutes: 0,
+      earlyGraceMinutes: 0,
       autoCheckoutReason: null,
       autoCheckedOut: false,
       scheduledCheckoutTime: null,

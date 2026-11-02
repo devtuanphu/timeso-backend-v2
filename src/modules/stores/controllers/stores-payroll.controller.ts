@@ -813,6 +813,8 @@ export class StoresPayrollController {
     await this.storesService.assertEmployeeSalaryAccess(
       employeeProfileId,
       user.userId,
+      undefined,
+      true, // chủ xem / trả nốt phiếu của người đã nghỉ
     );
     return this.storesService.getEmployeeSalaryOverview(employeeProfileId);
   }
@@ -827,6 +829,8 @@ export class StoresPayrollController {
     await this.storesService.assertEmployeeSalaryAccess(
       employeeProfileId,
       user.userId,
+      undefined,
+      true, // chủ xem / trả nốt phiếu của người đã nghỉ
     );
     return this.storesService.getEmployeeSalaryDetailByMonth(
       employeeProfileId,
@@ -874,6 +878,8 @@ export class StoresPayrollController {
     await this.storesService.assertEmployeeSalaryAccess(
       employeeProfileId,
       user.userId,
+      undefined,
+      true, // chủ xem / trả nốt phiếu của người đã nghỉ
     );
     return this.storesService.getEmployeePaymentHistories(employeeProfileId);
   }

@@ -11,6 +11,7 @@ import { vnDateString } from '../../common/utils/vn-calendar';
 import {
   CreatePersonalScheduleDto,
   UpdatePersonalScheduleDto,
+  UpdatePersonalScheduleWishDto,
 } from './dto/personal-schedule.dto';
 import {
   EmployeePersonalSchedule,
@@ -28,6 +29,19 @@ import {
 import { StoresService } from './stores.service';
 
 type ProfileRef = Pick<EmployeeProfile, 'id' | 'storeId' | 'joinedAt'>;
+
+export type PersonalScheduleWishes = Record<PersonalScheduleKind, string | null>;
+
+const KINDS = Object.values(PersonalScheduleKind);
+
+/** Mong muốn đủ ba loại (null = chưa nhập), từ cột jsonb có thể thiếu khoá. */
+const toWishes = (stored: EmployeeProfile['personalScheduleWishes']): PersonalScheduleWishes =>
+  Object.fromEntries(
+    KINDS.map((kind) => {
+      const value = stored?.[kind];
+      return [kind, typeof value === 'string' && value.trim() ? value : null];
+    }),
+  ) as PersonalScheduleWishes;
 
 /** Hàng của lịch cá nhân trả cho app (không có clientRequestId). */
 const toDto = (schedule: EmployeePersonalSchedule) => ({
@@ -89,7 +103,46 @@ export class PersonalScheduleService {
       STUDY: 0,
     };
     for (const schedule of schedules) summary[schedule.kind] += 1;
-    return { schedules: schedules.map(toDto), summary };
+    // Cột select: false — chỉ đọc ở đây (chính nhân viên hoặc chủ).
+    const wishesRow = await this.profileRepository.findOne({
+      where: { id: profile.id },
+      select: ['id', 'personalScheduleWishes'],
+    });
+    return {
+      schedules: schedules.map(toDto),
+      summary,
+      wishes: toWishes(wishesRow?.personalScheduleWishes),
+    };
+  }
+
+  /**
+   * Nhân viên ghi "Mong muốn được hỗ trợ" cho một loại lịch; rỗng = xoá. Sửa
+   * đúng một khoá trong một câu UPDATE: hai loại lưu cùng lúc không ghi đè nhau.
+   */
+  async updateMyWish(storeId: string, accountId: string, dto: UpdatePersonalScheduleWishDto) {
+    const profile = await this.resolveSelf(storeId, accountId);
+    const wish = dto.wish.trim();
+    if (wish) {
+      await this.profileRepository.query(
+        `UPDATE employee_profiles
+            SET personal_schedule_wishes =
+                  jsonb_set(COALESCE(personal_schedule_wishes, '{}'::jsonb), ARRAY[$2::text], to_jsonb($3::text))
+          WHERE id = $1`,
+        [profile.id, dto.kind, wish],
+      );
+    } else {
+      await this.profileRepository.query(
+        `UPDATE employee_profiles
+            SET personal_schedule_wishes = NULLIF(COALESCE(personal_schedule_wishes, '{}'::jsonb) - $2::text, '{}'::jsonb)
+          WHERE id = $1`,
+        [profile.id, dto.kind],
+      );
+    }
+    const row = await this.profileRepository.findOne({
+      where: { id: profile.id },
+      select: ['id', 'personalScheduleWishes'],
+    });
+    return { wishes: toWishes(row?.personalScheduleWishes) };
   }
 
   private normalize(dto: UpdatePersonalScheduleDto) {

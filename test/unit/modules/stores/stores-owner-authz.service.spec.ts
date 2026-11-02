@@ -174,6 +174,7 @@ describe('permanentDeleteEmployee', () => {
       })),
       delete: jest.fn().mockResolvedValue({ affected: 1 }),
       update: jest.fn().mockResolvedValue({ affected: 0 }),
+      query: jest.fn().mockResolvedValue([]),
     };
     t.service.dataSource = { transaction: jest.fn((cb: any) => cb(manager)) };
     return manager;

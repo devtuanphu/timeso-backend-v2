@@ -20,6 +20,7 @@ import {
 import {
   PERSONAL_SCHEDULE_MAX_SLOTS,
   PERSONAL_SCHEDULE_NOTE_MAX,
+  PERSONAL_SCHEDULE_WISH_MAX,
 } from '../personal-schedule.utils';
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
@@ -73,4 +74,19 @@ export class CreatePersonalScheduleDto extends UpdatePersonalScheduleDto {
   @IsOptional()
   @IsUUID()
   clientRequestId?: string;
+}
+
+export class UpdatePersonalScheduleWishDto {
+  @ApiProperty({ enum: PersonalScheduleKind })
+  @IsEnum(PersonalScheduleKind)
+  kind: PersonalScheduleKind;
+
+  @ApiProperty({
+    maxLength: PERSONAL_SCHEDULE_WISH_MAX,
+    description: 'Rỗng = xoá mong muốn của loại lịch này.',
+    example: 'Làm 4 ca/tuần, ưu tiên sắp ca tối',
+  })
+  @IsString()
+  @MaxLength(PERSONAL_SCHEDULE_WISH_MAX)
+  wish: string;
 }

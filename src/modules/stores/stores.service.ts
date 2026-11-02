@@ -1004,10 +1004,13 @@ export class StoresService {
     accountId: string,
     expectedStoreId: string | undefined,
     forbiddenMessage: string,
+    /** Cả hồ sơ đã xoá (người đã nghỉ) — chỉ chủ cửa hàng, không bao giờ chính họ. */
+    includeRemoved = false,
   ): Promise<{ profile: EmployeeProfile; isOwner: boolean }> {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
-      select: ['id', 'storeId', 'accountId', 'employmentStatus'],
+      select: ['id', 'storeId', 'accountId', 'employmentStatus', 'deletedAt'],
+      withDeleted: includeRemoved,
     });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
     if (expectedStoreId && profile.storeId !== expectedStoreId) {
@@ -1022,6 +1025,7 @@ export class StoresService {
     if (store.ownerAccountId === accountId) return { profile, isOwner: true };
     // Any employed member (probation and on-leave included) reads their own.
     if (
+      !!profile.deletedAt ||
       profile.accountId !== accountId ||
       !isEmployedStatus(profile.employmentStatus)
     ) {
@@ -1038,13 +1042,21 @@ export class StoresService {
     profileId: string,
     accountId: string,
     expectedStoreId?: string,
+    /**
+     * Chỉ các route ĐỌC phiếu (chi tiết, tổng hợp, lịch sử trả): chủ vẫn mở
+     * được phiếu của người đã nghỉ (hồ sơ đã xoá) để trả nốt lương. Route tạo
+     * mới (ứng lương, hỏi lương…) không bật: bản ghi gắn hồ sơ đã xoá sẽ mồ côi.
+     */
+    includeRemoved = false,
   ) {
-    return this.assertEmployeeCalendarAccess(
+    const { profile } = await this.resolveEmployeeOwnerOrSelf(
       profileId,
       accountId,
       expectedStoreId,
       'Bạn chỉ có thể xem lương của chính mình',
+      includeRemoved,
     );
+    return profile;
   }
 
   /**
@@ -3232,6 +3244,23 @@ export class StoresService {
         StockTransaction,
         { employeeId: profileId },
         { employeeId: null as any },
+      );
+      // Phạm vi khoản thưởng / phạt là uuid[] không có khoá ngoại: bỏ người
+      // này ra. Khoản chỉ còn mỗi người này thì tắt — phạm vi rỗng là toàn
+      // cửa hàng, khoản riêng không được nới thành khoản chung. Cùng khoá với
+      // lần lưu thiết lập (syncPayrollRulesV2): lưu đang chạy đã đọc thấy hồ
+      // sơ này sẽ ghi lại id của nó sau câu UPDATE nếu không chờ nhau.
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `payroll-rules:${profile.storeId}`,
+      ]);
+      await manager.query(
+        `UPDATE store_payroll_rules
+            SET is_active = CASE WHEN cardinality(array_remove(employee_profile_ids, $1::uuid)) = 0
+                                 THEN false ELSE is_active END,
+                employee_profile_ids = NULLIF(array_remove(employee_profile_ids, $1::uuid), '{}'),
+                updated_at = now()
+          WHERE store_id = $2 AND $1::uuid = ANY(employee_profile_ids)`,
+        [profileId, profile.storeId],
       );
 
       return manager.delete(EmployeeProfile, {

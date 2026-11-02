@@ -1,10 +1,24 @@
 import {
+  Inject,
   Injectable,
+  Logger,
   NotFoundException,
   ForbiddenException,
   BadRequestException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { randomUUID } from 'crypto';
+import { mkdir, unlink, writeFile } from 'fs/promises';
+import { basename, join } from 'path';
+import {
+  detectImageExtension,
+  GROUP_AVATAR_DIR,
+  GROUP_AVATAR_FILE_PATTERN,
+  GROUP_AVATAR_URL_PREFIX,
+  stripImageMetadata,
+} from './group-avatar-upload';
+import { CHAT_EVENT_PUBLISHER, ChatEventPublisher } from './chat-event-publisher';
 import {
   DataSource,
   EntityManager,
@@ -60,7 +74,13 @@ export class ChatGroupsService {
     private chatMessageRepository: Repository<ChatMessage>,
     private readonly dataSource: DataSource,
     private readonly authorization: ChatAuthorizationService,
+    // Tuỳ chọn: test và chế độ không realtime khởi tạo service không cần nó.
+    @Optional()
+    @Inject(CHAT_EVENT_PUBLISHER)
+    private readonly events?: ChatEventPublisher,
   ) {}
+
+  private readonly logger = new Logger(ChatGroupsService.name);
 
   // Create group with members
   async createGroup(dto: CreateChatGroupDto, userId: string) {
@@ -593,15 +613,129 @@ export class ChatGroupsService {
         );
       }
     }
+    // Ảnh nhóm chỉ đặt qua POST :id/avatar; PATCH chỉ được bỏ ảnh hoặc trỏ
+    // tới một ảnh nhóm do route đó tạo (không trỏ ra URL ngoài hay ảnh người
+    // khác).
+    if (dto.avatar !== undefined && dto.avatar !== null && dto.avatar !== '') {
+      if (
+        !dto.avatar.startsWith(GROUP_AVATAR_URL_PREFIX) ||
+        !GROUP_AVATAR_FILE_PATTERN.test(dto.avatar.slice(GROUP_AVATAR_URL_PREFIX.length))
+      ) {
+        throw new BadRequestException('Ảnh nhóm không hợp lệ');
+      }
+    }
+    const previousAvatar = group.avatar;
+    // DTO qua ValidationPipe mang sẵn các khoá `undefined`: gán thẳng làm
+    // group.avatar = undefined trong bộ nhớ (DB không đổi, nhưng response và
+    // sự kiện realtime báo nhóm mất ảnh mỗi lần đổi tên).
+    const provided = Object.fromEntries(
+      Object.entries(dto).filter(([, value]) => value !== undefined),
+    );
     Object.assign(group, {
-      ...dto,
+      ...provided,
       ...(dto.name !== undefined
         ? { name: validateChatGroupName(dto.name) }
         : {}),
     });
     await this.chatGroupRepository.save(group);
+    if (dto.avatar !== undefined && previousAvatar !== group.avatar) {
+      await this.removeUnusedGroupAvatar(previousAvatar);
+    }
+    if (dto.name !== undefined || dto.avatar !== undefined) {
+      await this.publishGroupUpdated(group);
+    }
 
     return group;
+  }
+
+  /**
+   * Ảnh đại diện nhóm: kiểm quyền admin nhóm trước, rồi mới ghi tệp (đuôi theo
+   * nội dung, tên ngẫu nhiên, đã bỏ EXIF/GPS) vào `./uploads/group-avatars` và
+   * gán cho nhóm. Ảnh cũ do route này tạo được xoá khi không nhóm nào dùng.
+   */
+  async updateGroupAvatar(groupId: string, image: Buffer, userId: string) {
+    const context = await this.authorization.requireGroupAdmin(groupId, userId);
+    if (context.group.directKey) throw directChatImmutable();
+    const extension = detectImageExtension(image);
+    if (!extension) {
+      throw new BadRequestException('Ảnh nhóm phải là JPG, PNG hoặc WEBP');
+    }
+    let clean: Buffer;
+    try {
+      clean = stripImageMetadata(image, extension);
+    } catch {
+      throw new BadRequestException('Ảnh nhóm bị hỏng, hãy chọn ảnh khác');
+    }
+
+    const filename = `${randomUUID()}${extension}`;
+    const filePath = join(GROUP_AVATAR_DIR, filename);
+    await mkdir(GROUP_AVATAR_DIR, { recursive: true });
+    await writeFile(filePath, clean);
+
+    let previousAvatar: string | null = null;
+    let group: ChatGroup;
+    try {
+      // Khoá dòng nhóm: hai lần đổi ảnh cùng lúc đọc cùng một ảnh cũ thì ảnh
+      // của lần thua sẽ nằm lại trên đĩa mà không ai dùng.
+      group = await this.dataSource.transaction(async (manager) => {
+        const locked = await manager.getRepository(ChatGroup).findOne({
+          where: { id: groupId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (!locked) throw new ForbiddenException('CHAT_ACCESS_DENIED');
+        previousAvatar = locked.avatar ?? null;
+        locked.avatar = `${GROUP_AVATAR_URL_PREFIX}${filename}`;
+        return manager.getRepository(ChatGroup).save(locked);
+      });
+    } catch (error) {
+      await unlink(filePath).catch(() => undefined);
+      throw error;
+    }
+    await this.removeUnusedGroupAvatar(previousAvatar);
+    await this.publishGroupUpdated(group);
+    return group;
+  }
+
+  /**
+   * Xoá tệp ảnh nhóm cũ khi không nhóm nào (kể cả nhóm đã giải tán) còn trỏ
+   * tới. Chỉ xoá tệp trong thư mục ảnh nhóm: avatar cũ có thể là đường dẫn bất
+   * kỳ (ảnh người dùng, ảnh cửa hàng) do PATCH cũ ghi vào.
+   */
+  private async removeUnusedGroupAvatar(avatar: string | null | undefined) {
+    if (!avatar?.startsWith(GROUP_AVATAR_URL_PREFIX)) return;
+    const name = avatar.slice(GROUP_AVATAR_URL_PREFIX.length);
+    if (!GROUP_AVATAR_FILE_PATTERN.test(name) || basename(name) !== name) return;
+    const stillUsed = await this.chatGroupRepository.count({
+      where: { avatar },
+      withDeleted: true,
+    });
+    if (stillUsed) return;
+    await unlink(join(GROUP_AVATAR_DIR, name)).catch(() => undefined);
+  }
+
+  /** Báo các thành viên (realtime) nhóm vừa đổi tên / ảnh; lỗi không chặn. */
+  private async publishGroupUpdated(group: ChatGroup) {
+    if (!this.events) return;
+    try {
+      const members = await this.chatGroupMemberRepository.find({
+        where: { groupId: group.id, status: 'active' },
+        select: { accountId: true },
+      });
+      await this.events.publishGroupUpdated(
+        {
+          version: 1,
+          groupId: group.id,
+          name: group.name,
+          avatar: group.avatar || null,
+          updatedAt: (group.updatedAt ?? new Date()).toISOString(),
+        },
+        members.map((member) => member.accountId),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `chat.group.updated publish failed: ${(error as Error)?.message ?? 'unknown'}`,
+      );
+    }
   }
 
   // Add members

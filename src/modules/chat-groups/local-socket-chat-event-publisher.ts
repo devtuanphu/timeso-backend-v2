@@ -3,6 +3,7 @@ import { Injectable } from '@nestjs/common';
 import {
   ChatDeliveredUpdatedEvent,
   ChatEventPublisher,
+  ChatGroupUpdatedEvent,
   ChatMessageCreatedEvent,
   ChatReadUpdatedEvent,
   ChatTypingEvent,
@@ -96,6 +97,18 @@ export class LocalSocketChatEventPublisher implements ChatEventPublisher {
           expiresAt: event.expiresAt,
         });
       }
+    }
+  }
+
+  /** Chỉ kênh v2: app cũ (legacy) không có màn nào nghe sự kiện này. */
+  async publishGroupUpdated(
+    event: ChatGroupUpdatedEvent,
+    recipientAccountIds: string[],
+  ): Promise<void> {
+    const v2 = this.readiness.getServer('v2');
+    if (!v2 || !this.readiness.isActive()) return;
+    for (const accountId of recipientAccountIds) {
+      v2.to(`account:${accountId}`).emit('chat.group.updated.v1', event);
     }
   }
 }

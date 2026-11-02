@@ -196,6 +196,24 @@ export function computeAttendanceDeltas(input: {
   };
 }
 
+/**
+ * Phút trễ / về sớm nằm trong mức cửa hàng cho phép (`applyGrace`): ghi nhận
+ * là 0 nên không phạt, nhưng giờ thật vẫn lệch. App dùng để nói "về sớm 9 phút
+ * (trong mức cho phép)" thay vì "đúng giờ" khi ra 06:51 ở ca kết thúc 07:00.
+ * 0 khi phút đã ghi nhận > 0 (đã nói "trễ X" / "về sớm X").
+ */
+export function withinGraceMinutes(
+  actual: { lateMinutes?: number; earlyMinutes?: number },
+  recorded: { lateMinutes?: number | null; earlyMinutes?: number | null },
+): { lateGraceMinutes: number; earlyGraceMinutes: number } {
+  return {
+    lateGraceMinutes:
+      Number(recorded.lateMinutes) > 0 ? 0 : Math.max(0, actual.lateMinutes ?? 0),
+    earlyGraceMinutes:
+      Number(recorded.earlyMinutes) > 0 ? 0 : Math.max(0, actual.earlyMinutes ?? 0),
+  };
+}
+
 /** 90 -> "1 giờ 30 phút", 120 -> "2 giờ", 45 -> "45 phút". */
 export const formatDurationVi = (minutes: number): string => {
   const total = Math.max(0, Math.round(minutes));

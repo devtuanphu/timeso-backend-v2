@@ -16,6 +16,7 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import {
   CreatePersonalScheduleDto,
   UpdatePersonalScheduleDto,
+  UpdatePersonalScheduleWishDto,
 } from './dto/personal-schedule.dto';
 import { StoreAccessGuard } from './guards/store-access.guard';
 import { PersonalScheduleService } from './personal-schedule.service';
@@ -70,6 +71,16 @@ export class PersonalScheduleController {
     @GetUser() user: any,
   ) {
     return this.service.remove(storeId, user.userId, scheduleId);
+  }
+
+  @Put(':storeId/me/personal-schedule-wishes')
+  @ApiOperation({ summary: 'Nhân viên ghi "Mong muốn được hỗ trợ" cho một loại lịch' })
+  async updateMyWish(
+    @Param('storeId', uuid) storeId: string,
+    @Body() dto: UpdatePersonalScheduleWishDto,
+    @GetUser() user: any,
+  ) {
+    return this.service.updateMyWish(storeId, user.userId, dto);
   }
 
   @Get(':storeId/employees/:profileId/personal-schedules')

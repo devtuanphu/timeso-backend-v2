@@ -26,6 +26,8 @@ import { addDays, parseDateOnly } from './shift-schedule.utils';
 export const PERSONAL_SCHEDULE_MAX_SLOTS = 50;
 export const PERSONAL_SCHEDULE_MAX_PER_EMPLOYEE = 50;
 export const PERSONAL_SCHEDULE_NOTE_MAX = 100;
+/** "Mong muốn được hỗ trợ" của một loại lịch. */
+export const PERSONAL_SCHEDULE_WISH_MAX = 200;
 /**
  * Ngày của khung giờ không được xa hơn chừng này ngày sau hôm nay (VN). Không
  * chặn ngày đã qua: lịch lặp tạo từ lâu vẫn đang có hiệu lực và phải sửa được.
@@ -35,6 +37,14 @@ export const PERSONAL_SCHEDULE_DATE_WINDOW_DAYS = 366;
 export const PERSONAL_SCHEDULE_MIN_DATE = '2020-01-01';
 
 const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+/** Câu cảnh báo kể tối đa chừng này khung giờ bị trùng, còn lại là "…". */
+const PERSONAL_WARNING_MAX_RANGES = 3;
+
+/** "09:00" → "9h", "09:30" → "9h30" (cách nói giờ trong câu cảnh báo). */
+const shortClock = (time: string) => {
+  const [hour, minute] = time.split(':');
+  return `${Number(hour)}h${minute === '00' ? '' : minute}`;
+};
 
 export const PERSONAL_SCHEDULE_LABELS: Record<PersonalScheduleKind, string> = {
   AVAILABLE: 'Lịch trống',
@@ -172,8 +182,10 @@ export function slotOccursOn(
  * Cảnh báo cho chủ khi xếp một ca giờ `startTime`–`endTime` vào các ngày
  * `workDates` (không trùng nhãn):
  *
- * - "Trùng lịch bận" / "Trùng lịch học": ca chồng lên một khung giờ bận / học
- *   bắt đầu hôm trước (qua đêm), cùng ngày, hoặc hôm sau (ca qua đêm).
+ * - "Trùng lịch bận (…)" / "Trùng lịch học (…)": ca chồng lên một khung giờ
+ *   bận / học bắt đầu hôm trước (qua đêm), cùng ngày, hoặc hôm sau (ca qua
+ *   đêm); trong ngoặc là các khung giờ bị trùng, vd "Trùng lịch học (9h - 12h)".
+ *   Câu bắt đầu đúng như trước để app cũ vẫn hiện được.
  * - "Ngoài lịch trống": ngày đó nhân viên có khai lịch trống (kể cả khung qua
  *   đêm từ hôm trước) nhưng không khung nào chứa trọn ca. Ngày không khai lịch
  *   trống thì không cảnh báo (không biết).
@@ -228,7 +240,7 @@ export function personalScheduleWarnings(
   const intervalsOn = (
     index: ReturnType<typeof indexOf>,
     date: string,
-  ): ShiftInterval[] => {
+  ): (ShiftInterval & { slot: CompiledSlot })[] => {
     const day = dayOf(date);
     const candidates = [
       ...(index.byDate.get(date) ?? []),
@@ -240,10 +252,13 @@ export function personalScheduleWarnings(
       .map((slot) => ({
         start: day.start + slot.startMinute,
         end: day.start + slot.endMinute,
+        slot,
       }));
   };
 
-  const labels = new Set<string>();
+  // Khung giờ bị trùng theo loại, để câu cảnh báo nói luôn giờ học / bận.
+  const overlapped = new Map<PersonalScheduleKind, Set<string>>();
+  let outsideAvailable = false;
   for (const workDate of [...new Set(workDates)].sort()) {
     const shift = toShiftInterval(workDate, startTime, endTime);
     const dayStart = dayOf(workDate).start;
@@ -269,20 +284,35 @@ export function personalScheduleWarnings(
         }
         continue;
       }
-      const overlaps = [previous, workDate, next].some((day) =>
-        intervalsOn(schedule.index, day).some((slot) =>
-          intervalsOverlap(slot, shift),
-        ),
-      );
-      if (overlaps) {
-        labels.add(
-          schedule.kind === PersonalScheduleKind.STUDY
-            ? 'Trùng lịch học'
-            : 'Trùng lịch bận',
-        );
+      for (const day of [previous, workDate, next]) {
+        for (const interval of intervalsOn(schedule.index, day)) {
+          if (!intervalsOverlap(interval, shift)) continue;
+          const ranges = overlapped.get(schedule.kind) ?? new Set<string>();
+          ranges.add(`${interval.slot.startTime}-${interval.slot.endTime}`);
+          overlapped.set(schedule.kind, ranges);
+        }
       }
     }
-    if (hasAvailable && !coveredByAvailable) labels.add('Ngoài lịch trống');
+    if (hasAvailable && !coveredByAvailable) outsideAvailable = true;
   }
-  return [...labels];
+
+  const labels: string[] = [];
+  for (const [kind, label] of [
+    [PersonalScheduleKind.BUSY, 'Trùng lịch bận'],
+    [PersonalScheduleKind.STUDY, 'Trùng lịch học'],
+  ] as const) {
+    const ranges = overlapped.get(kind);
+    if (!ranges?.size) continue;
+    const sorted = [...ranges].sort();
+    const shown = sorted
+      .slice(0, PERSONAL_WARNING_MAX_RANGES)
+      .map((range) => {
+        const [start, end] = range.split('-');
+        return `${shortClock(start)} - ${shortClock(end)}`;
+      });
+    if (sorted.length > shown.length) shown.push('…');
+    labels.push(`${label} (${shown.join(', ')})`);
+  }
+  if (outsideAvailable) labels.push('Ngoài lịch trống');
+  return labels;
 }
