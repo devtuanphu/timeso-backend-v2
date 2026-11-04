@@ -25,6 +25,16 @@ import {
   WORK_SHIFT_INACTIVE_CODE,
 } from '../../../../src/modules/stores/stores.service';
 
+/** Truy vấn kiểm trùng giờ khi đổi giờ ca mẫu (assertTemplateRetimeFree): không có ai. */
+const emptyRetimeBuilder = (): any => {
+  const b: any = {};
+  for (const m of ['innerJoinAndSelect', 'leftJoinAndSelect', 'innerJoin', 'where', 'andWhere']) {
+    b[m] = jest.fn(() => b);
+  }
+  b.getMany = jest.fn(async () => []);
+  return b;
+};
+
 /**
  * "Thiết lập ca làm và chấm công": the owner adds, edits and deletes shift
  * templates. Delete hides the shift (history keeps joining it), refuses while
@@ -379,6 +389,7 @@ describe('upsertTimekeepingSetting shift entries', () => {
     };
     service.shiftReminderService = { scheduleAssignmentReminders: jest.fn() };
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyRetimeBuilder()),
       query: jest.fn(async (sql: string) =>
         sql.includes('custom_shift_requests')
           ? customIds.map((id) => ({ id }))
@@ -542,7 +553,17 @@ describe('createWorkShift / updateWorkShift validation', () => {
       findOne: jest.fn(async () => (existing ? { id: existing.id } : null)),
     };
     service.logger = { error: jest.fn() };
+    // Đổi giờ ca mẫu: tìm ca đã có người để kiểm trùng giờ (không có ai).
+    const emptyBuilder: any = {
+      innerJoinAndSelect: jest.fn(() => emptyBuilder),
+      leftJoinAndSelect: jest.fn(() => emptyBuilder),
+      innerJoin: jest.fn(() => emptyBuilder),
+      where: jest.fn(() => emptyBuilder),
+      andWhere: jest.fn(() => emptyBuilder),
+      getMany: jest.fn(async () => []),
+    };
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyBuilder),
       query: jest.fn(
         async (_sql: string, _params?: unknown[]): Promise<any[]> => [],
       ),

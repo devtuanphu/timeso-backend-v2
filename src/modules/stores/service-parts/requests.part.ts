@@ -1161,6 +1161,30 @@ export class StoresRequestsPart {
       }
     } else if (clock) {
       requested = new Date(`${startDate}T${clock}+07:00`);
+      // Không gắn lượt ca: giờ xin nằm trong một ca qua đêm của ngày đó
+      // (ca 22:00 → 04:00, xin trễ đến 01:00) là giờ của ngày hôm sau.
+      if (employeeProfileId) {
+        const sameDay = await manager.find(ShiftAssignment, {
+          where: {
+            employeeId: employeeProfileId,
+            status: Not(ShiftAssignmentStatus.CANCELLED),
+            shiftSlot: { workDate: String(startDate).slice(0, 10) },
+          },
+          relations: ['shiftSlot', 'shiftSlot.workShift'],
+        });
+        for (const candidate of sameDay ?? []) {
+          if (!candidate.shiftSlot) continue;
+          const inShift = resolveRequestedInstant(
+            effectiveWindowOf({ shiftSlot: candidate.shiftSlot }),
+            String(startDate).slice(0, 10),
+            clock,
+          );
+          if (inShift) {
+            requested = inShift;
+            break;
+          }
+        }
+      }
     }
     if (
       type === LeaveType.LATE &&

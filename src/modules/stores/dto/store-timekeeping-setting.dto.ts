@@ -25,6 +25,11 @@ export const ATTENDANCE_RADIUS_MAX = 5000;
  */
 export const ALLOWED_LATE_MINUTES_MAX = 120;
 export const ATTENDANCE_WINDOW_MINUTES_MAX = 240;
+/** Giờ nghỉ tối thiểu giữa hai ca: mặc định 12 giờ (Bộ luật Lao động). */
+export const MIN_REST_MINUTES_DEFAULT = 720;
+export const MIN_REST_MINUTES_MIN = 60;
+export const MIN_REST_MINUTES_MAX = 1440;
+const MIN_REST_MESSAGE = `Giờ nghỉ tối thiểu giữa hai ca phải là số phút nguyên từ ${MIN_REST_MINUTES_MIN} đến ${MIN_REST_MINUTES_MAX}.`;
 
 const ALLOWED_LATE_MESSAGE = `Thời gian cho phép đi muộn phải là số phút nguyên từ 0 đến ${ALLOWED_LATE_MINUTES_MAX}.`;
 const ALLOWED_EARLY_LEAVE_MESSAGE = `Thời gian cho phép về sớm phải là số phút nguyên từ 0 đến ${ALLOWED_LATE_MINUTES_MAX}.`;
@@ -150,6 +155,27 @@ export class StoreTimekeepingSettingDto {
   @Max(MAX_OVERTIME_MINUTES_MAX, { message: MAX_OVERTIME_MESSAGE })
   @IsOptional()
   maxOvertimeMinutes?: number;
+
+  @ApiProperty({
+    description:
+      'Cảnh báo khi hai ca của cùng nhân viên cách nhau ít hơn giờ nghỉ tối thiểu',
+    example: false,
+  })
+  @IsBoolean()
+  @IsOptional()
+  restWarningEnabled?: boolean;
+
+  @ApiProperty({
+    description: 'Giờ nghỉ tối thiểu giữa hai ca (phút)',
+    example: MIN_REST_MINUTES_DEFAULT,
+    minimum: MIN_REST_MINUTES_MIN,
+    maximum: MIN_REST_MINUTES_MAX,
+  })
+  @IsInt({ message: MIN_REST_MESSAGE })
+  @Min(MIN_REST_MINUTES_MIN, { message: MIN_REST_MESSAGE })
+  @Max(MIN_REST_MINUTES_MAX, { message: MIN_REST_MESSAGE })
+  @IsOptional()
+  minRestMinutes?: number;
 
   @ApiProperty({ description: 'Bật tính lương phụ trội làm thêm giờ', example: false })
   @IsBoolean()

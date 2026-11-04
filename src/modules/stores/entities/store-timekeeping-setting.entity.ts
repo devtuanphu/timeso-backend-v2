@@ -60,6 +60,17 @@ export class StoreTimekeepingSetting extends BaseEntity {
   @Column({ name: 'max_overtime_minutes', type: 'int', default: 480 })
   maxOvertimeMinutes: number;
 
+  /**
+   * Cảnh báo khi xếp một nhân viên vào hai ca cách nhau ít hơn
+   * `minRestMinutes` (Bộ luật Lao động: làm theo ca được nghỉ ít nhất 12 giờ
+   * trước khi chuyển ca). Chỉ cảnh báo ở danh sách chọn nhân viên, không chặn.
+   */
+  @Column({ name: 'rest_warning_enabled', default: false })
+  restWarningEnabled: boolean;
+
+  @Column({ name: 'min_rest_minutes', type: 'int', default: 720 })
+  minRestMinutes: number;
+
   // -- Làm trễ / Làm thêm giờ --
   @Column({ name: 'enable_overtime_multiplier', default: false })
   enableOvertimeMultiplier: boolean;

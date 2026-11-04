@@ -53,6 +53,7 @@ import {
   vnDateString,
 } from '../../common/utils/vn-calendar';
 import { approvedLeaveCoversShiftSql } from './leave-coverage.utils';
+import { findChainedNextAssignment } from './shift-chain.utils';
 
 /** Nhắc check-in khi ca đã bắt đầu được ngần này phút mà chưa vào ca. */
 export const CHECK_IN_REMINDER_AFTER_MINUTES = 5;
@@ -132,6 +133,9 @@ export const overtimeEndAt = (
   }
   return at;
 };
+
+/** Ca sau đổi trạng thái giữa chừng khi nối ca: huỷ cả transaction nối. */
+class ChainRaceError extends Error {}
 
 /** Job hàng đợi 'attendance-background': tính lại phiếu lương một nhân viên. */
 export const RECOMPUTE_EMPLOYEE_PAYSLIP_JOB = 'recompute-employee-payslip';
@@ -420,6 +424,13 @@ export class ShiftEndWorkflowService {
     }
 
     const rules = await this.rulesFor(assignment.shiftSlot?.cycle?.storeId);
+    // Ca nối liền: đúng lúc hết ca thì tự sang ca sau thay vì nhắc chấm ra.
+    if (
+      workflow.state === ShiftEndWorkflowState.ACTIVE &&
+      (await this.chainIntoNextShift(data.assignmentId, { rules }))
+    ) {
+      return;
+    }
     if (data.reminderMinute === AUTO_CHECKOUT_STEP) {
       // The window is the store's current setting: an owner who widened it
       // after this job was queued gets the later time.
@@ -700,6 +711,7 @@ export class ShiftEndWorkflowService {
       result.assignment.shiftSlot?.cycle?.storeId || '',
       result.assignment.employeeId,
       result.autoCheckoutAt,
+      result.assignment.shiftSlot?.workDate,
     );
     void this.attendanceQueue
       .add(
@@ -746,14 +758,264 @@ export class ShiftEndWorkflowService {
     return true;
   }
 
+  /**
+   * Ca nối liền (shift-chain.utils.ts): ca `assignmentId` vẫn đang mở lúc hết
+   * giờ và có ca kế tiếp bắt đầu đúng lúc đó → chấm ra ca này ĐÚNG giờ kết
+   * thúc (như tự chấm ra đúng giờ, không phải "quên chấm công ra") và vào ca
+   * sau ĐÚNG giờ bắt đầu, trong một transaction: không bao giờ đóng ca trước
+   * mà ca sau chưa mở. Không nối khi ca đang có đơn tăng ca (chờ hoặc đã
+   * duyệt) hay chưa tới giờ kết thúc. true khi đã nối.
+   */
+  async chainIntoNextShift(
+    assignmentId: string,
+    options: { rules?: AttendanceRules; now?: Date } = {},
+  ): Promise<boolean> {
+    const nowMs = (options.now ?? new Date()).getTime();
+    let result: {
+      previous: ShiftAssignment;
+      next: ShiftAssignment;
+      at: Date;
+    } | null = null;
+    try {
+      result = await this.dataSource.transaction(async (manager) => {
+        const locked = await manager.findOne(ShiftAssignment, {
+          where: { id: assignmentId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        if (
+          !locked?.checkInTime ||
+          locked.checkOutTime ||
+          locked.status !== ShiftAssignmentStatus.CONFIRMED
+        ) {
+          return null;
+        }
+        const previous = await manager.findOne(ShiftAssignment, {
+          where: { id: assignmentId },
+          relations: ['shiftSlot', 'shiftSlot.workShift', 'shiftSlot.cycle'],
+        });
+        if (!previous) return null;
+        const { start, end } = effectiveWindowOf(previous);
+        if (!end || nowMs < end.getTime()) return null;
+        const overtime = await manager.findOne(BonusWorkRequest, {
+          where: {
+            shiftAssignmentId: assignmentId,
+            status: In([
+              BonusWorkRequestStatus.PENDING,
+              BonusWorkRequestStatus.APPROVED,
+            ]),
+          },
+          select: ['id'],
+        });
+        if (overtime) return null;
+
+        const candidate = await findChainedNextAssignment(manager, previous, end);
+        if (!candidate) return null;
+        const lockedNext = await manager.findOne(ShiftAssignment, {
+          where: { id: candidate.id },
+          lock: { mode: 'pessimistic_write' },
+        });
+        // Dưới khoá: vẫn là ca của CÙNG người (chủ có thể vừa duyệt đổi ca),
+        // chưa bị ghi vắng, và chưa hết giờ (job trễ vài giờ không được vào
+        // ca giùm một ca đã qua — cùng luật "không check-in sau giờ kết thúc").
+        const { end: nextEnd } = effectiveWindowOf(candidate);
+        if (
+          !lockedNext ||
+          lockedNext.checkInTime ||
+          lockedNext.status !== ShiftAssignmentStatus.APPROVED ||
+          lockedNext.employeeId !== previous.employeeId ||
+          lockedNext.attendanceStatus === AttendanceStatus.ABSENT ||
+          (nextEnd !== null && nowMs >= nextEnd.getTime())
+        ) {
+          return null;
+        }
+
+        const storeId = previous.shiftSlot?.cycle?.storeId;
+        const rules = options.rules ?? (await this.rulesFor(storeId));
+        const slot = previous.shiftSlot;
+        const workDate = slot?.workDate ? String(slot.workDate).slice(0, 10) : null;
+        const workedMinutes = creditedWorkedMinutes({
+          start,
+          end,
+          checkIn: previous.checkInTime!,
+          checkOut: end,
+          rules,
+          storedLateMinutes: previous.lateMinutes,
+          mode: await this.workedTimeModeFor(
+            storeId,
+            previous.employeeId,
+            shiftStartKey(workDate, slot?.startTime || slot?.workShift?.startTime),
+            manager,
+          ),
+        });
+        const closed = await manager
+          .createQueryBuilder()
+          .update(ShiftAssignment)
+          .set({
+            checkOutTime: end,
+            workedMinutes,
+            earlyMinutes: 0,
+            status: ShiftAssignmentStatus.COMPLETED,
+          })
+          .where('id = :assignmentId', { assignmentId })
+          .andWhere('check_out_time IS NULL')
+          .andWhere('status = :status', {
+            status: ShiftAssignmentStatus.CONFIRMED,
+          })
+          .execute();
+        if (!closed.affected) return null;
+        const opened = await manager
+          .createQueryBuilder()
+          .update(ShiftAssignment)
+          .set({
+            checkInTime: end,
+            lateMinutes: 0,
+            attendanceStatus: AttendanceStatus.ON_TIME,
+            status: ShiftAssignmentStatus.CONFIRMED,
+          })
+          .where('id = :nextId', { nextId: candidate.id })
+          .andWhere('employee_id = :employeeId', {
+            employeeId: previous.employeeId,
+          })
+          .andWhere('check_in_time IS NULL')
+          .andWhere('status = :status', {
+            status: ShiftAssignmentStatus.APPROVED,
+          })
+          .execute();
+        // Ca sau vừa bị đổi: huỷ cả lần chấm ra ca trước.
+        if (!opened.affected) throw new ChainRaceError();
+
+        for (const [id, type] of [
+          [previous.id, AttendanceLogType.CHECK_OUT],
+          [candidate.id, AttendanceLogType.CHECK_IN],
+        ] as const) {
+          await manager.save(
+            AttendanceLog,
+            manager.create(AttendanceLog, {
+              shiftAssignmentId: id,
+              employeeProfileId: previous.employeeId,
+              storeId: storeId || '',
+              type,
+              timestamp: end,
+              method: AttendanceMethod.SYSTEM,
+            }),
+          );
+        }
+        await manager.update(
+          ShiftEndWorkflow,
+          { shiftAssignmentId: previous.id },
+          { state: ShiftEndWorkflowState.COMPLETED_BY_EMPLOYEE },
+        );
+        return { previous, next: candidate, at: end };
+      });
+    } catch (error) {
+      // Nối ca hỏng không được chặn nhắc chấm ra / tự kết thúc ca: coi như
+      // không có ca nối, luồng cũ chạy tiếp.
+      if (!(error instanceof ChainRaceError)) {
+        this.logger.warn(
+          `chainIntoNextShift failed [assignment=${assignmentId}]: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      return false;
+    }
+    if (!result) return false;
+    const { previous, next, at } = result;
+    this.logger.log(
+      `Chained shift [from=${previous.id} to=${next.id} at=${at.toISOString()}]`,
+    );
+
+    void this.attendanceQueue
+      .add(
+        'process-checkout-payroll',
+        { assignmentId: previous.id },
+        { jobId: `checkout-payroll-${previous.id}`, removeOnComplete: 1000 },
+      )
+      .catch((error) => {
+        this.logger.error(
+          `Không thể xếp hàng tính lương cho ca ${previous.id}`,
+          error?.stack,
+        );
+      });
+    // Nhắc / tự kết thúc cho ca mới, và nhắc "sắp hết ca" của chủ.
+    try {
+      await this.scheduleForAssignment(next.id, options.rules);
+    } catch (error) {
+      this.logger.warn(
+        `Chained shift workflow not scheduled [assignment=${next.id}]: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const employee = await this.profileRepository.findOne({
+      where: { id: previous.employeeId },
+      select: ['id', 'accountId', 'reminderSettings'],
+    });
+    if (employee?.accountId) {
+      const nextSlot = next.shiftSlot;
+      const nextWorkDate = String(nextSlot?.workDate ?? '').slice(0, 10);
+      const dated = /^\d{4}-\d{2}-\d{2}$/.test(nextWorkDate);
+      const label = dated
+        ? this.shiftLabel(
+            nextWorkDate,
+            nextSlot?.startTime || nextSlot?.workShift?.startTime,
+            nextSlot?.endTime || nextSlot?.workShift?.endTime,
+          )
+        : 'ca tiếp theo';
+      try {
+        await this.notificationsService.create(
+          {
+            accountId: employee.accountId,
+            storeId: previous.shiftSlot?.cycle?.storeId,
+            title: 'Đã nối sang ca tiếp theo',
+            content: `Ca trước đã kết thúc lúc ${vnClockHHmm(
+              at,
+            )}. Hệ thống đã tự vào ${label} cho bạn, không cần chấm công lại.`,
+            type: NotificationType.SHIFT_CHECKOUT_REMINDER,
+            priority: NotificationPriority.HIGH,
+            actionUrl: SHIFT_ATTENDANCE_ACTION_URL,
+            metadata: {
+              type: 'SHIFT_CHAINED',
+              assignmentId: next.id,
+              previousAssignmentId: previous.id,
+              ...(dated ? { workDate: nextWorkDate, workDates: [nextWorkDate] } : {}),
+            },
+          },
+          {
+            priority: 'high',
+            channelId: shiftAlertChannel(employee.reminderSettings),
+          },
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Chained shift notification failed [assignment=${next.id}]: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return true;
+  }
+
   private async appendForgotCheckout(
     storeId: string,
     employeeId: string,
     at: Date,
+    workDate?: string | Date | null,
   ) {
     if (!storeId) return;
-    // Vietnam calendar day of the auto-checkout, not the server clock's day.
-    const reportDate = toDateMarker(vnDateString(at));
+    // Báo cáo của ngày làm của ca (ca 22:00 → 04:00 tự kết thúc 04:15 hôm sau
+    // vẫn thuộc ngày ca bắt đầu, như cron cuối ngày ghi); không có thì ngày
+    // giờ Việt Nam lúc tự kết thúc.
+    const workDay =
+      workDate instanceof Date
+        ? vnDateString(workDate)
+        : workDate
+          ? String(workDate).slice(0, 10)
+          : '';
+    const reportDate = toDateMarker(
+      /^\d{4}-\d{2}-\d{2}$/.test(workDay) ? workDay : vnDateString(at),
+    );
     let report = await this.dailyReportRepository.findOne({
       where: { storeId, reportDate },
     });
@@ -1127,6 +1389,15 @@ export class ShiftEndWorkflowService {
         });
         if (!workflow) continue;
         const now = Date.now();
+        // Ca nối liền: hết giờ mà vẫn trong ca → tự sang ca sau (dự phòng cho
+        // job nhắc lúc hết ca, xem handleReminderJob).
+        if (
+          workflow.state === ShiftEndWorkflowState.ACTIVE &&
+          now >= workflow.effectiveEndAt.getTime() &&
+          (await this.chainIntoNextShift(assignment.id, { rules }))
+        ) {
+          continue;
+        }
         if (
           (workflow.state === ShiftEndWorkflowState.ACTIVE ||
             workflow.state === ShiftEndWorkflowState.OVERTIME_APPROVED) &&

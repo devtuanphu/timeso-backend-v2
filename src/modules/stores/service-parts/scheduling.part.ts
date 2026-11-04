@@ -5,6 +5,14 @@ import {
   ConflictException,
 } from '@nestjs/common';
 import {
+  SHIFT_TIME_CONFLICT_CODE,
+  assertNoShiftTimeConflict,
+  describeShift,
+  findShiftTimeConflict,
+  restWarnings,
+  type ExistingShift,
+} from '../shift-time-conflict';
+import {
   In,
   MoreThanOrEqual,
   Between,
@@ -160,6 +168,7 @@ import {
   ONE_ACTIVE_CYCLE_CONSTRAINTS,
   assertBlockingLeaveExpansionBound,
   toBlockingLeaveIntervals,
+  leaveBlocksShifts,
   mergeIntervals,
 } from './shared';
 import {
@@ -562,16 +571,14 @@ export class StoresSchedulingPart {
     totalShifts = confirmedAssignments.length;
 
     confirmedAssignments.forEach((assign) => {
-      if (assign.shiftSlot?.workShift) {
-        const start = new Date(
-          `1970-01-01T${assign.shiftSlot.workShift.startTime}Z`,
-        );
-        const end = new Date(
-          `1970-01-01T${assign.shiftSlot.workShift.endTime}Z`,
-        );
-        const hours = (end.getTime() - start.getTime()) / (1000 * 60 * 60);
-        totalWorkHours += hours > 0 ? hours : 0;
-      }
+      // Giờ riêng của slot trước giờ ca mẫu; ca qua đêm (22:00 → 04:00) tính
+      // sang ngày sau: trước đây ra số âm rồi bị tính 0 giờ.
+      const slot = assign.shiftSlot;
+      const startTime = slot?.startTime || slot?.workShift?.startTime;
+      const endTime = slot?.endTime || slot?.workShift?.endTime;
+      if (!startTime || !endTime) return;
+      const { start, end } = toShiftInterval('2000-01-01', startTime, endTime);
+      totalWorkHours += (end - start) / 60;
     });
 
     // Part 2: Shift Requests (Registers & Swaps)
@@ -1000,6 +1007,8 @@ export class StoresSchedulingPart {
     // Additive (O4a): the saved shifts behind OTHER_SHIFT / CONFLICT, so the
     // owner app can say which shift an employee is already booked for.
     const otherShiftsByEmployee = new Map<string, ShiftEmployeeOtherShift[]>();
+    // Ca đã có của từng người, để cảnh báo nghỉ chưa đủ giữa hai ca.
+    const existingShiftsByEmployee = new Map<string, ExistingShift[]>();
     for (const assignment of assignments) {
       const slot = assignment.shiftSlot;
       if (slot?.workDate) {
@@ -1020,6 +1029,17 @@ export class StoresSchedulingPart {
         assignmentIntervalsByEmployee.get(assignment.employeeId) || [];
       intervals.push(interval);
       assignmentIntervalsByEmployee.set(assignment.employeeId, intervals);
+      const existing = existingShiftsByEmployee.get(assignment.employeeId) || [];
+      existing.push({
+        interval,
+        label: describeShift({
+          shiftName: slot.workShift?.shiftName,
+          workDate: String(slot.workDate).slice(0, 10),
+          startTime: assignmentStart,
+          endTime: assignmentEnd,
+        }),
+      });
+      existingShiftsByEmployee.set(assignment.employeeId, existing);
 
       // Same-day shifts are listed; an adjacent-day (±1) shift only when it
       // actually overlaps, i.e. an overnight shift crossing into the date.
@@ -1060,6 +1080,14 @@ export class StoresSchedulingPart {
     const bookedByEmployee = limitedIds.length
       ? await loadBookedWorkDates(this.dataSource.manager, storeId, limitedIds, workDates)
       : new Map<string, Set<string>>();
+    // Giờ nghỉ tối thiểu giữa hai ca: chỉ cảnh báo, khi cửa hàng bật.
+    const timekeeping = await this.timekeepingSettingRepository.findOne({
+      where: { storeId },
+      select: ['id', 'restWarningEnabled', 'minRestMinutes'],
+    });
+    const minRestMinutes = timekeeping?.restWarningEnabled
+      ? timekeeping.minRestMinutes || 720
+      : 0;
     // Lịch cá nhân (lịch trống / bận / học) nhân viên tự khai: chỉ cảnh báo.
     const personalSchedules = await loadPersonalSchedules(
       this.dataSource.manager,
@@ -1069,7 +1097,7 @@ export class StoresSchedulingPart {
 
     const options = employees
       .map((employee) => {
-        const hasBlockingLeave = intervalSetsOverlap(
+        const hasBlockingLeave = leaveBlocksShifts(
           [...proposedIntervals],
           leaveIntervalsByEmployee.get(employee.id) || [],
         );
@@ -1109,6 +1137,11 @@ export class StoresSchedulingPart {
             workDates,
             data.startTime,
             data.endTime,
+          ),
+          ...restWarnings(
+            proposedIntervals,
+            existingShiftsByEmployee.get(employee.id) ?? [],
+            minRestMinutes,
           ),
         ];
 
@@ -1271,7 +1304,7 @@ export class StoresSchedulingPart {
         [...proposed],
         assignmentIntervalsByEmployee.get(employeeId) || [],
       );
-      const leaveConflict = intervalSetsOverlap(
+      const leaveConflict = leaveBlocksShifts(
         [...proposed],
         leaveIntervalsByEmployee.get(employeeId) || [],
       );
@@ -1366,9 +1399,7 @@ export class StoresSchedulingPart {
         shiftIntervals.some((interval) => intervalsOverlap(proposed, interval))
       ) {
         conflicts.push({ date, reason: 'SHIFT' });
-      } else if (
-        leaveIntervals.some((interval) => intervalsOverlap(proposed, interval))
-      ) {
+      } else if (leaveBlocksShifts([proposed], leaveIntervals)) {
         conflicts.push({ date, reason: 'LEAVE' });
       }
     }
@@ -1995,6 +2026,98 @@ export class StoresSchedulingPart {
     }
   }
 
+  /**
+   * 400 khi đổi giờ ca mẫu `shiftId` sang `startTime`→`endTime` làm một nhân
+   * viên có hai ca trùng giờ (ca của mẫu này từ hôm nay trở đi, theo giờ mới,
+   * so với mọi ca khác của họ ở ngày kề). Một lần tải, so trong bộ nhớ.
+   */
+  async assertTemplateRetimeFree(
+    this: StoresService,
+    manager: EntityManager,
+    storeId: string,
+    shiftId: string,
+    startTime: string,
+    endTime: string,
+  ): Promise<void> {
+    const today = vnDateString(new Date());
+    const affected = await manager
+      .createQueryBuilder(ShiftAssignment, 'assignment')
+      .innerJoinAndSelect('assignment.shiftSlot', 'slot')
+      .innerJoin('slot.cycle', 'cycle')
+      .where('slot.workShiftId = :shiftId', { shiftId })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
+      .andWhere('slot.workDate >= :today', { today })
+      .andWhere('assignment.status != :cancelled', {
+        cancelled: ShiftAssignmentStatus.CANCELLED,
+      })
+      .getMany();
+    if (!affected.length) return;
+    const employeeIds = [...new Set(affected.map((row) => row.employeeId))];
+    const dates = affected
+      .map((row) => String(row.shiftSlot?.workDate ?? '').slice(0, 10))
+      .filter(Boolean)
+      .sort();
+    const others = await manager
+      .createQueryBuilder(ShiftAssignment, 'assignment')
+      .innerJoinAndSelect('assignment.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'workShift')
+      .innerJoin('slot.cycle', 'cycle')
+      .where('assignment.employeeId IN (:...employeeIds)', { employeeIds })
+      .andWhere('cycle.storeId = :storeId', { storeId })
+      .andWhere('cycle.status IN (:...cycleStatuses)', {
+        cycleStatuses: [WorkCycleStatus.ACTIVE, WorkCycleStatus.EXPIRED],
+      })
+      .andWhere('slot.workDate BETWEEN :from AND :to', {
+        from: addDays(dates[0], -1),
+        to: addDays(dates[dates.length - 1], 1),
+      })
+      .andWhere('assignment.status != :cancelled', {
+        cancelled: ShiftAssignmentStatus.CANCELLED,
+      })
+      .getMany();
+    // Giờ sau khi đổi: ca của mẫu này lấy giờ mới cho phần không đặt riêng.
+    const intervalOf = (row: ShiftAssignment) => {
+      const slot = row.shiftSlot;
+      const ofTemplate = slot?.workShiftId === shiftId;
+      const start =
+        slot?.startTime || (ofTemplate ? startTime : slot?.workShift?.startTime);
+      const end =
+        slot?.endTime || (ofTemplate ? endTime : slot?.workShift?.endTime);
+      if (!slot?.workDate || !start || !end) return null;
+      return {
+        interval: toShiftInterval(String(slot.workDate).slice(0, 10), start, end),
+        start,
+        end,
+      };
+    };
+    for (const row of affected) {
+      const mine = intervalOf(row);
+      if (!mine) continue;
+      for (const other of others) {
+        if (other.employeeId !== row.employeeId) continue;
+        if (other.shiftSlotId === row.shiftSlotId) continue;
+        const theirs = intervalOf(other);
+        if (!theirs || !intervalsOverlap(mine.interval, theirs.interval)) continue;
+        throw new BadRequestException({
+          code: SHIFT_TIME_CONFLICT_CODE,
+          message: `Giờ mới làm một nhân viên trùng giờ: ca ngày ${describeShift({
+            workDate: String(row.shiftSlot.workDate).slice(0, 10),
+            startTime: mine.start,
+            endTime: mine.end,
+          }).replace(/^ca /, '')} chạm ${describeShift({
+            shiftName: other.shiftSlot?.workShift?.shiftName,
+            workDate: String(other.shiftSlot.workDate).slice(0, 10),
+            startTime: theirs.start,
+            endTime: theirs.end,
+          })}.`,
+        });
+      }
+    }
+  }
+
   async updateWorkShift(
     this: StoresService,
     storeId: string,
@@ -2078,6 +2201,17 @@ export class StoresSchedulingPart {
           !sameShiftTime(nextStartInput, shift.startTime)) ||
         (nextEndInput !== undefined &&
           !sameShiftTime(nextEndInput, shift.endTime));
+      // Giờ mới áp cho mọi ca chưa tới của mẫu này (ca không đặt giờ riêng):
+      // không được làm ai trong đó trùng giờ với ca khác của họ.
+      if (timeChanged) {
+        await this.assertTemplateRetimeFree(
+          manager,
+          storeId,
+          shiftId,
+          nextStart,
+          nextEnd,
+        );
+      }
       const allowed: Partial<WorkShift> = {};
       if (nextName !== undefined) allowed.shiftName = nextName;
       if (nextStartInput !== undefined) allowed.startTime = nextStartInput;
@@ -3245,12 +3379,53 @@ export class StoresSchedulingPart {
         lock: { mode: 'pessimistic_write' },
       });
       if (!lockedSlot) throw new NotFoundException('Shift slot not found');
-      const nextStart = data.startTime ?? lockedSlot.startTime;
-      const nextEnd = data.endTime ?? lockedSlot.endTime;
-      if (nextStart && nextEnd && nextStart === nextEnd) {
+      // Giờ đang áp dụng: giờ riêng của slot, không có thì giờ của ca mẫu.
+      const template =
+        lockedSlot.startTime && lockedSlot.endTime
+          ? null
+          : await manager.findOne(WorkShift, {
+              where: { id: lockedSlot.workShiftId },
+            });
+      const nextStart =
+        data.startTime ?? lockedSlot.startTime ?? template?.startTime ?? null;
+      const nextEnd =
+        data.endTime ?? lockedSlot.endTime ?? template?.endTime ?? null;
+      // So theo HH:mm: "22:00" và "22:00:00" là cùng một giờ.
+      if (
+        nextStart &&
+        nextEnd &&
+        String(nextStart).slice(0, 5) === String(nextEnd).slice(0, 5)
+      ) {
         throw new BadRequestException(
           'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
         );
+      }
+      // Đổi giờ một ca đã có người: giờ mới không được trùng ca khác của
+      // chính những người đó (kể cả ca qua đêm ngày kề).
+      if (
+        (data.startTime !== undefined || data.endTime !== undefined) &&
+        nextStart &&
+        nextEnd &&
+        lockedSlot.workDate
+      ) {
+        const seated = await manager.find(ShiftAssignment, {
+          where: {
+            shiftSlotId: slotId,
+            status: Not(ShiftAssignmentStatus.CANCELLED),
+          },
+          select: ['id', 'employeeId'],
+        });
+        for (const assignment of seated) {
+          await assertNoShiftTimeConflict(manager, {
+            storeId,
+            employeeId: assignment.employeeId,
+            workDate: String(lockedSlot.workDate).slice(0, 10),
+            startTime: nextStart,
+            endTime: nextEnd,
+            excludeSlotIds: [slotId],
+            who: 'Một nhân viên trong ca',
+          });
+        }
       }
       await manager.update(ShiftSlot, slotId, updateData);
       if (data.maxStaff === undefined) return false;
@@ -3924,6 +4099,26 @@ export class StoresSchedulingPart {
           throw new BadRequestException('Nhân viên đã đăng ký ca này');
         }
 
+        // Trùng giờ với ca khác của chính người này, kể cả ca qua đêm của ngày
+        // trước / ca của ngày sau (22:00 → 04:00 với 03:00 → 08:00). Trong
+        // transaction đang giữ khoá cửa hàng nên hai đăng ký song song không
+        // cùng lọt qua.
+        {
+          const slotStart = slot.startTime || workShift?.startTime;
+          const slotEnd = slot.endTime || workShift?.endTime;
+          if (storeId && slot.workDate && slotStart && slotEnd) {
+            await assertNoShiftTimeConflict(manager, {
+              storeId,
+              employeeId,
+              workDate: String(slot.workDate).slice(0, 10),
+              startTime: slotStart,
+              endTime: slotEnd,
+              excludeSlotIds: [slotId],
+              who: authorizedOwnerAssign ? 'Nhân viên' : 'Bạn',
+            });
+          }
+        }
+
         // Điều kiện làm việc riêng (work-terms.utils.ts): ngày vào làm chính
         // thức chặn cả chủ; nghỉ cố định / giới hạn số ngày chỉ chặn nhân viên
         // tự đăng ký — chủ xếp ca thì đã thấy cảnh báo ở danh sách chọn. Đếm
@@ -4361,6 +4556,29 @@ export class StoresSchedulingPart {
 
   // ==================== SHIFT SWAP MANAGEMENT ====================
 
+  /** 400 khi người nhận ca đổi đã có ca trùng giờ với ca được đổi. */
+  async assertSwapTargetFree(
+    this: StoresService,
+    manager: EntityManager,
+    source: ShiftAssignment,
+    targetEmployeeId: string,
+  ): Promise<void> {
+    const slot = source.shiftSlot;
+    const startTime = slot?.startTime || slot?.workShift?.startTime;
+    const endTime = slot?.endTime || slot?.workShift?.endTime;
+    const storeId = slot?.cycle?.storeId;
+    if (!slot?.workDate || !startTime || !endTime || !storeId) return;
+    await assertNoShiftTimeConflict(manager, {
+      storeId,
+      employeeId: targetEmployeeId,
+      workDate: String(slot.workDate).slice(0, 10),
+      startTime,
+      endTime,
+      excludeAssignmentIds: [source.id],
+      who: 'Nhân viên nhận ca',
+    });
+  }
+
   async createShiftSwap(
     this: StoresService,
     data: {
@@ -4375,7 +4593,7 @@ export class StoresSchedulingPart {
       throw new ForbiddenException('Không xác định được tài khoản');
     const source = await this.shiftAssignmentRepository.findOne({
       where: { id: data.fromAssignmentId },
-      relations: ['shiftSlot', 'shiftSlot.cycle'],
+      relations: ['shiftSlot', 'shiftSlot.cycle', 'shiftSlot.workShift'],
     });
     if (!source) throw new NotFoundException('Assignment không tồn tại');
     const storeId = source.shiftSlot?.cycle?.storeId;
@@ -4412,6 +4630,8 @@ export class StoresSchedulingPart {
     if (notStarted) throw new BadRequestException(notStarted);
     if (source.status === ShiftAssignmentStatus.CANCELLED)
       throw new BadRequestException('Assignment đã bị hủy');
+    // Người nhận ca đã có ca khác trùng giờ (kể cả ca qua đêm ngày kề).
+    await this.assertSwapTargetFree(this.dataSource.manager, source, target.id);
     const swap = this.shiftSwapRepository.create({
       fromAssignmentId: source.id,
       toEmployeeId: target.id,
@@ -4445,6 +4665,7 @@ export class StoresSchedulingPart {
         'fromAssignment',
         'fromAssignment.shiftSlot',
         'fromAssignment.shiftSlot.cycle',
+        'fromAssignment.shiftSlot.workShift',
       ],
     });
     if (!swap) throw new NotFoundException('Shift swap request not found');
@@ -4535,6 +4756,13 @@ export class StoresSchedulingPart {
           swap.fromAssignment?.shiftSlot?.workDate,
         );
         if (notStarted) throw new BadRequestException(notStarted);
+        // Lịch người nhận có thể đã đổi từ lúc gửi yêu cầu: kiểm lại trùng giờ
+        // dưới khoá cửa hàng.
+        await this.assertSwapTargetFree(
+          manager,
+          swap.fromAssignment,
+          swap.toEmployeeId,
+        );
         const assignmentResult = await manager.update(
           ShiftAssignment,
           {
@@ -5098,6 +5326,7 @@ export class StoresSchedulingPart {
           : new Set<string>();
         let firstViolation: WorkTermViolation | null = null;
         let skippedByWorkTerms = 0;
+        let skippedByConflict = 0;
 
         const now = new Date();
 
@@ -5170,6 +5399,28 @@ export class StoresSchedulingPart {
             }
           }
 
+          // Trùng giờ với ca đã có (kể cả ca vừa đăng ký ở vòng trước, ca qua
+          // đêm của ngày kề): bỏ qua ca này, như ca đã đầy.
+          const lockedStart =
+            lockedSlot.startTime || lockedWorkShift?.startTime;
+          const lockedEnd = lockedSlot.endTime || lockedWorkShift?.endTime;
+          if (
+            slotDate &&
+            lockedStart &&
+            lockedEnd &&
+            (await findShiftTimeConflict(manager, {
+              storeId: data.storeId,
+              employeeId: data.employeeProfileId,
+              workDate: slotDate,
+              startTime: lockedStart,
+              endTime: lockedEnd,
+              excludeSlotIds: [lockedSlot.id],
+            }))
+          ) {
+            skippedByConflict++;
+            continue;
+          }
+
           // Create assignment
           const assignment = manager.create(ShiftAssignment, {
             shiftSlotId: lockedSlot.id,
@@ -5187,7 +5438,9 @@ export class StoresSchedulingPart {
         }
         if (successCount === 0) {
           throw new BadRequestException(
-            'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
+            skippedByConflict
+              ? 'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu, bạn đã đăng ký hoặc trùng giờ với ca khác của bạn.'
+              : 'Tất cả các ca bạn chọn đều đã đầy, đã bắt đầu hoặc bạn đã đăng ký.',
           );
         }
 
@@ -5209,9 +5462,12 @@ export class StoresSchedulingPart {
 
         // `skippedByWorkTerms` (mới, cộng thêm, chỉ có khi > 0): số ca (slot)
         // bỏ qua vì nghỉ cố định / đủ số ngày / chưa tới ngày vào làm.
+        // `skippedByConflict` (mới, cộng thêm, chỉ có khi > 0): số ca bỏ qua
+        // vì trùng giờ với ca khác của chính nhân viên.
         return {
           successCount,
           ...(skippedByWorkTerms ? { skippedByWorkTerms } : {}),
+          ...(skippedByConflict ? { skippedByConflict } : {}),
         };
       });
     }

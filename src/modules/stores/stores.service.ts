@@ -5297,9 +5297,10 @@ export class StoresService {
    */
   async ensureDailyReportForStore(
     storeId: string,
+    reportDateStr?: string,
   ): Promise<DailyEmployeeReport | null> {
     try {
-      return await this.createDailyReportForStore(storeId);
+      return await this.createDailyReportForStore(storeId, reportDateStr);
     } catch (error) {
       this.logger.warn(
         `[EnsureDailyReport] Failed for store ${storeId}: ${error instanceof Error ? error.message : String(error)}`,
@@ -5341,9 +5342,20 @@ export class StoresService {
       | 'extraShifts'
       | 'authorizedLeaves',
     employeeId: string,
+    /**
+     * Ngày làm (`work_date`, YYYY-MM-DD) của ca: báo cáo của ngày ca BẮT ĐẦU,
+     * kể cả khi sự kiện (về sớm 03:00 của ca 22:00 → 04:00) rơi sang hôm sau.
+     * Không truyền: hôm nay (giờ Việt Nam).
+     */
+    reportDateStr?: string,
   ): Promise<void> {
     try {
-      const report = await this.ensureDailyReportForStore(storeId);
+      const report = await this.ensureDailyReportForStore(
+        storeId,
+        reportDateStr && /^\d{4}-\d{2}-\d{2}$/.test(reportDateStr)
+          ? reportDateStr
+          : undefined,
+      );
       if (!report) return;
 
       // Atomic append. Loading the row, pushing onto the JSONB array and saving
@@ -5393,6 +5405,10 @@ export class StoresService {
   }> {
     const now = new Date();
     const todayStr = vnDateString(now); // Vietnam 'YYYY-MM-DD'
+    // Ca của hôm qua nữa: ca qua đêm (22:00 → 04:00) hay ca kết thúc 24:00
+    // chưa xong lúc cron chạy 23:30 ngày làm của nó; hôm sau mới chốt được.
+    // Ghi vào báo cáo của NGÀY LÀM; ghi lại là no-op (append không trùng).
+    const yesterdayStr = vnDateString(new Date(now.getTime() - 86_400_000));
 
     let forgotCount = 0;
     let unauthorizedCount = 0;
@@ -5408,7 +5424,7 @@ export class StoresService {
       const slots = await this.shiftSlotRepository.find({
         where: {
           cycle: { storeId: store.id },
-          workDate: todayStr,
+          workDate: In([yesterdayStr, todayStr]),
         },
         relations: ['cycle', 'workShift'],
       });
@@ -5450,6 +5466,7 @@ export class StoresService {
             store.id,
             'forgotClockOut',
             assignment.employeeId,
+            String(slot.workDate).slice(0, 10),
           );
           forgotCount++;
           continue;
@@ -5461,6 +5478,7 @@ export class StoresService {
             store.id,
             'unauthorizedLeaves',
             assignment.employeeId,
+            String(slot.workDate).slice(0, 10),
           );
           unauthorizedCount++;
           continue;
@@ -5482,6 +5500,7 @@ export class StoresService {
             store.id,
             'authorizedLeaves',
             assignment.employeeId,
+            String(slot.workDate).slice(0, 10),
           );
           authorizedCount++;
         }

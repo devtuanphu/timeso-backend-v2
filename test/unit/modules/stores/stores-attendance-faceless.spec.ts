@@ -40,6 +40,8 @@ function build(opts: {
   service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
   service.activityLogService = { record: jest.fn().mockResolvedValue(undefined) };
   service.shiftAssignmentRepository = {
+    // Ca khác đang mở của nhân viên (chặn vào hai ca cùng lúc): không có.
+    find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue({
       id: 'as-1',
       status: ShiftAssignmentStatus.APPROVED,

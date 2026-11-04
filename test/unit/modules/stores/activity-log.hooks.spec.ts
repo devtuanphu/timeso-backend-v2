@@ -87,6 +87,8 @@ function attendanceService(assignment: any) {
   const { service, record } = makeService();
   const manager = txManager();
   service.shiftAssignmentRepository = {
+    // Ca khác đang mở của nhân viên (chặn vào hai ca cùng lúc): không có.
+    find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(assignment),
   };
   service.applyAttendancePolicy = jest.fn().mockResolvedValue({
@@ -232,6 +234,8 @@ describe('activity log hooks', () => {
       findOne: jest.fn().mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' }),
     });
     service.shiftAssignmentRepository = {
+      // Ca khác đang mở của nhân viên (chặn vào hai ca cùng lúc): không có.
+      find: jest.fn().mockResolvedValue([]),
       findOne: jest.fn().mockResolvedValue({
         id: 'as-9',
         status: ShiftAssignmentStatus.PENDING,

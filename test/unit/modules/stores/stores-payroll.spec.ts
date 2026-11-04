@@ -1,7 +1,7 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
+import { DataSource, In } from 'typeorm';
 import { StoresService, monthlyPayrollLockKey } from '../../../../src/modules/stores/stores.service';
 import { AccountsService } from '../../../../src/modules/accounts/accounts.service';
 import { FaceRecognitionService } from '../../../../src/modules/stores/face-recognition.service';
@@ -2045,9 +2045,13 @@ describe('StoresService - daily report days are Vietnam days', () => {
 
     const result = await service.detectEndOfDayAttendanceIssues();
 
+    // Hôm qua nữa: ca qua đêm / ca kết thúc sau 23:30 của hôm qua chỉ chốt
+    // được hôm nay; ghi vào báo cáo của ngày làm.
     expect(service.shiftSlotRepository.find).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: expect.objectContaining({ workDate: '2026-09-01' }),
+        where: expect.objectContaining({
+          workDate: In(['2026-08-31', '2026-09-01']),
+        }),
       }),
     );
     // Report mirrors the per-minute truth (ABSENT / FORGOT_CHECKOUT) and the
@@ -2061,6 +2065,7 @@ describe('StoresService - daily report days are Vietnam days', () => {
       'store-1',
       'authorizedLeaves',
       'on-leave',
+      '2026-09-01',
     );
     expect(service.appendToDailyReport).not.toHaveBeenCalledWith(
       'store-1',
@@ -2071,11 +2076,13 @@ describe('StoresService - daily report days are Vietnam days', () => {
       'store-1',
       'unauthorizedLeaves',
       'absent',
+      '2026-09-01',
     );
     expect(service.appendToDailyReport).toHaveBeenCalledWith(
       'store-1',
       'forgotClockOut',
       'forgot',
+      '2026-09-01',
     );
     expect(service.appendToDailyReport).not.toHaveBeenCalledWith(
       'store-1',

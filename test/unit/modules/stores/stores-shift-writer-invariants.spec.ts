@@ -17,6 +17,16 @@ import { StoresService } from '../../../../src/modules/stores/stores.service';
 import { KpiApprovalRequest } from '../../../../src/modules/stores/entities/kpi-approval-request.entity';
 import { SalaryAdvanceRequest } from '../../../../src/modules/stores/entities/salary-advance-request.entity';
 
+/** Truy vấn kiểm trùng giờ khi đổi giờ ca mẫu (assertTemplateRetimeFree): không có ai. */
+const emptyRetimeBuilder = (): any => {
+  const b: any = {};
+  for (const m of ['innerJoinAndSelect', 'leftJoinAndSelect', 'innerJoin', 'where', 'andWhere']) {
+    b[m] = jest.fn(() => b);
+  }
+  b.getMany = jest.fn(async () => []);
+  return b;
+};
+
 const rawQb = (rows: any[], clauses: string[] = []) => {
   const qb: any = {};
   for (const method of [
@@ -329,6 +339,7 @@ describe('StoresService shift predicate writers', () => {
   it('ignores entries for a deleted (hidden) shift and never writes isActive, but rejects an empty name', async () => {
     const service = createService();
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyRetimeBuilder()),
       query: jest.fn(async () => []),
       findOne: jest.fn(async (entity: unknown) => {
         if (entity === Store) {
@@ -417,6 +428,7 @@ describe('StoresService shift predicate writers', () => {
   it('rejects a timekeeping shift id outside the authoritative store set', async () => {
     const service = createService();
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyRetimeBuilder()),
       query: jest.fn(async () => []),
       findOne: jest.fn(async (entity: unknown) =>
         entity === Store ? { id: 'store-1', ownerAccountId: 'owner-1' } : null,
@@ -452,6 +464,7 @@ describe('StoresService shift predicate writers', () => {
       scheduleAssignmentReminders,
     };
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyRetimeBuilder()),
       query: jest.fn(async () => []),
       findOne: jest.fn(async (entity: unknown) => {
         if (entity === Store) {
@@ -562,6 +575,7 @@ describe('StoresService shift predicate writers', () => {
         .mockRejectedValue(new Error('redis sensitive detail')),
     };
     const manager = {
+      createQueryBuilder: jest.fn(() => emptyRetimeBuilder()),
       query: jest.fn(async () => []),
       findOne: jest.fn(async (entity: unknown) =>
         entity === Store

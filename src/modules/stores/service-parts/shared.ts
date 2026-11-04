@@ -128,6 +128,8 @@ export const normalizeWorkShiftTime = (value: unknown): string | null => {
 
 /** Check-in before the store's early check-in window opens. */
 export const CHECK_IN_TOO_EARLY_CODE = 'CHECK_IN_TOO_EARLY';
+/** Check-in khi đang trong một ca khác chưa hết giờ (xem checkInWithFace). */
+export const ANOTHER_SHIFT_IN_PROGRESS_CODE = 'ANOTHER_SHIFT_IN_PROGRESS';
 
 export const sameShiftTime = (left: string, right: string) =>
   left.slice(0, 5) === right.slice(0, 5);
@@ -135,6 +137,12 @@ export const sameShiftTime = (left: string, right: string) =>
 export type ShiftInterval = {
   start: number;
   end: number;
+  /**
+   * Khoảng nghỉ cả ngày: chỉ chặn ca BẮT ĐẦU trong khoảng (nghỉ ngày D chặn
+   * ca 22:00 → 04:00 của ngày D nhưng không chặn ca đêm của ngày D-1 kéo sang
+   * D), cùng luật với nghỉ có phép theo ngày làm (leave-coverage.utils.ts).
+   */
+  startOnly?: boolean;
 };
 
 export const timeToMinutes = (time: string): number => {
@@ -332,6 +340,7 @@ export const toBlockingLeaveIntervals = (
       {
         start: parseDateOnly(leave.startDate).getTime() / 60000,
         end: parseDateOnly(addDays(leave.endDate, 1)).getTime() / 60000,
+        startOnly: true,
       },
     ];
   }
@@ -353,7 +362,31 @@ export const toBlockingLeaveIntervals = (
   return intervals;
 };
 
+/**
+ * Một trong các ca đề xuất có bị nghỉ phép chặn không: nghỉ cả ngày xét giờ
+ * bắt đầu của ca, nghỉ theo giờ xét khoảng giờ chạm nhau.
+ */
+export const leaveBlocksShifts = (
+  proposed: ShiftInterval[],
+  leaves: ShiftInterval[],
+): boolean =>
+  proposed.some((shift) =>
+    leaves.some((leave) =>
+      leave.startOnly
+        ? shift.start >= leave.start && shift.start < leave.end
+        : intervalsOverlap(shift, leave),
+    ),
+  );
+
+/** Gộp các khoảng chồng nhau; khoảng nghỉ cả ngày và theo giờ gộp riêng. */
 export const mergeIntervals = (intervals: ShiftInterval[]): ShiftInterval[] => {
+  const dayLong = intervals.filter((interval) => interval.startOnly);
+  if (dayLong.length && dayLong.length < intervals.length) {
+    return [
+      ...mergeIntervals(dayLong),
+      ...mergeIntervals(intervals.filter((interval) => !interval.startOnly)),
+    ];
+  }
   const sorted = sortIntervals(intervals);
   const merged: ShiftInterval[] = [];
   for (const interval of sorted) {

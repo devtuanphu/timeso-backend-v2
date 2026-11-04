@@ -90,6 +90,10 @@ function build({
   service.dataSource = {
     query: jest.fn().mockResolvedValue([{ covered: onLeave }]),
   };
+  // Luật chấm công của cửa hàng (mở check-in sớm 15 phút mặc định).
+  service.timekeepingSettingRepository = {
+    findOne: jest.fn().mockResolvedValue(null),
+  };
   service.builders = builders;
   return service;
 }
@@ -486,7 +490,8 @@ describe('getNextShiftAssignment — R5: relevant shift, deltas, worked today', 
     const loadedQuery = service.builders[3];
     expect(loadedQuery.andWhere).toHaveBeenCalledWith(
       'slot.workDate IN (:...workDates)',
-      { workDates: ['2026-09-13', '2026-09-14'] },
+      // Hôm qua (ca qua đêm), hôm nay, ngày mai (ca đã mở check-in sớm).
+      { workDates: ['2026-09-13', '2026-09-14', '2026-09-15'] },
     );
 
     // 07:00 VN: it ended with an automatic check-out.

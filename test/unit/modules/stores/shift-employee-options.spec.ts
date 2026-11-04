@@ -49,6 +49,10 @@ describe('Shift employee options', () => {
     leaveRows?: Partial<EmployeeLeaveRequest>[],
   ) => {
     const service = Object.create(StoresService.prototype) as StoresService;
+    // Cảnh báo giờ nghỉ tối thiểu: cửa hàng chưa bật.
+    (service as any).timekeepingSettingRepository = {
+      findOne: jest.fn(async () => null),
+    };
     (service as any).storeRepository = {
       findOne: jest.fn(async () => ({ id: 'store-1', ownerAccountId })),
     };
@@ -335,15 +339,20 @@ describe('Shift employee options', () => {
       label: 'all-day',
       startTime: null,
       endTime: null,
+      // Nghỉ cả ngày D+1 chỉ áp cho ca BẮT ĐẦU ngày D+1 (cùng luật nghỉ có
+      // phép theo ngày làm): ca 22:00 → 06:00 của ngày D không bị chặn.
+      blocked: false,
     },
     {
       label: 'hourly',
       startTime: '05:00',
       endTime: '08:00',
+      // Nghỉ theo giờ vẫn chặn mọi ca chạm khung giờ đó.
+      blocked: true,
     },
   ])(
-    'detects next-day $label leave for an overnight proposed shift in preflight and commit checks',
-    async ({ startTime, endTime }) => {
+    'next-day $label leave against an overnight proposed shift in preflight and commit checks',
+    async ({ startTime, endTime, blocked }) => {
       const nextDate = addDays(workDate, 1);
       const leave = {
         employeeProfileId: 'available',
@@ -365,7 +374,7 @@ describe('Shift employee options', () => {
       expect(
         result.employees.find((employee) => employee.id === 'available')
           ?.availability,
-      ).toBe('ON_LEAVE');
+      ).toBe(blocked ? 'ON_LEAVE' : 'AVAILABLE');
 
       const assignmentBuilder = createQueryBuilder([]);
       const leaveBuilder = createQueryBuilder([leave]);
@@ -382,23 +391,23 @@ describe('Shift employee options', () => {
           .mockReturnValueOnce(assignmentBuilder)
           .mockReturnValueOnce(leaveBuilder),
       };
-      await expect(
-        (service as any).assertShiftScheduleAvailabilityAtCommit(
-          manager,
-          'store-1',
-          [
-            {
-              shiftName: 'Ca đêm',
-              startTime: '22:00',
-              endTime: '06:00',
-              maxStaff: 1,
-              employeeIds: ['available'],
-              note: null,
-            },
-          ],
-          [workDate],
-        ),
-      ).rejects.toThrow('lịch nghỉ được duyệt');
+      const commit = (service as any).assertShiftScheduleAvailabilityAtCommit(
+        manager,
+        'store-1',
+        [
+          {
+            shiftName: 'Ca đêm',
+            startTime: '22:00',
+            endTime: '06:00',
+            maxStaff: 1,
+            employeeIds: ['available'],
+            note: null,
+          },
+        ],
+        [workDate],
+      );
+      if (blocked) await expect(commit).rejects.toThrow('lịch nghỉ được duyệt');
+      else await expect(commit).resolves.toBeUndefined();
       expect(leaveBuilder.andWhere).toHaveBeenCalledWith(
         'leave.endDate >= :rangeStart',
         { rangeStart: addDays(workDate, -1) },

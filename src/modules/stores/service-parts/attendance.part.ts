@@ -3,7 +3,15 @@ import {
   BadRequestException,
   ForbiddenException,
 } from '@nestjs/common';
-import { In, MoreThanOrEqual, LessThanOrEqual, EntityManager } from 'typeorm';
+import { findChainedNextAssignment } from '../shift-chain.utils';
+import {
+  In,
+  IsNull,
+  MoreThanOrEqual,
+  LessThanOrEqual,
+  EntityManager,
+  Not,
+} from 'typeorm';
 import * as QRCode from 'qrcode';
 import { mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
@@ -90,6 +98,7 @@ import { randomUUID } from 'crypto';
 import {
   normalizeActiveShiftName,
   CHECK_IN_TOO_EARLY_CODE,
+  ANOTHER_SHIFT_IN_PROGRESS_CODE,
   sameShiftTime,
   normalizeWorkShiftTime,
 } from './shared';
@@ -169,6 +178,8 @@ const defaultTimekeepingSettingData = (storeId: string) => ({
   earlyCheckinMinutes: 15,
   lateCheckoutMinutes: 15,
   maxOvertimeMinutes: DEFAULT_MAX_OVERTIME_MINUTES,
+  restWarningEnabled: false,
+  minRestMinutes: 720,
   enableOvertimeMultiplier: false,
   overtimeMultiplier: 1.5,
   notifyLateShift: false,
@@ -718,6 +729,17 @@ export class StoresAttendancePart {
         if (sameShiftTime(finalStartTime, finalEndTime)) {
           throw new BadRequestException(
             'Giờ bắt đầu và giờ kết thúc không được trùng nhau',
+          );
+        }
+        // Đổi giờ ca mẫu qua đường này (app chủ bản cũ) cũng không được làm
+        // ai trong các ca chưa tới của mẫu trùng giờ với ca khác của họ.
+        if (reminderShiftIds.includes(shift.id)) {
+          await this.assertTemplateRetimeFree(
+            manager,
+            storeId,
+            shift.id,
+            finalStartTime,
+            finalEndTime,
           );
         }
         const allowedUpdate: Partial<WorkShift> = {};
@@ -1461,6 +1483,42 @@ export class StoresAttendancePart {
       }
     }
 
+    // Đang trong một ca khác chưa hết giờ (19:00 → 24:00 lúc 23:50, muốn vào
+    // ca 00:00): không mở hai lượt chấm công cùng lúc. Ca nối liền thì hệ
+    // thống tự vào ca sau đúng giờ (ShiftEndWorkflowService.chainIntoNextShift).
+    {
+      const others = await this.shiftAssignmentRepository.find({
+        where: {
+          employeeId: assignment.employeeId,
+          id: Not(assignmentId),
+          status: ShiftAssignmentStatus.CONFIRMED,
+          checkOutTime: IsNull(),
+        },
+        relations: ['shiftSlot', 'shiftSlot.workShift'],
+      });
+      const { start: thisStart } = effectiveWindowOf(assignment);
+      for (const other of others ?? []) {
+        const { end: otherEnd } = effectiveWindowOf(other);
+        if (!otherEnd || Date.now() >= otherEnd.getTime()) continue;
+        const otherSlot = other.shiftSlot;
+        const range = `${String(
+          otherSlot?.startTime || otherSlot?.workShift?.startTime || '',
+        ).slice(0, 5)}–${String(
+          otherSlot?.endTime || otherSlot?.workShift?.endTime || '',
+        ).slice(0, 5)}`;
+        const chained =
+          !!thisStart && thisStart.getTime() === otherEnd.getTime();
+        throw new BadRequestException({
+          code: ANOTHER_SHIFT_IN_PROGRESS_CODE,
+          message: chained
+            ? `Bạn đang trong ca ${range}. Ca này sẽ tự vào lúc ${vnClockHHmm(
+                otherEnd,
+              )} khi ca hiện tại kết thúc, bạn không cần chấm công lại.`
+            : `Bạn đang trong ca ${range} chưa kết thúc. Hãy chấm công ra ca đó trước khi vào ca khác.`,
+        });
+      }
+    }
+
     const storeId = assignment.shiftSlot?.cycle?.storeId;
 
     // ===== Step 1: Store policy (QR + location) =====
@@ -1660,7 +1718,13 @@ export class StoresAttendancePart {
 
     // Ghi nhận đi trễ vào DailyEmployeeReport
     if (lateMinutes > 0 && storeId) {
-      this.appendToDailyReport(storeId, 'lateArrivals', assignment.employeeId);
+      // Báo cáo của ngày làm (ca 00:00 của ngày mai vào sớm lúc 23:50 hôm nay).
+      this.appendToDailyReport(
+        storeId,
+        'lateArrivals',
+        assignment.employeeId,
+        String(assignment.shiftSlot?.workDate ?? '').slice(0, 10),
+      );
     }
 
     // X6: tell the owner after commit. Not awaited; never fails the check-in.
@@ -1961,10 +2025,12 @@ export class StoresAttendancePart {
 
     // Ghi nhận về sớm vào DailyEmployeeReport
     if (earlyMinutes > 0 && storeId) {
+      // Báo cáo của ngày làm: về sớm 03:00 của ca 22:00 → 04:00 thuộc ngày ca bắt đầu.
       this.appendToDailyReport(
         storeId,
         'earlyDepartures',
         assignment.employeeId,
+        String(assignment.shiftSlot?.workDate ?? '').slice(0, 10),
       );
     }
 
@@ -2388,7 +2454,9 @@ export class StoresAttendancePart {
    *  1. check-out: a checked-in, not checked-out shift (any date, so an
    *     overnight shift stays actionable after midnight);
    *  2. check-in: the earliest APPROVED, not-started shift that has not ended,
-   *     among today's shifts and yesterday's overnight shift ending today;
+   *     among today's shifts, yesterday's overnight shift ending today, and
+   *     tomorrow's shift whose check-in window is already open (a 00:00
+   *     shift can be checked into from 23:45 with a 15-minute early window);
    *  3. done: among the same shifts, the finished one (completed, or ended
    *     without a check-in = missed) that STARTED LATEST — so a missed
    *     morning shift no longer hides the afternoon shift completed after it;
@@ -2407,6 +2475,11 @@ export class StoresAttendancePart {
     // "yesterday" between 00:00 and 07:00 VN).
     const todayStr = vnDateString(now);
     const yesterdayStr = vnDateString(new Date(now.getTime() - 86_400_000));
+    // Ca của ngày mai đã mở check-in (ca 00:00 → 05:00, vào sớm từ 23:45).
+    const tomorrowStr = vnDateString(new Date(now.getTime() + 86_400_000));
+    const rules = resolveAttendanceRules(
+      await this.timekeepingSettingRepository.findOne({ where: { storeId } }),
+    );
 
     this.logger.log(
       `[getNextShiftAssignment] employeeProfileId=${employeeProfileId}, storeId=${storeId}, todayStr=${todayStr}`,
@@ -2453,6 +2526,17 @@ export class StoresAttendancePart {
     };
     const startMs = (assignment: ShiftAssignment): number =>
       boundsOf(assignment).start?.getTime() ?? Number.NEGATIVE_INFINITY;
+    // Từ lúc nào được check-in: cùng mốc với cổng check-in (checkInWithFace),
+    // giờ bắt đầu theo lịch trừ "Cho phép check-in trước giờ làm".
+    const opensAtOf = (assignment: ShiftAssignment): Date | null => {
+      const slot = assignment.shiftSlot;
+      const { start } = resolveShiftBoundaries(
+        String(slot?.workDate ?? todayStr).slice(0, 10),
+        slot?.startTime || slot?.workShift?.startTime,
+        slot?.endTime || slot?.workShift?.endTime,
+      );
+      return checkInOpensAt(start, rules);
+    };
 
     // Additive attendance facts for the Home / "Hôm nay" cards.
     const attendanceFields = (assignment: ShiftAssignment) => {
@@ -2501,6 +2585,7 @@ export class StoresAttendancePart {
       const scheduledStartTime = slot?.startTime || ws?.startTime || '';
       const scheduledEndTime = slot?.endTime || ws?.endTime || '';
       const window = boundsOf(assignment);
+      const opensAt = opensAtOf(assignment);
       return {
         assignmentId: assignment.id,
         shiftName: ws?.shiftName || '',
@@ -2521,6 +2606,10 @@ export class StoresAttendancePart {
         lateApproved: !!assignment.adjustedStartAt,
         earlyLeaveApproved: !!assignment.adjustedEndAt,
         workDate: slot?.workDate || todayStr,
+        // Mới (cộng thêm): ca thuộc ngày mai (ca 00:00 đã mở check-in từ tối
+        // nay) và mốc được check-in, để app ghi "Ca ngày mai, vào từ 23:45".
+        isNextDay: String(slot?.workDate ?? todayStr).slice(0, 10) > todayStr,
+        checkInOpensAt: opensAt?.toISOString() ?? null,
         shiftSlotId: slot?.id || null,
         checkInTime: assignment.checkInTime?.toISOString() || null,
         lateMinutes: assignment.lateMinutes || 0,
@@ -2554,10 +2643,29 @@ export class StoresAttendancePart {
       this.logger.log(
         `[getNextShiftAssignment] Found active (checked-in) assignment: ${activeAssignment.id}`,
       );
+      // Mới (cộng thêm): ca nối liền sẽ được tự vào khi ca này hết giờ, để
+      // app ghi "Ca 00:00 – 05:00 sẽ tự nối, không cần chấm công ra".
+      const chained = await findChainedNextAssignment(
+        this.dataSource.manager,
+        activeAssignment,
+        boundsOf(activeAssignment).end,
+      ).catch(() => null);
+      const chainedSlot = chained?.shiftSlot;
       return {
         ...shiftFields(activeAssignment),
         mode: 'check-out' as const,
         workDate: activeAssignment.shiftSlot?.workDate || null,
+        chainsInto: chained
+          ? {
+              assignmentId: chained.id,
+              shiftName: chainedSlot?.workShift?.shiftName || '',
+              workDate: chainedSlot?.workDate || null,
+              startTime:
+                chainedSlot?.startTime || chainedSlot?.workShift?.startTime || '',
+              endTime:
+                chainedSlot?.endTime || chainedSlot?.workShift?.endTime || '',
+            }
+          : null,
         // Still checked in after the shift's end time — the app can prompt to
         // check out rather than letting it run silently past closing.
         shiftEnded: hasEnded(activeAssignment),
@@ -2586,7 +2694,7 @@ export class StoresAttendancePart {
       .leftJoinAndSelect('slot.cycle', 'cycle')
       .where('a.employeeId = :employeeProfileId', { employeeProfileId })
       .andWhere('slot.workDate IN (:...workDates)', {
-        workDates: [yesterdayStr, todayStr],
+        workDates: [yesterdayStr, todayStr, tomorrowStr],
       })
       .andWhere('cycle.storeId = :storeId', { storeId })
       .andWhere('a.status IN (:...statuses)', {
@@ -2608,6 +2716,17 @@ export class StoresAttendancePart {
         10,
       );
       if (workDate === todayStr) return true;
+      if (workDate === tomorrowStr) {
+        // Ca ngày mai chỉ khi đã tới giờ được check-in và chưa ai đụng tới
+        // (còn chờ vào ca): tối nay vẫn thấy ca vừa làm xong như trước.
+        const opensAt = opensAtOf(assignment);
+        return (
+          assignment.status === ShiftAssignmentStatus.APPROVED &&
+          !assignment.checkInTime &&
+          opensAt !== null &&
+          opensAt.getTime() <= now.getTime()
+        );
+      }
       if (workDate !== yesterdayStr) return false;
       // Yesterday's shift only when it runs past midnight into today.
       const { end } = boundsOf(assignment);
@@ -2720,6 +2839,8 @@ export class StoresAttendancePart {
       lateApproved: false,
       earlyLeaveApproved: false,
       workDate: null,
+      isNextDay: false,
+      checkInOpensAt: null,
       shiftSlotId: null,
       checkInTime: null,
       lateMinutes: 0,

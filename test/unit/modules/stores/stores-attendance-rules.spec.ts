@@ -28,6 +28,8 @@ function build(assignment: any, setting: Record<string, unknown> | null) {
   service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
   service.activityLogService = { record: jest.fn().mockResolvedValue(undefined) };
   service.shiftAssignmentRepository = {
+    // Ca khác đang mở của nhân viên (chặn vào hai ca cùng lúc): không có.
+    find: jest.fn().mockResolvedValue([]),
     findOne: jest.fn().mockResolvedValue(assignment),
   };
   service.timekeepingSettingRepository = {
@@ -336,6 +338,8 @@ describe('overtime decided after the employee checked out', () => {
     const service = Object.create(StoresService.prototype) as any;
     service.logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() };
     service.shiftAssignmentRepository = {
+      // Ca khác đang mở của nhân viên (chặn vào hai ca cùng lúc): không có.
+      find: jest.fn().mockResolvedValue([]),
       findOne: jest.fn().mockResolvedValue(assignment),
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
