@@ -26,7 +26,8 @@ export const ATTENDANCE_RADIUS_MAX = 5000;
 export const ALLOWED_LATE_MINUTES_MAX = 120;
 export const ATTENDANCE_WINDOW_MINUTES_MAX = 240;
 
-const ALLOWED_LATE_MESSAGE = `Thời gian cho phép đi muộn/về sớm phải là số phút nguyên từ 0 đến ${ALLOWED_LATE_MINUTES_MAX}.`;
+const ALLOWED_LATE_MESSAGE = `Thời gian cho phép đi muộn phải là số phút nguyên từ 0 đến ${ALLOWED_LATE_MINUTES_MAX}.`;
+const ALLOWED_EARLY_LEAVE_MESSAGE = `Thời gian cho phép về sớm phải là số phút nguyên từ 0 đến ${ALLOWED_LATE_MINUTES_MAX}.`;
 const EARLY_CHECKIN_MESSAGE = `Thời gian check-in trước giờ làm phải là số phút nguyên từ 0 đến ${ATTENDANCE_WINDOW_MINUTES_MAX}.`;
 const LATE_CHECKOUT_MESSAGE = `Thời gian check-out sau giờ làm phải là số phút nguyên từ 0 đến ${ATTENDANCE_WINDOW_MINUTES_MAX}.`;
 
@@ -73,7 +74,7 @@ export class StoreTimekeepingSettingDto {
 
   @ApiProperty({
     description:
-      'Đi muộn/về sớm trong số phút này được tính là đúng giờ (không ghi muộn/sớm, không phạt)',
+      'Đi muộn trong số phút này được tính là đúng giờ (không ghi muộn, không phạt). App chủ bản cũ chỉ gửi trường này cho cả về sớm.',
     example: 15,
     minimum: 0,
     maximum: ALLOWED_LATE_MINUTES_MAX,
@@ -83,6 +84,20 @@ export class StoreTimekeepingSettingDto {
   @Max(ALLOWED_LATE_MINUTES_MAX, { message: ALLOWED_LATE_MESSAGE })
   @IsOptional()
   allowedLateMinutes?: number;
+
+  @ApiProperty({
+    description:
+      'Về sớm trong số phút này được tính là đúng giờ (không ghi về sớm, không phạt). Không gửi: giữ nguyên; null trong DB = theo allowedLateMinutes.',
+    example: 10,
+    minimum: 0,
+    maximum: ALLOWED_LATE_MINUTES_MAX,
+    required: false,
+  })
+  @IsInt({ message: ALLOWED_EARLY_LEAVE_MESSAGE })
+  @Min(0, { message: ALLOWED_EARLY_LEAVE_MESSAGE })
+  @Max(ALLOWED_LATE_MINUTES_MAX, { message: ALLOWED_EARLY_LEAVE_MESSAGE })
+  @IsOptional()
+  allowedEarlyLeaveMinutes?: number;
 
   @ApiProperty({ description: 'Trừ giờ công nếu vượt quá', example: true })
   @IsBoolean()

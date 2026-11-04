@@ -27,10 +27,24 @@ describe('resolveAttendanceRules', () => {
       }),
     ).toEqual({
       graceMinutes: 10,
+      // Not split yet: early leave follows the late value.
+      earlyGraceMinutes: 10,
       earlyCheckinMinutes: 30,
       lateCheckoutMinutes: 45,
       creditLateEarly: false,
     });
+  });
+
+  it('reads a separate early-leave allowance, falling back to the late one', () => {
+    const split = resolveAttendanceRules({
+      allowedLateMinutes: 10,
+      allowedEarlyLeaveMinutes: 0,
+    });
+    expect([split.graceMinutes, split.earlyGraceMinutes]).toEqual([10, 0]);
+    expect(
+      resolveAttendanceRules({ allowedLateMinutes: 7, allowedEarlyLeaveMinutes: null })
+        .earlyGraceMinutes,
+    ).toBe(7);
   });
 
   it('credits late/early time when full time is counted or nothing is deducted', () => {
@@ -59,21 +73,28 @@ describe('resolveAttendanceRules', () => {
 });
 
 describe('applyGrace', () => {
-  const rules = { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10 };
+  const rules = { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 10 };
 
   it('treats minutes within the grace as on time', () => {
-    expect(applyGrace(0, rules)).toBe(0);
-    expect(applyGrace(10, rules)).toBe(0);
+    expect(applyGrace(0, rules, 'late')).toBe(0);
+    expect(applyGrace(10, rules, 'late')).toBe(0);
   });
 
   it('records the full minutes beyond the grace', () => {
-    expect(applyGrace(11, rules)).toBe(11);
-    expect(applyGrace(45, rules)).toBe(45);
+    expect(applyGrace(11, rules, 'late')).toBe(11);
+    expect(applyGrace(45, rules, 'late')).toBe(45);
+  });
+
+  it('uses the early-leave grace for early minutes', () => {
+    const split = { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 3 };
+    expect(applyGrace(5, split, 'late')).toBe(0);
+    expect(applyGrace(5, split, 'early')).toBe(5);
+    expect(applyGrace(3, split, 'early')).toBe(0);
   });
 
   it('is the raw value with the default (no grace)', () => {
-    expect(applyGrace(1, DEFAULT_ATTENDANCE_RULES)).toBe(1);
-    expect(applyGrace(0, DEFAULT_ATTENDANCE_RULES)).toBe(0);
+    expect(applyGrace(1, DEFAULT_ATTENDANCE_RULES, 'late')).toBe(1);
+    expect(applyGrace(0, DEFAULT_ATTENDANCE_RULES, 'late')).toBe(0);
   });
 });
 
@@ -104,6 +125,21 @@ describe('checkInOpensAt', () => {
 });
 
 describe('creditedWorkedMinutes', () => {
+  it('forgives late arrival and early leave by their own allowances', () => {
+    const { start, end } = resolveShiftBoundaries('2026-10-01', '08:00', '12:00');
+    const rules = { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 0 };
+    // 5 minutes late: forgiven (paid from 08:00); 5 minutes early: not.
+    expect(
+      creditedWorkedMinutes({
+        start,
+        end,
+        checkIn: vn('2026-10-01T08:05'),
+        checkOut: vn('2026-10-01T11:55'),
+        rules,
+      }),
+    ).toBe(235);
+  });
+
   const { start, end } = resolveShiftBoundaries('2026-10-01', '08:00', '12:00');
 
   it('equals check-in to check-out with the defaults', () => {
@@ -125,7 +161,7 @@ describe('creditedWorkedMinutes', () => {
         end,
         checkIn: vn('2026-10-01T08:07'),
         checkOut: vn('2026-10-01T11:55'),
-        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10 },
+        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 10 },
       }),
     ).toBe(240);
   });
@@ -137,7 +173,7 @@ describe('creditedWorkedMinutes', () => {
         end,
         checkIn: vn('2026-10-01T08:25'),
         checkOut: vn('2026-10-01T12:00'),
-        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10 },
+        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 10 },
       }),
     ).toBe(215);
   });
@@ -205,7 +241,7 @@ describe('creditedWorkedMinutes', () => {
         end: night.end,
         checkIn: vn('2026-10-01T22:05'),
         checkOut: vn('2026-10-02T05:58'),
-        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5 },
+        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5, earlyGraceMinutes: 5 },
       }),
     ).toBe(480);
   });
@@ -219,7 +255,7 @@ describe('creditedWorkedMinutes', () => {
         end,
         checkIn: vn('2026-10-01T08:07'),
         checkOut: vn('2026-10-01T12:00'),
-        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10 },
+        rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 10, earlyGraceMinutes: 10 },
         storedLateMinutes: 7,
       }),
     ).toBe(233);
@@ -244,7 +280,7 @@ describe('creditedWorkedMinutes', () => {
       end,
       checkIn: new Date(vn('2026-10-01T08:00').getTime() + 30_000),
       checkOut: vn('2026-10-01T12:00'),
-      rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5 },
+      rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5, earlyGraceMinutes: 5 },
       storedLateMinutes: 0,
     });
     const fourLate = creditedWorkedMinutes({
@@ -252,7 +288,7 @@ describe('creditedWorkedMinutes', () => {
       end,
       checkIn: new Date(vn('2026-10-01T08:04').getTime() + 30_000),
       checkOut: vn('2026-10-01T12:00'),
-      rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5 },
+      rules: { ...DEFAULT_ATTENDANCE_RULES, graceMinutes: 5, earlyGraceMinutes: 5 },
       storedLateMinutes: 0,
     });
     expect(onTime).toBe(240);

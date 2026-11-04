@@ -162,6 +162,13 @@ import {
   toBlockingLeaveIntervals,
   mergeIntervals,
 } from './shared';
+import {
+  framesFromOpenClose,
+  normalizeOperatingFrames,
+  OperatingFramesError,
+  openCloseFromFrames,
+  type OperatingFrame,
+} from '../operating-hours.utils';
 import type { StoresService } from '../stores.service';
 
 type ShiftEmployeeAvailability =
@@ -4574,7 +4581,13 @@ export class StoresSchedulingPart {
     if (!config) {
       config = await this.createDefaultShiftConfig(storeId);
     }
-    return config;
+    // Never saved as frames: the frames of the single open/close pair.
+    return {
+      ...config,
+      operatingHours: config.operatingHours?.length
+        ? config.operatingHours
+        : framesFromOpenClose(config.openTime, config.closeTime),
+    };
   }
 
   async upsertShiftConfig(
@@ -4600,6 +4613,26 @@ export class StoresSchedulingPart {
     let config = await this.shiftConfigRepository.findOne({
       where: { storeId },
     });
+    // Operating frames win over the pair: the pair is recomputed from them,
+    // so both always describe the same hours.
+    if (data.operatingHours !== undefined) {
+      let frames: OperatingFrame[];
+      try {
+        frames = normalizeOperatingFrames(data.operatingHours);
+      } catch (error) {
+        if (error instanceof OperatingFramesError) {
+          throw new BadRequestException(error.message);
+        }
+        throw error;
+      }
+      const pair = openCloseFromFrames(frames)!;
+      data = {
+        ...data,
+        operatingHours: frames,
+        openTime: pair.openTime,
+        closeTime: pair.closeTime,
+      };
+    }
     const hours = (value?: string) =>
       value ? `${value.slice(0, 5)}:00` : undefined;
     // A first save stores the column defaults (06:00 / 22:00) for what it
@@ -4617,6 +4650,10 @@ export class StoresSchedulingPart {
       ...data,
       ...(data.openTime ? { openTime: hours(data.openTime) } : {}),
       ...(data.closeTime ? { closeTime: hours(data.closeTime) } : {}),
+      // Only the pair changed (older owner app): frames follow it.
+      ...(data.operatingHours === undefined && (data.openTime || data.closeTime)
+        ? { operatingHours: framesFromOpenClose(openTime, closeTime) }
+        : {}),
     };
 
     if (config) {

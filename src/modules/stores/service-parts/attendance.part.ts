@@ -162,6 +162,7 @@ const defaultTimekeepingSettingData = (storeId: string) => ({
   requireQrScan: true,
   locationExceptionEmployeeIds: [] as string[],
   allowedLateMinutes: 0,
+  allowedEarlyLeaveMinutes: null,
   deductWorkTimeIfLate: true,
   showLateAlert: true,
   countFullTimeIfLate: false,
@@ -697,7 +698,12 @@ export class StoresAttendancePart {
       let setting = await manager.findOne(StoreTimekeepingSetting, {
         where: { storeId },
       });
-      if (setting) Object.assign(setting, settingData);
+      // Fields an older owner app leaves out arrive as undefined keys: they
+      // must not blank the saved value in the row this call returns.
+      const definedSettingData = Object.fromEntries(
+        Object.entries(settingData).filter(([, value]) => value !== undefined),
+      );
+      if (setting) Object.assign(setting, definedSettingData);
       else {
         setting = manager.create(StoreTimekeepingSetting, {
           ...settingData,
@@ -1550,7 +1556,11 @@ export class StoresAttendancePart {
         shiftSlot: slot,
       }).start;
       // Late within the store's allowed minutes counts as on time (0).
-      lateMinutes = applyGrace(calculateLateMinutes(shiftStart, now), rules);
+      lateMinutes = applyGrace(
+        calculateLateMinutes(shiftStart, now),
+        rules,
+        'late',
+      );
       attendanceStatus =
         lateMinutes > 0 ? AttendanceStatus.LATE : AttendanceStatus.ON_TIME;
 
@@ -1832,7 +1842,11 @@ export class StoresAttendancePart {
       });
       shiftEnd = window.end;
       // Leaving early within the store's allowed minutes counts as on time (0).
-      earlyMinutes = applyGrace(calculateEarlyMinutes(window.end, now), rules);
+      earlyMinutes = applyGrace(
+        calculateEarlyMinutes(window.end, now),
+        rules,
+        'early',
+      );
       // Paid time inside the shift, with forgiven (or not deducted) late/early
       // time counted; staying after the end is paid only up to an approved
       // overtime end. Whether the late arrival was forgiven is what check-in

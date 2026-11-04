@@ -31,7 +31,14 @@ export class StoreTimekeepingSetting extends BaseEntity {
 
   // -- Quy định đi muộn / Về sớm --
   @Column({ name: 'allowed_late_minutes', type: 'int', default: 0 })
-  allowedLateMinutes: number; // Cho phép đi muộn/về sớm tối đa X phút
+  allowedLateMinutes: number; // Cho phép đi muộn tối đa X phút
+
+  /**
+   * Cho phép về sớm tối đa X phút. NULL: cửa hàng chưa đặt riêng (trước khi
+   * tách khỏi đi muộn) — dùng allowedLateMinutes.
+   */
+  @Column({ name: 'allowed_early_leave_minutes', type: 'int', nullable: true })
+  allowedEarlyLeaveMinutes: number | null;
 
   @Column({ name: 'deduct_work_time_if_late', default: true })
   deductWorkTimeIfLate: boolean; // Trừ giờ công nếu vượt quá

@@ -674,6 +674,7 @@ export class StoresRequestsPart {
         updates.lateMinutes = applyGrace(
           calculateLateMinutes(at, checkIn),
           rules,
+          'late',
         );
       }
     } else {
@@ -697,6 +698,7 @@ export class StoresRequestsPart {
         updates.earlyMinutes = applyGrace(
           calculateEarlyMinutes(at, checkOut),
           rules,
+          'early',
         );
       }
     }

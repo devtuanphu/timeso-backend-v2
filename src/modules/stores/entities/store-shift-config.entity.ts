@@ -1,6 +1,7 @@
 import { Entity, Column, ManyToOne, JoinColumn } from 'typeorm';
 import { BaseEntity } from '../../../common/entities/base.entity';
 import { Store } from './store.entity';
+import type { OperatingFrame } from '../operating-hours.utils';
 
 // --- ENUMS ---
 
@@ -70,6 +71,15 @@ export class StoreShiftConfig extends BaseEntity {
 
   @Column({ name: 'close_time', type: 'time', default: '22:00:00' })
   closeTime: string;
+
+  /**
+   * "Giờ hoạt động cửa hàng": khung giờ trong một ngày, không khung nào qua
+   * nửa đêm (vd [{start:'12:00',end:'24:00'},{start:'00:00',end:'05:00'}]).
+   * NULL: chưa lưu — dùng openTime/closeTime (operating-hours.utils.ts). Lưu
+   * khung giờ thì openTime/closeTime cập nhật theo, và ngược lại.
+   */
+  @Column({ name: 'operating_hours', type: 'jsonb', nullable: true })
+  operatingHours: OperatingFrame[] | null;
 
   @Column({ name: 'is_active', default: true })
   isActive: boolean;

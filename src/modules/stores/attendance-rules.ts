@@ -4,10 +4,12 @@
  * These fields of `store_timekeeping_settings` were saved but never read, so
  * every store got the same hardcoded behaviour. They now decide:
  *
- *  - allowedLateMinutes: arriving late / leaving early by at most this many
- *    minutes counts as on time — stored late/early minutes are 0, so no LATE
- *    status, no owner "late" alert and no payroll fine. Beyond it, the full
- *    minutes are recorded.
+ *  - allowedLateMinutes: arriving late by at most this many minutes counts as
+ *    on time — stored late minutes are 0, so no LATE status, no owner "late"
+ *    alert and no payroll fine. Beyond it, the full minutes are recorded.
+ *  - allowedEarlyLeaveMinutes: the same for leaving early (stored early
+ *    minutes). Null (stores that set one value for both before the two were
+ *    split) falls back to allowedLateMinutes.
  *  - countFullTimeIfLate / deductWorkTimeIfLate: whether late/early minutes
  *    are taken out of worked time (hour-based pay uses worked time).
  *  - earlyCheckinMinutes: how long before the shift start check-in opens.
@@ -23,7 +25,10 @@
 import type { WorkedTimeMode } from './worked-time-rules';
 
 export interface AttendanceRules {
+  /** Late arrival forgiven up to this many minutes. */
   graceMinutes: number;
+  /** Early leave forgiven up to this many minutes. */
+  earlyGraceMinutes: number;
   earlyCheckinMinutes: number;
   lateCheckoutMinutes: number;
   /** Late arrival / early leave never reduce worked time. */
@@ -32,6 +37,7 @@ export interface AttendanceRules {
 
 export interface AttendanceRuleSettings {
   allowedLateMinutes?: number | null;
+  allowedEarlyLeaveMinutes?: number | null;
   earlyCheckinMinutes?: number | null;
   lateCheckoutMinutes?: number | null;
   countFullTimeIfLate?: boolean | null;
@@ -40,6 +46,7 @@ export interface AttendanceRuleSettings {
 
 export const DEFAULT_ATTENDANCE_RULES: AttendanceRules = Object.freeze({
   graceMinutes: 0,
+  earlyGraceMinutes: 0,
   earlyCheckinMinutes: 15,
   lateCheckoutMinutes: 15,
   creditLateEarly: false,
@@ -57,11 +64,13 @@ export function resolveAttendanceRules(
   setting?: AttendanceRuleSettings | null,
 ): AttendanceRules {
   if (!setting) return { ...DEFAULT_ATTENDANCE_RULES };
+  const graceMinutes = minutesOr(
+    setting.allowedLateMinutes,
+    DEFAULT_ATTENDANCE_RULES.graceMinutes,
+  );
   return {
-    graceMinutes: minutesOr(
-      setting.allowedLateMinutes,
-      DEFAULT_ATTENDANCE_RULES.graceMinutes,
-    ),
+    graceMinutes,
+    earlyGraceMinutes: minutesOr(setting.allowedEarlyLeaveMinutes, graceMinutes),
     earlyCheckinMinutes: minutesOr(
       setting.earlyCheckinMinutes,
       DEFAULT_ATTENDANCE_RULES.earlyCheckinMinutes,
@@ -76,10 +85,18 @@ export function resolveAttendanceRules(
   };
 }
 
-/** Late or early minutes as recorded: 0 within the store's grace. */
-export function applyGrace(rawMinutes: number, rules: AttendanceRules): number {
+/**
+ * Late (`kind` 'late') or early-leave ('early') minutes as recorded: 0 within
+ * the store's grace for that kind.
+ */
+export function applyGrace(
+  rawMinutes: number,
+  rules: AttendanceRules,
+  kind: 'late' | 'early',
+): number {
   const raw = Math.max(0, Math.floor(rawMinutes || 0));
-  return raw <= rules.graceMinutes ? 0 : raw;
+  const grace = kind === 'early' ? rules.earlyGraceMinutes : rules.graceMinutes;
+  return raw <= grace ? 0 : raw;
 }
 
 /** First instant check-in is accepted; null when the shift start is unknown. */
@@ -145,11 +162,15 @@ export function creditedWorkedMinutes(input: {
 
   // Called only for a real gap (> 0 ms); whole minutes decide the grace, as
   // they do for the recorded late/early minutes.
-  const credited = (gapMs: number, recorded?: number | null) =>
+  const credited = (
+    gapMs: number,
+    kind: 'late' | 'early',
+    recorded?: number | null,
+  ) =>
     rules.creditLateEarly ||
     (recorded != null
       ? Number(recorded) === 0
-      : applyGrace(Math.floor(gapMs / 60_000), rules) === 0);
+      : applyGrace(Math.floor(gapMs / 60_000), rules, kind) === 0);
 
   let from = checkIn.getTime();
   if (start) {
@@ -158,14 +179,14 @@ export function creditedWorkedMinutes(input: {
       from = start.getTime();
     } else if (
       from > start.getTime() &&
-      credited(from - start.getTime(), storedLateMinutes)
+      credited(from - start.getTime(), 'late', storedLateMinutes)
     ) {
       from = start.getTime();
     }
   }
   let to = checkOut.getTime();
   if (end && to < end.getTime()) {
-    if (credited(end.getTime() - to)) to = end.getTime();
+    if (credited(end.getTime() - to, 'early')) to = end.getTime();
   }
   if (paidEnd && to > paidEnd.getTime()) to = paidEnd.getTime();
   return Math.max(0, Math.floor((to - from) / 60_000));
