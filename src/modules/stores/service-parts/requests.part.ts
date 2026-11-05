@@ -15,6 +15,18 @@ import {
 } from 'typeorm';
 import { isUUID } from 'class-validator';
 import {
+  AttendanceLog,
+  AttendanceLogType,
+  AttendanceMethod,
+} from '../entities/attendance-log.entity';
+import { isShiftCoveredByApprovedLeave } from '../leave-coverage.utils';
+import {
+  REQUEST_POLICY_CODE,
+  requestPolicyViolation,
+  type RequestPolicyKind,
+} from '../request-policy.utils';
+import type { StoreApprovalSetting } from '../entities/store-approval-setting.entity';
+import {
   ShiftChangeRequest,
   ShiftChangeRequestStatus,
 } from '../entities/shift-change-request.entity';
@@ -55,7 +67,11 @@ import {
   toActivityDate,
   toActivityHHmm,
 } from '../activity-log.summary';
-import { vnClockHHmm, vnDateString } from '../../../common/utils/vn-calendar';
+import {
+  vnClockHHmm,
+  vnDateString,
+  vnMonthOfDateString,
+} from '../../../common/utils/vn-calendar';
 import {
   describeOwnerRequestNotification,
   OWNER_REQUEST_NOTIFICATION_TYPE,
@@ -745,7 +761,7 @@ export class StoresRequestsPart {
       employeeProfileId: string;
       storeId: string;
       requestId: string;
-      kind: 'LATE' | 'EARLY' | 'LEAVE' | 'OVERTIME' | 'SUDDEN';
+      kind: 'LATE' | 'EARLY' | 'LEAVE' | 'OVERTIME' | 'SUDDEN' | 'SUPPLEMENT';
       approved: boolean;
       reason?: string | null;
       assignmentId?: string | null;
@@ -780,6 +796,7 @@ export class StoresRequestsPart {
         LEAVE: 'Đơn xin nghỉ',
         SUDDEN: 'Đơn xin nghỉ đột xuất',
         OVERTIME: 'Yêu cầu tăng ca',
+        SUPPLEMENT: 'Đơn bổ sung công',
       }[input.kind];
       const title = `${label} ${input.approved ? 'đã được duyệt' : 'bị từ chối'}`;
       let content: string;
@@ -794,6 +811,8 @@ export class StoresRequestsPart {
         content = `Ca${on} kết thúc lúc ${clock}. Giờ làm được tính đến ${clock}.`;
       } else if (input.kind === 'OVERTIME' && clock) {
         content = `Ca${on} được tăng ca đến ${clock}. Giờ làm được tính đến ${clock}.`;
+      } else if (input.kind === 'SUPPLEMENT' && clock) {
+        content = `Công${on} đã được bổ sung, giờ làm tính đến ${clock}.`;
       } else if (input.kind === 'LEAVE') {
         const range =
           input.endDate && input.endDate !== input.workDate
@@ -855,6 +874,8 @@ export class StoresRequestsPart {
       workDate?: string | null;
       endDate?: string | null;
       time?: string | null;
+      fromTime?: string | null;
+      toTime?: string | null;
       minutes?: number | null;
       reason?: string | null;
       amount?: number | null;
@@ -916,6 +937,8 @@ export class StoresRequestsPart {
         shiftStart: window?.start ? vnClockHHmm(window.start) : null,
         shiftEnd: window?.end ? vnClockHHmm(window.end) : null,
         time: input.time ?? null,
+        fromTime: input.fromTime ?? null,
+        toTime: input.toTime ?? null,
         minutes,
         reason: input.reason ?? null,
         amount: input.amount ?? null,
@@ -958,6 +981,148 @@ export class StoresRequestsPart {
         }`,
       );
     }
+  }
+
+  /**
+   * Chặn đơn nhân viên tự gửi theo cài đặt duyệt đơn của cửa hàng (xem
+   * request-policy.utils.ts). Cửa hàng chưa lưu cài đặt: mặc định 24h / 2 lần
+   * (nghỉ), 12h / 2 lần (đổi ca), 2h / 2 lần (trễ / sớm) — đúng số app nhân
+   * viên đang hiển thị. Gọi trong transaction đã khoá hồ sơ nhân viên, nên hai
+   * đơn gửi cùng lúc không cùng lọt qua giới hạn số lần.
+   */
+  async assertApprovalPolicy(
+    this: StoresService,
+    /** Transaction đang khoá hồ sơ nhân viên; null khi không cần đếm (đăng ký ca). */
+    manager: EntityManager | null,
+    input: {
+      storeId: string;
+      employeeProfileId: string;
+      kind: RequestPolicyKind;
+      /** Thời điểm bị ảnh hưởng; hàm = chỉ tính khi cửa hàng đặt báo trước. */
+      affectsAt: Date | null | (() => Promise<Date | null>);
+      /** 'YYYY-MM-DD' của ngày bị ảnh hưởng: tháng để đếm số lần. */
+      monthDate: string | null;
+    },
+  ): Promise<void> {
+    const saved: StoreApprovalSetting | null =
+      (await this.approvalSettingRepository.findOne({
+        where: { storeId: input.storeId },
+      })) ?? null;
+    const policy = saved ?? {
+      enableShiftRegistration: true,
+      enableLeaveRequest: true,
+      enableShiftSwap: true,
+      leaveNoticeHours: 24,
+      leaveLimitPerMonth: 2,
+      swapNoticeHours: 12,
+      swapLimitPerMonth: 2,
+      lateEarlyNoticeHours: 2,
+      lateEarlyLimitPerMonth: 2,
+    };
+    const month = input.monthDate ? vnMonthOfDateString(input.monthDate) : null;
+    const positive = (value: unknown) => Number(value) > 0;
+    // Chỉ truy vấn khi cửa hàng có đặt: 0 = không giới hạn / không cần báo trước.
+    const limited =
+      input.kind === 'LEAVE'
+        ? positive(policy.leaveLimitPerMonth)
+        : input.kind === 'SWAP'
+          ? positive(policy.swapLimitPerMonth)
+          : input.kind === 'LATE' || input.kind === 'EARLY'
+            ? positive(policy.lateEarlyLimitPerMonth)
+            : false;
+    const noticed =
+      input.kind === 'LEAVE'
+        ? positive(policy.leaveNoticeHours)
+        : input.kind === 'SWAP'
+          ? positive(policy.swapNoticeHours)
+          : input.kind === 'LATE' || input.kind === 'EARLY'
+            ? positive(policy.lateEarlyNoticeHours)
+            : false;
+    const affectsAt =
+      !noticed
+        ? null
+        : typeof input.affectsAt === 'function'
+          ? await input.affectsAt()
+          : input.affectsAt;
+    let used = 0;
+    const live = In([LeaveRequestStatus.PENDING, LeaveRequestStatus.APPROVED]);
+    if (limited && manager && month && (input.kind === 'LEAVE' || input.kind === 'LATE' || input.kind === 'EARLY')) {
+      used = await manager.count(EmployeeLeaveRequest, {
+        where: {
+          employeeProfileId: input.employeeProfileId,
+          status: live,
+          startDate: Between(month.key, month.lastDate) as any,
+          type: In(
+            input.kind === 'LEAVE'
+              ? [
+                  LeaveType.SICK,
+                  LeaveType.PERSONAL,
+                  LeaveType.VACATION,
+                  LeaveType.UNPAID,
+                  LeaveType.OTHER,
+                ]
+              : [LeaveType.LATE, LeaveType.EARLY],
+          ),
+        },
+      });
+    } else if (limited && manager && month && input.kind === 'SWAP') {
+      const changes = await manager.count(ShiftChangeRequest, {
+        where: {
+          employeeProfileId: input.employeeProfileId,
+          status: In([ShiftChangeRequestStatus.PENDING, ShiftChangeRequestStatus.APPROVED]),
+          requestDate: Between(month.key, month.lastDate) as any,
+        },
+      });
+      const swaps = await manager
+        .createQueryBuilder(ShiftSwap, 'swap')
+        .innerJoin('swap.fromAssignment', 'assignment')
+        .innerJoin('assignment.shiftSlot', 'slot')
+        .where('swap.requestedByEmployeeId = :employeeId', {
+          employeeId: input.employeeProfileId,
+        })
+        .andWhere('swap.status IN (:...statuses)', {
+          statuses: [ShiftSwapStatus.PENDING, ShiftSwapStatus.APPROVED],
+        })
+        .andWhere('slot.workDate BETWEEN :from AND :to', {
+          from: month.key,
+          to: month.lastDate,
+        })
+        .getCount();
+      used = changes + swaps;
+    }
+    const violation = requestPolicyViolation({
+      policy,
+      kind: input.kind,
+      now: new Date(),
+      affectsAt,
+      usedThisMonth: used,
+    });
+    if (violation) {
+      throw new BadRequestException({ code: REQUEST_POLICY_CODE, message: violation });
+    }
+  }
+
+  /** Giờ bắt đầu sớm nhất của các ca nhân viên ngày `workDate` (giờ VN). */
+  async earliestShiftStartOn(
+    this: StoresService,
+    manager: EntityManager,
+    employeeProfileId: string,
+    workDate: string,
+  ): Promise<Date | null> {
+    const rows = await manager.find(ShiftAssignment, {
+      where: {
+        employeeId: employeeProfileId,
+        status: Not(ShiftAssignmentStatus.CANCELLED),
+        shiftSlot: { workDate: workDate as any },
+      },
+      relations: ['shiftSlot', 'shiftSlot.workShift'],
+    });
+    let earliest: Date | null = null;
+    for (const row of rows) {
+      const start = effectiveWindowOf(row).start;
+      if (start && (!earliest || start.getTime() < earliest.getTime())) earliest = start;
+    }
+    return earliest;
   }
 
   // Leave Request Management (Staff)
@@ -1023,6 +1188,54 @@ export class StoresRequestsPart {
         order: { createdAt: 'DESC' },
       });
       if (duplicate) return duplicate;
+
+      // Cài đặt duyệt đơn của chủ: bật / tắt, báo trước, số lần trong tháng.
+      const policyKind: RequestPolicyKind | null =
+        type === LeaveType.LATE
+          ? 'LATE'
+          : type === LeaveType.EARLY
+            ? 'EARLY'
+            : type === LeaveType.SUDDEN
+              ? 'SUDDEN'
+              : type === LeaveType.OVERTIME
+                ? null
+                : 'LEAVE';
+      if (policyKind) {
+        const affectsAt = async (): Promise<Date | null> => {
+        const linked = shiftAssignmentId
+          ? await manager.findOne(ShiftAssignment, {
+              where: { id: shiftAssignmentId },
+              relations: ['shiftSlot', 'shiftSlot.workShift'],
+            })
+          : null;
+        if (linked) {
+          const window = effectiveWindowOf(linked);
+          if (policyKind === 'EARLY') {
+            const leaveClock = /^(\d{1,2}):(\d{2})/.exec(String(data?.endTime ?? ''));
+            const at = leaveClock
+              ? resolveRequestedInstant(
+                  window,
+                  String(linked.shiftSlot?.workDate ?? startDate).slice(0, 10),
+                  `${leaveClock[1].padStart(2, '0')}:${leaveClock[2]}:00`,
+                )
+              : null;
+            return at ?? window.end;
+          }
+          return window.start;
+        }
+        return (
+          (await this.earliestShiftStartOn(manager, data.employeeProfileId, startDate)) ??
+          new Date(`${startDate}T00:00:00+07:00`)
+        );
+        };
+        await this.assertApprovalPolicy(manager, {
+          storeId,
+          employeeProfileId: data.employeeProfileId,
+          kind: policyKind,
+          affectsAt,
+          monthDate: startDate,
+        });
+      }
 
       await this.assertShiftChangeRequestFits(
         manager,
@@ -1361,7 +1574,7 @@ export class StoresRequestsPart {
     }); */
   }
 
-  /** Shift-linked overtime requests of a store as OVERTIME leave rows. */
+  /** Overtime and "bổ sung công" requests of a store as OVERTIME leave rows. */
   async linkedOvertimeRowsForStore(
     this: StoresService,
     storeId: string,
@@ -1375,8 +1588,9 @@ export class StoresRequestsPart {
         .createQueryBuilder('bw')
         .leftJoinAndSelect('bw.employeeProfile', 'employeeProfile')
         .leftJoinAndSelect('employeeProfile.account', 'employeeAccount')
-        .where('bw.storeId = :storeId', { storeId })
-        .andWhere('bw.shiftAssignmentId IS NOT NULL');
+        // Cả đơn không gắn ca ("Bổ sung công" từ nút Flash): trước đây bị lọc
+        // bỏ nên chủ không bao giờ thấy để duyệt.
+        .where('bw.storeId = :storeId', { storeId });
       if (status) query.andWhere('bw.status = :status', { status });
       if (from) query.andWhere('bw.requestDate >= :from', { from });
       if (to) query.andWhere('bw.requestDate <= :to', { to });
@@ -1413,8 +1627,10 @@ export class StoresRequestsPart {
           }
         : null,
       store: { id: storeId },
-      shiftAssignment: { id: bw.shiftAssignmentId },
+      shiftAssignment: bw.shiftAssignmentId ? { id: bw.shiftAssignmentId } : null,
       source: 'BONUS_WORK',
+      /** Không gắn ca: "Bổ sung công" (app chủ ghi "Xin bổ sung công"). */
+      isSupplement: !bw.shiftAssignmentId,
     }));
   }
 
@@ -1615,6 +1831,24 @@ export class StoresRequestsPart {
       if (existing) {
         throw new ConflictException('Yêu cầu đổi ca tương tự đang chờ duyệt');
       }
+
+      // Cài đặt duyệt đơn: đổi ca bật / tắt, báo trước, số lần trong tháng.
+      const reference = currentReference ?? (data.requestedShiftId ? references.get(data.requestedShiftId) : undefined);
+      const referenceDate = reference?.workDate
+        ? String(reference.workDate).slice(0, 10)
+        : String(data.requestDate).slice(0, 10);
+      const referenceClock = /^(\d{1,2}):(\d{2})/.exec(String(reference?.startTime ?? ''));
+      await this.assertApprovalPolicy(manager, {
+        storeId: data.storeId,
+        employeeProfileId: data.employeeProfileId,
+        kind: 'SWAP',
+        affectsAt: new Date(
+          `${referenceDate}T${
+            referenceClock ? `${referenceClock[1].padStart(2, '0')}:${referenceClock[2]}` : '00:00'
+          }:00+07:00`,
+        ),
+        monthDate: referenceDate,
+      });
 
       const request = manager.create(ShiftChangeRequest, {
         storeId: data.storeId,
@@ -2086,7 +2320,11 @@ export class StoresRequestsPart {
     void this.notifyOwnerOfRequest({
       storeId: saved.storeId,
       employeeProfileId: saved.employeeProfileId,
-      kind: 'OVERTIME',
+      // Không gắn ca = "Bổ sung công" (nhân viên khai khung giờ đã làm), không
+      // phải tăng ca: trước đây thông báo ghi "xin tăng ca".
+      kind: saved.shiftAssignmentId ? 'OVERTIME' : 'SUPPLEMENT',
+      fromTime: saved.shiftAssignmentId ? null : (saved.startTime ?? null),
+      toTime: saved.shiftAssignmentId ? null : (saved.endTime ?? null),
       requestId: saved.id,
       shiftAssignmentId: saved.shiftAssignmentId ?? null,
       workDate: saved.requestDate
@@ -2262,7 +2500,7 @@ export class StoresRequestsPart {
       employeeProfileId: request.employeeProfileId,
       storeId: request.storeId,
       requestId: request.id,
-      kind: 'OVERTIME',
+      kind: request.shiftAssignmentId ? 'OVERTIME' : 'SUPPLEMENT',
       approved,
       reason,
       assignmentId: request.shiftAssignmentId,
@@ -2282,6 +2520,9 @@ export class StoresRequestsPart {
   ) {
     const { request, approverProfileId } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
+    if (!request.shiftAssignmentId) {
+      return this.approveWorkSupplement(request, approverProfileId, ownerAccountId);
+    }
     const saved = await this.decideBonusWorkRequest(
       request,
       BonusWorkRequestStatus.APPROVED,
@@ -2305,6 +2546,16 @@ export class StoresRequestsPart {
   ) {
     const { request, approverProfileId } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
+    // Bổ sung công đã duyệt thì giờ vào / ra của ca đã được ghi theo đơn:
+    // từ chối lại không hoàn tác được chấm công, nên không cho.
+    if (
+      !request.shiftAssignmentId &&
+      request.status === BonusWorkRequestStatus.APPROVED
+    ) {
+      throw new BadRequestException(
+        'Đơn bổ sung công đã duyệt và đã cộng công vào ca, không từ chối lại được',
+      );
+    }
     const saved = await this.decideBonusWorkRequest(
       request,
       BonusWorkRequestStatus.REJECTED,
@@ -2318,6 +2569,234 @@ export class StoresRequestsPart {
     await this.repriceCheckedOutOvertime(saved);
     void this.notifyOvertimeDecision(saved, false, reason);
     return saved;
+  }
+
+  /**
+   * Duyệt "Bổ sung công" (đơn không gắn ca: nhân viên khai đã làm ngày D từ
+   * A đến B mà chấm công thiếu). Luật:
+   * - Gắn vào ca của nhân viên (ngày D, hoặc ca qua đêm của D-1) có khung giờ
+   *   trùng A–B nhiều nhất, ca đã duyệt / đã vào / đã ra; khung A–B phải đã
+   *   qua; ca không nằm trong đơn nghỉ đã duyệt; phiếu lương chưa chốt.
+   * - Giờ vào = sớm hơn giữa giờ vào đã có và A (chưa vào ca thì A). Giờ ra =
+   *   B khi chưa ra ca / hệ thống tự chấm ra / quên chấm ra; đã tự ra ca thì
+   *   muộn hơn giữa giờ ra đó và B.
+   * - Đi trễ, về sớm, giờ công tính lại đúng như chấm công thật (miễn trừ,
+   *   cách tính giờ công, tăng ca đã duyệt); ca thành COMPLETED; lương tính lại.
+   * Không có ca trùng: không duyệt được (chủ xếp ca rồi duyệt, hoặc từ chối).
+   */
+  async approveWorkSupplement(
+    this: StoresService,
+    request: BonusWorkRequest,
+    approverProfileId: string | null,
+    ownerAccountId: string | undefined,
+  ) {
+    if (request.status !== BonusWorkRequestStatus.PENDING) {
+      throw new BadRequestException('Chỉ duyệt được đơn bổ sung công đang chờ duyệt.');
+    }
+    const date = request.requestDate ? String(request.requestDate).slice(0, 10) : '';
+    const clock = (value?: string | null) => {
+      const match = /^(\d{1,2}):(\d{2})/.exec(String(value ?? ''));
+      return match ? `${match[1].padStart(2, '0')}:${match[2]}` : null;
+    };
+    const fromClock = clock(request.startTime);
+    const toClock = clock(request.endTime);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !fromClock || !toClock) {
+      throw new BadRequestException('Đơn bổ sung công thiếu ngày hoặc giờ vào / ra');
+    }
+    const from = new Date(`${date}T${fromClock}:00+07:00`);
+    let to = new Date(`${date}T${toClock}:00+07:00`);
+    if (to.getTime() <= from.getTime()) to = new Date(to.getTime() + 24 * 60 * 60 * 1000);
+    if (to.getTime() > Date.now()) {
+      throw new BadRequestException('Chỉ bổ sung công cho khung giờ đã qua');
+    }
+    const previousDate = vnDateString(new Date(new Date(`${date}T12:00:00+07:00`).getTime() - 24 * 60 * 60 * 1000));
+    const candidates = await this.shiftAssignmentRepository
+      .createQueryBuilder('assignment')
+      .innerJoinAndSelect('assignment.shiftSlot', 'slot')
+      .leftJoinAndSelect('slot.workShift', 'workShift')
+      .innerJoinAndSelect('slot.cycle', 'cycle')
+      .where('assignment.employeeId = :employeeId', { employeeId: request.employeeProfileId })
+      .andWhere('cycle.storeId = :storeId', { storeId: request.storeId })
+      .andWhere('assignment.status IN (:...statuses)', {
+        statuses: [
+          ShiftAssignmentStatus.APPROVED,
+          ShiftAssignmentStatus.CONFIRMED,
+          ShiftAssignmentStatus.COMPLETED,
+        ],
+      })
+      .andWhere('slot.workDate IN (:...dates)', { dates: [previousDate, date] })
+      .getMany();
+    let best: { assignment: ShiftAssignment; overlap: number } | null = null;
+    for (const candidate of candidates) {
+      const { start, end } = effectiveWindowOf(candidate);
+      if (!start || !end) continue;
+      const overlap =
+        Math.min(end.getTime(), to.getTime()) - Math.max(start.getTime(), from.getTime());
+      if (overlap > 0 && (!best || overlap > best.overlap)) best = { assignment: candidate, overlap };
+    }
+    if (!best) {
+      throw new BadRequestException(
+        `Nhân viên không có ca nào trong khung ${fromClock} – ${toClock} ngày ${date.slice(8, 10)}/${date.slice(5, 7)}. Hãy xếp ca cho nhân viên rồi duyệt, hoặc từ chối đơn.`,
+      );
+    }
+    const target = best.assignment;
+    const slot = target.shiftSlot;
+    const workDate = String(slot.workDate).slice(0, 10);
+    if (
+      await isShiftCoveredByApprovedLeave(
+        this.dataSource,
+        target.employeeId,
+        workDate,
+        target.id,
+      )
+    ) {
+      throw new BadRequestException('Ca này đang có đơn nghỉ đã duyệt, không bổ sung công được');
+    }
+    await this.assertPayslipOpen(target.employeeId, workDate);
+    const setting = await this.timekeepingSettingRepository.findOne({
+      where: { storeId: request.storeId },
+    });
+    const rules = resolveAttendanceRules(setting);
+    const mode = await this.workedTimeModeFor(request.storeId, target.employeeId, slot);
+
+    const credited = await this.dataSource.transaction(async (manager) => {
+      const locked = await manager.findOne(ShiftAssignment, {
+        where: { id: target.id },
+        lock: { mode: 'pessimistic_write' },
+      });
+      if (!locked || locked.status === ShiftAssignmentStatus.CANCELLED) {
+        throw new BadRequestException('Ca đã thay đổi, vui lòng tải lại');
+      }
+      const decided = await manager.update(
+        BonusWorkRequest,
+        { id: request.id, status: BonusWorkRequestStatus.PENDING },
+        {
+          status: BonusWorkRequestStatus.APPROVED,
+          approvedById: approverProfileId,
+          // Ca đã được bổ sung công (để tra lại). Không ghi shiftAssignmentId:
+          // đơn gắn ca là tăng ca, sẽ kéo dài giờ được trả của ca.
+          shiftSlotId: slot.id,
+        } as any,
+      );
+      if (!decided.affected) {
+        throw new BadRequestException('Yêu cầu đã được cập nhật, vui lòng tải lại');
+      }
+      const window = effectiveWindowOf({
+        adjustedStartAt: locked.adjustedStartAt,
+        adjustedEndAt: locked.adjustedEndAt,
+        shiftSlot: slot,
+      });
+      const oldIn = locked.checkInTime ? new Date(locked.checkInTime) : null;
+      const oldOut = locked.checkOutTime ? new Date(locked.checkOutTime) : null;
+      const checkIn = oldIn && oldIn.getTime() < from.getTime() ? oldIn : from;
+      const outWasMissing =
+        !oldOut ||
+        !!locked.isAutoCheckout ||
+        !!locked.autoCheckoutReason ||
+        locked.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT;
+      const checkOut = outWasMissing
+        ? to
+        : oldOut.getTime() > to.getTime()
+          ? oldOut
+          : to;
+      if (checkOut.getTime() <= checkIn.getTime()) {
+        throw new BadRequestException('Giờ ra phải sau giờ vào của ca');
+      }
+      const lateMinutes = applyGrace(calculateLateMinutes(window.start, checkIn), rules, 'late');
+      const earlyMinutes = applyGrace(calculateEarlyMinutes(window.end, checkOut), rules, 'early');
+      const workedMinutes = creditedWorkedMinutes({
+        start: window.start,
+        end: window.end,
+        checkIn,
+        checkOut,
+        rules,
+        storedLateMinutes: lateMinutes,
+        paidUntil: await this.approvedOvertimeEnd(locked.id, window.end),
+        mode,
+      });
+      const attendanceStatus =
+        lateMinutes > 0 && earlyMinutes > 0
+          ? AttendanceStatus.LATE_AND_EARLY
+          : lateMinutes > 0
+            ? AttendanceStatus.LATE
+            : earlyMinutes > 0
+              ? AttendanceStatus.EARLY
+              : AttendanceStatus.ON_TIME;
+      await manager.update(
+        ShiftAssignment,
+        { id: locked.id },
+        {
+          checkInTime: checkIn,
+          checkOutTime: checkOut,
+          lateMinutes,
+          earlyMinutes,
+          workedMinutes,
+          attendanceStatus,
+          status: ShiftAssignmentStatus.COMPLETED,
+          isAutoCheckout: false,
+          autoCheckoutReason: null,
+        } as any,
+      );
+      const logs: AttendanceLog[] = [];
+      if (!oldIn || oldIn.getTime() !== checkIn.getTime()) {
+        logs.push(
+          manager.create(AttendanceLog, {
+            shiftAssignmentId: locked.id,
+            employeeProfileId: locked.employeeId,
+            storeId: request.storeId,
+            type: AttendanceLogType.CHECK_IN,
+            timestamp: checkIn,
+            method: AttendanceMethod.MANUAL,
+          }),
+        );
+      }
+      if (!oldOut || oldOut.getTime() !== checkOut.getTime()) {
+        logs.push(
+          manager.create(AttendanceLog, {
+            shiftAssignmentId: locked.id,
+            employeeProfileId: locked.employeeId,
+            storeId: request.storeId,
+            type: AttendanceLogType.CHECK_OUT,
+            timestamp: checkOut,
+            method: AttendanceMethod.MANUAL,
+          }),
+        );
+      }
+      if (logs.length) await manager.save(AttendanceLog, logs);
+      return { assignmentId: locked.id, checkOut, workedMinutes };
+    });
+
+    const saved = Object.assign(request, {
+      status: BonusWorkRequestStatus.APPROVED,
+      approvedById: approverProfileId,
+      shiftSlotId: slot.id,
+    });
+    await this.logBonusWorkActivity(
+      ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_APPROVED,
+      saved,
+      ownerAccountId ?? null,
+    );
+    try {
+      await this.processCheckoutPayroll(credited.assignmentId);
+    } catch {
+      this.logger.error(
+        `[WorkSupplement] Payslip not recomputed after crediting ${credited.assignmentId}`,
+      );
+    }
+    void this.notifyRequestDecision({
+      employeeProfileId: request.employeeProfileId,
+      storeId: request.storeId,
+      requestId: request.id,
+      kind: 'SUPPLEMENT',
+      approved: true,
+      assignmentId: credited.assignmentId,
+      workDate,
+      time: vnClockHHmm(credited.checkOut),
+    });
+    return Object.assign(saved, {
+      creditedAssignmentId: credited.assignmentId,
+      creditedWorkedMinutes: credited.workedMinutes,
+    });
   }
 
   /** Whether `id` is an overtime ("bổ sung công") request, not a leave row. */
@@ -2519,11 +2998,11 @@ export class StoresRequestsPart {
       where: { storeId },
       select: ['status', 'createdAt'],
     });
-    // Shift-linked overtime requests are reviewed with the leave requests.
+    // Overtime and "bổ sung công" requests are reviewed with the leave requests.
     let overtimeRequests: BonusWorkRequest[] = [];
     try {
       overtimeRequests = await this.bonusWorkRequestRepository.find({
-        where: { storeId, shiftAssignmentId: Not(IsNull()) },
+        where: { storeId },
         select: ['status', 'createdAt'],
       });
     } catch {

@@ -192,6 +192,11 @@ export class CreateSkillDto extends RequirementsField {
 
   @IsEnum(SkillConfirmation)
   confirmation: SkillConfirmation;
+
+  /** false = không theo thứ tự (mở ngay, không khoá kỹ năng khác). Mặc định true. */
+  @IsOptional()
+  @IsBoolean()
+  isOrdered?: boolean;
 }
 
 export class UpdateSkillDto extends RequirementsField {
@@ -230,6 +235,11 @@ export class UpdateSkillDto extends RequirementsField {
   @IsOptional()
   @IsEnum(SkillConfirmation)
   confirmation?: SkillConfirmation;
+
+  /** false = không theo thứ tự (mở ngay, không khoá kỹ năng khác). */
+  @IsOptional()
+  @IsBoolean()
+  isOrdered?: boolean;
 
   /** "Ngừng dùng" (D10): kỹ năng đã có người đạt không xoá được. */
   @IsOptional()

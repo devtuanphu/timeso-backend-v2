@@ -9,6 +9,7 @@ export type OwnerRequestKind =
   | 'SUDDEN'
   | 'LEAVE'
   | 'OVERTIME'
+  | 'SUPPLEMENT'
   | 'SALARY_INQUIRY'
   | 'SALARY_ADVANCE';
 
@@ -19,6 +20,9 @@ export const OWNER_REQUEST_NOTIFICATION_TYPE: Record<OwnerRequestKind, string> =
   SUDDEN: 'OWNER_SUDDEN_LEAVE_REQUEST',
   LEAVE: 'OWNER_LEAVE_REQUEST',
   OVERTIME: 'OWNER_OVERTIME_REQUEST',
+  // "Bổ sung công" nằm chung danh sách duyệt với tăng ca: cùng loại thông báo
+  // để app chủ (kể cả bản cũ) mở đúng màn duyệt.
+  SUPPLEMENT: 'OWNER_OVERTIME_REQUEST',
   SALARY_INQUIRY: 'OWNER_SALARY_INQUIRY',
   SALARY_ADVANCE: 'OWNER_SALARY_ADVANCE_REQUEST',
 };
@@ -37,6 +41,9 @@ export interface OwnerRequestNotificationInput {
   shiftEnd?: string | null;
   /** "HH:mm" asked for: arrival (late), leave (early), overtime end. */
   time?: string | null;
+  /** "HH:mm" from / to of a work-time supplement ("bổ sung công"). */
+  fromTime?: string | null;
+  toTime?: string | null;
   /** Minutes late / early / of overtime the request means. */
   minutes?: number | null;
   reason?: string | null;
@@ -109,6 +116,17 @@ export function describeOwnerRequestNotification(
           length ? ` (${length})` : ''
         }.${reason}`,
       };
+    case 'SUPPLEMENT': {
+      const date = ddmm(input.workDate);
+      const from = hhmm(input.fromTime);
+      const to = hhmm(input.toTime);
+      return {
+        title: 'Nhân viên xin bổ sung công',
+        content: `${input.who} xin bổ sung công${date ? ` ngày ${date}` : ''}${
+          from && to ? ` (${from}–${to})` : ''
+        }.${reason}`,
+      };
+    }
     case 'SALARY_INQUIRY':
       return {
         title: 'Nhân viên hỏi về bảng lương',

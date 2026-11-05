@@ -89,6 +89,8 @@ export interface SkillView {
   description: string | null;
   level: SkillLevel;
   confirmation: SkillConfirmation;
+  /** false = không theo thứ tự. */
+  isOrdered: boolean;
   isActive: boolean;
   achievedCount: number;
   requirements: RequirementView[];
@@ -266,6 +268,7 @@ export class CareerStructureService {
         description: s.description ?? null,
         level: s.level,
         confirmation: s.confirmation,
+        isOrdered: s.isOrdered !== false,
         isActive: s.isActive,
         achievedCount: achieved.get(s.id) ?? 0,
         requirements: skillReqs.get(s.id) ?? [],
@@ -561,6 +564,7 @@ export class CareerStructureService {
             description: s.description,
             level: s.level,
             confirmation: s.confirmation,
+            isOrdered: s.isOrdered !== false,
             isActive: s.isActive,
           }),
         );
@@ -748,6 +752,7 @@ export class CareerStructureService {
       sequence?: number;
       level: SkillLevel;
       confirmation: SkillConfirmation;
+      isOrdered?: boolean;
       requirements?: RequirementInput[];
     },
     actorAccountId: string | null,
@@ -773,6 +778,7 @@ export class CareerStructureService {
           description: trimOrNull(dto.description) as string,
           level: dto.level,
           confirmation: dto.confirmation,
+          isOrdered: dto.isOrdered !== false,
           isActive: true,
         }),
       );
@@ -794,6 +800,7 @@ export class CareerStructureService {
       sequence?: number;
       level?: SkillLevel;
       confirmation?: SkillConfirmation;
+      isOrdered?: boolean;
       isActive?: boolean;
       requirements?: RequirementInput[];
     },
@@ -870,6 +877,7 @@ export class CareerStructureService {
       }
       if (dto.level !== undefined) changes.level = dto.level;
       if (dto.confirmation !== undefined) changes.confirmation = dto.confirmation;
+      if (dto.isOrdered !== undefined) changes.isOrdered = dto.isOrdered;
       if (dto.isActive !== undefined) changes.isActive = dto.isActive;
       if (Object.keys(changes).length) await m.update(StoreSkill, { id: skill.id }, changes);
       if (dto.requirements !== undefined) {

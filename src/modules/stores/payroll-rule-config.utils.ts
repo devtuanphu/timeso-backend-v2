@@ -334,6 +334,37 @@ const fmt = (value: number): string => {
 };
 
 /**
+ * Những lần phát sinh được tính tiền của một khoản v3: bỏ lần trong miễn trừ
+ * (X phút đầu), và khi không cộng dồn trong ngày thì mỗi ngày giữ lần nặng
+ * nhất. Dùng chung cho tiền (evaluateRuleConfig) và chi tiết từng lần trên
+ * phiếu lương ("Đi muộn 18 phút 25/10/26").
+ */
+export function countedOccurrences(
+  code: string,
+  config: Pick<RuleCalcConfig, 'graceMinutes' | 'accumulateDaily'>,
+  occurrences: RuleOccurrence[],
+): RuleOccurrence[] {
+  const minuteBased = MINUTE_BASED_CODES.has(code);
+  const grace = minuteBased ? Math.max(0, config.graceMinutes ?? 0) : 0;
+  // Miễn trừ: bỏ lần không vượt X phút đầu.
+  let list = (occurrences ?? []).filter((o) =>
+    minuteBased ? o.minutes > grace : o.quantity > 0,
+  );
+  // Không cộng dồn trong ngày: mỗi ngày giữ lần nặng nhất.
+  if (config.accumulateDaily === false) {
+    const byDay = new Map<string, RuleOccurrence>();
+    for (const o of list) {
+      const prev = byDay.get(o.date);
+      const weight = minuteBased ? o.minutes : o.quantity;
+      const prevWeight = prev ? (minuteBased ? prev.minutes : prev.quantity) : -1;
+      if (!prev || weight > prevWeight) byDay.set(o.date, o);
+    }
+    list = [...byDay.values()];
+  }
+  return list;
+}
+
+/**
  * Tiền của một khoản v3 trong tháng.
  * - occurrences: các lần phát sinh (đã gồm ghi nhận tay với khoản thủ công);
  * - monthly: số liệu tháng cho kiểu "Theo mốc điều kiện".
@@ -353,19 +384,7 @@ export function evaluateRuleConfig(input: {
   const recorded = manual && code !== 'MISSED_PUNCH';
   const grace = minuteBased ? Math.max(0, config.graceMinutes ?? 0) : 0;
 
-  // Miễn trừ: bỏ lần không vượt X phút đầu.
-  let list = input.occurrences.filter((o) => (minuteBased ? o.minutes > grace : o.quantity > 0));
-  // Không cộng dồn trong ngày: mỗi ngày giữ lần nặng nhất.
-  if (config.accumulateDaily === false) {
-    const byDay = new Map<string, RuleOccurrence>();
-    for (const o of list) {
-      const prev = byDay.get(o.date);
-      const weight = minuteBased ? o.minutes : o.quantity;
-      const prevWeight = prev ? (minuteBased ? prev.minutes : prev.quantity) : -1;
-      if (!prev || weight > prevWeight) byDay.set(o.date, o);
-    }
-    list = [...byDay.values()];
-  }
+  const list = countedOccurrences(code, config, input.occurrences);
   const after = (o: RuleOccurrence) => Math.max(0, o.minutes - grace);
   /** Số lượng một lần theo đơn vị (khoản thủ công: số lượng chủ ghi nhận). */
   const measure = (o: RuleOccurrence, unit: RuleUnit): number => {

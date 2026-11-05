@@ -64,6 +64,8 @@ export interface SkillState {
   sequence: number | null;
   level: SkillLevel;
   confirmation: SkillConfirmation;
+  /** false = không theo thứ tự (mở ngay, không khoá kỹ năng khác). */
+  isOrdered: boolean;
   status: SkillStateStatus;
   unlockedAt: Date | null;
   achievedAt: Date | null;
@@ -459,7 +461,12 @@ export class CareerEvaluationService {
         sequence: skill.sequence,
         level: skill.level,
         confirmation: skill.confirmation,
+        isOrdered: skill.isOrdered !== false,
       };
+      // "Không theo thứ tự": mở ngay từ lúc vào bộ phận / nhận vị trí, không
+      // chờ kỹ năng bắt buộc đứng trước, và (kể cả khi bắt buộc) không khoá
+      // hay dời giờ mở khoá của kỹ năng đứng sau.
+      const ordered = skill.isOrdered !== false;
 
       if (row?.status === SkillProgressStatus.ACHIEVED) {
         states.push({
@@ -470,19 +477,21 @@ export class CareerEvaluationService {
           passCount: 0,
           evaluation: null,
         });
-        if (skill.level === SkillLevel.REQUIRED) {
+        if (ordered && skill.level === SkillLevel.REQUIRED) {
           lastRequiredAchievedAt = later(lastRequiredAchievedAt, row.achievedAt);
         }
         continue;
       }
 
-      if (!gateOpen) {
+      if (ordered && !gateOpen) {
         states.push({ ...base, status: 'locked', unlockedAt: null, achievedAt: null, passCount: 0, evaluation: null });
         continue;
       }
 
       const entered = skill.positionId ? enteredPosition : enteredDepartment;
-      const unlockedAt = later(entered, skill.createdAt, lastRequiredAchievedAt);
+      const unlockedAt = ordered
+        ? later(entered, skill.createdAt, lastRequiredAchievedAt)
+        : later(entered, skill.createdAt);
       const evaluation = await this.evaluateSkill(ctx, graph, skill, unlockedAt);
       const passCount = await ctx.passCount(skill.id, unlockedAt);
       states.push({
@@ -494,7 +503,7 @@ export class CareerEvaluationService {
         evaluation,
       });
       // Kỹ năng bắt buộc chưa đạt khoá mọi kỹ năng đứng sau; kỹ năng tuỳ chọn thì không.
-      if (skill.level === SkillLevel.REQUIRED) gateOpen = false;
+      if (ordered && skill.level === SkillLevel.REQUIRED) gateOpen = false;
     }
     return states;
   }

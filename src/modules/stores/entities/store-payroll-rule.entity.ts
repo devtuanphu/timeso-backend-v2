@@ -162,4 +162,21 @@ export class StorePayrollRule extends BaseEntity {
    */
   @Column({ name: 'employee_profile_ids', type: 'uuid', array: true, nullable: true })
   employeeProfileIds: string[] | null;
+
+  /**
+   * Phiên bản (scripts/migration_payroll_rule_versions.sql): sửa phần ảnh
+   * hưởng tiền của một khoản tạo dòng mới cùng `lineageId`, dòng cũ hết hạn
+   * từ ngày sửa — cách tính mới chỉ áp dụng từ đó trở đi. NULL ở cả ba = hiệu
+   * lực mọi ngày (dòng có từ trước).
+   */
+  @Column({ name: 'lineage_id', type: 'uuid', nullable: true })
+  lineageId: string | null;
+
+  /** Ngày (giờ VN, 'YYYY-MM-DD') bắt đầu áp dụng; null = từ trước tới nay. */
+  @Column({ name: 'valid_from', type: 'date', nullable: true })
+  validFrom: string | null;
+
+  /** Ngày (giờ VN) hết áp dụng, không gồm ngày đó; null = đang áp dụng. */
+  @Column({ name: 'valid_to', type: 'date', nullable: true })
+  validTo: string | null;
 }

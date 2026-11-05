@@ -307,6 +307,10 @@ describe('StoresService - Shift & Bonus Request Features', () => {
     }).compile();
 
     service = module.get<StoresService>(StoresService);
+    // Cài đặt duyệt đơn không chặn gì: các test này kiểm luồng tạo đơn, không kiểm luật.
+    (service as any).approvalSettingRepository = {
+      findOne: jest.fn().mockResolvedValue({ swapNoticeHours: 0, swapLimitPerMonth: 0 }),
+    };
     repoMap.get(EmployeeProfile)!.findOne.mockResolvedValue({
       id: 'emp-1',
       storeId: 'store-1',
@@ -1082,6 +1086,8 @@ describe('StoresService - Shift & Bonus Request Features', () => {
       const mockRequest = {
         id: 'bonus-1',
         storeId: 'store-1',
+        // Tăng ca gắn ca (đơn không gắn ca là bổ sung công, luồng riêng).
+        shiftAssignmentId: 'assign-1',
         status: BonusWorkRequestStatus.PENDING,
         approvedById: null as string | null,
         rejectionReason: null as string | null,
@@ -1108,6 +1114,8 @@ describe('StoresService - Shift & Bonus Request Features', () => {
       const mockRequest = {
         id: 'bonus-1',
         storeId: 'store-1',
+        // Tăng ca gắn ca (đơn không gắn ca là bổ sung công, luồng riêng).
+        shiftAssignmentId: 'assign-1',
         status: BonusWorkRequestStatus.PENDING,
         approvedById: null as string | null,
       };

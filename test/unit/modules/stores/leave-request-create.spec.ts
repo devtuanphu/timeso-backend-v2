@@ -31,7 +31,10 @@ function build(
     pending?: any;
   } = {},
 ) {
-  const service = Object.create(StoresService.prototype) as any;
+  const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(OPEN_POLICY) },
+    }) as any;
   service.profileRepository = {
     findOne: jest.fn().mockResolvedValue({
       id: PROFILE,
@@ -59,6 +62,9 @@ function build(
       if (entity === EmployeeLeaveRequest) return options.pending ?? null;
       return { id: PROFILE };
     }),
+    // Chưa có đơn nào trong tháng / không có ca khác trong ngày.
+    count: jest.fn(async () => 0),
+    find: jest.fn(async () => []),
     create: jest.fn((_entity: unknown, value: any) => ({ ...value })),
     save: jest.fn(async (_entity: unknown, value: any) => {
       saved.push(value);
@@ -76,6 +82,14 @@ const request = (over: Record<string, unknown> = {}) => ({
   endDate: '2026-09-22',
   ...over,
 });
+
+/** Cài đặt duyệt đơn không chặn gì: các test này kiểm luồng tạo đơn, không kiểm luật. */
+const OPEN_POLICY = {
+  leaveNoticeHours: 0,
+  leaveLimitPerMonth: 0,
+  lateEarlyNoticeHours: 0,
+  lateEarlyLimitPerMonth: 0,
+};
 
 describe('createLeaveRequest', () => {
   it("resolves a slot id to the caller's own assignment", async () => {
@@ -243,7 +257,10 @@ describe('leave history type filter (B7)', () => {
   });
 
   const historyService = () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(OPEN_POLICY) },
+    }) as any;
     service.assertEmployeeCalendarAccess = jest.fn().mockResolvedValue(undefined);
     service.leaveRequestRepository = { find: jest.fn().mockResolvedValue([]) };
     return service;

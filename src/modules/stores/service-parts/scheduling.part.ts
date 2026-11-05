@@ -561,7 +561,7 @@ export class StoresSchedulingPart {
     // --- Build Response ---
 
     // Part 1: Overview (Calculate directly from assignments in month)
-    let totalWorkHours = 0;
+    let totalWorkMinutes = 0;
     let totalShifts = 0;
 
     // Only count CONFIRMED or COMPLETED shifts for overview
@@ -570,15 +570,31 @@ export class StoresSchedulingPart {
     );
     totalShifts = confirmedAssignments.length;
 
+    // Giờ làm thật, không phải độ dài ca theo lịch: ca đã ra ca lấy số phút
+    // được công nhận (workedMinutes — đã trừ đi trễ/về sớm), ca đang làm lấy
+    // từ giờ vào ca tới bây giờ (tối đa tới giờ kết thúc ca). Trước đây cộng độ
+    // dài ca rồi làm tròn 1 chữ số: làm 17 giờ 43 phút vẫn hiện "18h".
+    const nowMs = Date.now();
     confirmedAssignments.forEach((assign) => {
-      // Giờ riêng của slot trước giờ ca mẫu; ca qua đêm (22:00 → 04:00) tính
-      // sang ngày sau: trước đây ra số âm rồi bị tính 0 giờ.
+      if (assign.status === ShiftAssignmentStatus.COMPLETED && assign.workedMinutes != null) {
+        totalWorkMinutes += Math.max(0, Math.round(Number(assign.workedMinutes) || 0));
+        return;
+      }
       const slot = assign.shiftSlot;
       const startTime = slot?.startTime || slot?.workShift?.startTime;
       const endTime = slot?.endTime || slot?.workShift?.endTime;
-      if (!startTime || !endTime) return;
-      const { start, end } = toShiftInterval('2000-01-01', startTime, endTime);
-      totalWorkHours += (end - start) / 60;
+      const checkIn = assign.checkInTime ? new Date(assign.checkInTime).getTime() : NaN;
+      if (!Number.isFinite(checkIn)) return;
+      let until = assign.checkOutTime ? new Date(assign.checkOutTime).getTime() : nowMs;
+      if (startTime && endTime && slot?.workDate) {
+        const { end } = resolveShiftBoundaries(
+          String(slot.workDate).slice(0, 10),
+          startTime,
+          endTime,
+        );
+        if (end) until = Math.min(until, end.getTime());
+      }
+      totalWorkMinutes += Math.max(0, Math.floor((until - checkIn) / 60000));
     });
 
     // Part 2: Shift Requests (Registers & Swaps)
@@ -698,7 +714,9 @@ export class StoresSchedulingPart {
 
     return {
       overview: {
-        totalWorkHours: parseFloat(totalWorkHours.toFixed(1)),
+        // App cũ hiển thị `${totalWorkHours}h`; app mới đọc totalWorkMinutes.
+        totalWorkHours: Math.round((totalWorkMinutes / 60) * 100) / 100,
+        totalWorkMinutes,
         totalShifts: totalShifts,
       },
       shiftRequests: shiftRequests.sort(
@@ -3977,6 +3995,14 @@ export class StoresSchedulingPart {
           'Nhân viên chỉ có thể tự đăng ký ca của mình',
         );
       }
+      // Chủ tắt "Đăng ký ca": nhân viên không tự đăng ký được (chủ vẫn xếp).
+      await this.assertApprovalPolicy(null, {
+        storeId,
+        employeeProfileId: employeeId,
+        kind: 'REGISTER',
+        affectsAt: null,
+        monthDate: null,
+      });
     }
     const savedAssignment = await this.dataSource.transaction(
       async (manager) => {
@@ -4632,14 +4658,32 @@ export class StoresSchedulingPart {
       throw new BadRequestException('Assignment đã bị hủy');
     // Người nhận ca đã có ca khác trùng giờ (kể cả ca qua đêm ngày kề).
     await this.assertSwapTargetFree(this.dataSource.manager, source, target.id);
-    const swap = this.shiftSwapRepository.create({
-      fromAssignmentId: source.id,
-      toEmployeeId: target.id,
-      requestedByEmployeeId: requester.id,
-      note: data.note,
-      status: ShiftSwapStatus.PENDING,
+    return this.dataSource.transaction(async (manager) => {
+      // Khoá hồ sơ người gửi: hai đơn gửi cùng lúc không cùng lọt giới hạn số lần.
+      await manager.findOne(EmployeeProfile, {
+        where: { id: requester.id },
+        select: ['id'],
+        lock: { mode: 'pessimistic_write' },
+      });
+      // Cài đặt duyệt đơn: đổi ca bật / tắt, báo trước, số lần trong tháng.
+      await this.assertApprovalPolicy(manager, {
+        storeId,
+        employeeProfileId: requester.id,
+        kind: 'SWAP',
+        affectsAt: effectiveWindowOf(source).start,
+        monthDate: source.shiftSlot?.workDate
+          ? String(source.shiftSlot.workDate).slice(0, 10)
+          : null,
+      });
+      const swap = manager.create(ShiftSwap, {
+        fromAssignmentId: source.id,
+        toEmployeeId: target.id,
+        requestedByEmployeeId: requester.id,
+        note: data.note,
+        status: ShiftSwapStatus.PENDING,
+      });
+      return manager.save(ShiftSwap, swap);
     });
-    return this.shiftSwapRepository.save(swap);
   }
 
   async updateShiftSwapStatus(
@@ -5188,6 +5232,15 @@ export class StoresSchedulingPart {
         'Nhân viên không còn hoạt động, không thể đăng ký ca',
       );
     }
+    // Chủ tắt "Đăng ký ca": nhân viên không tự đăng ký được (đăng ký cố định
+    // cũng vậy; một ca lẻ kiểm lại trong registerToShiftSlot).
+    await this.assertApprovalPolicy(null, {
+      storeId: data.storeId,
+      employeeProfileId: data.employeeProfileId,
+      kind: 'REGISTER',
+      affectsAt: null,
+      monthDate: null,
+    });
     // If slotId provided, delegate to existing registerToShiftSlot
     if (data.slotId) {
       return this.registerToShiftSlot(

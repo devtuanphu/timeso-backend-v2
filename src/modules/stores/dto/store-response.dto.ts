@@ -1002,6 +1002,9 @@ export class ScheduleOverviewDto {
   @ApiProperty()
   totalWorkHours: number;
 
+  @ApiProperty({ description: 'Số phút làm thật trong tháng (không làm tròn).' })
+  totalWorkMinutes: number;
+
   @ApiProperty()
   totalShifts: number;
 }

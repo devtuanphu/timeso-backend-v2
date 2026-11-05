@@ -57,4 +57,12 @@ export class StoreSkill extends BaseEntity {
 
   @Column({ type: 'varchar', length: 16, default: SkillConfirmation.MANAGER })
   confirmation: SkillConfirmation;
+
+  /**
+   * false = "không theo thứ tự": mở ngay từ lúc vào bộ phận / nhận vị trí,
+   * không chờ kỹ năng đứng trước và không khoá kỹ năng đứng sau.
+   * scripts/migration_career_skill_unordered.sql
+   */
+  @Column({ name: 'is_ordered', type: 'boolean', default: true })
+  isOrdered: boolean;
 }

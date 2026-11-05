@@ -8,10 +8,12 @@ import {
   Between,
   In,
   IsNull,
+  MoreThan,
   MoreThanOrEqual,
   LessThanOrEqual,
   Not,
   EntityManager,
+  Repository,
 } from 'typeorm';
 import { isUUID } from 'class-validator';
 import {
@@ -200,6 +202,7 @@ import {
   computeNetFromIncome,
   computePayslip,
   computeRuleAdjustmentBreakdown,
+  payrollRulePricingChanged,
   sumAllowances,
   PayslipAdjustmentLine,
   computePayslipTotals,
@@ -569,6 +572,8 @@ export class StoresPayrollPart {
       (rule) => !!rule.calcMode,
     );
     const rulesToSave: StorePayrollRule[] = [];
+    const kept = new Set<string>();
+    const today = vnDateString();
     for (const ruleData of incomingRules) {
       const legacyCode = legacyRuleCodeOf(ruleData.ruleType);
       if (
@@ -594,11 +599,20 @@ export class StoresPayrollPart {
         category: ruleData.category,
         storeId,
       };
-      rulesToSave.push(rule ? Object.assign(rule, payload) : repo.create(payload));
+      if (rule) {
+        kept.add(rule.id);
+        rulesToSave.push(await this.nextPayrollRuleVersion(repo, rule, payload, today));
+      } else {
+        rulesToSave.push(repo.create({ ...payload, validFrom: today }));
+      }
     }
-    const keep = new Set(rulesToSave.map((r) => r.id).filter(Boolean));
-    const toRemove = currentRules.filter((r) => !keep.has(r.id)).map((r) => r.id);
-    if (toRemove.length) await repo.delete({ id: In(toRemove) });
+    // Trước đây xoá hẳn: lần phát sinh trước khi bỏ khoản mất luôn tiền.
+    // Giờ như màn thiết lập mới: hết hạn từ hôm nay + xoá mềm.
+    await this.retirePayrollRules(
+      repo,
+      currentRules.filter((r) => !kept.has(r.id)),
+      today,
+    );
     if (rulesToSave.length) await repo.save(rulesToSave);
     return true;
   }
@@ -749,11 +763,12 @@ export class StoresPayrollPart {
     const current = await repo.find({ where: { storeId } });
     const used = new Set<string>();
     const toSave: StorePayrollRule[] = [];
+    const today = vnDateString();
     for (const r of incoming) {
       const code =
         r.category === PayrollRuleCategory.BENEFIT ? null : r.code || PayrollRuleCode.CUSTOM;
       const free = (rule: StorePayrollRule) => !used.has(rule.id);
-      let rule =
+      const rule =
         (r.id && current.find((x) => x.id === r.id && free(x))) ||
         (!r.id && code && code !== CUSTOM_RULE_CODE
           ? current.find((x) => free(x) && x.category === r.category && x.code === code)
@@ -818,17 +833,82 @@ export class StoresPayrollPart {
             : null
           : (rule?.employeeProfileIds ?? null),
       };
-      if (rule) Object.assign(rule, payload);
-      else rule = repo.create(payload);
-      if (rule.id) used.add(rule.id);
-      toSave.push(rule);
+      if (rule) {
+        used.add(rule.id);
+        toSave.push(await this.nextPayrollRuleVersion(repo, rule, payload, today));
+      } else {
+        toSave.push(repo.create({ ...payload, validFrom: today }));
+      }
     }
-    const toRemove = current
-      .filter((x) => !used.has(x.id) && present.has(x.category))
-      .map((x) => x.id);
-    if (toRemove.length) await repo.softDelete({ id: In(toRemove) });
+    const toRemove = current.filter((x) => !used.has(x.id) && present.has(x.category));
+    await this.retirePayrollRules(repo, toRemove, today);
     if (toSave.length) await repo.save(toSave);
     return true;
+  }
+
+  /**
+   * Khoản `rule` sửa thành `payload`. Đổi phần ảnh hưởng tiền của một khoản
+   * đã áp dụng trước hôm nay: dòng cũ hết hạn từ hôm nay (valid_to + xoá mềm)
+   * và trả về dòng mới cùng khoản (lineage_id), áp dụng từ hôm nay — lần phát
+   * sinh trước đó vẫn tính theo cách cũ. Chỉ đổi tên / mô tả, hoặc khoản mới
+   * có từ hôm nay: sửa tại chỗ như trước.
+   */
+  async nextPayrollRuleVersion(
+    this: StoresService,
+    repo: Repository<StorePayrollRule>,
+    rule: StorePayrollRule,
+    payload: Partial<StorePayrollRule>,
+    today: string,
+  ): Promise<StorePayrollRule> {
+    const since =
+      rule.validFrom ? String(rule.validFrom).slice(0, 10) : rule.createdAt ? vnDateString(new Date(rule.createdAt)) : today;
+    if (!payrollRulePricingChanged(rule, payload) || since >= today) {
+      return Object.assign(rule, payload);
+    }
+    await repo.update({ id: rule.id }, { validTo: today });
+    await repo.softDelete({ id: rule.id });
+    // Dòng mới mang đủ cột của dòng cũ (mã khoản, mô tả, cấu hình, phạm vi…)
+    // rồi mới tới phần sửa: payload của app cũ chỉ có tên / loại / mức, thiếu
+    // `code` thì app mới thêm khoản cùng mã sẽ thành hai dòng, phạt hai lần.
+    const {
+      id: _id,
+      createdAt: _createdAt,
+      updatedAt: _updatedAt,
+      deletedAt: _deletedAt,
+      ...columns
+    } = rule as StorePayrollRule & { deletedAt?: Date | null };
+    return repo.create({
+      ...columns,
+      ...payload,
+      lineageId: rule.lineageId || rule.id,
+      validFrom: today,
+      validTo: null,
+    });
+  }
+
+  /**
+   * Bỏ các khoản: khoản đã áp dụng trước hôm nay thì hết hạn từ hôm nay
+   * (lần phát sinh trước đó vẫn được tính), rồi xoá mềm như trước.
+   */
+  async retirePayrollRules(
+    this: StoresService,
+    repo: Repository<StorePayrollRule>,
+    rules: StorePayrollRule[],
+    today: string,
+  ): Promise<void> {
+    if (!rules.length) return;
+    const applied = rules.filter((rule) => {
+      const since = rule.validFrom
+        ? String(rule.validFrom).slice(0, 10)
+        : rule.createdAt
+          ? vnDateString(new Date(rule.createdAt))
+          : today;
+      return since < today;
+    });
+    if (applied.length) {
+      await repo.update({ id: In(applied.map((rule) => rule.id)) }, { validTo: today });
+    }
+    await repo.softDelete({ id: In(rules.map((rule) => rule.id)) });
   }
 
   // --- Ghi nhận thưởng / vi phạm thủ công (employee_payroll_records) ---
@@ -856,13 +936,28 @@ export class StoresPayrollPart {
       withDeleted: false,
       order: { workDate: 'DESC', createdAt: 'DESC' },
     });
+    // Ghi nhận trỏ vào phiên bản khoản đã hết hạn (xoá mềm): quan hệ `rule`
+    // không nạp dòng đó, nạp lại để vẫn có tên / cách tính / đơn vị.
+    const missing = [
+      ...new Set(rows.filter((r) => r.ruleId && !r.rule).map((r) => r.ruleId as string)),
+    ];
+    const expired = missing.length
+      ? new Map(
+          (
+            await this.payrollRuleRepository.find({
+              where: { id: In(missing) },
+              withDeleted: true,
+            })
+          ).map((rule) => [rule.id, rule]),
+        )
+      : new Map<string, StorePayrollRule>();
     return rows.map((r) => ({
       id: r.id,
       ruleId: r.ruleId,
-      ruleName: r.rule?.name || r.ruleName,
+      ruleName: (r.rule ?? expired.get(r.ruleId as string))?.name || r.ruleName,
       category: r.category,
-      calcMode: r.rule?.calcMode ?? null,
-      calcConfig: r.rule?.calcConfig ?? null,
+      calcMode: (r.rule ?? expired.get(r.ruleId as string))?.calcMode ?? null,
+      calcConfig: (r.rule ?? expired.get(r.ruleId as string))?.calcConfig ?? null,
       workDate: String(r.workDate).slice(0, 10),
       quantity: Number(r.quantity),
       note: r.note,
@@ -899,9 +994,23 @@ export class StoresPayrollPart {
     if (!profile?.storeId || !isShiftEligibleEmploymentStatus(profile.employmentStatus)) {
       throw new NotFoundException('Không tìm thấy nhân viên đang làm');
     }
-    const rule = await this.payrollRuleRepository.findOne({
+    let rule = await this.payrollRuleRepository.findOne({
       where: { id: dto.ruleId, storeId: profile.storeId },
     });
+    if (!rule) {
+      // App còn giữ id của phiên bản đã hết hạn (khoản vừa được sửa): ghi nhận
+      // vào phiên bản đang áp dụng của cùng khoản.
+      const stale = await this.payrollRuleRepository.findOne({
+        where: { id: dto.ruleId, storeId: profile.storeId },
+        withDeleted: true,
+      });
+      if (stale?.validTo) {
+        rule = await this.payrollRuleRepository.findOne({
+          where: { storeId: profile.storeId, lineageId: stale.lineageId || stale.id },
+          order: { createdAt: 'DESC' },
+        });
+      }
+    }
     const revenueBased =
       rule?.calcConfig?.kind === 'PERCENT' && rule.calcConfig.base === 'REVENUE';
     if (
@@ -955,6 +1064,58 @@ export class StoresPayrollPart {
       workDate,
     });
     return { id: saved.id };
+  }
+
+  /**
+   * Sửa một lần ghi nhận thưởng / vi phạm (popup Thưởng / Phạt ở sao kê lương
+   * của app chủ). Cùng luật với ghi nhận mới: ngày trong tháng này tới hôm
+   * nay, phiếu lương chưa chốt; khoản giữ nguyên. Phiếu lương tính lại ngay.
+   */
+  async updatePayrollRecord(
+    this: StoresService,
+    recordId: string,
+    dto: { workDate?: string; quantity?: number; note?: string | null },
+  ) {
+    const repo = this.dataSource.getRepository(EmployeePayrollRecord);
+    const record = await repo.findOne({ where: { id: recordId } });
+    if (!record) throw new NotFoundException('Không tìm thấy ghi nhận');
+    const before = String(record.workDate).slice(0, 10);
+    await this.assertPayslipOpen(record.employeeProfileId, before);
+    const changes: { workDate?: string; quantity?: number; note?: string | null } = {};
+    if (dto.workDate !== undefined && dto.workDate !== before) {
+      const parsed = new Date(`${dto.workDate}T00:00:00Z`);
+      const today = vnDateString();
+      if (
+        Number.isNaN(parsed.getTime()) ||
+        parsed.toISOString().slice(0, 10) !== dto.workDate ||
+        dto.workDate.slice(0, 7) !== today.slice(0, 7) ||
+        dto.workDate > today
+      ) {
+        throw new BadRequestException('Chỉ ghi nhận được cho một ngày từ đầu tháng này đến hôm nay');
+      }
+      await this.assertPayslipOpen(record.employeeProfileId, dto.workDate);
+      changes.workDate = dto.workDate;
+    }
+    if (dto.quantity !== undefined) {
+      changes.quantity = Math.round(Number(dto.quantity) * 100) / 100;
+    }
+    if (dto.note !== undefined) changes.note = dto.note?.trim() || null;
+    if (!Object.keys(changes).length) return { id: record.id };
+    await repo.update({ id: record.id }, changes as any);
+    const after = changes.workDate ? String(changes.workDate) : before;
+    await this.recomputeEmployeePayslipForWorkDate({
+      employeeProfileId: record.employeeProfileId,
+      storeId: record.storeId,
+      workDate: after,
+    });
+    if (after.slice(0, 7) !== before.slice(0, 7)) {
+      await this.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: record.employeeProfileId,
+        storeId: record.storeId,
+        workDate: before,
+      });
+    }
+    return { id: record.id };
   }
 
   async deletePayrollRecord(this: StoresService, recordId: string) {
@@ -1194,9 +1355,7 @@ export class StoresPayrollPart {
         month,
         manager,
       );
-      const rules = await manager
-        .getRepository(StorePayrollRule)
-        .find({ where: { storeId, isActive: true } });
+      const rules = await this.loadPayrollRulesForMonth(storeId, month, manager);
       const standardWorkingDays = await this.getStandardWorkingDays(
         storeId,
         month,
@@ -2036,6 +2195,38 @@ export class StoresPayrollPart {
    * The single payslip composer used by generation, recalculation, check-out
    * and the live estimate. Read-only: it performs no writes.
    */
+  /**
+   * Khoản thưởng / vi phạm để tính phiếu lương tháng `month`: các khoản đang
+   * bật, kèm phiên bản cũ đã hết hạn trong (hoặc sau) tháng đó — để lần phát
+   * sinh trước ngày chủ sửa vẫn tính theo cách cũ (migration_payroll_rule_versions).
+   * Phiên bản cũ là dòng xoá mềm có valid_to; khoản xoá trước khi có phiên bản
+   * (valid_to null) vẫn bị bỏ như trước.
+   */
+  async loadPayrollRulesForMonth(
+    this: StoresService,
+    storeId: string,
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<StorePayrollRule[]> {
+    const repo = manager
+      ? manager.getRepository(StorePayrollRule)
+      : this.payrollRuleRepository;
+    const rules = await repo.find({
+      where: [
+        { storeId, isActive: true, deletedAt: IsNull() },
+        { storeId, isActive: true, validTo: MoreThan(month.key) },
+      ],
+      withDeleted: true,
+      order: { createdAt: 'ASC' },
+    });
+    return (rules ?? []).filter((rule) => {
+      // Mock / dòng cũ: xoá mềm không có valid_to thì bỏ như trước.
+      if (rule.deletedAt && !rule.validTo) return false;
+      const from = rule.validFrom ? String(rule.validFrom).slice(0, 10) : null;
+      return !from || from < month.endExclusiveDate;
+    });
+  }
+
   async computeEmployeePayslip(
     this: StoresService,
     p: {
@@ -2089,6 +2280,10 @@ export class StoresPayrollPart {
     const todayVn = vnDateString(p.now ?? new Date());
     const facts = summarizeMonthlyAttendance(assignments, todayVn);
     facts.monthComplete = todayVn >= p.month.endExclusiveDate;
+    // Kỳ của phiếu: phiên bản khoản (sửa giữa tháng) chỉ tính trên những lần
+    // phát sinh trong thời gian nó có hiệu lực (ruleRawLines).
+    facts.periodStart = p.month.key;
+    facts.periodEndExclusive = p.month.endExclusiveDate;
     // Đơn giá theo ca / vị trí / khung giờ (lương giờ, lương ca): mỗi ca đã
     // làm được định giá riêng. Null = cửa hàng chưa đặt đơn giá cho hình thức
     // này, lương tính y như trước.
@@ -3606,9 +3801,7 @@ export class StoresPayrollPart {
         ).rate
       : 0;
     const rules = activeContract
-      ? await this.payrollRuleRepository.find({
-          where: { storeId, isActive: true },
-        })
+      ? await this.loadPayrollRulesForMonth(storeId, month)
       : [];
     const composed = await this.computeEmployeePayslip({
       employeeProfileId,
@@ -5214,9 +5407,7 @@ export class StoresPayrollPart {
           month,
           manager,
         );
-        const rules = await manager
-          .getRepository(StorePayrollRule)
-          .find({ where: { storeId: input.storeId, isActive: true } });
+        const rules = await this.loadPayrollRulesForMonth(input.storeId, month, manager);
         const standardWorkingDays = await this.getStandardWorkingDays(
           input.storeId,
           month,
@@ -5415,13 +5606,7 @@ export class StoresPayrollPart {
           ).rate
         : 0;
       const payrollRules = activeContract
-        ? await (
-            manager
-              ? manager.getRepository(StorePayrollRule)
-              : this.payrollRuleRepository
-          ).find({
-            where: { storeId, isActive: true },
-          })
+        ? await this.loadPayrollRulesForMonth(storeId, month, manager)
         : [];
       // Read-only: facts and the month's payslip from the shared composer.
       const composed = await this.computeEmployeePayslip({
@@ -5636,9 +5821,7 @@ export class StoresPayrollPart {
           .rate
       : 0;
     const rules = activeContract
-      ? await this.payrollRuleRepository.find({
-          where: { storeId: employee.storeId, isActive: true },
-        })
+      ? await this.loadPayrollRulesForMonth(employee.storeId, targetMonth)
       : [];
     const composed = await this.computeEmployeePayslip({
       employeeProfileId: employee.id,

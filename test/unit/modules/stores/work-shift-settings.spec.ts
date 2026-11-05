@@ -81,7 +81,10 @@ function buildDeleteService(opts: {
   slots?: ShiftSlot[];
   storeOwner?: string;
 }) {
-  const service = Object.create(StoresService.prototype) as any;
+  const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
   let committed = false;
   const manager = {
     query: jest.fn(async () => []),
@@ -319,7 +322,10 @@ describe('deleteWorkShift', () => {
 
 describe('settings shift list', () => {
   const build = (shifts: Partial<WorkShift>[], customIds: string[] = []) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.workShiftRepository = {
       find: jest.fn(async () => shifts),
       query: jest.fn(async () => customIds.map((id) => ({ id }))),
@@ -382,7 +388,10 @@ describe('settings shift list', () => {
 
 describe('upsertTimekeepingSetting shift entries', () => {
   const build = (customIds: string[] = []) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     const setting = { id: 'setting-1', storeId: STORE };
     service.storeRepository = {
       findOne: jest.fn(async () => ({ id: STORE, ownerAccountId: OWNER })),
@@ -545,7 +554,10 @@ describe('upsertTimekeepingSetting shift entries', () => {
 
 describe('createWorkShift / updateWorkShift validation', () => {
   const build = (existing: WorkShift | null = shiftRow()) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.storeRepository = {
       findOne: jest.fn(async () => ({ id: STORE, ownerAccountId: OWNER })),
     };
@@ -743,7 +755,10 @@ describe('registration to a deleted (hidden) shift', () => {
   afterEach(() => jest.useRealTimers());
 
   it('refuses a fixed registration for it', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.profileRepository = {
       findOne: jest.fn(async () => ({
         id: 'profile-1',
@@ -780,7 +795,10 @@ describe('registration to a deleted (hidden) shift', () => {
   });
 
   it('refuses a staff self-registration to one of its slots', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.shiftSlotRepository = {
       findOne: jest.fn(async () => ({
         id: 'slot-1',
@@ -836,7 +854,10 @@ describe('registration to a deleted (hidden) shift', () => {
 
 describe('slot generation skips deleted (hidden) shifts', () => {
   it('does not generate template slots for a hidden shift', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.workCycleRepository = {
       findOne: jest.fn(async () => ({
         id: 'cycle-1',
@@ -873,7 +894,10 @@ describe('slot generation skips deleted (hidden) shifts', () => {
 
 describe('hidden shifts in legacy cycle / manual slot writes', () => {
   const buildService = (shifts: Array<{ id: string; isActive: boolean }>) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.assertOwnerStoreAccess = jest.fn(async () => undefined);
     service.workShiftRepository = {
       find: jest.fn(async () => shifts),
@@ -962,7 +986,10 @@ describe('hidden shifts in legacy cycle / manual slot writes', () => {
   });
 
   it('refuses a deleted shift as a new hire default shift', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     const manager = {
       // The shift belongs to the store, and it is hidden.
       exists: jest.fn(

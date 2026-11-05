@@ -14,6 +14,8 @@ import {
   normalizeRuleCalcConfig,
   type DayPay,
   type RuleOccurrence,
+  countedOccurrences,
+  MINUTE_BASED_CODES,
 } from './payroll-rule-config.utils';
 import { PayslipBuiltinRow } from './entities/store-payslip-row.entity';
 import {
@@ -121,6 +123,20 @@ export interface MonthlyAttendanceFacts {
   /** Total of the employee's COMPLETED orders in the month (Theo % doanh số). */
   revenue?: number;
   /**
+   * The payslip's period ('YYYY-MM-DD', end exclusive). Needed to price rule
+   * versions (validFrom / validTo): without it only current versions apply.
+   */
+  periodStart?: string;
+  periodEndExclusive?: string;
+  /**
+   * Set only on facts narrowed to a rule version's window (factsWithin): the
+   * whole month's absences / completed shifts, for month-level conditions
+   * ("có nghỉ không phép trong tháng thì không có chuyên cần", "tháng chưa làm
+   * ca nào thì không thưởng") that a window must not change.
+   */
+  monthAbsentCount?: number;
+  monthCompletedShifts?: number;
+  /**
    * The month is over (Vietnam calendar). A "≤" milestone ("≤ 2 lần trễ →
    * thưởng", "≤ 20 công → phạt") can only be decided then; undefined = over.
    */
@@ -134,7 +150,15 @@ export type PayrollRuleInput = Pick<
   Partial<
     Pick<
       StorePayrollRule,
-      'id' | 'name' | 'code' | 'calcMode' | 'threshold' | 'calcConfig'
+      | 'id'
+      | 'name'
+      | 'code'
+      | 'calcMode'
+      | 'threshold'
+      | 'calcConfig'
+      | 'lineageId'
+      | 'validFrom'
+      | 'validTo'
     >
   >;
 
@@ -603,12 +627,20 @@ export type RuleAdjustmentFacts = Pick<
       | 'recordOccurrences'
       | 'revenue'
       | 'monthComplete'
+      | 'periodStart'
+      | 'periodEndExclusive'
+      | 'monthAbsentCount'
+      | 'monthCompletedShifts'
     >
   >;
 
 /** A bonus is only ever paid for a month with at least one COMPLETED shift. */
 const hasCompletedWork = (facts: RuleAdjustmentFacts): boolean =>
-  toFiniteNumber(facts.completedShifts) > 0;
+  toFiniteNumber(facts.monthCompletedShifts ?? facts.completedShifts) > 0;
+
+/** Nghỉ không phép trong cả tháng (không theo cửa sổ của phiên bản khoản). */
+const monthAbsences = (facts: RuleAdjustmentFacts): number =>
+  toFiniteNumber(facts.monthAbsentCount ?? facts.absentCount);
 
 /** One automatic bonus/fine line of a payslip, for the salary screen. */
 export interface PayslipAdjustmentLine {
@@ -622,6 +654,17 @@ export interface PayslipAdjustmentLine {
   count: number;
   /** Whole VND, positive. */
   amount: number;
+  /**
+   * Từng lần phát sinh của dòng (ngày làm, số phút / số lượng), để app ghi rõ
+   * "Đi muộn 18 phút 25/10/26", "Trách nhiệm (1 giờ) 25/10/26". Không có với
+   * khoản tính cả tháng (mốc, % lương tháng) và thưởng tháng kiểu cũ.
+   */
+  occurrences?: Array<{ date: string; minutes: number; quantity: number }>;
+  /**
+   * Đơn vị của một lần: MINUTE (đọc `minutes` — trễ, sớm, tăng ca…), HOUR /
+   * SHIFT / DAY / OCCURRENCE (đọc `quantity` — ghi nhận tay).
+   */
+  occurrenceUnit?: 'MINUTE' | 'HOUR' | 'SHIFT' | 'DAY' | 'OCCURRENCE';
 }
 
 const ADJUSTMENT_LABELS: Record<string, string> = {
@@ -657,7 +700,7 @@ function v2RuleBasis(
     case 'OVERTIME':
       return { hours: n(facts.overtimeMinutes) / 60, shifts: n(facts.overtimeShifts) };
     case 'ATTENDANCE':
-      return hasCompletedWork(facts) && n(facts.absentCount) === 0
+      return hasCompletedWork(facts) && monthAbsences(facts) === 0
         ? { hours: n(facts.workedMinutes) / 60, shifts: n(facts.completedShifts) }
         : { hours: 0, shifts: 0 };
     case 'PUNCTUALITY':
@@ -757,7 +800,7 @@ function v3RuleLine(
   if (
     code === 'ATTENDANCE' &&
     (config.kind !== 'MILESTONE' || config.metric === 'OCCURRENCES') &&
-    n(facts.absentCount) > 0
+    monthAbsences(facts) > 0
   ) {
     occurrences = [];
   }
@@ -798,6 +841,224 @@ const AUTO_RULE_CODES: ReadonlySet<string> = new Set([
   'ABSENT',
 ]);
 
+const ymdOf = (value: unknown): string | null => {
+  if (!value) return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
+  }
+  const text = String(value).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+};
+
+/** Lần phát sinh đếm cả tháng một lần (mốc, % lương tháng, thưởng tháng cũ). */
+function isPeriodLevelRule(rule: RuleWithName): boolean {
+  if (rule.calcConfig) {
+    const kind = String((rule.calcConfig as Record<string, unknown>).kind ?? '');
+    const base = String((rule.calcConfig as Record<string, unknown>).base ?? '');
+    if (kind === 'FIXED' || kind === 'UNIT_PRICE' || kind === 'SALARY_COEF') return false;
+    if (kind === 'SALARY_BLOCK') return false;
+    if (kind === 'PERCENT') return base === 'MONTHLY' || base === 'REVENUE';
+    // Bậc thang / luỹ tiến của khoản đo bằng phút (trễ, sớm, tăng ca…) tính
+    // theo từng lần (evaluateRuleConfig); theo số lần / số lượng trong tháng
+    // thì là khoản cả tháng.
+    const minuteBased = MINUTE_BASED_CODES.has(rule.code || 'CUSTOM');
+    if (kind === 'TIERED') return !minuteBased;
+    if (kind === 'PROGRESSIVE') {
+      const unit = String((rule.calcConfig as Record<string, unknown>).unit ?? 'MINUTE');
+      return !(minuteBased && (unit === 'MINUTE' || unit === 'HOUR'));
+    }
+    return true;
+  }
+  if (rule.calcMode) return String(rule.calcMode).startsWith('MILESTONE_');
+  // Khoản cũ: phạt trễ / sớm / vắng tính theo lần; thưởng cũ là thưởng tháng.
+  return rule.category !== PayrollRuleCategory.FINE;
+}
+
+/**
+ * Số liệu tháng chỉ trong [from, to) — để tính một phiên bản khoản đã hết
+ * hạn (hay mới có) giữa tháng trên đúng những lần phát sinh trong thời gian
+ * nó có hiệu lực. Đếm lại từ từng lần phát sinh (ruleOccurrences); ghi nhận
+ * tay của mọi phiên bản cùng khoản (`lineageIds`) gom về `ruleId`.
+ */
+function factsWithin(
+  facts: RuleAdjustmentFacts,
+  from: string,
+  to: string,
+  ruleId: string | null | undefined,
+  lineageIds: ReadonlySet<string>,
+  recordFrom: string = from,
+): RuleAdjustmentFacts {
+  const inside = (o: RuleOccurrence) => o.date >= from && o.date < to;
+  const recordInside = (o: RuleOccurrence) => o.date >= recordFrom && o.date < to;
+  const occurrences: Record<string, RuleOccurrence[]> = {};
+  for (const [code, list] of Object.entries(facts.ruleOccurrences ?? {})) {
+    occurrences[code] = (list ?? []).filter(inside);
+  }
+  const of = (code: string) => occurrences[code] ?? [];
+  const minutes = (code: string) => of(code).reduce((sum, o) => sum + (Number(o.minutes) || 0), 0);
+  const records: RuleOccurrence[] = [];
+  for (const [id, list] of Object.entries(facts.recordOccurrences ?? {})) {
+    if (lineageIds.has(id)) records.push(...(list ?? []).filter(recordInside));
+  }
+  const attendance = of('ATTENDANCE');
+  return {
+    ...facts,
+    lateCount: of('LATE').length,
+    totalLateMinutes: minutes('LATE'),
+    earlyCount: of('EARLY').length,
+    totalEarlyMinutes: minutes('EARLY'),
+    absentCount: of('ABSENT').length,
+    absentMinutes: minutes('ABSENT'),
+    missedPunchCount: of('MISSED_PUNCH').length,
+    overtimeShifts: of('OVERTIME').length,
+    overtimeMinutes: minutes('OVERTIME'),
+    nightShifts: of('NIGHT_SHIFT').length,
+    nightMinutes: minutes('NIGHT_SHIFT'),
+    punctualShifts: of('PUNCTUALITY').length,
+    punctualMinutes: minutes('PUNCTUALITY'),
+    // Ca đã làm có giờ công (ATTENDANCE chỉ ghi ca có phút làm).
+    completedShifts: attendance.length,
+    workedMinutes: minutes('ATTENDANCE'),
+    daysWorked: new Set(attendance.map((o) => o.date)).size,
+    ruleOccurrences: occurrences,
+    monthAbsentCount: toFiniteNumber(facts.monthAbsentCount ?? facts.absentCount),
+    monthCompletedShifts: toFiniteNumber(facts.monthCompletedShifts ?? facts.completedShifts),
+    recordOccurrences: ruleId ? { [ruleId]: records } : {},
+    ruleQuantities: ruleId
+      ? { [ruleId]: records.reduce((sum, o) => sum + (Number(o.quantity) || 0), 0) }
+      : {},
+  };
+}
+
+const MAX_LINE_OCCURRENCES = 62;
+
+/** Đơn vị một lần phát sinh của khoản (xem PayslipAdjustmentLine.occurrenceUnit). */
+function occurrenceUnitOf(
+  rule: RuleWithName,
+): 'MINUTE' | 'HOUR' | 'SHIFT' | 'DAY' | 'OCCURRENCE' {
+  const code = rule.code || rule.ruleType || 'CUSTOM';
+  if (MINUTE_CODES.has(code)) return 'MINUTE';
+  if (rule.calcConfig) {
+    const unit = String((rule.calcConfig as Record<string, unknown>).unit ?? '');
+    if (unit === 'HOUR' || unit === 'SHIFT' || unit === 'DAY' || unit === 'OCCURRENCE') return unit;
+    return 'OCCURRENCE';
+  }
+  if (rule.calcMode && String(rule.calcMode).endsWith('_PER_HOUR')) return 'HOUR';
+  if (rule.calcMode && String(rule.calcMode).endsWith('_PER_SHIFT')) return 'SHIFT';
+  return 'OCCURRENCE';
+}
+
+const MINUTE_CODES: ReadonlySet<string> = new Set(['LATE', 'EARLY', 'OVERTIME', 'NIGHT_SHIFT', 'ABSENT', 'ATTENDANCE', 'PUNCTUALITY']);
+
+/**
+ * Những lần phát sinh làm nên một dòng thưởng / vi phạm (v2, v3): lần tự động
+ * của mã khoản (v3: sau miễn trừ) hoặc ghi nhận tay của khoản. Khoản tính cả
+ * tháng không có (một mốc không gắn với ngày nào).
+ */
+function lineOccurrences(rule: RuleWithName, facts: RuleAdjustmentFacts): RuleOccurrence[] {
+  if (isPeriodLevelRule(rule)) return [];
+  const code = rule.code || 'CUSTOM';
+  const manual = !AUTO_RULE_CODES.has(code);
+  const list = manual
+    ? rule.id
+      ? (facts.recordOccurrences?.[rule.id] ?? [])
+      : []
+    : (facts.ruleOccurrences?.[code] ?? []);
+  if (code === 'ATTENDANCE' && monthAbsences(facts) > 0) return [];
+  if (rule.calcConfig) {
+    const config = rule.calcConfig as Record<string, unknown>;
+    return countedOccurrences(code, {
+      graceMinutes: Number(config.graceMinutes) || 0,
+      accumulateDaily: config.accumulateDaily === false ? false : undefined,
+    }, list);
+  }
+  return list.filter((o) => (manual ? (Number(o.quantity) || 0) > 0 : true));
+}
+
+/**
+ * Mỗi khoản (phiên bản) với số liệu nó được tính trên. Khoản không có phiên
+ * bản (validFrom / validTo null — mọi khoản có từ trước) dùng nguyên số liệu
+ * tháng như cũ. Phiên bản chỉ hiệu lực một phần kỳ: khoản tính theo từng lần
+ * dùng các lần phát sinh trong thời gian hiệu lực; khoản tính cả tháng chỉ
+ * phiên bản còn hiệu lực cuối kỳ được tính (không trả hai lần một mốc).
+ */
+function versionedRuleInputs(
+  rules: RuleWithName[],
+  facts: RuleAdjustmentFacts,
+): Array<{ rule: RuleWithName; facts: RuleAdjustmentFacts }> {
+  const start = ymdOf(facts.periodStart);
+  const end = ymdOf(facts.periodEndExclusive);
+  const lineageOf = (rule: RuleWithName) => String(rule.lineageId || rule.id || '');
+  const lineages = new Map<string, Set<string>>();
+  for (const rule of rules ?? []) {
+    const key = lineageOf(rule);
+    if (!key) continue;
+    const ids = lineages.get(key) ?? new Set<string>([key]);
+    if (rule.id) ids.add(String(rule.id));
+    lineages.set(key, ids);
+  }
+  // Phiên bản sớm nhất (đã nạp) của mỗi khoản: ghi nhận tay đặt cho một ngày
+  // trước mọi phiên bản (khoản thêm hôm nay, chủ ghi nhận cho ngày 2) được
+  // tính theo phiên bản đó, không bị bỏ.
+  const earliest = new Map<string, RuleWithName>();
+  for (const rule of rules ?? []) {
+    const key = lineageOf(rule);
+    const current = earliest.get(key);
+    const from = ymdOf(rule.validFrom) ?? '';
+    if (!current || from < (ymdOf(current.validFrom) ?? '')) earliest.set(key, rule);
+  }
+  /** Ghi nhận tay của mọi phiên bản cùng khoản, gom về `rule.id`, không lọc ngày. */
+  const withLineageRecords = (rule: RuleWithName, ids: Set<string>): RuleAdjustmentFacts => {
+    if (!rule.id || ids.size <= 1) return facts;
+    const records: RuleOccurrence[] = [];
+    for (const [id, list] of Object.entries(facts.recordOccurrences ?? {})) {
+      if (ids.has(id)) records.push(...(list ?? []));
+    }
+    return {
+      ...facts,
+      recordOccurrences: { ...(facts.recordOccurrences ?? {}), [rule.id]: records },
+      ruleQuantities: {
+        ...(facts.ruleQuantities ?? {}),
+        [rule.id]: records.reduce((sum, o) => sum + (Number(o.quantity) || 0), 0),
+      },
+    };
+  };
+  const out: Array<{ rule: RuleWithName; facts: RuleAdjustmentFacts }> = [];
+  for (const rule of rules ?? []) {
+    const from = ymdOf(rule.validFrom);
+    const to = ymdOf(rule.validTo);
+    if (!from && !to) {
+      out.push({ rule, facts });
+      continue;
+    }
+    if (!start || !end) {
+      // Không biết kỳ: chỉ phiên bản đang áp dụng (như trước khi có phiên bản).
+      if (!to) out.push({ rule, facts });
+      continue;
+    }
+    if ((to && to <= start) || (from && from >= end) || (from && to && to <= from)) continue;
+    const coversPeriod = (!from || from <= start) && (!to || to >= end);
+    const ids = lineages.get(lineageOf(rule)) ?? new Set<string>();
+    if (isPeriodLevelRule(rule)) {
+      // Khoản cả tháng: chỉ phiên bản còn hiệu lực cuối kỳ, trên nguyên số
+      // liệu tháng (không trả hai lần một mốc).
+      if (!to || to >= end) out.push({ rule, facts: withLineageRecords(rule, ids) });
+      continue;
+    }
+    if (coversPeriod) {
+      out.push({ rule, facts: withLineageRecords(rule, ids) });
+      continue;
+    }
+    const windowFrom = from && from > start ? from : start;
+    const recordFrom = earliest.get(lineageOf(rule)) === rule ? start : windowFrom;
+    out.push({
+      rule,
+      facts: factsWithin(facts, windowFrom, to && to < end ? to : end, rule.id, ids, recordFrom),
+    });
+  }
+  return out;
+}
+
 /**
  * Every bonus / fine line of the store's active rules, unrounded. The single
  * source of computeRuleAdjustments (totals) and computeRuleAdjustmentBreakdown
@@ -827,9 +1088,21 @@ function ruleRawLines(
     count: number,
     exact: number,
     label?: string,
+    occurrences?: RuleOccurrence[],
   ) => {
     if (!(exact !== 0) || !Number.isFinite(exact)) return;
+    const detail = occurrences?.length
+      ? [...occurrences]
+          .sort((a, b) => a.date.localeCompare(b.date))
+          .slice(0, MAX_LINE_OCCURRENCES)
+          .map((o) => ({
+            date: o.date,
+            minutes: Math.round(Number(o.minutes) || 0),
+            quantity: Number(o.quantity) || 0,
+          }))
+      : undefined;
     raw.push({
+      ...(detail ? { occurrences: detail, occurrenceUnit: occurrenceUnitOf(rule) } : {}),
       kind,
       ruleId: rule.id ?? null,
       ruleType,
@@ -853,7 +1126,8 @@ function ruleRawLines(
     return 0;
   };
 
-  for (const rule of rules ?? []) {
+  const monthFacts = facts;
+  for (const { rule, facts } of versionedRuleInputs(rules, monthFacts)) {
     if (
       rule.category !== PayrollRuleCategory.FINE &&
       rule.category !== PayrollRuleCategory.BONUS
@@ -871,20 +1145,38 @@ function ruleRawLines(
         (typeof rule.name === 'string' && rule.name.trim()) ||
         (kind === 'FINE' ? 'Vi phạm' : 'Thưởng');
       const line = v3RuleLine(rule, facts, name);
-      if (line) push(kind, rule, rule.code || 'CUSTOM', line.count, line.exact, line.label);
+      if (line) {
+        push(
+          kind,
+          rule,
+          rule.code || 'CUSTOM',
+          line.count,
+          line.exact,
+          line.label,
+          lineOccurrences(rule, facts),
+        );
+      }
       continue;
     }
     if (rule.calcMode) {
       const line = v2RuleLine(rule, facts);
-      push(kind, rule, rule.code || 'CUSTOM', line.count, line.exact, line.label);
+      push(
+        kind,
+        rule,
+        rule.code || 'CUSTOM',
+        line.count,
+        line.exact,
+        line.label,
+        lineOccurrences(rule, facts),
+      );
       continue;
     }
     if (kind === 'FINE') {
       if (rule.ruleType === 'LATE') {
-        push('FINE', rule, 'LATE', facts.lateCount, countedFine(rule, facts.lateCount));
+        push('FINE', rule, 'LATE', facts.lateCount, countedFine(rule, facts.lateCount), undefined, facts.ruleOccurrences?.LATE);
       }
       if (rule.ruleType === 'EARLY') {
-        push('FINE', rule, 'EARLY', facts.earlyCount, countedFine(rule, facts.earlyCount));
+        push('FINE', rule, 'EARLY', facts.earlyCount, countedFine(rule, facts.earlyCount), undefined, facts.ruleOccurrences?.EARLY);
       }
       if (
         rule.ruleType === 'ABSENT' &&
@@ -897,6 +1189,8 @@ function ruleRawLines(
           'ABSENT',
           facts.absentCount,
           toFiniteNumber(rule.value) * facts.absentCount,
+          undefined,
+          facts.ruleOccurrences?.ABSENT,
         );
       }
     } else {
@@ -1373,4 +1667,49 @@ export function computeStintSplitEarnedBase(input: {
     currentStintEarned,
     priorStintEarned,
   };
+}
+
+
+/** JSON với khoá sắp xếp: jsonb của Postgres không giữ thứ tự khoá. */
+const stableJson = (value: unknown): string => {
+  if (value === null || value === undefined) return 'null';
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${stableJson(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+};
+
+/**
+ * Sửa `rule` thành `next` có đổi số tiền một nhân viên nhận không (mức, cách
+ * tính, mốc, phạm vi, bật / tắt, loại). Chỉ đổi tên / mô tả thì không: dòng
+ * được sửa tại chỗ, không tạo phiên bản.
+ */
+export function payrollRulePricingChanged(
+  rule: Partial<StorePayrollRule>,
+  next: Partial<StorePayrollRule>,
+): boolean {
+  const has = (key: keyof StorePayrollRule) => Object.prototype.hasOwnProperty.call(next, key);
+  const num = (value: unknown) => (value === null || value === undefined || value === '' ? null : Number(value));
+  const text = (value: unknown) => (value === null || value === undefined || value === '' ? null : String(value));
+  const ids = (value: unknown) =>
+    Array.isArray(value) && value.length ? [...value].map(String).sort().join(',') : null;
+  if (has('category') && text(rule.category) !== text(next.category)) return true;
+  if (has('ruleType') && text(rule.ruleType) !== text(next.ruleType)) return true;
+  if (has('calcType') && text(rule.calcType) !== text(next.calcType)) return true;
+  if (has('value') && num(rule.value) !== num(next.value)) return true;
+  if (has('isActive') && (rule.isActive !== false) !== (next.isActive !== false)) return true;
+  if (has('code') && text(rule.code) !== text(next.code)) return true;
+  if (has('calcMode') && text(rule.calcMode) !== text(next.calcMode)) return true;
+  if (has('threshold') && num(rule.threshold) !== num(next.threshold)) return true;
+  if (has('calcConfig') && stableJson(rule.calcConfig ?? null) !== stableJson(next.calcConfig ?? null)) {
+    return true;
+  }
+  if (has('employeeProfileIds') && ids(rule.employeeProfileIds) !== ids(next.employeeProfileIds)) {
+    return true;
+  }
+  return false;
 }

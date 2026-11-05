@@ -37,7 +37,10 @@ describe('shift eligibility includes probation', () => {
   });
 
   const registerService = (employmentStatus: EmploymentStatus) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.shiftSlotRepository = {
       findOne: jest.fn().mockResolvedValue({
         id: 'slot-1',
@@ -106,7 +109,10 @@ describe('shift eligibility includes probation', () => {
   });
 
   const selfService = (employmentStatus: EmploymentStatus) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.profileRepository = {
       findOne: jest.fn().mockResolvedValue({
         id: 'emp-1',
@@ -143,7 +149,10 @@ describe('shift eligibility includes probation', () => {
   });
 
   it('offers probation staff in the owner schedule picker', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.storeRepository = {
       findOne: jest.fn().mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' }),
     };
@@ -171,7 +180,10 @@ describe('shift eligibility includes probation', () => {
   });
 
   it('accepts probation staff when a schedule commits', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     const manager = {
       find: jest.fn().mockResolvedValue([]),
     };
@@ -199,7 +211,10 @@ describe('shift eligibility includes probation', () => {
 
 describe('fixed-shift registration range (B3)', () => {
   const rangeService = (latest: unknown) => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     const qb: any = {};
     for (const method of ['innerJoin', 'select', 'where', 'andWhere']) {
       qb[method] = jest.fn(() => qb);
@@ -255,7 +270,10 @@ describe('fixed-shift registration range (B3)', () => {
   });
 
   it('passes the resolved end to the batch slot query', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.profileRepository = {
       findOne: jest.fn().mockResolvedValue({
         id: 'emp-1',
@@ -317,7 +335,10 @@ describe('probation staff read their schedule and are paid', () => {
   });
 
   it('GET :id/shift-slots lets a probation employee read their own slots', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.storeRepository = {
       findOne: jest.fn().mockResolvedValue({ id: 'store-1', ownerAccountId: 'owner-1' }),
     };
@@ -363,7 +384,10 @@ describe('probation staff read their schedule and are paid', () => {
       aggregation.assertEmployeeCalendarAccess('store-1', 'emp-1', 'acc-1'),
     ).rejects.toBeInstanceOf(ForbiddenException);
 
-    const legacy = Object.create(StoresService.prototype) as any;
+    const legacy = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     legacy.storeRepository = aggregation.storeRepo;
     legacy.profileRepository = {
       findOne: jest.fn().mockResolvedValue(probationer()),
@@ -380,7 +404,10 @@ describe('probation staff read their schedule and are paid', () => {
   });
 
   it('POST shift-change-requests accepts a probation employee, not one on leave', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     service.profileRepository = profilesRepo([probationer()]);
     // Stop right after the employee check.
     service.resolveShiftChangeReferences = jest.fn(async () => {
@@ -404,7 +431,10 @@ describe('probation staff read their schedule and are paid', () => {
   });
 
   it('payroll generation covers active and probation staff (not on-leave)', async () => {
-    const service = Object.create(StoresService.prototype) as any;
+    const service = Object.assign(Object.create(StoresService.prototype), {
+      // Cài đặt duyệt đơn chưa lưu: mặc định (đăng ký ca bật).
+      approvalSettingRepository: { findOne: jest.fn().mockResolvedValue(null) },
+    }) as any;
     const find = jest.fn().mockResolvedValue([]);
     const manager = { getRepository: jest.fn(() => ({ find })) };
     service.dataSource = { transaction: jest.fn(async (work: any) => work(manager)) };
