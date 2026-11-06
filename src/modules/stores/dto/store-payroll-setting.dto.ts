@@ -33,6 +33,12 @@ export class PayrollRuleDto {
   @ApiProperty({ required: false }) @IsOptional() @IsObject() calcConfig?: Record<string, unknown>;
   // v3: phạm vi áp dụng; rỗng / thiếu = toàn cửa hàng.
   @ApiProperty({ required: false, type: [String] }) @IsOptional() @IsArray() @ArrayMaxSize(500) @IsUUID('4', { each: true }) employeeProfileIds?: string[];
+  // Phiên bản khoản (chỉ đọc): GET trả kèm và app chủ gửi lại nguyên dòng
+  // phúc lợi khi lưu. Nhận để không bị 400 "should not exist", nhưng không
+  // bao giờ ghi — phiên bản chỉ do backend đặt (nextPayrollRuleVersion).
+  @ApiProperty({ required: false, readOnly: true }) @IsOptional() @IsString() @MaxLength(64) lineageId?: string | null;
+  @ApiProperty({ required: false, readOnly: true }) @IsOptional() @IsString() @MaxLength(32) validFrom?: string | null;
+  @ApiProperty({ required: false, readOnly: true }) @IsOptional() @IsString() @MaxLength(32) validTo?: string | null;
 }
 
 export class IncrementRuleDto {
