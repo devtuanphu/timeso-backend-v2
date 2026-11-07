@@ -30,6 +30,28 @@ export const multerConfig = {
 };
 
 /**
+ * Tệp đính kèm của nội quy / tài liệu. Đuôi tệp không phân biệt hoa thường (máy
+ * ảnh và iOS hay đặt .PDF, .JPG) và báo 400 thay vì lỗi 500 của multerConfig.
+ */
+export const storeDocumentMulterConfig = {
+  storage: multerConfig.storage,
+  limits: {
+    fileSize: 20 * 1024 * 1024,
+    files: 10,
+    parts: 40,
+  },
+  fileFilter: (req, file, callback) => {
+    if (!/\.(pdf|doc|docx|jpg|jpeg|png)$/i.test(file.originalname)) {
+      return callback(
+        new BadRequestException('Chỉ đính kèm được tệp PDF, Word hoặc ảnh'),
+        false,
+      );
+    }
+    callback(null, true);
+  },
+};
+
+/**
  * Identity documents (CCCD/ID scans) are sensitive personal data and must not
  * land in `./uploads`, which `ServeStaticModule` publishes at `/uploads` with
  * no authentication. They go to a sibling directory that is not served

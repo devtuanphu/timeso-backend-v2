@@ -76,6 +76,9 @@ import { StorePayrollRule } from './entities/store-payroll-rule.entity';
 import { StorePayslipRow } from './entities/store-payslip-row.entity';
 import { EmployeePayrollRecord } from './entities/employee-payroll-record.entity';
 import { EmployeePayrollWaiver } from './entities/employee-payroll-waiver.entity';
+import { StoreDocument } from './entities/store-document.entity';
+import { StoreDocumentView } from './entities/store-document-view.entity';
+import { StoreDocumentsService } from './store-documents.service';
 import { StorePayrollIncrementRule } from './entities/store-payroll-increment-rule.entity';
 import { StoreInternalRule } from './entities/store-internal-rule.entity';
 import { StorePermissionConfig } from './entities/store-permission-config.entity';
@@ -142,6 +145,7 @@ import { StoresAttendanceController } from './controllers/stores-attendance.cont
 import { StoresSchedulingController } from './controllers/stores-scheduling.controller';
 import { StoresCareerController } from './controllers/stores-career.controller';
 import { StoresWorkTypesController } from './controllers/stores-work-types.controller';
+import { StoresDocumentsController } from './controllers/stores-documents.controller';
 import { WorkTypesService } from './work-types.service';
 import { CareerStructureService } from './career/career-structure.service';
 import { CareerEvaluationService } from './career/career-evaluation.service';
@@ -234,6 +238,8 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
       EmployeePayrollWaiver,
       StorePayrollIncrementRule,
       StoreInternalRule,
+      StoreDocument,
+      StoreDocumentView,
       StorePermissionConfig,
       StoreShiftConfig,
       AssetExportType,
@@ -282,9 +288,11 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     PersonalScheduleController,
     StoresCareerController,
     StoresWorkTypesController,
+    StoresDocumentsController,
   ],
   providers: [
     StoresService,
+    StoreDocumentsService,
     WorkTypesService,
     CareerLadderService,
     CareerStructureService,
