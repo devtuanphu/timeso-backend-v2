@@ -141,6 +141,20 @@ export interface MonthlyAttendanceFacts {
    * thưởng", "≤ 20 công → phạt") can only be decided then; undefined = over.
    */
   monthComplete?: boolean;
+  /** Những lần / dòng chủ đã xoá khỏi lương tháng (applyPayrollWaivers). */
+  waivers?: PayrollWaiverFacts;
+}
+
+/**
+ * Khoản thưởng / vi phạm chủ đã xoá (miễn) khỏi lương tháng, theo khoản —
+ * khoá là lineage của khoản (`lineageId || id`), để sửa khoản giữa tháng
+ * (phiên bản mới) không làm lần đã xoá tính lại.
+ */
+export interface PayrollWaiverFacts {
+  /** Khoản → id ca của các lần phát sinh đã xoá. */
+  occurrences?: Record<string, string[]>;
+  /** Khoản đã xoá cả dòng trong tháng (khoản tính cả tháng). */
+  lines?: string[];
 }
 
 export type PayrollRuleInput = Pick<
@@ -194,12 +208,14 @@ export function summarizeMonthlyAttendance(
   const occurrences: Record<string, RuleOccurrence[]> = {};
   // shiftMinutes: giờ theo lịch của ca đó (gốc "giờ của ca hôm đó").
   let shiftMinutesOfA = 0;
+  let assignmentIdOfA: string | undefined;
   const occur = (code: string, date: string, minutes: number) =>
     (occurrences[code] ??= []).push({
       date,
       minutes,
       quantity: 1,
       shiftMinutes: shiftMinutesOfA,
+      ...(assignmentIdOfA ? { assignmentId: assignmentIdOfA } : {}),
     });
 
   for (const a of assignments) {
@@ -207,6 +223,7 @@ export function summarizeMonthlyAttendance(
     const early = toFiniteNumber(a.earlyMinutes);
     const workDate = workDateOf(a.workDate);
     shiftMinutesOfA = windowMinutes(a);
+    assignmentIdOfA = a.id ? String(a.id) : undefined;
     if (late > 0) {
       lateCount += 1;
       occur('LATE', workDate, late);
@@ -631,6 +648,7 @@ export type RuleAdjustmentFacts = Pick<
       | 'periodEndExclusive'
       | 'monthAbsentCount'
       | 'monthCompletedShifts'
+      | 'waivers'
     >
   >;
 
@@ -659,7 +677,15 @@ export interface PayslipAdjustmentLine {
    * "Đi muộn 18 phút 25/10/26", "Trách nhiệm (1 giờ) 25/10/26". Không có với
    * khoản tính cả tháng (mốc, % lương tháng) và thưởng tháng kiểu cũ.
    */
-  occurrences?: Array<{ date: string; minutes: number; quantity: number }>;
+  occurrences?: Array<{
+    date: string;
+    minutes: number;
+    quantity: number;
+    /** Ca của lần tự động: app chủ gửi khi xoá đúng lần đó. */
+    assignmentId?: string;
+    /** Ghi nhận tay của lần thủ công. */
+    recordId?: string;
+  }>;
   /**
    * Đơn vị của một lần: MINUTE (đọc `minutes` — trễ, sớm, tăng ca…), HOUR /
    * SHIFT / DAY / OCCURRENCE (đọc `quantity` — ghi nhận tay).
@@ -851,7 +877,7 @@ const ymdOf = (value: unknown): string | null => {
 };
 
 /** Lần phát sinh đếm cả tháng một lần (mốc, % lương tháng, thưởng tháng cũ). */
-function isPeriodLevelRule(rule: RuleWithName): boolean {
+export function isPeriodLevelRule(rule: RuleWithName): boolean {
   if (rule.calcConfig) {
     const kind = String((rule.calcConfig as Record<string, unknown>).kind ?? '');
     const base = String((rule.calcConfig as Record<string, unknown>).base ?? '');
@@ -1059,6 +1085,62 @@ function versionedRuleInputs(
   return out;
 }
 
+/** Số liệu tháng tính lại từ các lần còn lại của một mã khoản tự động. */
+const RECOUNTED_FIELDS: Record<string, (kept: RuleOccurrence[], minutes: number) => Partial<RuleAdjustmentFacts>> = {
+  LATE: (kept, minutes) => ({ lateCount: kept.length, totalLateMinutes: minutes }),
+  EARLY: (kept, minutes) => ({ earlyCount: kept.length, totalEarlyMinutes: minutes }),
+  ABSENT: (kept, minutes) => ({ absentCount: kept.length, absentMinutes: minutes }),
+  MISSED_PUNCH: (kept) => ({ missedPunchCount: kept.length }),
+  OVERTIME: (kept, minutes) => ({ overtimeShifts: kept.length, overtimeMinutes: minutes }),
+  NIGHT_SHIFT: (kept, minutes) => ({ nightShifts: kept.length, nightMinutes: minutes }),
+  PUNCTUALITY: (kept, minutes) => ({ punctualShifts: kept.length, punctualMinutes: minutes }),
+  ATTENDANCE: (kept, minutes) => ({
+    completedShifts: kept.length,
+    workedMinutes: minutes,
+    daysWorked: new Set(kept.map((o) => o.date)).size,
+  }),
+};
+
+/**
+ * Số liệu một khoản được tính trên, sau khi bỏ những gì chủ đã xoá (popup
+ * "Chi tiết thưởng / vi phạm", employee_payroll_waivers). Null = chủ đã xoá
+ * cả dòng của khoản trong tháng. Chỉ khoản đó đổi: xoá một lần đi muộn không
+ * làm khoản khác (vd. chuyên cần "không đi muộn") đổi theo. Ghi nhận tay đã
+ * xoá thì xoá mềm hẳn, không qua đây.
+ */
+function applyPayrollWaivers(
+  rule: RuleWithName,
+  facts: RuleAdjustmentFacts,
+  waivers: PayrollWaiverFacts | undefined,
+): RuleAdjustmentFacts | null {
+  if (!waivers) return facts;
+  const key = String(rule.lineageId || rule.id || '');
+  if (!key) return facts;
+  if (waivers.lines?.includes(key)) return null;
+  const ids = waivers.occurrences?.[key];
+  if (!ids?.length) return facts;
+  const code = AUTO_RULE_CODES.has(rule.code ?? '')
+    ? String(rule.code)
+    : !rule.calcMode && !rule.calcConfig
+      ? String(rule.ruleType ?? '')
+      : '';
+  const list = code ? facts.ruleOccurrences?.[code] : undefined;
+  const recount = RECOUNTED_FIELDS[code];
+  if (!list?.length || !recount) return facts;
+  const waived = new Set(ids);
+  const kept = list.filter((o) => !o.assignmentId || !waived.has(o.assignmentId));
+  if (kept.length === list.length) return facts;
+  const minutes = kept.reduce((sum, o) => sum + (Number(o.minutes) || 0), 0);
+  return {
+    ...facts,
+    ...recount(kept, minutes),
+    ruleOccurrences: { ...(facts.ruleOccurrences ?? {}), [code]: kept },
+    // Điều kiện cả tháng (nghỉ không phép, tháng có làm ca) không đổi.
+    monthAbsentCount: monthAbsences(facts),
+    monthCompletedShifts: toFiniteNumber(facts.monthCompletedShifts ?? facts.completedShifts),
+  };
+}
+
 /**
  * Every bonus / fine line of the store's active rules, unrounded. The single
  * source of computeRuleAdjustments (totals) and computeRuleAdjustmentBreakdown
@@ -1099,6 +1181,8 @@ function ruleRawLines(
             date: o.date,
             minutes: Math.round(Number(o.minutes) || 0),
             quantity: Number(o.quantity) || 0,
+            ...(o.assignmentId ? { assignmentId: o.assignmentId } : {}),
+            ...(o.recordId ? { recordId: o.recordId } : {}),
           }))
       : undefined;
     raw.push({
@@ -1127,13 +1211,17 @@ function ruleRawLines(
   };
 
   const monthFacts = facts;
-  for (const { rule, facts } of versionedRuleInputs(rules, monthFacts)) {
+  for (const versioned of versionedRuleInputs(rules, monthFacts)) {
+    const rule = versioned.rule;
     if (
       rule.category !== PayrollRuleCategory.FINE &&
       rule.category !== PayrollRuleCategory.BONUS
     ) {
       continue;
     }
+    // Chủ đã xoá cả dòng / từng lần của khoản này trong tháng.
+    const facts = applyPayrollWaivers(rule, versioned.facts, monthFacts.waivers);
+    if (!facts) continue;
     const kind = rule.category === PayrollRuleCategory.FINE ? 'FINE' : 'BONUS';
     if (rule.calcConfig) {
       // Khoản tự động không thưởng tháng chưa làm ca nào ("≤ 0 lần trễ");

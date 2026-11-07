@@ -1,4 +1,5 @@
 import { BadRequestException, ConflictException } from '@nestjs/common';
+import { EmployeePayrollWaiver } from '../../../../src/modules/stores/entities/employee-payroll-waiver.entity';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { DataSource, In } from 'typeorm';
@@ -158,6 +159,7 @@ function mockRepo() {
 
 const ENTITIES = [
   Store,
+  EmployeePayrollWaiver,
   StoreEmployeeType,
   StoreRole,
   EmployeeProfile,
@@ -1245,6 +1247,8 @@ async function buildPayrollHarness() {
         // to run a raw DELETE through the manager fails the test.
         provide: DataSource,
         useValue: {
+          // Đọc ngoài transaction (khoản chủ đã xoá — loadPayrollWaivers).
+          manager: { getRepository: (entity: any) => repoMap.get(entity) },
           transaction: (callback: (manager: any) => unknown) => {
             const manager = {
               query: jest.fn().mockResolvedValue([]),

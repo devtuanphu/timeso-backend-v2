@@ -22,7 +22,11 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { StoresService } from '../stores.service';
-import { CreatePayrollRecordDto, UpdatePayrollRecordDto } from '../dto/payroll-record.dto';
+import {
+  CreatePayrollRecordDto,
+  CreatePayrollWaiverDto,
+  UpdatePayrollRecordDto,
+} from '../dto/payroll-record.dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { StoreAccessGuard } from '../guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../guards/store-resource-access.guard';
@@ -141,6 +145,19 @@ export class StoresPayrollController {
     @Body() body: UpdatePayrollRecordDto,
   ) {
     return this.storesService.updatePayrollRecord(recordId, body);
+  }
+
+  @StoreOwnerOnly()
+  @Post('employees/:profileId/payroll-waivers')
+  @ApiOperation({
+    summary: 'Xoá (miễn) một khoản thưởng / vi phạm của nhân viên trong tháng, kèm lý do',
+  })
+  async createPayrollWaiver(
+    @Param('profileId') profileId: string,
+    @Body() body: CreatePayrollWaiverDto,
+    @GetUser() user: any,
+  ) {
+    return this.storesService.createPayrollWaiver(profileId, body, user.userId);
   }
 
   @StoreOwnerOnly()

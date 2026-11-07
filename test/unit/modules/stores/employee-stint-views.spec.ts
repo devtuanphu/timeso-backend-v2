@@ -419,6 +419,7 @@ describe('employee views — current stint only (r6 repairs)', () => {
       service.sumApprovedAdvances = jest.fn().mockResolvedValue(0);
       service.loadStageCompletion = jest.fn().mockResolvedValue(undefined);
       service.loadWagePricing = jest.fn().mockResolvedValue(null);
+      service.loadPayrollWaivers = jest.fn().mockResolvedValue(undefined);
       return service.computeEmployeePayslip({
         employeeProfileId: PROFILE,
         storeId: 'store-1',

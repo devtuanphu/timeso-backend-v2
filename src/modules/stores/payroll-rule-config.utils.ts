@@ -79,6 +79,10 @@ export interface RuleOccurrence {
    * viên ngày đó). Gốc "giờ của ca hôm đó" của hệ số lương.
    */
   shiftMinutes?: number;
+  /** Ca làm của lần tự động (để chủ xoá đúng lần đó — employee_payroll_waivers). */
+  assignmentId?: string;
+  /** Ghi nhận tay của lần thủ công (employee_payroll_records.id). */
+  recordId?: string;
 }
 
 /** Khoản đo bằng số phút của từng lần (miễn trừ, bậc phút, luỹ tiến phút…). */

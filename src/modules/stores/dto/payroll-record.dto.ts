@@ -44,3 +44,36 @@ export class UpdatePayrollRecordDto {
   @MaxLength(300)
   note?: string | null;
 }
+
+/**
+ * Chủ xoá một khoản thưởng / vi phạm trong popup chi tiết của sao kê lương,
+ * kèm lý do. `recordId` (ghi nhận tay) hoặc `assignmentId` (một lần của khoản
+ * tự động, theo ca); không có cả hai = cả dòng của khoản trong tháng.
+ */
+export class CreatePayrollWaiverDto {
+  @ApiPropertyOptional({
+    description: 'Khoản của dòng (adjustmentBreakdown[].ruleId); bắt buộc trừ khi xoá ghi nhận tay (recordId)',
+  })
+  @IsOptional()
+  @IsUUID()
+  ruleId?: string;
+
+  @ApiProperty({ example: '2026-11', description: 'Tháng của phiếu lương (YYYY-MM)' })
+  @Matches(/^\d{4}-\d{2}$/)
+  month: string;
+
+  @ApiPropertyOptional({ description: 'Ca của lần tự động (occurrences[].assignmentId)' })
+  @IsOptional()
+  @IsUUID()
+  assignmentId?: string;
+
+  @ApiPropertyOptional({ description: 'Ghi nhận tay (occurrences[].recordId)' })
+  @IsOptional()
+  @IsUUID()
+  recordId?: string;
+
+  @ApiProperty({ description: 'Lý do xoá' })
+  @IsString()
+  @MaxLength(300)
+  reason: string;
+}

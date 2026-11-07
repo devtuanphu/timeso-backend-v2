@@ -75,6 +75,7 @@ import { StorePayrollSetting } from './entities/store-payroll-setting.entity';
 import { StorePayrollRule } from './entities/store-payroll-rule.entity';
 import { StorePayslipRow } from './entities/store-payslip-row.entity';
 import { EmployeePayrollRecord } from './entities/employee-payroll-record.entity';
+import { EmployeePayrollWaiver } from './entities/employee-payroll-waiver.entity';
 import { StorePayrollIncrementRule } from './entities/store-payroll-increment-rule.entity';
 import { StoreInternalRule } from './entities/store-internal-rule.entity';
 import { StorePermissionConfig } from './entities/store-permission-config.entity';
@@ -230,6 +231,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
       StorePayrollRule,
       StorePayslipRow,
       EmployeePayrollRecord,
+      EmployeePayrollWaiver,
       StorePayrollIncrementRule,
       StoreInternalRule,
       StorePermissionConfig,

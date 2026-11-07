@@ -100,7 +100,7 @@ import {
   FINE_PAYROLL_RULE_CODES,
   legacyRuleCodeOf,
 } from '../entities/store-payroll-rule.entity';
-import { CreatePayrollRecordDto } from '../dto/payroll-record.dto';
+import { CreatePayrollRecordDto, CreatePayrollWaiverDto } from '../dto/payroll-record.dto';
 
 /** Mã khoản tự thêm, dạng chuỗi (code của rule là string, không phải enum). */
 const CUSTOM_RULE_CODE: string = PayrollRuleCode.CUSTOM;
@@ -202,9 +202,11 @@ import {
   computeNetFromIncome,
   computePayslip,
   computeRuleAdjustmentBreakdown,
+  isPeriodLevelRule,
   payrollRulePricingChanged,
   sumAllowances,
   PayslipAdjustmentLine,
+  type PayrollWaiverFacts,
   computePayslipTotals,
   MonthlyAttendanceFacts,
   PayrollAssignmentFact,
@@ -236,6 +238,10 @@ import {
   type WageRateRule,
 } from '../wage-rates.utils';
 import { EmployeePayrollRecord } from '../entities/employee-payroll-record.entity';
+import {
+  EmployeePayrollWaiver,
+  PayrollWaiverKind,
+} from '../entities/employee-payroll-waiver.entity';
 import { Order, OrderStatus } from '../entities/order.entity';
 import {
   NotificationPriority,
@@ -2383,6 +2389,10 @@ export class StoresPayrollPart {
         assignments,
       });
     }
+    // Khoản chủ đã xoá (miễn) trong tháng: chỉ khi có khoản để tính.
+    if (p.contract && rules.length) {
+      facts.waivers = await this.loadPayrollWaivers(p.employeeProfileId, p.month, p.manager);
+    }
     facts.stageCompletion = await this.loadStageCompletion(
       p.employeeProfileId,
       p.storeId,
@@ -2620,11 +2630,12 @@ export class StoresPayrollPart {
     month: VnMonth,
     manager?: EntityManager,
   ): Promise<Record<string, RuleOccurrence[]>> {
-    const rows: Array<{ ruleId: string; workDate: string; quantity: string }> =
+    const rows: Array<{ id: string; ruleId: string; workDate: string; quantity: string }> =
       await (manager ?? this.dataSource.manager)
         .getRepository(EmployeePayrollRecord)
         .createQueryBuilder('r')
-        .select('r.ruleId', 'ruleId')
+        .select('r.id', 'id')
+        .addSelect('r.ruleId', 'ruleId')
         .addSelect(`to_char(r.workDate, 'YYYY-MM-DD')`, 'workDate')
         .addSelect('r.quantity', 'quantity')
         .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
@@ -2640,9 +2651,230 @@ export class StoresPayrollPart {
         date: String(row.workDate).slice(0, 10),
         minutes: 0,
         quantity,
+        ...(row.id ? { recordId: String(row.id) } : {}),
       });
     }
     return out;
+  }
+
+  /**
+   * Những lần / dòng thưởng / vi phạm chủ đã xoá khỏi lương tháng (popup chi
+   * tiết ở sao kê lương). RECORD không có ở đây: ghi nhận đó đã xoá mềm.
+   */
+  async loadPayrollWaivers(
+    this: StoresService,
+    employeeProfileId: string,
+    month: VnMonth,
+    manager?: EntityManager,
+  ): Promise<PayrollWaiverFacts | undefined> {
+    const rows = await (manager ?? this.dataSource.manager)
+      .getRepository(EmployeePayrollWaiver)
+      .find({
+        where: {
+          employeeProfileId,
+          periodStart: month.key,
+          kind: In([PayrollWaiverKind.OCCURRENCE, PayrollWaiverKind.LINE]),
+        },
+        select: ['kind', 'ruleLineageId', 'assignmentId'],
+      });
+    if (!rows?.length) return undefined;
+    const occurrences: Record<string, string[]> = {};
+    const lines: string[] = [];
+    for (const row of rows) {
+      if (row.kind === PayrollWaiverKind.LINE) lines.push(row.ruleLineageId);
+      else if (row.assignmentId) (occurrences[row.ruleLineageId] ??= []).push(row.assignmentId);
+    }
+    return { occurrences, lines };
+  }
+
+  /**
+   * Chủ xoá một khoản thưởng / vi phạm của nhân viên, kèm lý do (popup "Chi
+   * tiết thưởng / vi phạm" của sao kê lương):
+   * - `recordId`: ghi nhận tay — xoá mềm ghi nhận đó, giữ lý do;
+   * - `assignmentId`: một lần của khoản tự động (đi muộn ca đó…) — bỏ lần đó;
+   * - không có cả hai: cả dòng của khoản trong tháng (khoản tính cả tháng).
+   * Chỉ tháng này và phiếu lương chưa chốt (như ghi nhận tay); phiếu lương
+   * tính lại ngay. Gửi lại cùng một lần: không thêm dòng, trả lần đã có.
+   */
+  async createPayrollWaiver(
+    this: StoresService,
+    profileId: string,
+    dto: CreatePayrollWaiverDto,
+    ownerAccountId: string,
+  ) {
+    const reason = String(dto.reason ?? '').trim();
+    if (!reason) throw new BadRequestException('Hãy nhập lý do xoá');
+    // Như ghi nhận tay: chỉ người đang làm — phiếu của người đã nghỉ không
+    // được tính lại (recomputeEmployeePayslipForWorkDate bỏ qua), xoá ở đây
+    // sẽ làm màn lương và phiếu đã lưu lệch nhau.
+    const profile = await this.profileRepository.findOne({ where: { id: profileId } });
+    if (!profile?.storeId || !isShiftEligibleEmploymentStatus(profile.employmentStatus)) {
+      throw new NotFoundException('Không tìm thấy nhân viên đang làm');
+    }
+    const month = /^\d{4}-\d{2}$/.test(dto.month ?? '')
+      ? vnMonthOfDateString(`${dto.month}-01`)
+      : null;
+    if (!month || month.key !== vnMonthOf().key) {
+      throw new BadRequestException('Chỉ xoá được khoản của tháng này');
+    }
+    await this.assertPayslipOpen(profile.id, month.key);
+    const repo = this.dataSource.getRepository(EmployeePayrollWaiver);
+    const common = {
+      storeId: profile.storeId,
+      employeeProfileId: profile.id,
+      periodStart: month.key,
+      reason: reason.slice(0, 300),
+      createdByAccountId: ownerAccountId,
+    };
+    let workDate: string = month.key;
+    if (dto.recordId) {
+      // Ghi nhận tay: khoản đọc từ chính ghi nhận (có thể đã bị xoá hẳn —
+      // rule_id NULL — vẫn xoá được như trước).
+      const record = await this.dataSource
+        .getRepository(EmployeePayrollRecord)
+        .findOne({ where: { id: dto.recordId }, withDeleted: true });
+      if (!record || record.employeeProfileId !== profile.id) {
+        throw new NotFoundException('Không tìm thấy ghi nhận');
+      }
+      // Gửi lại sau khi đã xoá (mạng chập chờn): coi như đã xoá.
+      if (record.deletedAt) {
+        const done = await repo.findOne({
+          where: { recordId: record.id, kind: PayrollWaiverKind.RECORD },
+        });
+        if (done) return { deleted: true };
+        throw new NotFoundException('Không tìm thấy ghi nhận');
+      }
+      workDate = String(record.workDate).slice(0, 10);
+      if (workDate < month.key || workDate >= month.endExclusiveDate) {
+        throw new BadRequestException('Ghi nhận không thuộc tháng này');
+      }
+      const recordRule = record.ruleId
+        ? await this.payrollRuleRepository.findOne({
+            where: { id: record.ruleId },
+            withDeleted: true,
+          })
+        : null;
+      const fresh = await this.dataSource.transaction(async (manager) => {
+        // Khoá ghi nhận: hai lần bấm cùng lúc chỉ một lần xoá, lần kia
+        // thấy ghi nhận đã xoá và trả "đã xoá" (không 500 vì trùng khoá).
+        const locked = await manager
+          .getRepository(EmployeePayrollRecord)
+          .createQueryBuilder('r')
+          .setLock('pessimistic_write')
+          .where('r.id = :id', { id: record.id })
+          .andWhere('r.deletedAt IS NULL')
+          .getOne();
+        if (!locked) return false;
+        const waivers = manager.getRepository(EmployeePayrollWaiver);
+        await waivers.save(
+          waivers.create({
+            ...common,
+            category: record.category,
+            ruleLineageId: recordRule?.lineageId || record.ruleId || record.id,
+            ruleName: record.ruleName || recordRule?.name || '',
+            kind: PayrollWaiverKind.RECORD,
+            recordId: record.id,
+            workDate,
+          }),
+        );
+        await manager.getRepository(EmployeePayrollRecord).softDelete({ id: record.id });
+        return true;
+      });
+      if (!fresh) return { deleted: true };
+      await this.recomputeEmployeePayslipForWorkDate({
+        employeeProfileId: profile.id,
+        storeId: profile.storeId,
+        workDate,
+      });
+      return { deleted: true };
+    }
+    const rule = dto.ruleId
+      ? await this.payrollRuleRepository.findOne({
+          where: { id: dto.ruleId, storeId: profile.storeId },
+          withDeleted: true,
+        })
+      : null;
+    if (
+      !rule ||
+      (rule.category !== PayrollRuleCategory.BONUS && rule.category !== PayrollRuleCategory.FINE)
+    ) {
+      throw new BadRequestException('Không tìm thấy khoản thưởng / vi phạm');
+    }
+    // Cả dòng chỉ với khoản tính cả tháng (mốc, % lương tháng, thưởng tháng
+    // kiểu cũ…). Khoản tính theo từng lần phải xoá từng lần: xoá cả dòng sẽ
+    // nuốt luôn những lần phát sinh sau (đi muộn ngày mai, ghi nhận thêm).
+    if (!dto.assignmentId && !isPeriodLevelRule(rule)) {
+      throw new BadRequestException('Khoản này xoá theo từng lần, hãy chọn lần cần xoá');
+    }
+    const lineage = rule.lineageId || rule.id;
+    const base = {
+      ...common,
+      category: rule.category,
+      ruleLineageId: lineage,
+      ruleName: rule.name,
+    };
+    if (dto.assignmentId) {
+      const assignment = await this.shiftAssignmentRepository.findOne({
+        where: { id: dto.assignmentId, employeeId: profile.id },
+        relations: ['shiftSlot'],
+        withDeleted: true,
+      });
+      workDate = String(assignment?.shiftSlot?.workDate ?? '').slice(0, 10);
+      if (!assignment || workDate < month.key || workDate >= month.endExclusiveDate) {
+        throw new BadRequestException('Không tìm thấy ca của lần này trong tháng');
+      }
+      const existing = await repo.findOne({
+        where: {
+          employeeProfileId: profile.id,
+          ruleLineageId: lineage,
+          assignmentId: assignment.id,
+          kind: PayrollWaiverKind.OCCURRENCE,
+        },
+      });
+      if (existing) return { deleted: true };
+      await this.savePayrollWaiverOnce(
+        repo,
+        repo.create({
+          ...base,
+          kind: PayrollWaiverKind.OCCURRENCE,
+          assignmentId: assignment.id,
+          workDate,
+        }),
+      );
+    } else {
+      const existing = await repo.findOne({
+        where: {
+          employeeProfileId: profile.id,
+          ruleLineageId: lineage,
+          periodStart: month.key,
+          kind: PayrollWaiverKind.LINE,
+        },
+      });
+      if (existing) return { deleted: true };
+      await this.savePayrollWaiverOnce(
+        repo,
+        repo.create({ ...base, kind: PayrollWaiverKind.LINE }),
+      );
+    }
+    await this.recomputeEmployeePayslipForWorkDate({
+      employeeProfileId: profile.id,
+      storeId: profile.storeId,
+      workDate,
+    });
+    return { deleted: true };
+  }
+
+  /** Lưu một lần xoá; trùng (bấm hai lần cùng lúc) thì coi như đã xoá. */
+  async savePayrollWaiverOnce(
+    this: StoresService,
+    repo: Repository<EmployeePayrollWaiver>,
+    row: EmployeePayrollWaiver,
+  ) {
+    try {
+      await repo.save(row);
+    } catch (error: any) {
+      if (error?.code !== '23505') throw error;
+    }
   }
 
   /**
