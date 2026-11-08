@@ -1081,27 +1081,49 @@ export class CareerLadderService {
   async deleteRung(storeId: string, rungId: string) {
     const { rung, ladder } = await this.ownedRung(storeId, rungId);
 
-    // Xoá một bậc có người đang đứng sẽ làm lịch sử của họ trỏ vào khoảng
-    // không, nên chặn lại và để chủ chuyển người đi trước.
-    const holders = await this.profileRepository.count({
-      where: {
-        storeId,
-        [this.profileColumn(ladder.dimension)]: rung.targetId,
-      } as any,
-    });
-    if (holders > 0) {
-      throw new BadRequestException({
-        code: 'CAREER_RUNG_IN_USE',
-        message: `Còn ${holders} nhân viên đang ở bậc này`,
-        employeesAffected: holders,
-      });
-    }
+    const isStage = ladder.dimension === LadderDimension.EMPLOYMENT_TYPE;
 
     // Gỡ bậc giữa dãy không được làm đứt lộ trình. Bậc chỉ bị xoá mềm nên
     // ON DELETE CASCADE của cạnh không chạy; tự dọn cạnh ở đây, và nối thẳng
     // mọi bậc trước sang mọi bậc sau để A→B→C thành A→C khi gỡ B. Không tạo
     // được vòng lặp, vì đường A→C vốn đã tồn tại qua B.
     await this.dataSource.transaction(async (manager) => {
+      if (isStage) {
+        // Cùng khoá với saveStage: một lần lưu giai đoạn đang chạy (đã đọc
+        // bậc / loại nhân viên) không được ghi đè lần xoá này và làm giai
+        // đoạn sống lại. Đọc lại bậc sau khi có khoá.
+        await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+          `stage-ladder:${storeId}`,
+        ]);
+        const stillThere = await manager.exists(StoreLadderRung, {
+          where: { id: rung.id, ladderId: ladder.id },
+        });
+        if (!stillThere) throw new NotFoundException('Không tìm thấy giai đoạn');
+      }
+
+      // Xoá một bậc có người đang đứng sẽ làm lịch sử của họ trỏ vào khoảng
+      // không, nên chặn lại và để chủ chuyển người đi trước.
+      //
+      // Giai đoạn (loại nhân viên): chỉ người đang làm chặn. Người đã nghỉ
+      // không hiện ở màn "Giai đoạn và đánh giá" nên chủ không có cách nào
+      // chuyển họ đi; hồ sơ của họ vẫn trỏ tới loại nhân viên (không xoá, chỉ
+      // ẩn bên dưới) nên lịch sử vẫn đọc được tên, và khôi phục họ thì bỏ
+      // giai đoạn đã xoá (reconcileRestoredPlacement).
+      const holders = await manager.count(EmployeeProfile, {
+        where: {
+          storeId,
+          [this.profileColumn(ladder.dimension)]: rung.targetId,
+          ...(isStage ? { employmentStatus: In([...EMPLOYED_STATUSES]) } : {}),
+        } as any,
+      });
+      if (holders > 0) {
+        throw new BadRequestException({
+          code: 'CAREER_RUNG_IN_USE',
+          message: `Còn ${holders} nhân viên đang ở bậc này`,
+          employeesAffected: holders,
+        });
+      }
+
       const edges = await manager.find(StoreLadderEdge, {
         where: { ladderId: ladder.id },
       });
@@ -1118,6 +1140,17 @@ export class CareerLadderService {
       }
 
       await manager.softRemove(StoreLadderRung, rung);
+
+      // Giai đoạn đã xoá không được hiện lại ở ô "Chọn giai đoạn" khi thêm
+      // nhân viên (danh mục chỉ lấy loại còn hoạt động), và tên được dùng lại
+      // khi tạo giai đoạn mới (kiểm trùng tên chỉ xét loại còn hoạt động).
+      if (isStage) {
+        await manager.update(
+          StoreEmployeeType,
+          { id: rung.targetId, storeId },
+          { isActive: false },
+        );
+      }
     });
 
     return this.describeLadder(ladder);

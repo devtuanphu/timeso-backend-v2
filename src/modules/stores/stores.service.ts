@@ -1619,6 +1619,18 @@ export class StoresService {
       const exists = await manager.exists(entity, { where: { id, storeId } });
       if (!exists) throw this.invalidStoreReference();
     }
+    // Giai đoạn đã xoá (loại nhân viên bị ẩn) không còn trong ô chọn; ô chọn
+    // mở từ trước lúc xoá vẫn có thể gửi lên.
+    if (
+      data.employeeTypeId &&
+      (await manager.exists(StoreEmployeeType, {
+        where: { id: data.employeeTypeId, storeId, isActive: false },
+      }))
+    ) {
+      throw new BadRequestException(
+        'Giai đoạn này đã bị xoá, hãy chọn giai đoạn khác',
+      );
+    }
     // A new hire's default shift comes from the settings list; a deleted
     // (hidden) shift is no longer offered there.
     if (
@@ -3304,6 +3316,14 @@ export class StoresService {
         where: { id: profile.departmentId, storeId: profile.storeId },
       });
       if (!exists) profile.departmentId = null as any;
+    }
+    // Giai đoạn đã xoá (loại nhân viên bị ẩn khi xoá giai đoạn — người đã
+    // nghỉ không chặn lệnh xoá): bỏ giai đoạn, chủ xếp lại ở màn giai đoạn.
+    if (profile.employeeTypeId) {
+      const active = await manager.exists(StoreEmployeeType, {
+        where: { id: profile.employeeTypeId, storeId: profile.storeId, isActive: true },
+      });
+      if (!active) profile.employeeTypeId = null as any;
     }
   }
 
