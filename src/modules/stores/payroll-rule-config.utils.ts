@@ -83,6 +83,11 @@ export interface RuleOccurrence {
   assignmentId?: string;
   /** Ghi nhận tay của lần thủ công (employee_payroll_records.id). */
   recordId?: string;
+  /**
+   * Số tiền riêng của ghi nhận tay (employee_payroll_records.amount): lần đó
+   * trả / trừ đúng số này thay vì theo cách tính của khoản.
+   */
+  amount?: number | null;
 }
 
 /** Khoản đo bằng số phút của từng lần (miễn trừ, bậc phút, luỹ tiến phút…). */
@@ -102,6 +107,7 @@ export const MANUAL_CODES: ReadonlySet<string> = new Set([
   'SALES',
   'HOT_BONUS',
   'RULE_VIOLATION',
+  'DAMAGE',
   'CUSTOM',
 ]);
 

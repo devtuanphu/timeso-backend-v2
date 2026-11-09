@@ -1,7 +1,21 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsNumber, IsOptional, IsString, IsUUID, Matches, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  Max,
+  MaxLength,
+  Min,
+  ValidateIf,
+} from 'class-validator';
 
 /** Chủ ghi nhận một khoản thưởng / vi phạm thủ công cho một nhân viên. */
+/** Một lần ghi nhận tối đa 100 triệu đồng (như mức tối đa của một khoản). */
+export const PAYROLL_RECORD_AMOUNT_MAX = 100_000_000;
+
 export class CreatePayrollRecordDto {
   @ApiProperty({ description: 'Khoản (store_payroll_rules.id), loại ghi nhận thủ công' })
   @IsUUID()
@@ -16,6 +30,17 @@ export class CreatePayrollRecordDto {
   @Min(0.01)
   @Max(1000)
   quantity: number;
+
+  @ApiPropertyOptional({
+    example: 30000,
+    description:
+      'Số tiền của riêng lần này (đồng). Bỏ trống = tính theo cách tính của khoản × số lượng.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(PAYROLL_RECORD_AMOUNT_MAX)
+  amount?: number;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -37,6 +62,18 @@ export class UpdatePayrollRecordDto {
   @Min(0.01)
   @Max(1000)
   quantity?: number;
+
+  @ApiPropertyOptional({
+    example: 20000,
+    nullable: true,
+    description: 'Số tiền của riêng lần này (đồng); null = bỏ, tính lại theo cách tính của khoản.',
+  })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @IsInt()
+  @Min(1)
+  @Max(PAYROLL_RECORD_AMOUNT_MAX)
+  amount?: number | null;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -76,4 +113,15 @@ export class CreatePayrollWaiverDto {
   @IsString()
   @MaxLength(300)
   reason: string;
+}
+
+export class UpdateOvertimeCoefficientDto {
+  @ApiProperty({
+    example: 1.5,
+    description: 'Hệ số lương giờ / ca của khoản "Tăng ca" (1,5 = trả 150% lương giờ)',
+  })
+  @IsNumber({ maxDecimalPlaces: 2 })
+  @Min(1)
+  @Max(100)
+  coef: number;
 }

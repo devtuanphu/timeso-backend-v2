@@ -14,7 +14,7 @@ import {
   MinLength,
   ValidateNested,
 } from 'class-validator';
-import { PayslipRowSign } from '../entities/store-payslip-row.entity';
+import { PayslipRowSign, PayslipRowUnit } from '../entities/store-payslip-row.entity';
 
 /** A built-in payslip row (Phụ cấp / Thưởng / Khấu trừ): renamed or removed. */
 export class PayslipBuiltinRowDto {
@@ -55,6 +55,14 @@ export class PayslipExtraItemDto {
 
   @IsEnum(PayslipRowSign)
   sign: PayslipRowSign;
+
+  /**
+   * Cách tính: MONTH (mặc định, app cũ không gửi) = cố định mỗi tháng; DAY /
+   * HOUR / SHIFT = `amount` là đơn giá × ngày công / giờ làm / ca hoàn thành.
+   */
+  @IsOptional()
+  @IsEnum(PayslipRowUnit)
+  unit?: PayslipRowUnit;
 
   @Type(() => Number)
   @IsInt()

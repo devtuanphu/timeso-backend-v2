@@ -43,6 +43,22 @@ export class EmployeePayrollRecord extends BaseEntity {
   @Column({ type: 'decimal', precision: 10, scale: 2 })
   quantity: number;
 
+  /**
+   * Số tiền của riêng lần này (đồng), chủ nhập khi ghi nhận ("lần này 30k,
+   * lần sau 20k"). Null = tính theo cách tính của khoản × số lượng.
+   */
+  @Column({
+    type: 'decimal',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+    transformer: {
+      to: (value: number | null | undefined) => value ?? null,
+      from: (value: string | null) => (value === null || value === undefined ? null : Number(value)),
+    },
+  })
+  amount: number | null;
+
   @Column({ type: 'text', nullable: true })
   note: string | null;
 

@@ -17,6 +17,7 @@ import { mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { Store } from '../entities/store.entity';
 import {
+  EmployeeProfile,
   EmploymentStatus,
   WorkingStatus,
 } from '../entities/employee-profile.entity';
@@ -166,6 +167,8 @@ const DEFAULT_TIMEKEEPING_SHIFTS = [
 const defaultTimekeepingSettingData = (storeId: string) => ({
   storeId,
   enableFlexibleShift: false,
+  flexibleShiftScope: 'ALL' as const,
+  flexibleShiftEmployeeIds: [] as string[],
   requireLocation: true,
   attendanceRadius: 50,
   requireQrScan: true,
@@ -714,10 +717,26 @@ export class StoresAttendancePart {
       const definedSettingData = Object.fromEntries(
         Object.entries(settingData).filter(([, value]) => value !== undefined),
       );
+      // Ca linh hoạt cho "nhân viên được chọn": chỉ giữ hồ sơ của chính cửa
+      // hàng này (id lạ / của cửa hàng khác bị bỏ, không lưu).
+      if (Array.isArray(settingData.flexibleShiftEmployeeIds)) {
+        const wanted = [...new Set(settingData.flexibleShiftEmployeeIds)];
+        const own = wanted.length
+          ? await manager.find(EmployeeProfile, {
+              where: { id: In(wanted), storeId },
+              select: ['id'],
+            })
+          : [];
+        const ownIds = new Set(own.map((profile) => profile.id));
+        definedSettingData.flexibleShiftEmployeeIds = wanted.filter((id) =>
+          ownIds.has(id),
+        );
+      }
       if (setting) Object.assign(setting, definedSettingData);
       else {
         setting = manager.create(StoreTimekeepingSetting, {
           ...settingData,
+          ...definedSettingData,
           storeId,
         });
       }

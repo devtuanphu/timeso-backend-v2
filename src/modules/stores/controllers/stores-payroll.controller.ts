@@ -25,6 +25,7 @@ import { StoresService } from '../stores.service';
 import {
   CreatePayrollRecordDto,
   CreatePayrollWaiverDto,
+  UpdateOvertimeCoefficientDto,
   UpdatePayrollRecordDto,
 } from '../dto/payroll-record.dto';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
@@ -112,6 +113,19 @@ export class StoresPayrollController {
     @Body() body: UpdatePayrollSettingDto,
   ) {
     return this.storesService.upsertPayrollSetting(id, body);
+  }
+
+  @StoreOwnerOnly()
+  @Put(':id/payroll-settings/overtime-coefficient')
+  @ApiOperation({
+    summary:
+      'Sửa hệ số của khoản thưởng "Tăng ca" (Thiết lập ca làm & chấm công → Làm thêm giờ)',
+  })
+  async updateOvertimeCoefficient(
+    @Param('id') id: string,
+    @Body() body: UpdateOvertimeCoefficientDto,
+  ) {
+    return this.storesService.updateOvertimeCoefficient(id, Number(body.coef));
   }
 
   // Ghi nhận thưởng / vi phạm thủ công cho từng nhân viên

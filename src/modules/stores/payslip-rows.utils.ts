@@ -8,6 +8,7 @@
 import {
   PayslipBuiltinRow,
   PayslipRowSign,
+  PayslipRowUnit,
 } from './entities/store-payslip-row.entity';
 
 export const PAYSLIP_BUILTIN_DEFAULT_LABELS: Record<PayslipBuiltinRow, string> = {
@@ -20,9 +21,26 @@ export interface PayslipExtraItem {
   id?: string;
   label: string;
   sign: PayslipRowSign;
-  /** Whole VND, ≥ 0; the sign says whether it is added or taken. */
+  /**
+   * Whole VND, ≥ 0; the sign says whether it is added or taken. In the store
+   * template: the fixed monthly amount (MONTH) or the unit price (DAY / HOUR /
+   * SHIFT). In a payslip's snapshot (resolvePayslipRows): what this employee
+   * is paid / charged for the month, so every reader just sums `amount`.
+   */
   amount: number;
+  /** Cách tính; missing (older rows / snapshots) = MONTH. */
+  unit?: PayslipRowUnit;
+  /** DAY / HOUR / SHIFT in a payslip snapshot: the unit price `amount` came from. */
+  rate?: number;
+  /** DAY / HOUR / SHIFT in a payslip snapshot: worked days / hours / shifts. */
+  quantity?: number;
 }
+
+/** A stored / sent unit, MONTH when missing or unknown. */
+export const payslipRowUnitOf = (value: unknown): PayslipRowUnit =>
+  value === PayslipRowUnit.DAY || value === PayslipRowUnit.HOUR || value === PayslipRowUnit.SHIFT
+    ? value
+    : PayslipRowUnit.MONTH;
 
 export interface PayslipRowsSnapshot {
   labels: Record<PayslipBuiltinRow, string>;
@@ -37,6 +55,7 @@ export interface PayslipTemplateRowLike {
   label: string;
   sign: PayslipRowSign | string;
   amount: number | string;
+  unit?: PayslipRowUnit | string | null;
   sortOrder?: number | null;
   isActive?: boolean | null;
 }
@@ -74,6 +93,7 @@ export function payslipRowsSnapshot(
       label,
       sign: toSign(row.sign),
       amount: toAmount(row.amount),
+      unit: payslipRowUnitOf(row.unit),
     });
   }
   return { labels, removed, items };
@@ -95,12 +115,61 @@ export function readPayslipRowsSnapshot(value: unknown): PayslipRowsSnapshot | n
     ),
     items: (Array.isArray(raw.items) ? raw.items : [])
       .filter((item) => item && String(item.label ?? '').trim())
-      .map((item) => ({
-        ...(item.id ? { id: String(item.id) } : {}),
-        label: String(item.label).trim(),
-        sign: toSign(item.sign),
-        amount: toAmount(item.amount),
-      })),
+      .map((item) => {
+        const unit = payslipRowUnitOf(item.unit);
+        const perUnit = unit !== PayslipRowUnit.MONTH;
+        const quantity = Number(item.quantity);
+        return {
+          ...(item.id ? { id: String(item.id) } : {}),
+          label: String(item.label).trim(),
+          sign: toSign(item.sign),
+          amount: toAmount(item.amount),
+          unit,
+          ...(perUnit && item.rate !== undefined ? { rate: toAmount(item.rate) } : {}),
+          ...(perUnit && Number.isFinite(quantity) && quantity >= 0 ? { quantity } : {}),
+        };
+      }),
+  };
+}
+
+/** The month's figures an extra line is priced on (one employee). */
+export interface PayslipRowFacts {
+  /** Distinct days worked. */
+  daysWorked: number;
+  workedMinutes: number;
+  completedShifts: number;
+}
+
+/**
+ * The template as one employee's payslip pays it: a DAY / HOUR / SHIFT line's
+ * `amount` becomes unit price × that employee's worked days / hours /
+ * completed shifts (the price kept in `rate`). MONTH lines are unchanged.
+ * Idempotent: an already resolved snapshot is priced again from `rate`, so
+ * recomputing a payslip with its own snapshot follows the new facts.
+ */
+export function resolvePayslipRows(
+  snapshot: PayslipRowsSnapshot | null | undefined,
+  facts: PayslipRowFacts,
+): PayslipRowsSnapshot | null {
+  if (!snapshot) return null;
+  const n = (value: unknown) => {
+    const x = Number(value);
+    return Number.isFinite(x) && x > 0 ? x : 0;
+  };
+  return {
+    ...snapshot,
+    items: snapshot.items.map((item) => {
+      const unit = payslipRowUnitOf(item.unit);
+      if (unit === PayslipRowUnit.MONTH) return { ...item, unit };
+      const rate = toAmount(item.rate ?? item.amount);
+      const quantity =
+        unit === PayslipRowUnit.DAY
+          ? n(facts.daysWorked)
+          : unit === PayslipRowUnit.HOUR
+            ? Math.round((n(facts.workedMinutes) / 60) * 100) / 100
+            : n(facts.completedShifts);
+      return { ...item, unit, rate, quantity, amount: Math.round(rate * quantity) };
+    }),
   };
 }
 

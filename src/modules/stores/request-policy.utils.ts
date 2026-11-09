@@ -90,3 +90,47 @@ export function requestPolicyViolation(input: {
   }
   return null;
 }
+
+const WEEK_MINUTES = 7 * 24 * 60;
+const WEEKDAY_INDEX: Record<string, number> = {
+  MONDAY: 0,
+  TUESDAY: 1,
+  WEDNESDAY: 2,
+  THURSDAY: 3,
+  FRIDAY: 4,
+  SATURDAY: 5,
+  SUNDAY: 6,
+};
+
+/** Khoảng tối thiểu giữa giờ mở và giờ khoá đăng ký ca (phút). */
+export const SHIFT_REGISTER_MIN_GAP_MINUTES = 30;
+
+/** "Monday" + "08:30" → phút tính từ 00:00 thứ Hai; null khi không đọc được. */
+export function weeklyMinuteOf(day: unknown, time: unknown): number | null {
+  const index = WEEKDAY_INDEX[String(day ?? '').trim().toUpperCase()];
+  const match = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(String(time ?? '').trim());
+  if (index === undefined || !match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return index * 24 * 60 + hours * 60 + minutes;
+}
+
+/**
+ * Giờ mở và giờ khoá đăng ký ca (lặp hàng tuần) cách nhau bao nhiêu phút,
+ * theo chiều gần hơn trên vòng tuần: mở Thứ 2 08:00 / khoá Thứ 2 08:00 → 0;
+ * khoá Chủ nhật 23:50 / mở Thứ 2 00:10 → 20. Null khi một trong hai không
+ * đọc được.
+ */
+export function shiftRegisterWindowGapMinutes(input: {
+  openDay: unknown;
+  openTime: unknown;
+  closeDay: unknown;
+  closeTime: unknown;
+}): number | null {
+  const open = weeklyMinuteOf(input.openDay, input.openTime);
+  const close = weeklyMinuteOf(input.closeDay, input.closeTime);
+  if (open === null || close === null) return null;
+  const forward = (((close - open) % WEEK_MINUTES) + WEEK_MINUTES) % WEEK_MINUTES;
+  return Math.min(forward, WEEK_MINUTES - forward);
+}

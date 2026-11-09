@@ -9,6 +9,18 @@ export enum PayslipBuiltinRow {
   DEDUCTION = 'DEDUCTION', // Khấu trừ (fine rules + other deductions)
 }
 
+/**
+ * Cách tính một hàng tự thêm: MONTH = `amount` cố định mỗi tháng (như
+ * trước); DAY / HOUR / SHIFT = `amount` là đơn giá × ngày công / giờ làm /
+ * ca hoàn thành của từng nhân viên trong tháng.
+ */
+export enum PayslipRowUnit {
+  MONTH = 'MONTH',
+  DAY = 'DAY',
+  HOUR = 'HOUR',
+  SHIFT = 'SHIFT',
+}
+
 export enum PayslipRowSign {
   PLUS = 'PLUS',
   MINUS = 'MINUS',
@@ -54,6 +66,9 @@ export class StorePayslipRow extends BaseEntity {
 
   @Column({ type: 'decimal', precision: 12, scale: 2, default: 0 })
   amount: number;
+
+  @Column({ type: 'varchar', length: 16, default: PayslipRowUnit.MONTH })
+  unit: PayslipRowUnit;
 
   @Column({ name: 'sort_order', type: 'int', default: 0 })
   sortOrder: number;

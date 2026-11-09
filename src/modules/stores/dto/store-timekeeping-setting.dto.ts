@@ -1,8 +1,11 @@
 import { ApiProperty } from '@nestjs/swagger';
 import {
+  ArrayMaxSize,
   IsArray,
   IsBoolean,
+  IsIn,
   IsInt,
+  IsUUID,
   IsNumber,
   IsOptional,
   IsString,
@@ -48,6 +51,26 @@ export class StoreTimekeepingSettingDto {
   @IsBoolean()
   @IsOptional()
   enableFlexibleShift?: boolean;
+
+  @ApiProperty({
+    description: 'Ca linh hoạt áp dụng cho: ALL = toàn bộ nhân viên, SELECTED = flexibleShiftEmployeeIds',
+    example: 'ALL',
+    required: false,
+  })
+  @IsIn(['ALL', 'SELECTED'])
+  @IsOptional()
+  flexibleShiftScope?: 'ALL' | 'SELECTED';
+
+  @ApiProperty({
+    description: 'Nhân viên (employee_profiles.id) áp dụng ca linh hoạt khi phạm vi là SELECTED',
+    example: [],
+    required: false,
+  })
+  @IsArray()
+  @ArrayMaxSize(500)
+  @IsUUID(undefined, { each: true })
+  @IsOptional()
+  flexibleShiftEmployeeIds?: string[];
 
   @ApiProperty({ description: 'Bắt buộc có vị trí khi chấm công', example: true })
   @IsBoolean()

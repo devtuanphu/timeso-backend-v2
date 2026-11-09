@@ -16,6 +16,16 @@ export class StoreTimekeepingSetting extends BaseEntity {
   @Column({ name: 'enable_flexible_shift', default: false })
   enableFlexibleShift: boolean;
 
+  /**
+   * Ca linh hoạt áp dụng cho ai: ALL = toàn bộ nhân viên, SELECTED = chỉ
+   * `flexibleShiftEmployeeIds`. Mới chỉ lưu (app chủ ghi "Chưa áp dụng").
+   */
+  @Column({ name: 'flexible_shift_scope', type: 'varchar', length: 16, default: 'ALL' })
+  flexibleShiftScope: 'ALL' | 'SELECTED';
+
+  @Column({ type: 'simple-array', name: 'flexible_shift_employee_ids', nullable: true })
+  flexibleShiftEmployeeIds: string[] | null;
+
   // -- Vị trí chấm công --
   @Column({ name: 'require_location', default: true })
   requireLocation: boolean;

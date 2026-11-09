@@ -32,6 +32,8 @@ export enum PayrollRuleCode {
   MISSED_PUNCH = 'MISSED_PUNCH',
   ABSENT = 'ABSENT',
   RULE_VIOLATION = 'RULE_VIOLATION',
+  /** Hư hao / bể vỡ (đền): chủ ghi nhận từng lần, số tiền tuỳ lần, bắt buộc có lý do. */
+  DAMAGE = 'DAMAGE',
   CUSTOM = 'CUSTOM',
 }
 
@@ -41,6 +43,7 @@ export const MANUAL_PAYROLL_RULE_CODES: ReadonlySet<string> = new Set([
   PayrollRuleCode.SALES,
   PayrollRuleCode.HOT_BONUS,
   PayrollRuleCode.RULE_VIOLATION,
+  PayrollRuleCode.DAMAGE,
   PayrollRuleCode.CUSTOM,
 ]);
 
@@ -61,6 +64,7 @@ export const FINE_PAYROLL_RULE_CODES: ReadonlySet<string> = new Set([
   PayrollRuleCode.MISSED_PUNCH,
   PayrollRuleCode.ABSENT,
   PayrollRuleCode.RULE_VIOLATION,
+  PayrollRuleCode.DAMAGE,
   PayrollRuleCode.CUSTOM,
 ]);
 

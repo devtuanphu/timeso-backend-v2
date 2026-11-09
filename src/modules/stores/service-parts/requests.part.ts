@@ -23,6 +23,8 @@ import { isShiftCoveredByApprovedLeave } from '../leave-coverage.utils';
 import {
   REQUEST_POLICY_CODE,
   requestPolicyViolation,
+  SHIFT_REGISTER_MIN_GAP_MINUTES,
+  shiftRegisterWindowGapMinutes,
   type RequestPolicyKind,
 } from '../request-policy.utils';
 import type { StoreApprovalSetting } from '../entities/store-approval-setting.entity';
@@ -217,6 +219,37 @@ export class StoresRequestsPart {
     let setting = await this.approvalSettingRepository.findOne({
       where: { storeId },
     });
+
+    // Mở / khoá đăng ký ca cách nhau ít nhất 30 phút. Chỉ xét khi lần lưu này
+    // đổi một trong bốn ô: lưu ô khác (vd "gợi ý cảnh báo thiếu người" từ màn
+    // Thiết lập ca làm) không bị chặn bởi giá trị cũ đã lưu trước khi có luật.
+    const touchesWindow = (
+      [
+        'shiftRegisterOpenDay',
+        'shiftRegisterOpenTime',
+        'shiftRegisterCloseDay',
+        'shiftRegisterCloseTime',
+      ] as const
+    ).some(
+      (key) =>
+        data[key] !== undefined && (!setting || String(data[key]) !== String(setting[key])),
+    );
+    if (touchesWindow) {
+      const gap = shiftRegisterWindowGapMinutes({
+        openDay: data.shiftRegisterOpenDay ?? setting?.shiftRegisterOpenDay ?? 'Monday',
+        openTime: data.shiftRegisterOpenTime ?? setting?.shiftRegisterOpenTime ?? '08:00',
+        closeDay: data.shiftRegisterCloseDay ?? setting?.shiftRegisterCloseDay ?? 'Thursday',
+        closeTime: data.shiftRegisterCloseTime ?? setting?.shiftRegisterCloseTime ?? '00:00',
+      });
+      if (gap === null) {
+        throw new BadRequestException('Thời gian mở / khoá đăng ký ca không hợp lệ');
+      }
+      if (gap < SHIFT_REGISTER_MIN_GAP_MINUTES) {
+        throw new BadRequestException(
+          `Thời gian mở đăng ký ca và thời gian khoá ca phải cách nhau từ ${SHIFT_REGISTER_MIN_GAP_MINUTES} phút trở lên`,
+        );
+      }
+    }
 
     if (setting) {
       Object.assign(setting, data);

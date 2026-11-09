@@ -22,6 +22,7 @@ import {
   countedPayslipDeductions,
   isBuiltinRemoved,
   payslipExtraTotals,
+  resolvePayslipRows,
   type PayslipRowsSnapshot,
 } from './payslip-rows.utils';
 
@@ -685,6 +686,8 @@ export interface PayslipAdjustmentLine {
     assignmentId?: string;
     /** Ghi nhận tay của lần thủ công. */
     recordId?: string;
+    /** Số tiền riêng chủ nhập cho lần ghi nhận này (đồng). */
+    amount?: number;
   }>;
   /**
    * Đơn vị của một lần: MINUTE (đọc `minutes` — trễ, sớm, tăng ca…), HOUR /
@@ -1002,6 +1005,37 @@ function lineOccurrences(rule: RuleWithName, facts: RuleAdjustmentFacts): RuleOc
 }
 
 /**
+ * Ghi nhận tay của khoản `rule` có số tiền riêng (employee_payroll_records.
+ * amount): tổng tiền, số lần, và số liệu còn lại (chỉ các ghi nhận không có
+ * số tiền riêng) để tính phần theo cách tính của khoản. Null = không có lần
+ * nào có số tiền riêng (khoản tính y như trước).
+ */
+function pricedRecordsOf(
+  rule: RuleWithName,
+  facts: RuleAdjustmentFacts,
+): { amount: number; count: number; rest: RuleAdjustmentFacts } | null {
+  const code = rule.code || 'CUSTOM';
+  if (!rule.id || AUTO_RULE_CODES.has(code)) return null;
+  if (!rule.calcConfig && !rule.calcMode) return null;
+  const list = facts.recordOccurrences?.[rule.id] ?? [];
+  const priced = list.filter((o) => o.amount != null && Number(o.amount) > 0);
+  if (!priced.length) return null;
+  const rest = list.filter((o) => !(o.amount != null && Number(o.amount) > 0));
+  return {
+    amount: priced.reduce((sum, o) => sum + Number(o.amount), 0),
+    count: priced.length,
+    rest: {
+      ...facts,
+      recordOccurrences: { ...(facts.recordOccurrences ?? {}), [rule.id]: rest },
+      ruleQuantities: {
+        ...(facts.ruleQuantities ?? {}),
+        [rule.id]: rest.reduce((sum, o) => sum + (Number(o.quantity) || 0), 0),
+      },
+    },
+  };
+}
+
+/**
  * Mỗi khoản (phiên bản) với số liệu nó được tính trên. Khoản không có phiên
  * bản (validFrom / validTo null — mọi khoản có từ trước) dùng nguyên số liệu
  * tháng như cũ. Phiên bản chỉ hiệu lực một phần kỳ: khoản tính theo từng lần
@@ -1183,6 +1217,7 @@ function ruleRawLines(
             quantity: Number(o.quantity) || 0,
             ...(o.assignmentId ? { assignmentId: o.assignmentId } : {}),
             ...(o.recordId ? { recordId: o.recordId } : {}),
+            ...(o.amount != null && o.amount > 0 ? { amount: Math.round(o.amount) } : {}),
           }))
       : undefined;
     raw.push({
@@ -1223,6 +1258,30 @@ function ruleRawLines(
     const facts = applyPayrollWaivers(rule, versioned.facts, monthFacts.waivers);
     if (!facts) continue;
     const kind = rule.category === PayrollRuleCategory.FINE ? 'FINE' : 'BONUS';
+    // Ghi nhận tay có số tiền riêng ("lần này 30k"): trả đúng số đó, phần còn
+    // lại của khoản tính theo cách tính như trước (trên các lần không có số
+    // tiền riêng). Chi tiết từng lần vẫn liệt kê đủ mọi lần.
+    const priced = pricedRecordsOf(rule, facts);
+    if (priced) {
+      const name =
+        (typeof rule.name === 'string' && rule.name.trim()) ||
+        (kind === 'FINE' ? 'Vi phạm' : 'Thưởng');
+      const line = rule.calcConfig
+        ? v3RuleLine(rule, priced.rest, name)
+        : rule.calcMode
+          ? v2RuleLine(rule, priced.rest)
+          : null;
+      push(
+        kind,
+        rule,
+        rule.code || 'CUSTOM',
+        (line?.exact ? line.count : 0) + priced.count,
+        (line?.exact ?? 0) + priced.amount,
+        line?.exact ? line.label : name,
+        lineOccurrences(rule, facts),
+      );
+      continue;
+    }
     if (rule.calcConfig) {
       // Khoản tự động không thưởng tháng chưa làm ca nào ("≤ 0 lần trễ");
       // khoản chủ ghi nhận tay thì trả theo ghi nhận, như v2.
@@ -1599,7 +1658,13 @@ export function computePayslip(input: {
           standardWorkingDays: input.standardWorkingDays,
           calendarDays: input.calendarDays,
         });
-  const template = input.payslipRows ?? null;
+  // Hàng tự thêm theo ngày công / giờ làm / ca: tiền của chính nhân viên này
+  // (ảnh chụp lưu trên phiếu mang số đã tính, nên mọi chỗ đọc chỉ cộng amount).
+  const template = resolvePayslipRows(input.payslipRows ?? null, {
+    daysWorked: input.facts.daysWorked,
+    workedMinutes: input.facts.workedMinutes,
+    completedShifts: input.facts.completedShifts,
+  });
   const adjustments = computeRuleAdjustments(
     input.rules,
     input.facts,

@@ -45,6 +45,7 @@ import { MonthlyPayroll } from '../entities/monthly-payroll.entity';
 import {
   PayslipBuiltinRow,
   PayslipRowSign,
+  PayslipRowUnit,
   StorePayslipRow,
 } from '../entities/store-payslip-row.entity';
 import {
@@ -52,6 +53,7 @@ import {
   isBuiltinRemoved,
   PAYSLIP_BUILTIN_DEFAULT_LABELS,
   payslipExtraTotals,
+  payslipRowUnitOf,
   payslipRowsSnapshot,
   readPayslipRowsSnapshot,
   type PayslipRowsSnapshot,
@@ -94,6 +96,7 @@ import {
   StorePayrollRule,
   PayrollRuleCategory,
   PayrollCalcType,
+  PayrollRuleCalcMode,
   PayrollRuleCode,
   MANUAL_PAYROLL_RULE_CODES,
   BONUS_PAYROLL_RULE_CODES,
@@ -101,6 +104,23 @@ import {
   legacyRuleCodeOf,
 } from '../entities/store-payroll-rule.entity';
 import { CreatePayrollRecordDto, CreatePayrollWaiverDto } from '../dto/payroll-record.dto';
+
+/**
+ * Khoản nhận "số tiền riêng của lần này" (employee_payroll_records.amount):
+ * chỉ khoản tính số tiền cố định mỗi lần (làm sai quy định, hư hao / bể vỡ,
+ * thưởng nóng…). Khoản tính theo giờ / ca / bậc / mốc thì số lượng mới có
+ * nghĩa, một số tiền riêng ở đó sẽ làm lệch bậc / mốc.
+ */
+const acceptsRecordAmount = (rule: Pick<StorePayrollRule, 'calcConfig'> | null | undefined) => {
+  const config = rule?.calcConfig as Record<string, unknown> | null | undefined;
+  return config?.kind === 'FIXED' && (config.unit ?? 'OCCURRENCE') === 'OCCURRENCE';
+};
+
+/** Hư hao / bể vỡ (đền): mỗi lần ghi nhận phải có lý do (Note 14). */
+const DAMAGE_REASON_REQUIRED = 'Hư hao/ bể vỡ (đền) cần ghi lý do';
+
+/** Đơn giá tối đa của hàng tự thêm theo ngày công / giờ làm / ca. */
+const PAYSLIP_ROW_UNIT_PRICE_MAX = 10_000_000;
 
 /** Mã khoản tự thêm, dạng chuỗi (code của rule là string, không phải enum). */
 const CUSTOM_RULE_CODE: string = PayrollRuleCode.CUSTOM;
@@ -554,6 +574,99 @@ export class StoresPayrollPart {
   }
 
   /**
+   * "Làm thêm giờ: lương theo giờ/ca x [1,5] lần" ở Thiết lập ca làm & chấm
+   * công: chính là hệ số của khoản thưởng "Tăng ca" (Thiết lập tính lương),
+   * để chỉ có một nơi tính tiền tăng ca. Sửa qua đúng đường phiên bản khoản:
+   * áp dụng từ hôm nay, lần tăng ca trước đó vẫn tính theo hệ số cũ; phiếu
+   * lương tháng này (chưa chốt) tính lại như khi lưu thiết lập tính lương.
+   */
+  async updateOvertimeCoefficient(
+    this: StoresService,
+    storeId: string,
+    coef: number,
+  ): Promise<{ ruleId: string; coef: number; recalculationFailed?: boolean }> {
+    const saved = await this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT pg_advisory_xact_lock(hashtext($1))', [
+        `payroll-rules:${storeId}`,
+      ]);
+      const repo = manager.getRepository(StorePayrollRule);
+      const rule = await repo.findOne({
+        where: {
+          storeId,
+          category: PayrollRuleCategory.BONUS,
+          code: PayrollRuleCode.OVERTIME,
+          isActive: true,
+          validTo: IsNull(),
+        },
+        order: { createdAt: 'DESC' },
+      });
+      if (!rule) {
+        throw new BadRequestException(
+          'Chưa bật khoản thưởng "Tăng ca" ở Thiết lập tính lương',
+        );
+      }
+      // Khoản v2 (calc_mode COEF_PER_HOUR, chưa có calc_config): quy đổi đúng
+      // tiền như app chủ (configFromV2) — v2 đọc `value` là phần trả THÊM,
+      // v3 đọc hệ số là mức trả của giờ, nên hệ số v3 = value + 1.
+      const current: Record<string, unknown> | null =
+        (rule.calcConfig as Record<string, unknown> | null) ??
+        (rule.calcMode === 'COEF_PER_HOUR'
+          ? {
+              kind: 'SALARY_COEF',
+              coef: Math.round((Number(rule.value) + 1) * 100) / 100,
+              base: 'HOURLY',
+            }
+          : null);
+      if (!current || current.kind !== 'SALARY_COEF') {
+        throw new BadRequestException(
+          'Khoản "Tăng ca" đang tính theo cách khác (không nhân hệ số lương). Hãy sửa ở Thiết lập tính lương.',
+        );
+      }
+      const config = normalizeRuleCalcConfig({ ...current, coef }, rule.name);
+      if (typeof config === 'string') throw new BadRequestException(config);
+      if (rule.calcConfig && Number(current.coef) === Number(config.coef)) {
+        return { rule, changed: false, coef: Number(config.coef) };
+      }
+      // Kèm cách tính v2 gần đúng như khi lưu thiết lập tính lương, để app cũ
+      // vẫn thấy đúng một khoản v2.
+      const fallback = fallbackCalcModeOf(config, PayrollRuleCode.OVERTIME);
+      const next = await this.nextPayrollRuleVersion(
+        repo,
+        rule,
+        {
+          calcConfig: config as unknown as Record<string, unknown>,
+          calcMode: fallback.calcMode as PayrollRuleCalcMode,
+          value: fallback.value,
+          threshold: fallback.threshold,
+        },
+        vnDateString(),
+      );
+      return { rule: await repo.save(next), changed: true, coef: Number(config.coef) };
+    });
+    let recalculationFailed = false;
+    if (saved.changed) {
+      const payroll = await this.dataSource
+        .getRepository(MonthlyPayroll)
+        .findOne({ where: { storeId, month: toMonthMarker(vnMonthOf()) } });
+      if (payroll) {
+        try {
+          await this.recalculatePayroll(storeId);
+        } catch (error) {
+          recalculationFailed = true;
+          this.logger?.warn(
+            `Overtime coefficient saved but recalculation failed for ${storeId}: ${String(error)}`,
+          );
+        }
+      }
+    }
+    return {
+      ruleId: saved.rule.id,
+      coef: saved.coef,
+      ...(recalculationFailed ? { recalculationFailed } : {}),
+    };
+  }
+
+  /**
    * App cũ: chỉ trong phạm vi khoản cũ ĐANG BẬT (calc_mode null) — đúng những
    * gì nó đọc được. Khoản v2 và khoản đang tắt không bao giờ bị nó sửa / xoá.
    */
@@ -961,11 +1074,13 @@ export class StoresPayrollPart {
       id: r.id,
       ruleId: r.ruleId,
       ruleName: (r.rule ?? expired.get(r.ruleId as string))?.name || r.ruleName,
+      code: (r.rule ?? expired.get(r.ruleId as string))?.code ?? null,
       category: r.category,
       calcMode: (r.rule ?? expired.get(r.ruleId as string))?.calcMode ?? null,
       calcConfig: (r.rule ?? expired.get(r.ruleId as string))?.calcConfig ?? null,
       workDate: String(r.workDate).slice(0, 10),
       quantity: Number(r.quantity),
+      amount: r.amount != null && Number(r.amount) > 0 ? Number(r.amount) : null,
       note: r.note,
       createdAt: r.createdAt,
     }));
@@ -1049,6 +1164,14 @@ export class StoresPayrollPart {
     ) {
       throw new BadRequestException('Chỉ ghi nhận được cho một ngày từ đầu tháng này đến hôm nay');
     }
+    if (dto.amount != null && !acceptsRecordAmount(rule)) {
+      throw new BadRequestException(
+        'Khoản này tính theo số lượng, không nhập số tiền riêng cho từng lần được',
+      );
+    }
+    if (rule.code === PayrollRuleCode.DAMAGE && !dto.note?.trim()) {
+      throw new BadRequestException(DAMAGE_REASON_REQUIRED);
+    }
     await this.assertPayslipOpen(profile.id, workDate);
     const repo = this.dataSource.getRepository(EmployeePayrollRecord);
     const saved = await repo.save(
@@ -1059,7 +1182,9 @@ export class StoresPayrollPart {
         ruleName: rule.name,
         category: rule.category,
         workDate,
-        quantity: Math.round(Number(dto.quantity) * 100) / 100,
+        // Số tiền riêng là tiền của cả lần đó: số lượng luôn là 1.
+        quantity: dto.amount != null ? 1 : Math.round(Number(dto.quantity) * 100) / 100,
+        amount: dto.amount != null ? Math.round(Number(dto.amount)) : null,
         note: dto.note?.trim() || null,
         createdByAccountId: ownerAccountId,
       }),
@@ -1080,14 +1205,24 @@ export class StoresPayrollPart {
   async updatePayrollRecord(
     this: StoresService,
     recordId: string,
-    dto: { workDate?: string; quantity?: number; note?: string | null },
+    dto: {
+      workDate?: string;
+      quantity?: number;
+      amount?: number | null;
+      note?: string | null;
+    },
   ) {
     const repo = this.dataSource.getRepository(EmployeePayrollRecord);
     const record = await repo.findOne({ where: { id: recordId } });
     if (!record) throw new NotFoundException('Không tìm thấy ghi nhận');
     const before = String(record.workDate).slice(0, 10);
     await this.assertPayslipOpen(record.employeeProfileId, before);
-    const changes: { workDate?: string; quantity?: number; note?: string | null } = {};
+    const changes: {
+      workDate?: string;
+      quantity?: number;
+      amount?: number | null;
+      note?: string | null;
+    } = {};
     if (dto.workDate !== undefined && dto.workDate !== before) {
       const parsed = new Date(`${dto.workDate}T00:00:00Z`);
       const today = vnDateString();
@@ -1105,7 +1240,39 @@ export class StoresPayrollPart {
     if (dto.quantity !== undefined) {
       changes.quantity = Math.round(Number(dto.quantity) * 100) / 100;
     }
+    if (dto.amount != null) {
+      const rule = record.ruleId
+        ? await this.payrollRuleRepository.findOne({
+            where: { id: record.ruleId },
+            withDeleted: true,
+          })
+        : null;
+      if (!acceptsRecordAmount(rule)) {
+        throw new BadRequestException(
+          'Khoản này tính theo số lượng, không nhập số tiền riêng cho từng lần được',
+        );
+      }
+      changes.amount = Math.round(Number(dto.amount));
+      // Tiền của cả lần đó: số lượng về 1 (không nhân thêm).
+      changes.quantity = 1;
+    } else if (dto.amount === null) {
+      changes.amount = null;
+    } else if (dto.quantity !== undefined && record.amount != null) {
+      // App chủ bản cũ chỉ biết số lượng: sửa số lượng của lần đang có số tiền
+      // riêng thì bỏ số tiền riêng, để tiền theo đúng số lượng nó hiển thị.
+      changes.amount = null;
+    }
     if (dto.note !== undefined) changes.note = dto.note?.trim() || null;
+    // Hư hao / bể vỡ: không xoá trắng lý do của lần đã ghi.
+    if (changes.note === null && dto.note !== undefined && record.ruleId) {
+      const ruleOfRecord = await this.payrollRuleRepository.findOne({
+        where: { id: record.ruleId },
+        withDeleted: true,
+      });
+      if (ruleOfRecord?.code === PayrollRuleCode.DAMAGE) {
+        throw new BadRequestException(DAMAGE_REASON_REQUIRED);
+      }
+    }
     if (!Object.keys(changes).length) return { id: record.id };
     await repo.update({ id: record.id }, changes as any);
     const after = changes.workDate ? String(changes.workDate) : before;
@@ -1835,6 +2002,19 @@ export class StoresPayrollPart {
   ): Promise<PayslipRowsSnapshot & { recalculationFailed?: boolean }> {
     const builtins = body?.builtins ?? {};
     const items = Array.isArray(body?.items) ? body.items : [];
+    // Hàng theo ngày công / giờ / ca: đơn giá × số lượng tháng phải còn nằm
+    // trong cột tiền của phiếu lương (numeric(12,2)), không thì tính lại lương
+    // cả cửa hàng hỏng.
+    for (const item of items) {
+      if (
+        payslipRowUnitOf(item.unit) !== PayslipRowUnit.MONTH &&
+        Number(item.amount) > PAYSLIP_ROW_UNIT_PRICE_MAX
+      ) {
+        throw new BadRequestException(
+          `Đơn giá của "${String(item.label).trim()}" tối đa ${PAYSLIP_ROW_UNIT_PRICE_MAX.toLocaleString('vi-VN')}đ`,
+        );
+      }
+    }
     await this.dataSource.transaction(async (manager) => {
       // Saves of one store run one after the other: two concurrent
       // delete-then-insert would otherwise both insert their extra lines
@@ -1843,6 +2023,21 @@ export class StoresPayrollPart {
         `payslip-rows:${storeId}`,
       ]);
       const repository = manager.getRepository(StorePayslipRow);
+      // App chủ bản cũ không gửi `unit`: hàng cùng tên + dấu giữ cách tính
+      // đang lưu, không bị lặng lẽ đổi thành "cố định / tháng".
+      const previousUnits = (await repository.find({ where: { storeId } }))
+        .filter((row) => row.builtinKey == null && row.isActive !== false)
+        .map((row) => ({
+          key: `${row.sign}:${String(row.label ?? '').trim()}`,
+          unit: payslipRowUnitOf(row.unit),
+        }));
+      const unitFor = (item: (typeof items)[number]): PayslipRowUnit => {
+        if (item.unit) return payslipRowUnitOf(item.unit);
+        const key = `${item.sign === PayslipRowSign.MINUS ? PayslipRowSign.MINUS : PayslipRowSign.PLUS}:${String(item.label).trim()}`;
+        const index = previousUnits.findIndex((row) => row.key === key);
+        if (index < 0) return PayslipRowUnit.MONTH;
+        return previousUnits.splice(index, 1)[0].unit;
+      };
       await repository.delete({ storeId });
       const rows: Partial<StorePayslipRow>[] = [];
       for (const key of Object.values(PayslipBuiltinRow)) {
@@ -1875,6 +2070,7 @@ export class StoresPayrollPart {
               ? PayslipRowSign.MINUS
               : PayslipRowSign.PLUS,
           amount: Math.round(Number(item.amount) || 0),
+          unit: unitFor(item),
           sortOrder: index + 1,
           isActive: true,
         });
@@ -2630,7 +2826,13 @@ export class StoresPayrollPart {
     month: VnMonth,
     manager?: EntityManager,
   ): Promise<Record<string, RuleOccurrence[]>> {
-    const rows: Array<{ id: string; ruleId: string; workDate: string; quantity: string }> =
+    const rows: Array<{
+      id: string;
+      ruleId: string;
+      workDate: string;
+      quantity: string;
+      amount: string | null;
+    }> =
       await (manager ?? this.dataSource.manager)
         .getRepository(EmployeePayrollRecord)
         .createQueryBuilder('r')
@@ -2638,6 +2840,7 @@ export class StoresPayrollPart {
         .addSelect('r.ruleId', 'ruleId')
         .addSelect(`to_char(r.workDate, 'YYYY-MM-DD')`, 'workDate')
         .addSelect('r.quantity', 'quantity')
+        .addSelect('r.amount', 'amount')
         .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
         .andWhere('r.ruleId IS NOT NULL')
         .andWhere('r.workDate >= :start', { start: month.key })
@@ -2647,11 +2850,13 @@ export class StoresPayrollPart {
     for (const row of rows) {
       const quantity = Number(row.quantity) || 0;
       if (!(quantity > 0)) continue;
+      const amount = row.amount == null ? null : Number(row.amount);
       (out[row.ruleId] ??= []).push({
         date: String(row.workDate).slice(0, 10),
         minutes: 0,
         quantity,
         ...(row.id ? { recordId: String(row.id) } : {}),
+        ...(amount != null && amount > 0 ? { amount } : {}),
       });
     }
     return out;
