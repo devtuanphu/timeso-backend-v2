@@ -712,15 +712,54 @@ export class CareerLadderService {
         });
       }
 
-      const clash = await manager
+      const clashes = await manager
         .getRepository(StoreEmployeeType)
         .createQueryBuilder('t')
         .where('t.store_id = :storeId', { storeId })
         .andWhere('t.is_active')
         .andWhere('lower(t.name) = lower(:name)', { name })
         .andWhere(type.id ? 't.id <> :id' : '1=1', { id: type.id })
-        .getOne();
-      if (clash) throw new BadRequestException('Đã có giai đoạn cùng tên');
+        .orderBy('t.createdAt', 'ASC')
+        .getMany();
+      // Màn quản lý giai đoạn là chuẩn: chỉ giai đoạn đang nằm trên lộ trình
+      // mới được tính là trùng tên. Loại nhân viên "mồ côi" (còn hoạt động
+      // nhưng không có bậc nào trỏ tới — tạo từ danh mục cũ, hoặc bậc bị gỡ
+      // trước khi xoá giai đoạn biết ẩn loại) chủ không nhìn thấy ở đâu cả,
+      // nên không được chặn.
+      for (const clash of clashes) {
+        const onLadder = await manager.exists(StoreLadderRung, {
+          where: { ladderId: ladder.id, targetId: clash.id },
+        });
+        if (onLadder) throw new BadRequestException('Đã có giai đoạn cùng tên');
+      }
+      const orphan = clashes[0];
+      if (orphan && !rungId) {
+        // Tạo giai đoạn trùng tên loại mồ côi = đưa loại đó lên lộ trình: nhân
+        // viên đang mang loại này hiện ngay ở giai đoạn mới, không đẻ thêm
+        // một loại cùng tên.
+        type = orphan;
+      } else if (orphan) {
+        // Đổi tên sang tên của loại mồ côi: gộp nhân viên của loại đó vào giai
+        // đoạn này là đổi giai đoạn của họ ngầm, nên không làm. Không ai đang
+        // làm mang loại đó thì ẩn nó (hồ sơ cũ vẫn đọc được tên).
+        const holders = await manager.count(EmployeeProfile, {
+          where: {
+            storeId,
+            employeeTypeId: In(clashes.map((c) => c.id)),
+            employmentStatus: In([...EMPLOYED_STATUSES]),
+          },
+        });
+        if (holders > 0) {
+          throw new BadRequestException(
+            `Còn ${holders} nhân viên mang loại "${orphan.name}" nhưng chưa thuộc giai đoạn nào. Hãy tạo giai đoạn mới tên "${orphan.name}" để đưa họ vào, thay vì đổi tên giai đoạn này.`,
+          );
+        }
+        await manager.update(
+          StoreEmployeeType,
+          { id: In(clashes.map((c) => c.id)), storeId },
+          { isActive: false },
+        );
+      }
 
       type.name = name;
       if (input.description !== undefined || !type.id) {
