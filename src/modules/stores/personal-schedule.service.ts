@@ -2,15 +2,17 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { MoreThanOrEqual, Repository } from 'typeorm';
 
-import { vnDateString } from '../../common/utils/vn-calendar';
+import { vnDateString, vnMonthOf } from '../../common/utils/vn-calendar';
 import {
   CreatePersonalScheduleDto,
   UpdatePersonalScheduleDto,
+  UpdatePersonalSchedulePreferencesDto,
   UpdatePersonalScheduleWishDto,
 } from './dto/personal-schedule.dto';
 import {
@@ -23,14 +25,29 @@ import {
 } from './entities/employee-profile.entity';
 import { stintFloor } from './employment-stint.utils';
 import {
+  estimateFromPreferences,
   normalizePersonalSlots,
   PERSONAL_SCHEDULE_MAX_PER_EMPLOYEE,
+  type PreferenceEstimate,
 } from './personal-schedule.utils';
 import { StoresService } from './stores.service';
 
 type ProfileRef = Pick<EmployeeProfile, 'id' | 'storeId' | 'joinedAt'>;
 
 export type PersonalScheduleWishes = Record<PersonalScheduleKind, string | null>;
+
+/** "Mong muốn số ngày làm / số giờ mỗi ca" (tham khảo); null = chưa chọn. */
+export interface PersonalSchedulePreferences {
+  daysPerWeek: number | null;
+  hoursPerShift: number | null;
+}
+
+const toPreferences = (
+  row: Pick<EmployeeProfile, 'desiredDaysPerWeek' | 'desiredHoursPerShift'> | null | undefined,
+): PersonalSchedulePreferences => ({
+  daysPerWeek: row?.desiredDaysPerWeek ?? null,
+  hoursPerShift: row?.desiredHoursPerShift ?? null,
+});
 
 const KINDS = Object.values(PersonalScheduleKind);
 
@@ -64,6 +81,8 @@ const isUniqueViolation = (error: unknown) =>
  */
 @Injectable()
 export class PersonalScheduleService {
+  private readonly logger = new Logger(PersonalScheduleService.name);
+
   constructor(
     @InjectRepository(EmployeePersonalSchedule)
     private readonly scheduleRepository: Repository<EmployeePersonalSchedule>,
@@ -92,7 +111,13 @@ export class PersonalScheduleService {
     };
   }
 
-  private async list(profile: ProfileRef) {
+  /**
+   * `estimate`: khung ước tính của mong muốn số ngày / giờ — chỉ khi app hỏi
+   * (màn Lịch học / Lịch bận, màn của chủ), để các lần đọc nhẹ (nhắc ở Trang
+   * chủ, đồng bộ lời nhắc) không tải hợp đồng / đơn giá. 'self' kèm thu nhập
+   * ước tính; 'owner' chỉ số giờ / ngày.
+   */
+  private async list(profile: ProfileRef, estimate?: 'self' | 'owner') {
     const schedules = await this.scheduleRepository.find({
       where: this.currentStint(profile),
       order: { createdAt: 'DESC' },
@@ -104,15 +129,122 @@ export class PersonalScheduleService {
     };
     for (const schedule of schedules) summary[schedule.kind] += 1;
     // Cột select: false — chỉ đọc ở đây (chính nhân viên hoặc chủ).
-    const wishesRow = await this.profileRepository.findOne({
+    const row = await this.profileRepository.findOne({
       where: { id: profile.id },
-      select: ['id', 'personalScheduleWishes'],
+      select: ['id', 'personalScheduleWishes', 'desiredDaysPerWeek', 'desiredHoursPerShift'],
     });
+    const preferences = toPreferences(row);
     return {
       schedules: schedules.map(toDto),
       summary,
-      wishes: toWishes(wishesRow?.personalScheduleWishes),
+      wishes: toWishes(row?.personalScheduleWishes),
+      preferences,
+      ...(estimate
+        ? { estimate: await this.estimate(profile, preferences, estimate === 'self') }
+        : {}),
     };
+  }
+
+  /**
+   * Khung ước tính: số giờ / tuần và số ngày / tháng luôn tính được từ mong
+   * muốn; thu nhập (chỉ cho chính nhân viên) theo hợp đồng đang hiệu lực, mức
+   * lương của tháng này (điều chỉnh lương) và đơn giá cả ngày của cửa hàng /
+   * vị trí — cùng chuỗi với tiền ước tính khi đăng ký ca. Không có ca cụ thể
+   * nên đơn giá riêng theo ca / khung giờ không áp được. Lỗi phía lương không
+   * làm hỏng danh sách lịch: thu nhập về null.
+   */
+  private async estimate(
+    profile: ProfileRef,
+    preferences: PersonalSchedulePreferences,
+    includeIncome: boolean,
+  ): Promise<PreferenceEstimate> {
+    const month = vnMonthOf();
+    const withoutIncome = () =>
+      estimateFromPreferences({
+        ...preferences,
+        contract: null,
+        standardWorkingDays: 0,
+        calendarDays: month.calendarDays,
+      });
+    if (!includeIncome || !preferences.daysPerWeek) return withoutIncome();
+    try {
+      const withContracts = await this.profileRepository.findOne({
+        where: { id: profile.id, storeId: profile.storeId },
+        relations: ['contracts'],
+      });
+      const contract = withContracts?.contracts?.find((item) => item.isActive) ?? null;
+      if (!contract) return withoutIncome();
+      const { rate: contractRate } = await this.storesService.resolveRateForMonth(
+        profile.id,
+        contract,
+        month,
+      );
+      const rate = await this.storesService.wageRateOfShift({
+        storeId: profile.storeId,
+        employeeProfileId: profile.id,
+        paymentType: contract.paymentType,
+        contractRate: Number(contractRate) || 0,
+        workShiftId: null,
+        from: null,
+        to: null,
+      });
+      const standardWorkingDays = await this.storesService.getStandardWorkingDays(
+        profile.storeId,
+        month,
+      );
+      return estimateFromPreferences({
+        ...preferences,
+        contract: { paymentType: contract.paymentType, rate: Number(rate) || 0 },
+        standardWorkingDays,
+        calendarDays: month.calendarDays,
+      });
+    } catch (error) {
+      // Chỉ id hồ sơ, không ghi số tiền.
+      this.logger.warn(
+        `[PersonalSchedule] ${profile.id}: income estimate failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return withoutIncome();
+    }
+  }
+
+  /**
+   * Nhân viên chọn "Mong muốn số ngày làm" / "Mong muốn số giờ mỗi ca" (tham
+   * khảo). Chỉ cột được gửi bị đổi (undefined = giữ nguyên, null = xoá), trong
+   * một câu UPDATE: hai lần chọn liên tiếp không xoá mất giá trị của nhau.
+   */
+  async updateMyPreferences(
+    storeId: string,
+    accountId: string,
+    dto: UpdatePersonalSchedulePreferencesDto,
+  ) {
+    const profile = await this.resolveSelf(storeId, accountId);
+    // Thuộc tính vắng mặt vẫn có trên DTO (class field ES2022) với giá trị
+    // undefined: chỉ `!== undefined` mới là "có gửi".
+    const changes: Array<[column: string, value: number | null]> = [];
+    if (dto.daysPerWeek !== undefined) {
+      changes.push(['desired_days_per_week', dto.daysPerWeek]);
+    }
+    if (dto.hoursPerShift !== undefined) {
+      changes.push(['desired_hours_per_shift', dto.hoursPerShift]);
+    }
+    if (!changes.length) {
+      throw new BadRequestException('Chọn số ngày làm hoặc số giờ mỗi ca.');
+    }
+    // Tên cột lấy từ danh sách cố định ở trên, không từ dữ liệu người dùng.
+    await this.profileRepository.query(
+      `UPDATE employee_profiles
+          SET ${changes.map(([column], index) => `${column} = $${index + 2}`).join(', ')}
+        WHERE id = $1`,
+      [profile.id, ...changes.map(([, value]) => value)],
+    );
+    const row = await this.profileRepository.findOne({
+      where: { id: profile.id },
+      select: ['id', 'desiredDaysPerWeek', 'desiredHoursPerShift'],
+    });
+    const preferences = toPreferences(row);
+    return { preferences, estimate: await this.estimate(profile, preferences, true) };
   }
 
   /**
@@ -152,19 +284,28 @@ export class PersonalScheduleService {
     return { repeat: dto.repeat, slots: result.slots, note: note || null };
   }
 
-  async listMine(storeId: string, accountId: string) {
-    return this.list(await this.resolveSelf(storeId, accountId));
+  async listMine(storeId: string, accountId: string, withEstimate = false) {
+    return this.list(
+      await this.resolveSelf(storeId, accountId),
+      withEstimate ? 'self' : undefined,
+    );
   }
 
   /** Chủ cửa hàng (hoặc chính nhân viên) xem lịch cá nhân của một nhân viên. */
-  async listForEmployee(storeId: string, profileId: string, accountId: string) {
+  async listForEmployee(
+    storeId: string,
+    profileId: string,
+    accountId: string,
+    withEstimate = false,
+  ) {
     await this.storesService.assertEmployeeCalendarAccess(profileId, accountId, storeId);
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
       select: ['id', 'storeId', 'joinedAt'],
     });
     if (!profile) throw new NotFoundException('Không tìm thấy nhân viên');
-    return this.list(profile);
+    // Route của chủ: không kèm thu nhập ước tính của nhân viên.
+    return this.list(profile, withEstimate ? 'owner' : undefined);
   }
 
   async create(storeId: string, accountId: string, dto: CreatePersonalScheduleDto) {

@@ -284,6 +284,48 @@ export class AccountsService {
     return (result.affected ?? 0) > 0;
   }
 
+  /**
+   * Sets the email only when the account still has none and no other account
+   * uses it (case-insensitive) — e.g. the email typed on a job application,
+   * recorded when the owner accepts. Takes the same advisory lock as `update`
+   * so a concurrent registration / profile edit of that email cannot slip in,
+   * and the UPDATE is conditional so an email the user set meanwhile is kept.
+   * Returns true when written, false when skipped (already has an email, the
+   * email is taken or invalid).
+   */
+  async setEmailIfEmpty(accountId: string, email: string): Promise<boolean> {
+    let normalized: string;
+    try {
+      normalized = normalizeEmail(email);
+    } catch {
+      return false;
+    }
+    if (!normalized) return false;
+    try {
+      return await this.accountRepository.manager.transaction(async (manager) => {
+        await manager.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [
+          `account-identifier:email:${normalized}`,
+        ]);
+        const result = await manager
+          .createQueryBuilder()
+          .update(Account)
+          .set({ email: normalized })
+          .where('id = :accountId', { accountId })
+          .andWhere("(email IS NULL OR btrim(email) = '')")
+          .andWhere(
+            'NOT EXISTS (SELECT 1 FROM accounts other WHERE other.id <> :accountId AND (other.email = :email OR LOWER(other.email) = :email))',
+            { accountId, email: normalized },
+          )
+          .execute();
+        return (result.affected ?? 0) > 0;
+      });
+    } catch (error) {
+      // Unique index on accounts.email: another account took it meanwhile.
+      if ((error as { code?: string } | null)?.code === '23505') return false;
+      throw error;
+    }
+  }
+
   async verifyPassword(accountId: string, password: string): Promise<boolean> {
     const account = await this.accountRepository
       .createQueryBuilder('account')

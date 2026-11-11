@@ -82,6 +82,8 @@ function build() {
     create: jest.fn((row: any) => row),
     save: jest.fn().mockResolvedValue({ id: 'pending-profile-1' }),
     delete: jest.fn().mockResolvedValue({ affected: 1 }),
+    // `accept` writes the application introduction onto the hired profile.
+    update: jest.fn().mockResolvedValue({ affected: 1 }),
   };
   const accountsService: any = {
     findById: jest.fn().mockResolvedValue({
@@ -93,6 +95,8 @@ function build() {
     // backfill looked fine while doing nothing.
     update: jest.fn().mockResolvedValue({}),
     setAvatarIfEmpty: jest.fn().mockResolvedValue(true),
+    // Acceptance records the application email only into an empty account email.
+    setEmailIfEmpty: jest.fn().mockResolvedValue(true),
   };
   const notificationsService: any = { create: jest.fn().mockResolvedValue({}) };
   const storesService: any = {
@@ -361,11 +365,19 @@ describe('JobApplicationService.accept', () => {
     introduction: null,
   };
 
+  // The hired profile, as `recordApplicantDetails` checks it before writing.
+  const employed = (t: ReturnType<typeof build>, status = 'active') =>
+    t.profileRepository.findOne.mockResolvedValue({
+      id: 'profile-1',
+      employmentStatus: status,
+    });
+
   // EmployeeProfile stores no name: every employee list reads account.fullName.
   // A phone-only signup has none, so without this backfill a hire made through
   // this flow showed up nameless in the owner's employee list.
   it('fills the applicant name onto an account that has none', async () => {
     const t = build();
+    employed(t);
     t.applicationRepository.findOne.mockResolvedValue({
       ...pending,
       gender: 'Nữ',
@@ -388,14 +400,17 @@ describe('JobApplicationService.accept', () => {
     });
   });
 
-  // What the account already holds was set by its owner and outranks anything
-  // typed into an application form.
-  it('never overwrites identity the account already has', async () => {
+  // N16: the accepted application is the newest thing the person told us, so
+  // gender, birthday and address replace what the account held. The name is
+  // still only filled when missing.
+  it('overwrites gender, birthday and address with the application values', async () => {
     const t = build();
+    employed(t);
     t.applicationRepository.findOne.mockResolvedValue({
       ...pending,
       gender: 'Nữ',
       birthday: '1999-03-02',
+      address: '12 Lê Lợi, Quận 1',
     });
     t.accountsService.findById.mockResolvedValue({
       id: APPLICANT,
@@ -403,6 +418,35 @@ describe('JobApplicationService.accept', () => {
       fullName: 'Tên Đã Có',
       gender: 'Nam',
       birthday: '1990-01-01',
+      address: 'Địa chỉ cũ',
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+      gender: 'Nữ',
+      birthday: '1999-03-02',
+      address: '12 Lê Lợi, Quận 1',
+    });
+  });
+
+  // An empty field on the application never blanks what the account holds.
+  it('keeps account values the application leaves empty', async () => {
+    const t = build();
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      gender: null,
+      birthday: null,
+      address: '   ',
+    });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: 'Tên Đã Có',
+      gender: 'Nam',
+      birthday: '1990-01-01',
+      address: 'Địa chỉ cũ',
     });
 
     await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
@@ -410,9 +454,241 @@ describe('JobApplicationService.accept', () => {
     expect(t.accountsService.update).not.toHaveBeenCalled();
   });
 
+  it('does not rewrite values that are already the same', async () => {
+    const t = build();
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      gender: 'Nam',
+      birthday: '1990-01-01',
+      address: 'Địa chỉ cũ',
+    });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: 'Tên Đã Có',
+      gender: 'Nam',
+      birthday: '1990-01-01',
+      address: 'Địa chỉ cũ',
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).not.toHaveBeenCalled();
+  });
+
+  // The owner's forms store 'male' / 'female' / 'other' and older owner builds
+  // only recognise 'male': an equivalent gender must not be rewritten.
+  it.each([
+    ['male', 'Nam'],
+    ['female', 'Nữ'],
+    ['other', 'Khác'],
+    ['Nữ'.normalize('NFD'), 'Nữ'],
+  ])('keeps the equivalent account gender %s for an application %s', async (stored, applied) => {
+    const t = build();
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({ ...pending, gender: applied });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: 'Tên Đã Có',
+      gender: stored,
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.update).not.toHaveBeenCalled();
+  });
+
+  // The catch path finds "a profile of this account here". When it was hired
+  // earlier through another flow, this application may be stale: corrections
+  // made since then are kept and only empty fields are filled.
+  describe('when the attach fails and the person is already employed here', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    // The realistic stale case: applied, then hired through another flow
+    // (joinedAt AFTER the application), then this old application accepted.
+    const staleApplication = {
+      ...pending,
+      createdAt: new Date(Date.now() - 10 * DAY),
+      gender: 'Nữ',
+      birthday: '1999-03-02',
+      address: '12 Lê Lợi, Quận 1',
+      email: form.email,
+      introduction: 'Xin chào',
+    };
+    const accountWithValues = {
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: 'Tên Đã Có',
+      gender: 'Nam',
+      birthday: '1990-01-01',
+      address: null,
+    };
+    const catchPath = (t: ReturnType<typeof build>, joinedAt: Date | null) => {
+      t.storesService.addEmployee.mockRejectedValue(
+        new ConflictException('EMPLOYEE_REHIRE_REQUIRES_RESTORE'),
+      );
+      t.profileRepository.findOne
+        .mockResolvedValueOnce({ id: 'profile-1', joinedAt }) // catch-path lookup
+        .mockResolvedValueOnce({ id: 'profile-1', employmentStatus: 'active' });
+      t.applicationRepository.findOne.mockResolvedValue({ ...staleApplication });
+      t.accountsService.findById.mockResolvedValue({ ...accountWithValues });
+    };
+
+    it('only fills empty account fields for a profile hired before this accept', async () => {
+      const t = build();
+      catchPath(t, new Date(Date.now() - 2 * DAY));
+
+      await expect(
+        t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+      ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+
+      expect(t.accountsService.update).toHaveBeenCalledTimes(1);
+      expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+        address: '12 Lê Lợi, Quận 1',
+      });
+      expect(t.accountsService.setEmailIfEmpty).toHaveBeenCalledWith(APPLICANT, form.email);
+      expect(t.profileRepository.update).toHaveBeenCalledWith(
+        { id: 'profile-1' },
+        { introduction: 'Xin chào' },
+      );
+    });
+
+    it('fills an empty or blank gender and a missing birthday when not hired by this accept', async () => {
+      const t = build();
+      catchPath(t, new Date(Date.now() - 2 * DAY));
+      t.accountsService.findById.mockResolvedValue({
+        ...accountWithValues,
+        gender: '  ',
+        birthday: null,
+        address: 'Địa chỉ đã sửa',
+      });
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+        gender: 'Nữ',
+        birthday: '1999-03-02',
+      });
+    });
+
+    // The reference is the claim time with a 60 s allowance, not the
+    // application's own timestamps.
+    it.each([
+      ['61 s before the claim: hired elsewhere', 61_000, { address: '12 Lê Lợi, Quận 1' }],
+      [
+        '59 s before the claim: this accept',
+        59_000,
+        { gender: 'Nữ', birthday: '1999-03-02', address: '12 Lê Lợi, Quận 1' },
+      ],
+    ])('joinedAt %s', async (_label, ago, expected) => {
+      const t = build();
+      catchPath(t, new Date(Date.now() - ago));
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, expected);
+    });
+
+    it('treats a profile without joinedAt as not hired by this accept', async () => {
+      const t = build();
+      catchPath(t, null);
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+        address: '12 Lê Lợi, Quận 1',
+      });
+    });
+
+    // The other catch-path case: this accept's attach committed, then its
+    // follow-up read failed — the normal overwrite rule applies.
+    it('overwrites as usual when the profile joined during this accept', async () => {
+      const t = build();
+      catchPath(t, new Date());
+
+      await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+      expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
+        gender: 'Nữ',
+        birthday: '1999-03-02',
+        address: '12 Lê Lợi, Quận 1',
+      });
+    });
+  });
+
+  // The email is the login identifier: only an empty account email is set,
+  // and only when nobody else uses it — decided inside setEmailIfEmpty.
+  it('records the application email only through setEmailIfEmpty', async () => {
+    const t = build();
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      email: form.email,
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.accountsService.setEmailIfEmpty).toHaveBeenCalledWith(APPLICANT, form.email);
+    expect(t.accountsService.update).not.toHaveBeenCalledWith(
+      APPLICANT,
+      expect.objectContaining({ email: expect.anything() }),
+    );
+  });
+
+  // "Giới thiệu bản thân" belongs to this store's employee profile.
+  it('stores the introduction on the hired profile', async () => {
+    const t = build();
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      introduction: '  Tôi từng làm pha chế 1 năm  ',
+    });
+
+    await t.service.accept(STORE, APPLICATION, OWNER, {} as any);
+
+    expect(t.profileRepository.update).toHaveBeenCalledWith(
+      { id: 'profile-1' },
+      { introduction: 'Tôi từng làm pha chế 1 năm' },
+    );
+  });
+
+  // The lookup only matches the hired profile of this applicant at this store,
+  // and a PENDING placeholder (hire not committed) gets nothing.
+  it('records nothing when the profile is not employed', async () => {
+    const t = build();
+    employed(t, 'pending');
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      gender: 'Nữ',
+      email: form.email,
+      introduction: 'Xin chào',
+    });
+    t.accountsService.findById.mockResolvedValue({
+      id: APPLICANT,
+      status: AccountStatus.ACTIVE,
+      fullName: null,
+      gender: 'Nam',
+    });
+
+    await expect(
+      t.service.accept(STORE, APPLICATION, OWNER, {} as any),
+    ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+
+    expect(t.profileRepository.findOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'profile-1', storeId: STORE, accountId: APPLICANT },
+      }),
+    );
+    expect(t.accountsService.update).not.toHaveBeenCalled();
+    expect(t.accountsService.setEmailIfEmpty).not.toHaveBeenCalled();
+    expect(t.profileRepository.update).not.toHaveBeenCalled();
+  });
+
   // A blank-but-present name is as useless as a missing one.
   it('treats a whitespace-only account name as missing', async () => {
     const t = build();
+    employed(t);
     t.applicationRepository.findOne.mockResolvedValue({ ...pending });
     t.accountsService.findById.mockResolvedValue({
       id: APPLICANT,
@@ -427,20 +703,32 @@ describe('JobApplicationService.accept', () => {
     });
   });
 
-  // The hire has already committed; a bookkeeping failure must not undo it.
+  // The hire has already committed; a bookkeeping failure must not undo it,
+  // and each recording step fails on its own.
   it('still reports a successful hire when the backfill throws', async () => {
     const t = build();
-    t.applicationRepository.findOne.mockResolvedValue({ ...pending });
+    employed(t);
+    t.applicationRepository.findOne.mockResolvedValue({
+      ...pending,
+      email: form.email,
+      introduction: 'Xin chào',
+    });
     t.accountsService.findById.mockResolvedValue({
       id: APPLICANT,
       status: AccountStatus.ACTIVE,
       fullName: null,
     });
     t.accountsService.update.mockRejectedValue(new Error('account write failed'));
+    t.accountsService.setEmailIfEmpty.mockRejectedValue(new Error('email write failed'));
 
     await expect(
       t.service.accept(STORE, APPLICATION, OWNER, {} as any),
     ).resolves.toMatchObject({ status: JobApplicationStatus.ACCEPTED });
+    expect(t.accountsService.setEmailIfEmpty).toHaveBeenCalled();
+    expect(t.profileRepository.update).toHaveBeenCalledWith(
+      { id: 'profile-1' },
+      { introduction: 'Xin chào' },
+    );
   });
 
   describe('O3: avatar from the application selfie', () => {

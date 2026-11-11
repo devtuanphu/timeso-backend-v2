@@ -26,6 +26,7 @@ import {
   EMPLOYED_STATUSES,
   EmployeeProfile,
   EmploymentStatus,
+  isEmployedStatus,
 } from './entities/employee-profile.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { Store, StoreStatus } from './entities/store.entity';
@@ -49,6 +50,39 @@ import {
   MyJobApplicationDto,
   RejectJobApplicationDto,
 } from './dto/job-application.dto';
+
+/** 'YYYY-MM-DD' of a `date` column value (string from the driver, or a Date). */
+const toDateOnly = (value: unknown): string | null => {
+  if (value == null || value === '') return null;
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
+  }
+  const text = String(value).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+};
+
+/**
+ * What a stored gender means. Two value sets with the same meaning live on
+ * accounts: 'Nam' / 'Nữ' / 'Khác' (applications, the staff app) and
+ * 'male' / 'female' / 'other' (the owner's add / edit employee forms).
+ * Comparing meanings keeps an equivalent value from being rewritten — older
+ * owner app builds only recognise 'male'.
+ */
+const genderMeaning = (value: unknown): string | null => {
+  const text = typeof value === 'string' ? value.normalize('NFC').trim().toLowerCase() : '';
+  if (!text) return null;
+  if (text === 'nam' || text === 'male') return 'male';
+  if (text === 'nữ' || text === 'female') return 'female';
+  if (text === 'khác' || text === 'other') return 'other';
+  return text;
+};
+
+/**
+ * The catch path of `accept` only finds "a profile of this account at this
+ * store". It is this accept's hire when it joined after the claim (both
+ * timestamps come from this process); the allowance covers a clock step.
+ */
+const HIRE_MATCH_ALLOWANCE_MS = 60_000;
 
 /**
  * Staff-initiated job applications.
@@ -383,12 +417,13 @@ export class JobApplicationService {
 
     // Claim the application before doing any work. A second tap finds zero
     // affected rows and is rejected rather than attaching the employee twice.
+    const claimedAt = new Date();
     const claimed = await this.applicationRepository.update(
       { id: application.id, status: JobApplicationStatus.PENDING },
       {
         status: JobApplicationStatus.ACCEPTED,
         reviewedById: ownerAccountId,
-        reviewedAt: new Date(),
+        reviewedAt: claimedAt,
       },
     );
     if (!claimed.affected) {
@@ -399,6 +434,9 @@ export class JobApplicationService {
     }
 
     let employee: any;
+    // False when the catch path below finds a profile this accept did not
+    // hire (the person was already employed here through another flow).
+    let hiredByThisAccept = true;
     try {
       // Hire the account that actually applied. The phone captured on the form
       // is applicant-supplied contact information and must never select which
@@ -422,7 +460,7 @@ export class JobApplicationService {
       // be accepted again. Check first.
       const hired = await this.profileRepository.findOne({
         where: { accountId: application.accountId, storeId },
-        select: ['id'],
+        select: ['id', 'joinedAt'],
       });
 
       if (!hired) {
@@ -436,13 +474,17 @@ export class JobApplicationService {
         }`,
       );
       employee = { profile: { id: hired.id } };
+      // Every hire (new, promoted placeholder, revived former row) stamps
+      // joinedAt; an older stamp means someone else hired this person.
+      const joinedAt = hired.joinedAt ? new Date(hired.joinedAt).getTime() : NaN;
+      hiredByThisAccept = joinedAt >= claimedAt.getTime() - HIRE_MATCH_ALLOWANCE_MS;
     }
 
     // `addEmployee` resolves to `{ profile, monthlySummary, recentActivities }`,
     // so the id lives under `profile`, not at the top level.
     const employeeProfileId: string | undefined = employee?.profile?.id;
 
-    await this.backfillAccountIdentity(application);
+    await this.recordApplicantDetails(application, employeeProfileId, hiredByThisAccept);
     await this.backfillAccountAvatarFromSelfie(application);
 
     // The durable outcome — employee hired, application ACCEPTED — is already
@@ -944,8 +986,118 @@ export class JobApplicationService {
   }
 
   /**
+   * On acceptance, records what the applicant entered on this application as
+   * the employee's information (the latest application wins):
+   * - account: full name only when empty; gender, birthday and address are
+   *   overwritten with the application's non-empty values (gender compared by
+   *   meaning, so 'male' is not rewritten to 'Nam');
+   * - email: only when the account has none and no other account uses it —
+   *   it is the login identifier (AccountsService.setEmailIfEmpty);
+   * - this store's employee profile: the introduction ("Giới thiệu bản thân").
+   *
+   * Only for a profile that is actually employed, never for the PENDING
+   * placeholder. When this accept did not hire the person (`hiredByThisAccept`
+   * false: already employed here through another flow, so the application may
+   * be stale), gender, birthday and address only fill empty fields — newer
+   * corrections on the account are kept. Three independent best-effort steps:
+   * the hire is already durable, so a failure is logged with ids only (no
+   * applicant data) and never thrown. Runs before the 90-day redaction of the
+   * application row, which keeps its own copy until then.
+   */
+  private async recordApplicantDetails(
+    application: JobApplication,
+    employeeProfileId: string | undefined,
+    hiredByThisAccept: boolean,
+  ) {
+    const failure = (step: string, error: unknown) =>
+      this.logger.warn(
+        `[JobApplication] ${application.id}: hired but could not record ${step}: ${
+          (error as { code?: string } | null)?.code ??
+          (error instanceof Error ? error.name : 'error')
+        }`,
+      );
+    if (!employeeProfileId) return;
+    let profileId: string | null = null;
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: {
+          id: employeeProfileId,
+          storeId: application.storeId,
+          accountId: application.accountId,
+        },
+        select: ['id', 'employmentStatus'],
+      });
+      if (profile && isEmployedStatus(profile.employmentStatus)) profileId = profile.id;
+    } catch (error) {
+      failure('the profile check', error);
+      return;
+    }
+    if (!profileId) {
+      this.logger.warn(
+        `[JobApplication] ${application.id}: profile ${employeeProfileId} is not employed; applicant details not recorded`,
+      );
+      return;
+    }
+
+    try {
+      const account = await this.accountsService.findById(application.accountId);
+      if (account) {
+        const patch: Partial<Account> = {};
+        // Replace a different value only for this accept's own hire;
+        // otherwise only fill a field that is empty.
+        const shouldWrite = (differs: boolean, empty: boolean) =>
+          hiredByThisAccept ? differs : empty;
+        const fullName = application.fullName?.trim();
+        if (!account.fullName?.trim() && fullName) patch.fullName = fullName;
+        const gender = application.gender?.trim();
+        if (
+          gender &&
+          shouldWrite(
+            genderMeaning(gender) !== genderMeaning(account.gender),
+            !genderMeaning(account.gender),
+          )
+        ) {
+          patch.gender = gender;
+        }
+        // `date` columns come back as 'YYYY-MM-DD' strings.
+        const birthday = toDateOnly(application.birthday);
+        const currentBirthday = toDateOnly(account.birthday);
+        if (birthday && shouldWrite(birthday !== currentBirthday, !currentBirthday)) {
+          patch.birthday = birthday as unknown as Date;
+        }
+        const address = application.address?.trim();
+        if (address && shouldWrite(address !== account.address, !account.address?.trim())) {
+          patch.address = address;
+        }
+        if (Object.keys(patch).length) {
+          await this.accountsService.update(application.accountId, patch);
+        }
+      }
+    } catch (error) {
+      failure('account details', error);
+    }
+
+    try {
+      const email = application.email?.trim();
+      if (email) await this.accountsService.setEmailIfEmpty(application.accountId, email);
+    } catch (error) {
+      failure('the email', error);
+    }
+
+    try {
+      const introduction = application.introduction?.trim();
+      if (introduction) {
+        await this.profileRepository.update({ id: profileId }, { introduction });
+      }
+    } catch (error) {
+      failure('the introduction', error);
+    }
+  }
+
+  /**
    * Copies the identity the applicant typed onto their own account, but only
-   * into fields that are still empty.
+   * into fields that are still empty. Runs when the application is submitted;
+   * acceptance records the application's details with recordApplicantDetails.
    *
    * `EmployeeProfile` stores no name of its own — every screen that lists
    * employees reads `account.fullName`. An account created by phone-only

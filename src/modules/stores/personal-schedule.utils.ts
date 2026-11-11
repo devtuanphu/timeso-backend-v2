@@ -10,11 +10,16 @@
  *   thì bỏ qua). Không lặp: đúng ngày đó.
  * - Chỉ để chủ tham khảo: cảnh báo khi xếp ca, không chặn.
  */
+import { PaymentType } from './entities/employee-contract.entity';
 import {
   PersonalScheduleKind,
   PersonalScheduleRepeat,
   PersonalScheduleSlot,
 } from './entities/employee-personal-schedule.entity';
+import {
+  computeEarnedBase,
+  resolvePayrollPaymentType,
+} from './payroll-calculation.utils';
 import {
   intervalsOverlap,
   ShiftInterval,
@@ -28,6 +33,81 @@ export const PERSONAL_SCHEDULE_MAX_PER_EMPLOYEE = 50;
 export const PERSONAL_SCHEDULE_NOTE_MAX = 100;
 /** "Mong muốn được hỗ trợ" của một loại lịch. */
 export const PERSONAL_SCHEDULE_WISH_MAX = 200;
+/** "Mong muốn số ngày làm (tham khảo)": 1–7 ngày / tuần. */
+export const PERSONAL_SCHEDULE_DESIRED_DAYS_MAX = 7;
+/** "Mong muốn số giờ mỗi ca (tham khảo)": 1–12 tiếng / ca. */
+export const PERSONAL_SCHEDULE_DESIRED_HOURS_MAX = 12;
+/** Ước tính theo thiết kế: 1 tháng = 4 tuần (4 ngày / tuần → 16 ngày / tháng). */
+export const PREFERENCE_WEEKS_PER_MONTH = 4;
+
+/** Ước tính từ mong muốn số ngày / tuần và số giờ / ca. */
+export interface PreferenceEstimate {
+  /** Tổng số giờ dự kiến mỗi tuần = ngày × giờ; null khi thiếu một trong hai. */
+  hoursPerWeek: number | null;
+  /** Số ngày dự kiến mỗi tháng = ngày × 4; null khi chưa chọn số ngày. */
+  daysPerMonth: number | null;
+  /**
+   * Thu nhập ước tính mỗi tháng (đồng), theo hợp đồng đang hiệu lực đúng như
+   * cách tính lương (computeEarnedBase); null khi không tính được (chưa có
+   * hợp đồng / mức lương, chưa chọn đủ, hoặc không được trả cho người xem).
+   */
+  monthlyIncome: number | null;
+  /** Hình thức trả lương dùng để ước tính ('Giờ', 'Ca'…); null khi không có hợp đồng. */
+  paymentType: PaymentType | null;
+}
+
+const preferenceValue = (value: unknown, max: number): number | null =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= max
+    ? value
+    : null;
+
+/**
+ * Ước tính cho khung "Hỗ trợ" ở Lịch học / Lịch bận. Thu nhập dùng đúng công
+ * thức lương (computeEarnedBase) với giả định mỗi ngày một ca:
+ * - Giờ: mức lương × (ngày × 4 × giờ); Ca / Ngày: mức lương × (ngày × 4);
+ * - Tuần: mức lương × (ngày × 4) ÷ 6; Tháng (và không rõ hình thức): mức lương
+ *   ÷ số ngày công chuẩn × (ngày × 4) — không giới hạn trần, như phiếu lương.
+ * Chỉ là lương theo giờ / ca: không có phụ cấp, thưởng, phạt.
+ */
+export function estimateFromPreferences(input: {
+  daysPerWeek: number | null | undefined;
+  hoursPerShift: number | null | undefined;
+  /** Hợp đồng đang hiệu lực với mức lương đã tính điều chỉnh + đơn giá; null = không có. */
+  contract: { paymentType: PaymentType | string | null | undefined; rate: number } | null;
+  standardWorkingDays: number;
+  calendarDays: number;
+}): PreferenceEstimate {
+  const days = preferenceValue(input.daysPerWeek, PERSONAL_SCHEDULE_DESIRED_DAYS_MAX);
+  const hours = preferenceValue(input.hoursPerShift, PERSONAL_SCHEDULE_DESIRED_HOURS_MAX);
+  const daysPerMonth = days ? days * PREFERENCE_WEEKS_PER_MONTH : null;
+  const hoursPerWeek = days && hours ? days * hours : null;
+  const paymentType = input.contract
+    ? resolvePayrollPaymentType(input.contract.paymentType)
+    : null;
+  let monthlyIncome: number | null = null;
+  // Lương giờ cần cả số giờ mỗi ca; các hình thức khác chỉ cần số ngày.
+  if (
+    input.contract &&
+    paymentType &&
+    daysPerMonth &&
+    (paymentType !== PaymentType.HOUR || hours)
+  ) {
+    const income = computeEarnedBase({
+      paymentType,
+      rate: input.contract.rate,
+      facts: {
+        completedShifts: daysPerMonth,
+        workedMinutes: daysPerMonth * (hours ?? 0) * 60,
+        daysWorked: daysPerMonth,
+      },
+      standardWorkingDays: input.standardWorkingDays,
+      calendarDays: input.calendarDays,
+    });
+    monthlyIncome = income > 0 ? income : null;
+  }
+  return { hoursPerWeek, daysPerMonth, monthlyIncome, paymentType };
+}
+
 /**
  * Ngày của khung giờ không được xa hơn chừng này ngày sau hôm nay (VN). Không
  * chặn ngày đã qua: lịch lặp tạo từ lâu vẫn đang có hiệu lực và phải sửa được.
@@ -120,7 +200,7 @@ export function normalizePersonalSlots(
   for (let i = 0; i < intervals.length; i += 1) {
     for (let j = i + 1; j < intervals.length; j += 1) {
       if (intervalsOverlap(intervals[i], intervals[j])) {
-        return { error: 'Các khung giờ không được chồng lên nhau.' };
+        return { error: 'Các khung giờ không được trùng nhau.' };
       }
     }
   }

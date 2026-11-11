@@ -226,6 +226,26 @@ export class EmployeeProfile extends BaseEntity {
   @Column({ name: 'personal_schedule_wishes', type: 'jsonb', nullable: true, select: false })
   personalScheduleWishes?: Partial<Record<'AVAILABLE' | 'BUSY' | 'STUDY', string>> | null;
 
+  /**
+   * "Mong muốn số ngày làm (tham khảo)" 1–7 / tuần và "Mong muốn số giờ mỗi ca
+   * (tham khảo)" 1–12, nhân viên tự chọn ở Lịch học / Lịch bận. Chỉ để chủ
+   * tham khảo — không phải giới hạn `workDaysPerWeek`. `select: false` như
+   * personalScheduleWishes: chỉ chính nhân viên và chủ đọc (PersonalScheduleService).
+   */
+  @Column({ name: 'desired_days_per_week', type: 'smallint', nullable: true, select: false })
+  desiredDaysPerWeek?: number | null;
+
+  @Column({ name: 'desired_hours_per_shift', type: 'smallint', nullable: true, select: false })
+  desiredHoursPerShift?: number | null;
+
+  /**
+   * "Giới thiệu bản thân" của nhân viên ở cửa hàng này, chép từ đơn ứng tuyển
+   * khi chủ nhận. `select: false`: không theo các truy vấn hồ sơ đồng nghiệp đọc
+   * được; chi tiết nhân viên (chủ hoặc chính nhân viên) chọn thêm cột này.
+   */
+  @Column({ name: 'introduction', type: 'text', nullable: true, select: false })
+  introduction?: string | null;
+
   @Column({
     name: 'reminder_settings',
     type: 'jsonb',

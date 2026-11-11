@@ -5,11 +5,14 @@ import {
   ArrayMinSize,
   IsArray,
   IsEnum,
+  IsInt,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateNested,
 } from 'class-validator';
 
@@ -18,6 +21,8 @@ import {
   PersonalScheduleRepeat,
 } from '../entities/employee-personal-schedule.entity';
 import {
+  PERSONAL_SCHEDULE_DESIRED_DAYS_MAX,
+  PERSONAL_SCHEDULE_DESIRED_HOURS_MAX,
   PERSONAL_SCHEDULE_MAX_SLOTS,
   PERSONAL_SCHEDULE_NOTE_MAX,
   PERSONAL_SCHEDULE_WISH_MAX,
@@ -89,4 +94,37 @@ export class UpdatePersonalScheduleWishDto {
   @IsString()
   @MaxLength(PERSONAL_SCHEDULE_WISH_MAX)
   wish: string;
+}
+
+/**
+ * "Mong muốn số ngày làm" / "Mong muốn số giờ mỗi ca" (tham khảo) của chính
+ * nhân viên. Không gửi một trường = giữ nguyên; null = xoá. Phải gửi ít nhất
+ * một trường (kiểm ở service: thuộc tính vắng mặt vẫn là undefined).
+ */
+export class UpdatePersonalSchedulePreferencesDto {
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: PERSONAL_SCHEDULE_DESIRED_DAYS_MAX,
+    nullable: true,
+    description: 'Số ngày làm mong muốn mỗi tuần (tham khảo). null = xoá.',
+    example: 4,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(PERSONAL_SCHEDULE_DESIRED_DAYS_MAX)
+  daysPerWeek?: number | null;
+
+  @ApiPropertyOptional({
+    minimum: 1,
+    maximum: PERSONAL_SCHEDULE_DESIRED_HOURS_MAX,
+    nullable: true,
+    description: 'Số giờ mong muốn mỗi ca (tham khảo). null = xoá.',
+    example: 5,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  @Max(PERSONAL_SCHEDULE_DESIRED_HOURS_MAX)
+  hoursPerShift?: number | null;
 }

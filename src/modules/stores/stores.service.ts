@@ -1884,6 +1884,12 @@ export class StoresService {
               workDaysPerMonth: null,
               fixedDaysOff: [],
               ownerNote: null,
+              // Mong muốn (số ngày / giờ, "Mong muốn khác") và giới thiệu của
+              // đợt làm trước cũng không mang sang: lịch cá nhân đã lọc theo đợt.
+              desiredDaysPerWeek: null,
+              desiredHoursPerShift: null,
+              personalScheduleWishes: null,
+              introduction: null,
             }
           : {}),
       }),
@@ -2191,17 +2197,19 @@ export class StoresService {
       .sort((a, b) => b.time.getTime() - a.time.getTime())
       .slice(0, 10);
 
-    // Cột select: false (ghi chú riêng của chủ); route trả cho chính nhân viên
-    // bỏ nó ở toSelfEmployeeDetail.
+    // Cột select: false: ghi chú riêng của chủ (route trả cho chính nhân viên
+    // bỏ nó ở toSelfEmployeeDetail) và giới thiệu bản thân từ đơn ứng tuyển
+    // (chủ và chính nhân viên đều xem).
     const note = await this.profileRepository.findOne({
       where: { id: profileId },
-      select: { id: true, ownerNote: true },
+      select: { id: true, ownerNote: true, introduction: true },
     });
 
     return {
       profile: {
         ...profile,
         ownerNote: note?.ownerNote ?? null,
+        introduction: note?.introduction ?? null,
         totalShifts: summary?.totalShifts || 0,
         completedShifts: summary?.completedShifts || 0,
         onTimeArrivalsCount: summary?.onTimeArrivalsCount || 0,
