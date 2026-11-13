@@ -38,6 +38,8 @@ import {
   CreateShiftScheduleDto,
   ShiftEmployeeOptionsDto,
 } from '../dto/create-shift-schedule.dto';
+import { BatchCreateShiftSchedulesDto } from '../dto/batch-create-shift-schedules.dto';
+import { EstimateShiftSalariesDto } from '../dto/estimate-shift-salaries.dto';
 
 /**
  * StoresSchedulingController: routes split out of StoresController by domain. Same prefix,
@@ -186,6 +188,59 @@ export class StoresSchedulingController {
     @Body() body: CreateShiftScheduleDto,
   ) {
     return this.storesService.createShiftSchedule(storeId, user.userId, body);
+  }
+
+  @StoreOwnerOnly()
+  @Post(':id/shift-schedules/batch')
+  @ApiOperation({
+    summary: 'Tạo nhiều lịch ca làm việc trong một giao dịch (all-or-nothing)',
+    description:
+      'Mỗi mục có cùng hình dạng với tạo lịch ca đơn lẻ (startDate + quy tắc lặp + danh sách ca). ' +
+      'Tất cả mục được tạo trong CÙNG một giao dịch, cùng khoá và cùng kiểm tra (quá khứ, trùng giờ, ' +
+      'tình trạng rảnh lúc commit, trùng tên cùng ngày kể cả GIỮA các mục). Thông báo chỉ gửi sau khi ' +
+      'commit. Có lỗi ở bất kỳ mục nào thì không tạo gì cả.',
+  })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Tạo thành công. Trả về { itemCount, cycleIds[], generatedSlotCount, generatedAssignmentCount, firstWorkDate, lastGeneratedWorkDate }',
+  })
+  async createShiftSchedulesBatch(
+    @GetUser() user: any,
+    @Param('id') storeId: string,
+    @Body() body: BatchCreateShiftSchedulesDto,
+  ) {
+    return this.storesService.createShiftSchedulesBatch(
+      storeId,
+      user.userId,
+      body.items,
+    );
+  }
+
+  @StoreOwnerOnly()
+  @Post(':id/shift-schedules/estimate')
+  @ApiOperation({
+    summary: 'Ước tính lương cho các ca đang soạn',
+    description:
+      'Tính lương tạm tính cho từng nhân viên của mỗi ca được đề xuất bằng ĐÚNG công thức lương (đơn giá ' +
+      'theo ca/vị trí/khung giờ + calculateShiftEarnings). Nhân viên không thuộc cửa hàng trả về 0 và ' +
+      'không tiết lộ thông tin nào.',
+  })
+  @ApiResponse({
+    status: 201,
+    description:
+      'Trả về { shifts: [{ clientId, total, employees: [{ employeeId, amount }] }] }',
+  })
+  async estimateShiftSalaries(
+    @GetUser() user: any,
+    @Param('id') storeId: string,
+    @Body() body: EstimateShiftSalariesDto,
+  ) {
+    return this.storesService.estimateShiftSalaries(
+      storeId,
+      user.userId,
+      body.shifts,
+    );
   }
 
   @StoreOwnerOnly()

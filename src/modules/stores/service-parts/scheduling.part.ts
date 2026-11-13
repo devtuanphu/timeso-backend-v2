@@ -1713,6 +1713,153 @@ export class StoresSchedulingPart {
   }
 
   /**
+   * Atomic multi-item create (owner "Tạo ca làm việc" day/week/month flow).
+   *
+   * Every item is one `CreateShiftScheduleDto` — the same shape, plan and
+   * persistence as `createShiftSchedule` — but all items share ONE transaction
+   * and ONE clock, so the whole batch is all-or-nothing. Because
+   * `persistShiftSchedule` runs its same-name and availability-at-commit checks
+   * through the transaction's `manager`, earlier items' uncommitted ACTIVE
+   * cycles/APPROVED assignments are visible to later ones: a same-name-same-date
+   * clash or an employee overlap ACROSS items rejects the whole batch.
+   *
+   * Nothing here changes `createShiftSchedule`, `createShiftScheduleWithin` or
+   * `persistShiftSchedule`; it only orchestrates them.
+   */
+  async createShiftSchedulesBatch(
+    this: StoresService,
+    storeId: string,
+    ownerAccountId: string,
+    items: CreateShiftScheduleDto[],
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+
+    // One shared clock for the whole batch so "start not in the past" is judged
+    // against a single instant for every item.
+    const now = new Date();
+    // Plan item by item and stop as soon as the running totals pass the shared
+    // limits. Each item's own `planShiftSchedule` already bounds itself, but
+    // planning all 200 items first would hold up to 200× an item's generated
+    // dates in memory before rejecting; failing fast keeps the batch no more
+    // expensive to reject than a single schedule.
+    const planned: Array<{
+      item: CreateShiftScheduleDto;
+      plan: ReturnType<StoresService['planShiftSchedule']>;
+    }> = [];
+    let totalSlots = 0;
+    let totalAssignments = 0;
+    for (const item of items) {
+      const plan = this.planShiftSchedule(item);
+      totalSlots += plan.drafts.length * plan.workDates.length;
+      const assignmentsPerDate = plan.drafts.reduce(
+        (sum, draft) => sum + draft.employeeIds.length,
+        0,
+      );
+      totalAssignments += assignmentsPerDate * plan.workDates.length;
+      if (totalSlots > MAX_GENERATED_SHIFT_SLOTS) {
+        throw new BadRequestException(
+          `Lịch này tạo quá ${MAX_GENERATED_SHIFT_SLOTS} ô ca. Vui lòng giảm số ca hoặc số lần lặp.`,
+        );
+      }
+      if (totalAssignments > MAX_GENERATED_SHIFT_ASSIGNMENTS) {
+        throw new BadRequestException(
+          `Lịch này tạo quá ${MAX_GENERATED_SHIFT_ASSIGNMENTS} lượt phân ca. Vui lòng giảm số nhân viên hoặc số lần lặp.`,
+        );
+      }
+      assertShiftsStartAhead(plan.drafts, plan.workDates[0], now);
+      planned.push({ item, plan });
+    }
+
+    let results: Awaited<
+      ReturnType<StoresService['persistShiftSchedule']>
+    >[];
+    try {
+      results = await this.dataSource.transaction(async (manager) => {
+        const persisted: Awaited<
+          ReturnType<StoresService['persistShiftSchedule']>
+        >[] = [];
+        // Sequential: each item sees the rows the earlier ones wrote, which is
+        // what makes the cross-item same-name/overlap checks hold.
+        for (const { item, plan } of planned) {
+          persisted.push(
+            await this.persistShiftSchedule(
+              manager,
+              storeId,
+              ownerAccountId,
+              item,
+              plan,
+            ),
+          );
+        }
+        return persisted;
+      });
+    } catch (error: any) {
+      if (isOneActiveCycleViolation(error)) {
+        throw new BadRequestException('Cửa hàng đã có chu kỳ đang hoạt động');
+      }
+      throw error;
+    }
+
+    // Post-commit side effects, once for the union of all items.
+    const assignmentIds = results.flatMap((result) => result.assignmentIds);
+    if (assignmentIds.length) {
+      void this.shiftReminderService
+        .scheduleAssignmentReminders(assignmentIds)
+        .catch(() => {
+          this.logger.error(
+            'Failed to schedule reminders for newly created shift schedules (batch)',
+          );
+        });
+      void this.notifyEmployeesOfNewShifts(assignmentIds, 'assigned');
+    }
+
+    // R-M2: `selectCreatedShiftAnnouncement` is per item (it needs that item's
+    // drafts + workDates). Merge into ONE "Có ca mới để đăng ký" notice:
+    // concat the announced shifts; exclude only profiles that every announcing
+    // item would have excluded (i.e. picked for all open shifts of all items),
+    // so a profile open on any item's shift is still told about it.
+    const announcements = planned
+      .map(({ plan }) =>
+        selectCreatedShiftAnnouncement(plan.drafts, plan.workDates, now),
+      )
+      .filter((announcement) => announcement.shifts.length > 0);
+    const mergedShifts = announcements.flatMap(
+      (announcement) => announcement.shifts,
+    );
+    const mergedExcludeProfileIds = announcements.length
+      ? announcements[0].excludeProfileIds.filter((profileId) =>
+          announcements.every((announcement) =>
+            announcement.excludeProfileIds.includes(profileId),
+          ),
+        )
+      : [];
+    void this.notifyEmployeesOfCreatedShifts(
+      storeId,
+      mergedShifts,
+      mergedExcludeProfileIds,
+    );
+
+    const workDates = results
+      .flatMap((result) => [result.firstWorkDate, result.lastGeneratedWorkDate])
+      .filter((date): date is string => Boolean(date))
+      .sort();
+    return {
+      itemCount: results.length,
+      cycleIds: results.map((result) => result.id),
+      generatedSlotCount: results.reduce(
+        (sum, result) => sum + result.generatedSlotCount,
+        0,
+      ),
+      generatedAssignmentCount: results.reduce(
+        (sum, result) => sum + result.generatedAssignmentCount,
+        0,
+      ),
+      firstWorkDate: workDates[0] ?? null,
+      lastGeneratedWorkDate: workDates[workDates.length - 1] ?? null,
+    };
+  }
+
+  /**
    * `createShiftSchedule` inside the caller's transaction (X5 custom shift
    * request approval): the same validation, locks, same-name rule,
    * availability-at-commit check and writes, so every invariant of the
@@ -3921,6 +4068,242 @@ export class StoresSchedulingPart {
             : false,
       };
     });
+  }
+
+  /**
+   * Per-employee estimated salary for a set of PROPOSED (not yet persisted)
+   * shifts, so the owner "Tạo ca làm việc" screen can show a live amount pill
+   * before creating anything.
+   *
+   * Every amount is computed with EXACTLY the building blocks
+   * `getStoreShiftSlots`' `slotSalary` uses for `estimatedSalary` — active
+   * contract (isActive, newest), `loadWagePricing` + `wageRateForShift`
+   * (workShiftId null, the employee's role), overnight-aware duration,
+   * `calculateShiftEarnings(...) ?? 0`, and the store's working-days divisor for
+   * MONTH pay — so for a single shift the quote matches the staff "Đăng ký ca"
+   * estimate. The one intended difference is the MONTH rule below (2nd+ shift
+   * of a day = 0, as payroll pays it), which `getStoreShiftSlots` does not apply.
+   *
+   * MONTH rule (R-N1, matches payroll): a monthly salary is paid per distinct
+   * day worked, so per employee the first shift of each date counts as a worked
+   * day and the 2nd+ shift that date earns 0. `getStoreShiftSlots` does not pass
+   * `countsAsWorkedDay`, so this is the one place the rule is applied.
+   *
+   * Scoping: owner-only; employees that are not shift-eligible members of this
+   * store resolve to amount 0 and nothing about them is disclosed.
+   */
+  async estimateShiftSalaries(
+    this: StoresService,
+    storeId: string,
+    ownerAccountId: string,
+    shifts: Array<{
+      clientId: string;
+      date: string;
+      startTime: string;
+      endTime: string;
+      employeeIds: string[];
+    }>,
+  ) {
+    await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+
+    // Bound total work: employees × shifts across the whole request.
+    const totalPairs = shifts.reduce(
+      (sum, shift) => sum + (shift.employeeIds?.length ?? 0),
+      0,
+    );
+    if (totalPairs > 2000) {
+      throw new BadRequestException(
+        'Yêu cầu quá lớn: tổng số (nhân viên × ca) không được vượt quá 2000.',
+      );
+    }
+
+    // Resolve referenced employees against THIS store and shift eligibility.
+    // Ids outside the store are simply absent from `inStore` → amount 0, and
+    // nothing (name, contract, membership) about them leaves the method.
+    const referencedIds = [
+      ...new Set(shifts.flatMap((shift) => shift.employeeIds ?? [])),
+    ];
+    const employees = referencedIds.length
+      ? await this.profileRepository.find({
+          where: {
+            id: In(referencedIds),
+            storeId,
+            employmentStatus: In([...SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES]),
+          },
+          select: ['id'],
+        })
+      : [];
+    const inStore = new Set(employees.map((employee) => employee.id));
+
+    // Active contract + wage pricing per in-store employee, once each.
+    const contractByEmployee = new Map<string, EmployeeContract | null>();
+    const pricingByEmployee = new Map<
+      string,
+      Awaited<ReturnType<StoresService['loadWagePricing']>>
+    >();
+    // One query for every in-store employee's active contracts; the newest per
+    // employee wins (same rule as the per-employee findOne elsewhere).
+    const activeContracts = employees.length
+      ? await this.contractRepository.find({
+          where: {
+            employeeProfileId: In(employees.map((employee) => employee.id)),
+            isActive: true,
+          },
+          order: { createdAt: 'DESC' },
+        })
+      : [];
+    const newestContract = new Map<string, EmployeeContract>();
+    for (const contract of activeContracts) {
+      if (!newestContract.has(contract.employeeProfileId)) {
+        newestContract.set(contract.employeeProfileId, contract);
+      }
+    }
+    for (const employee of employees) {
+      const contract = newestContract.get(employee.id) ?? null;
+      contractByEmployee.set(employee.id, contract);
+      const pricing =
+        contract?.salaryAmount != null && Number(contract.salaryAmount) > 0
+          ? await this.loadWagePricing(
+              storeId,
+              employee.id,
+              contract.paymentType,
+            ).catch(() => null)
+          : null;
+      pricingByEmployee.set(employee.id, pricing);
+    }
+
+    // Working-days divisor from the store's shift-config days off (MONTH pay),
+    // loaded once and memoized per Vietnam month — same as `getStoreShiftSlots`.
+    const anySalaried = [...contractByEmployee.values()].some(
+      (contract) =>
+        contract?.salaryAmount != null && Number(contract.salaryAmount) > 0,
+    );
+    const daysOff = anySalaried
+      ? (
+          await this.shiftConfigRepository.findOne({
+            where: { storeId },
+            select: ['id', 'daysOff'],
+          })
+        )?.daysOff
+      : undefined;
+    const workingDaysByMonth = new Map<string, number>();
+    const workingDaysFor = (workDate: string): number | undefined => {
+      const month = vnMonthOfDateString(workDate);
+      if (!month) return undefined;
+      let days = workingDaysByMonth.get(month.key);
+      if (days === undefined) {
+        days = countWorkingDaysInMonth(month.year, month.monthIndex, daysOff);
+        workingDaysByMonth.set(month.key, days);
+      }
+      return days;
+    };
+
+    // R-N1: per employee, order that employee's shifts by (date, startTime);
+    // the first shift on each date carries the day's pay (MONTH only). Key by
+    // the shift's index in the request so duplicate (date,start) rows are
+    // handled deterministically.
+    const countsAsWorkedDay = new Map<string, boolean>();
+    const refsByEmployee = new Map<
+      string,
+      Array<{ index: number; date: string; startTime: string }>
+    >();
+    shifts.forEach((shift, index) => {
+      for (const employeeId of shift.employeeIds ?? []) {
+        if (!inStore.has(employeeId)) continue;
+        const refs = refsByEmployee.get(employeeId) ?? [];
+        refs.push({ index, date: shift.date, startTime: shift.startTime });
+        refsByEmployee.set(employeeId, refs);
+      }
+    });
+    for (const [employeeId, refs] of refsByEmployee) {
+      const sorted = [...refs].sort((a, b) =>
+        a.date === b.date
+          ? a.startTime.localeCompare(b.startTime)
+          : a.date.localeCompare(b.date),
+      );
+      const seenDates = new Set<string>();
+      for (const ref of sorted) {
+        const isFirstOfDate = !seenDates.has(ref.date);
+        seenDates.add(ref.date);
+        countsAsWorkedDay.set(`${employeeId}:${ref.index}`, isFirstOfDate);
+      }
+    }
+
+    // One shift's amount for one employee — mirrors `getStoreShiftSlots`'
+    // `slotSalary`, with workShiftId null (a brand-new shift) and the R-N1
+    // countsAsWorkedDay applied.
+    const amountFor = (
+      contract: EmployeeContract,
+      pricing: Awaited<ReturnType<StoresService['loadWagePricing']>>,
+      shift: { date: string; startTime: string; endTime: string },
+      countsWorked: boolean,
+    ): number => {
+      const salaryAmount = Number(contract.salaryAmount);
+      if (!salaryAmount) return 0;
+      const start = new Date(`1970-01-01T${shift.startTime}Z`).getTime();
+      let end = new Date(`1970-01-01T${shift.endTime}Z`).getTime();
+      if (end < start) end += 24 * 60 * 60 * 1000;
+      const durationHours = (end - start) / 3600000;
+      const window = effectiveWindowOf({
+        shiftSlot: {
+          workDate: shift.date,
+          startTime: shift.startTime,
+          endTime: shift.endTime,
+        },
+      });
+      const base = pricing
+        ? wageRateForShift({
+            rules: pricing.rules,
+            unit: pricing.unit,
+            fallbackRate: salaryAmount,
+            shift: {
+              workShiftId: null,
+              roleId: pricing.roleId,
+              from: window.start,
+              to: window.end,
+            },
+          })
+        : salaryAmount;
+      return (
+        calculateShiftEarnings({
+          paymentType: contract.paymentType,
+          baseSalary: base,
+          hours: durationHours,
+          referenceDate: vnMiddayInstant(shift.date),
+          workingDaysInMonth: workingDaysFor(shift.date),
+          countsAsWorkedDay: countsWorked,
+        }) ?? 0
+      );
+    };
+
+    return {
+      shifts: shifts.map((shift, index) => {
+        const perEmployee = (shift.employeeIds ?? []).map((employeeId) => {
+          const contract = inStore.has(employeeId)
+            ? (contractByEmployee.get(employeeId) ?? null)
+            : null;
+          if (
+            !contract ||
+            contract.salaryAmount == null ||
+            Number(contract.salaryAmount) <= 0
+          ) {
+            return { employeeId, amount: 0 };
+          }
+          const amount = amountFor(
+            contract,
+            pricingByEmployee.get(employeeId) ?? null,
+            shift,
+            countsAsWorkedDay.get(`${employeeId}:${index}`) ?? true,
+          );
+          return { employeeId, amount };
+        });
+        return {
+          clientId: shift.clientId,
+          total: perEmployee.reduce((sum, entry) => sum + entry.amount, 0),
+          employees: perEmployee,
+        };
+      }),
+    };
   }
 
   validateShiftSlotDateRange(
