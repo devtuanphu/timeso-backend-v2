@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { WeekDaySchedule } from './entities/shift-management.entity';
+import { CycleType, WeekDaySchedule } from './entities/shift-management.entity';
 import {
   ShiftMonthlyMode,
   ShiftRecurrenceEndType,
@@ -59,6 +59,37 @@ export function addDays(dateString: string, amount: number): string {
 
 export function getWeekDayForDate(dateString: string): WeekDaySchedule {
   return WEEK_DAYS[parseDateOnly(dateString).getUTCDay()];
+}
+
+/**
+ * Cấu hình một chu kỳ ca "một ngày, không lặp" — ĐÚNG hình dạng mà
+ * `persistShiftSchedule` tạo cho lịch không lặp (`recurrence.enabled = false`):
+ * cycleType DAILY, recurrence_rule KHÁC null, start = end = ngày đó.
+ *
+ * recurrence_rule khác null là chủ đích: nó đưa chu kỳ ra ngoài chỉ mục
+ * một-chu-kỳ-hoạt-động-cũ (`uq_work_cycles_one_active_legacy_per_store` chỉ xét
+ * recurrence_rule IS NULL) nên cửa hàng vẫn tạo được chu kỳ này khi đã có chu kỳ
+ * khác, và cron sinh ca hằng ngày không nhân bản nó. Dùng cho ca "Bổ sung công"
+ * tạo tức thời (D3) và cho ca bị dời sang ngày nằm ngoài phạm vi chu kỳ cũ.
+ */
+export function singleDayCycleFields(date: string): {
+  cycleType: CycleType;
+  recurrenceRule: ShiftRecurrenceRule;
+  startDate: string;
+  endDate: string;
+} {
+  return {
+    cycleType: CycleType.DAILY,
+    recurrenceRule: {
+      enabled: false,
+      frequency: ShiftRecurrenceFrequency.DAILY,
+      interval: 1,
+      endType: ShiftRecurrenceEndType.COUNT,
+      occurrenceCount: 1,
+    },
+    startDate: date,
+    endDate: date,
+  };
 }
 
 export function getTodayDateString(timeZone = 'Asia/Ho_Chi_Minh'): string {

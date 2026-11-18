@@ -95,6 +95,8 @@ describe('check-out follows the worked-time rule', () => {
     };
     service.bonusWorkRequestRepository = {
       findOne: jest.fn().mockResolvedValue(null),
+      // approvedOvertimeEnd nay cũng xét "Bổ sung công" cùng khung ca (R2).
+      find: jest.fn().mockResolvedValue([]),
     };
     service.workedTimeRuleRepository = {
       find: jest.fn().mockResolvedValue(rules),
@@ -240,6 +242,8 @@ describe('overtime repricing follows the rule of the shift start', () => {
     };
     service.bonusWorkRequestRepository = {
       findOne: jest.fn().mockResolvedValue(null),
+      // approvedOvertimeEnd nay cũng xét "Bổ sung công" cùng khung ca (R2).
+      find: jest.fn().mockResolvedValue([]),
     };
     service.workedTimeRuleRepository = {
       find: jest.fn().mockResolvedValue(rules),

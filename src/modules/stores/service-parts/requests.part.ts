@@ -49,16 +49,28 @@ import {
 } from '../entities/employee-leave-request.entity';
 import { AttendanceStatus } from '../entities/shift-management.entity';
 import {
+  CycleType,
   ShiftAssignment,
+  ShiftSlot,
   ShiftSwap,
+  WorkCycle,
   WorkCycleStatus,
   ShiftAssignmentStatus,
   ShiftSwapStatus,
 } from '../entities/shift-management.entity';
+import { WorkShift } from '../entities/work-shift.entity';
 import { StoreApprovalSettingDto } from '../dto/store-approval-setting.dto';
 import { DEFAULT_MAX_OVERTIME_MINUTES } from '../dto/store-timekeeping-setting.dto';
-import { lockStoreShiftAvailability } from '../shift-availability-lock';
-import { parseDateOnly } from '../shift-schedule.utils';
+import {
+  lockEmployeeWorkSupplement,
+  lockStoreShiftAvailability,
+} from '../shift-availability-lock';
+import {
+  addDays,
+  getWeekDayForDate,
+  parseDateOnly,
+  singleDayCycleFields,
+} from '../shift-schedule.utils';
 import { StoreTimekeepingSetting } from '../entities/store-timekeeping-setting.entity';
 import {
   NotificationPriority,
@@ -85,6 +97,7 @@ import {
   effectiveWindowOf,
   formatDurationVi,
   resolveRequestedInstant,
+  supplementWindow,
 } from '../attendance-time.utils';
 import {
   applyGrace,
@@ -92,12 +105,18 @@ import {
   resolveAttendanceRules,
 } from '../attendance-rules';
 import { overtimeEndAt } from '../shift-end-workflow.service';
+import type { WorkedTimeMode } from '../worked-time-rules';
 import { SHIFT_ELIGIBLE_EMPLOYMENT_STATUSES } from './shared';
 import {
   normalizeLeaveType,
   parseLeaveTypeFilter,
   OVERTIME_SHIFT_MISMATCH,
   CLEARED_SHIFT_REQUEST_EFFECTS,
+  BLOCKING_LEAVE_TYPE_VALUES,
+  leaveBlocksShifts,
+  toBlockingLeaveIntervals,
+  toShiftInterval,
+  type ShiftInterval,
 } from './shared';
 import { swapTargetNotStarted } from '../work-terms.utils';
 import type { StoresService } from '../stores.service';
@@ -146,6 +165,118 @@ const isOvertimeShiftMismatch = (error: unknown): boolean => {
     (response as { code?: string }).code === OVERTIME_SHIFT_MISMATCH
   );
 };
+
+/** Khung giờ hiệu lực của một ca ứng viên khi chia công bổ sung. */
+export interface SupplementCandidateWindow {
+  start: Date;
+  end: Date;
+}
+
+/** Một khung con [from, to] của đơn bổ sung công, gắn với ca thứ `index`. */
+export interface SupplementCreditPlan {
+  index: number;
+  from: Date;
+  to: Date;
+}
+
+/**
+ * Chia khung [A, B] của một đơn "Bổ sung công" cho những ca có khung giờ trùng
+ * A–B, sao cho tổng thời gian cộng ≤ B − A.
+ *
+ * Vì sao phải chia thay vì chỉ cộng vào một ca: một khung bổ sung có thể phủ hai
+ * ca LIÊN TIẾP không giao giờ trong ngày (ca sáng + ca chiều). Cộng cả B−A vào
+ * từng ca sẽ trả gấp đôi; chỉ cộng vào một ca thì ca kia thiếu công.
+ *
+ * NHƯNG khi hai ca ứng viên có khung giờ chồng NHAU (lịch bất thường: một người
+ * hai ca giao giờ) thì KHÔNG chia được an toàn: creditSupplementAssignment lấy
+ * giờ vào = min(giờ vào thật, phần được chia), nên giờ vào thật của ca sau kéo
+ * công lùi vào phần ca trước và cộng trùng đoạn giao (MAJOR 1). Khi đó quay về
+ * cách cũ: cộng cả [A, B] vào DUY NHẤT ca trùng [A,B] nhiều nhất (hoà → bắt đầu
+ * sớm nhất). Chỉ các khung ca KHÔNG giao nhau mới chia nhiều ca.
+ *
+ * Ca KHÔNG lọc theo trạng thái chu kỳ (ca thuộc chu kỳ đã hết hạn vẫn là mục
+ * tiêu bổ sung hợp lệ — R1).
+ */
+export function planSupplementCredits(
+  candidates: SupplementCandidateWindow[],
+  from: Date,
+  to: Date,
+): SupplementCreditPlan[] {
+  const A = from.getTime();
+  const B = to.getTime();
+  const overlapping = candidates
+    .map((window, index) => ({
+      index,
+      start: window.start.getTime(),
+      end: window.end.getTime(),
+    }))
+    .filter((c) => c.start < B && A < c.end)
+    .sort((left, right) => left.start - right.start || left.end - right.end);
+  if (!overlapping.length) return [];
+
+  // Có hai khung ca giao nhau không? (đã xếp theo giờ bắt đầu: một ca bắt đầu
+  // trước khi mốc kết thúc lớn nhất trước đó là có giao).
+  let maxEnd = -Infinity;
+  let windowsOverlap = false;
+  for (const c of overlapping) {
+    if (c.start < maxEnd) {
+      windowsOverlap = true;
+      break;
+    }
+    if (c.end > maxEnd) maxEnd = c.end;
+  }
+
+  if (windowsOverlap) {
+    // Ca trùng [A,B] nhiều nhất; hoà → bắt đầu sớm nhất (danh sách đã xếp theo
+    // giờ bắt đầu, dùng so sánh ">" nên ca sớm nhất trong các ca hoà được giữ).
+    let best = overlapping[0];
+    let bestOverlap = -Infinity;
+    for (const c of overlapping) {
+      const ov = Math.min(c.end, B) - Math.max(c.start, A);
+      if (ov > bestOverlap) {
+        bestOverlap = ov;
+        best = c;
+      }
+    }
+    return [{ index: best.index, from: new Date(A), to: new Date(B) }];
+  }
+
+  // Khung ca không giao nhau: chia [A,B] theo từng ca, không chồng. Ca cuối ôm
+  // nốt tới B (phần sau giờ tan ca của nó là tăng ca, D2); ca giữa chỉ tới giờ
+  // tan ca của chính nó.
+  const plans: SupplementCreditPlan[] = [];
+  let prevTo: number | null = null;
+  overlapping.forEach((c, i) => {
+    const rawFrom = i === 0 ? A : Math.max(A, c.start);
+    const rawTo = i === overlapping.length - 1 ? B : Math.min(B, c.end);
+    const creditFrom = prevTo === null ? rawFrom : Math.max(rawFrom, prevTo);
+    if (rawTo <= creditFrom) return;
+    plans.push({ index: c.index, from: new Date(creditFrom), to: new Date(rawTo) });
+    prevTo = rawTo;
+  });
+  return plans;
+}
+
+/**
+ * Phút công TRƯỚC giờ bắt đầu ca mà một đơn "Bổ sung công" khai (D2 / R8). Ở
+ * chế độ SHIFT, creditedWorkedMinutes tính từ giờ bắt đầu ca nên bỏ phần đến
+ * sớm; phải cộng riêng đúng phần khai trước ca, chặn theo độ dài khung khai.
+ * ACTUAL mode đã tính từ giờ vào thật nên không cộng. Dùng chung cho lúc duyệt
+ * (creditSupplementAssignment) và lúc tính lại (repriceCheckedOutOvertime) để
+ * một lượt duyệt tăng ca sau đó không âm thầm xoá phần công trước ca.
+ */
+export function supplementPreStartMinutes(
+  mode: WorkedTimeMode | null | undefined,
+  windowStart: Date | null,
+  from: Date,
+  to: Date,
+): number {
+  if ((mode ?? 'SHIFT') === 'ACTUAL' || !windowStart) return 0;
+  if (from.getTime() >= windowStart.getTime()) return 0;
+  const pre = Math.floor((windowStart.getTime() - from.getTime()) / 60_000);
+  const span = Math.floor((to.getTime() - from.getTime()) / 60_000);
+  return Math.max(0, Math.min(pre, span));
+}
 
 /**
  * StoresRequestsPart: requests methods of StoresService, split out of stores.service.ts.
@@ -2208,6 +2339,43 @@ export class StoresRequestsPart {
     }
 
     const saveUnlinked = async () => {
+      // "Bổ sung công" (đơn không gắn ca): luật hợp lệ DUY NHẤT là khung giờ đã
+      // khai phải ĐÃ QUA — không khai công cho tương lai. Chặn ở đây (và chặn cả
+      // đường rơi về từ nhánh gắn ca của bản app cũ) để đơn chỉ chờ chủ xác nhận
+      // giờ chứ không bao giờ chờ cho tới khi khung giờ trôi qua. Bản app cũ luôn
+      // gửi đủ ngày + giờ nên vẫn đi qua được.
+      const startHHmm = /^(\d{1,2}):([0-5]\d)(?::[0-5]\d)?$/.exec(
+        String(data.startTime ?? '').trim(),
+      );
+      const endHHmm = /^(\d{1,2}):([0-5]\d)(?::[0-5]\d)?$/.exec(
+        String(data.endTime ?? '').trim(),
+      );
+      const window = supplementWindow(
+        data.requestDate,
+        data.startTime,
+        data.endTime,
+      );
+      if (!startHHmm || !endHHmm || !window) {
+        throw new BadRequestException(
+          'Vui lòng nhập ngày, giờ vào ca và giờ tan ca hợp lệ.',
+        );
+      }
+      // So HH:mm (bỏ giây): trùng giờ thì khung +24h thành cả ngày, vô nghĩa.
+      if (
+        `${startHHmm[1].padStart(2, '0')}:${startHHmm[2]}` ===
+        `${endHHmm[1].padStart(2, '0')}:${endHHmm[2]}`
+      ) {
+        throw new BadRequestException(
+          'Giờ vào và giờ ra không được trùng nhau',
+        );
+      }
+      if (window.to.getTime() > Date.now()) {
+        throw new BadRequestException({
+          code: 'SUPPLEMENT_WINDOW_IN_FUTURE',
+          message:
+            'Chỉ bổ sung công cho khoảng thời gian đã qua. Giờ tan ca phải trước thời điểm hiện tại.',
+        });
+      }
       const request = this.bonusWorkRequestRepository.create({
         storeId: data.storeId,
         employeeProfileId: data.employeeProfileId,
@@ -2605,17 +2773,22 @@ export class StoresRequestsPart {
   }
 
   /**
-   * Duyệt "Bổ sung công" (đơn không gắn ca: nhân viên khai đã làm ngày D từ
-   * A đến B mà chấm công thiếu). Luật:
-   * - Gắn vào ca của nhân viên (ngày D, hoặc ca qua đêm của D-1) có khung giờ
-   *   trùng A–B nhiều nhất, ca đã duyệt / đã vào / đã ra; khung A–B phải đã
-   *   qua; ca không nằm trong đơn nghỉ đã duyệt; phiếu lương chưa chốt.
-   * - Giờ vào = sớm hơn giữa giờ vào đã có và A (chưa vào ca thì A). Giờ ra =
-   *   B khi chưa ra ca / hệ thống tự chấm ra / quên chấm ra; đã tự ra ca thì
-   *   muộn hơn giữa giờ ra đó và B.
-   * - Đi trễ, về sớm, giờ công tính lại đúng như chấm công thật (miễn trừ,
-   *   cách tính giờ công, tăng ca đã duyệt); ca thành COMPLETED; lương tính lại.
-   * Không có ca trùng: không duyệt được (chủ xếp ca rồi duyệt, hoặc từ chối).
+   * Duyệt "Bổ sung công" (đơn không gắn ca: nhân viên khai đã làm ngày D từ A
+   * đến B mà chấm công thiếu). D1: luật hợp lệ DUY NHẤT là B ≤ bây giờ; luôn
+   * duyệt được, kể cả khi chưa có ca nào trùng.
+   *
+   * - Khoá theo nhân viên trước (không hai lượt duyệt cùng người cùng lúc), rồi
+   *   "chiếm" đơn (UPDATE … WHERE status = PENDING) để không cộng công hai lần.
+   * - Tìm mọi ca đã duyệt / đã vào / đã ra của người này ngày D (hoặc ca qua đêm
+   *   của D-1) có khung giờ trùng A–B, KHÔNG lọc theo trạng thái chu kỳ (R1).
+   *   + Không có ca nào (D3): tạo một ca "Bổ sung công" đúng A–B rồi cộng công.
+   *   + Một / nhiều ca: chia [A,B] cho từng ca (planSupplementCredits) để không
+   *     trả trùng giờ và không thiếu công khi khung phủ hai ca.
+   * - Mỗi ca: giờ vào = sớm hơn giữa giờ vào đã có và khung; giờ ra = B khi chưa
+   *   ra / tự chấm ra / quên chấm ra, muộn hơn giữa giờ ra cũ và B khi đã ra;
+   *   tính lại trễ / sớm / giờ công; ca thành COMPLETED; lương tính lại.
+   * - Ca còn trong đơn nghỉ đã duyệt, hoặc phiếu lương đã chốt → từ chối cả lượt
+   *   (một transaction).
    */
   async approveWorkSupplement(
     this: StoresService,
@@ -2627,194 +2800,197 @@ export class StoresRequestsPart {
       throw new BadRequestException('Chỉ duyệt được đơn bổ sung công đang chờ duyệt.');
     }
     const date = request.requestDate ? String(request.requestDate).slice(0, 10) : '';
-    const clock = (value?: string | null) => {
-      const match = /^(\d{1,2}):(\d{2})/.exec(String(value ?? ''));
-      return match ? `${match[1].padStart(2, '0')}:${match[2]}` : null;
-    };
-    const fromClock = clock(request.startTime);
-    const toClock = clock(request.endTime);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !fromClock || !toClock) {
+    const window = supplementWindow(date, request.startTime, request.endTime);
+    if (!window) {
       throw new BadRequestException('Đơn bổ sung công thiếu ngày hoặc giờ vào / ra');
     }
-    const from = new Date(`${date}T${fromClock}:00+07:00`);
-    let to = new Date(`${date}T${toClock}:00+07:00`);
-    if (to.getTime() <= from.getTime()) to = new Date(to.getTime() + 24 * 60 * 60 * 1000);
+    const { from, to } = window;
+    // Phòng thủ nhiều lớp: đơn tạo sau đã bị chặn khung tương lai, nhưng lúc
+    // duyệt vẫn chặn (đơn của bản app cũ, hoặc đồng hồ lệch).
     if (to.getTime() > Date.now()) {
       throw new BadRequestException('Chỉ bổ sung công cho khung giờ đã qua');
     }
-    const previousDate = vnDateString(new Date(new Date(`${date}T12:00:00+07:00`).getTime() - 24 * 60 * 60 * 1000));
-    const candidates = await this.shiftAssignmentRepository
-      .createQueryBuilder('assignment')
-      .innerJoinAndSelect('assignment.shiftSlot', 'slot')
-      .leftJoinAndSelect('slot.workShift', 'workShift')
-      .innerJoinAndSelect('slot.cycle', 'cycle')
-      .where('assignment.employeeId = :employeeId', { employeeId: request.employeeProfileId })
-      .andWhere('cycle.storeId = :storeId', { storeId: request.storeId })
-      .andWhere('assignment.status IN (:...statuses)', {
-        statuses: [
-          ShiftAssignmentStatus.APPROVED,
-          ShiftAssignmentStatus.CONFIRMED,
-          ShiftAssignmentStatus.COMPLETED,
-        ],
-      })
-      .andWhere('slot.workDate IN (:...dates)', { dates: [previousDate, date] })
-      .getMany();
-    let best: { assignment: ShiftAssignment; overlap: number } | null = null;
-    for (const candidate of candidates) {
-      const { start, end } = effectiveWindowOf(candidate);
-      if (!start || !end) continue;
-      const overlap =
-        Math.min(end.getTime(), to.getTime()) - Math.max(start.getTime(), from.getTime());
-      if (overlap > 0 && (!best || overlap > best.overlap)) best = { assignment: candidate, overlap };
-    }
-    if (!best) {
-      throw new BadRequestException(
-        `Nhân viên không có ca nào trong khung ${fromClock} – ${toClock} ngày ${date.slice(8, 10)}/${date.slice(5, 7)}. Hãy xếp ca cho nhân viên rồi duyệt, hoặc từ chối đơn.`,
-      );
-    }
-    const target = best.assignment;
-    const slot = target.shiftSlot;
-    const workDate = String(slot.workDate).slice(0, 10);
-    if (
-      await isShiftCoveredByApprovedLeave(
-        this.dataSource,
-        target.employeeId,
-        workDate,
-        target.id,
-      )
-    ) {
-      throw new BadRequestException('Ca này đang có đơn nghỉ đã duyệt, không bổ sung công được');
-    }
-    await this.assertPayslipOpen(target.employeeId, workDate);
+    const previousDate = vnDateString(
+      new Date(new Date(`${date}T12:00:00+07:00`).getTime() - 24 * 60 * 60 * 1000),
+    );
     const setting = await this.timekeepingSettingRepository.findOne({
       where: { storeId: request.storeId },
     });
     const rules = resolveAttendanceRules(setting);
-    const mode = await this.workedTimeModeFor(request.storeId, target.employeeId, slot);
 
-    const credited = await this.dataSource.transaction(async (manager) => {
-      const locked = await manager.findOne(ShiftAssignment, {
-        where: { id: target.id },
-        lock: { mode: 'pessimistic_write' },
-      });
-      if (!locked || locked.status === ShiftAssignmentStatus.CANCELLED) {
-        throw new BadRequestException('Ca đã thay đổi, vui lòng tải lại');
-      }
+    const result = await this.dataSource.transaction(async (manager) => {
+      // Khoá nhân viên TRƯỚC (rồi mới tới khoá cửa hàng ở nhánh tạo ca ad-hoc).
+      await lockEmployeeWorkSupplement(manager, request.employeeProfileId);
+      // Chiếm đơn: lượt thứ hai thấy affected = 0 thì dừng, không cộng công hai
+      // lần / không tạo hai ca ad-hoc cho cùng đơn.
       const decided = await manager.update(
         BonusWorkRequest,
         { id: request.id, status: BonusWorkRequestStatus.PENDING },
         {
           status: BonusWorkRequestStatus.APPROVED,
           approvedById: approverProfileId,
-          // Ca đã được bổ sung công (để tra lại). Không ghi shiftAssignmentId:
-          // đơn gắn ca là tăng ca, sẽ kéo dài giờ được trả của ca.
-          shiftSlotId: slot.id,
         } as any,
       );
       if (!decided.affected) {
         throw new BadRequestException('Yêu cầu đã được cập nhật, vui lòng tải lại');
       }
-      const window = effectiveWindowOf({
-        adjustedStartAt: locked.adjustedStartAt,
-        adjustedEndAt: locked.adjustedEndAt,
-        shiftSlot: slot,
-      });
-      const oldIn = locked.checkInTime ? new Date(locked.checkInTime) : null;
-      const oldOut = locked.checkOutTime ? new Date(locked.checkOutTime) : null;
-      const checkIn = oldIn && oldIn.getTime() < from.getTime() ? oldIn : from;
-      const outWasMissing =
-        !oldOut ||
-        !!locked.isAutoCheckout ||
-        !!locked.autoCheckoutReason ||
-        locked.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT;
-      const checkOut = outWasMissing
-        ? to
-        : oldOut.getTime() > to.getTime()
-          ? oldOut
-          : to;
-      if (checkOut.getTime() <= checkIn.getTime()) {
-        throw new BadRequestException('Giờ ra phải sau giờ vào của ca');
-      }
-      const lateMinutes = applyGrace(calculateLateMinutes(window.start, checkIn), rules, 'late');
-      const earlyMinutes = applyGrace(calculateEarlyMinutes(window.end, checkOut), rules, 'early');
-      const workedMinutes = creditedWorkedMinutes({
-        start: window.start,
-        end: window.end,
-        checkIn,
-        checkOut,
-        rules,
-        storedLateMinutes: lateMinutes,
-        paidUntil: await this.approvedOvertimeEnd(locked.id, window.end),
-        mode,
-      });
-      const attendanceStatus =
-        lateMinutes > 0 && earlyMinutes > 0
-          ? AttendanceStatus.LATE_AND_EARLY
-          : lateMinutes > 0
-            ? AttendanceStatus.LATE
-            : earlyMinutes > 0
-              ? AttendanceStatus.EARLY
-              : AttendanceStatus.ON_TIME;
-      await manager.update(
-        ShiftAssignment,
-        { id: locked.id },
-        {
-          checkInTime: checkIn,
-          checkOutTime: checkOut,
-          lateMinutes,
-          earlyMinutes,
-          workedMinutes,
-          attendanceStatus,
-          status: ShiftAssignmentStatus.COMPLETED,
-          isAutoCheckout: false,
-          autoCheckoutReason: null,
-        } as any,
+
+      const candidates = await manager
+        .createQueryBuilder(ShiftAssignment, 'assignment')
+        .innerJoinAndSelect('assignment.shiftSlot', 'slot')
+        .leftJoinAndSelect('slot.workShift', 'workShift')
+        .innerJoinAndSelect('slot.cycle', 'cycle')
+        .where('assignment.employeeId = :employeeId', {
+          employeeId: request.employeeProfileId,
+        })
+        .andWhere('cycle.storeId = :storeId', { storeId: request.storeId })
+        .andWhere('assignment.status IN (:...statuses)', {
+          statuses: [
+            ShiftAssignmentStatus.APPROVED,
+            ShiftAssignmentStatus.CONFIRMED,
+            ShiftAssignmentStatus.COMPLETED,
+          ],
+        })
+        .andWhere('slot.workDate IN (:...dates)', { dates: [previousDate, date] })
+        .getMany();
+      const windowed = candidates
+        .map((candidate) => ({ candidate, ...effectiveWindowOf(candidate) }))
+        .filter(
+          (entry): entry is typeof entry & { start: Date; end: Date } =>
+            !!entry.start && !!entry.end,
+        );
+      const plans = planSupplementCredits(
+        windowed.map((entry) => ({ start: entry.start, end: entry.end })),
+        from,
+        to,
       );
-      const logs: AttendanceLog[] = [];
-      if (!oldIn || oldIn.getTime() !== checkIn.getTime()) {
-        logs.push(
-          manager.create(AttendanceLog, {
-            shiftAssignmentId: locked.id,
-            employeeProfileId: locked.employeeId,
-            storeId: request.storeId,
-            type: AttendanceLogType.CHECK_IN,
-            timestamp: checkIn,
-            method: AttendanceMethod.MANUAL,
-          }),
+
+      const credited: Array<{
+        assignmentId: string;
+        slotId: string;
+        checkOut: Date;
+        workedMinutes: number;
+      }> = [];
+      let createdAdHocShift = false;
+
+      if (!plans.length) {
+        // D3: chủ gọi người làm ngoài lịch, chưa có ca nào trùng. Tạo ca đúng
+        // A–B rồi cộng công như giờ thường (khung = ca nên không có tăng ca).
+        await this.assertNoApprovedLeaveOverSupplement(
+          manager,
+          request.storeId,
+          request.employeeProfileId,
+          date,
+          from,
+          to,
         );
-      }
-      if (!oldOut || oldOut.getTime() !== checkOut.getTime()) {
-        logs.push(
-          manager.create(AttendanceLog, {
-            shiftAssignmentId: locked.id,
-            employeeProfileId: locked.employeeId,
-            storeId: request.storeId,
-            type: AttendanceLogType.CHECK_OUT,
-            timestamp: checkOut,
-            method: AttendanceMethod.MANUAL,
-          }),
+        await this.assertPayslipOpen(request.employeeProfileId, date, manager);
+        const adhoc = await this.createAdHocSupplementShift(
+          manager,
+          request,
+          date,
+          from,
+          to,
         );
+        const mode = await this.workedTimeModeFor(
+          request.storeId,
+          request.employeeProfileId,
+          adhoc.slot,
+          manager,
+        );
+        credited.push(
+          await this.creditSupplementAssignment(
+            manager,
+            adhoc.assignment,
+            adhoc.slot,
+            from,
+            to,
+            rules,
+            mode,
+            request.storeId,
+            // MINOR 4: ca ad-hoc chưa commit, khung = A–B nên không tra tăng ca.
+            false,
+          ),
+        );
+        createdAdHocShift = true;
+      } else {
+        for (const plan of plans) {
+          const entry = windowed[plan.index];
+          const locked = await manager.findOne(ShiftAssignment, {
+            where: { id: entry.candidate.id },
+            lock: { mode: 'pessimistic_write' },
+          });
+          if (!locked || locked.status === ShiftAssignmentStatus.CANCELLED) {
+            throw new BadRequestException('Ca đã thay đổi, vui lòng tải lại');
+          }
+          const slot = entry.candidate.shiftSlot;
+          const slotDate = String(slot.workDate).slice(0, 10);
+          if (
+            await isShiftCoveredByApprovedLeave(
+              // Inside the transaction: read the approved-leave coverage on the
+              // transaction connection, not this.dataSource (default pool).
+              manager,
+              locked.employeeId,
+              slotDate,
+              locked.id,
+            )
+          ) {
+            throw new BadRequestException(
+              'Ca này đang có đơn nghỉ đã duyệt, không bổ sung công được',
+            );
+          }
+          await this.assertPayslipOpen(locked.employeeId, slotDate, manager);
+          const mode = await this.workedTimeModeFor(
+            request.storeId,
+            locked.employeeId,
+            slot,
+            manager,
+          );
+          credited.push(
+            await this.creditSupplementAssignment(
+              manager,
+              locked,
+              slot,
+              plan.from,
+              plan.to,
+              rules,
+              mode,
+              request.storeId,
+            ),
+          );
+        }
       }
-      if (logs.length) await manager.save(AttendanceLog, logs);
-      return { assignmentId: locked.id, checkOut, workedMinutes };
+
+      // Gắn đơn vào khung của ca cộng CUỐI (ca mang phần sau giờ tan ca). Giữ
+      // shiftAssignmentId = null: gắn assignment nghĩa là tăng ca.
+      const last = credited[credited.length - 1];
+      await manager.update(
+        BonusWorkRequest,
+        { id: request.id },
+        { shiftSlotId: last.slotId } as any,
+      );
+      return { credited, createdAdHocShift, lastSlotId: last.slotId };
     });
 
+    const last = result.credited[result.credited.length - 1];
     const saved = Object.assign(request, {
       status: BonusWorkRequestStatus.APPROVED,
       approvedById: approverProfileId,
-      shiftSlotId: slot.id,
+      shiftSlotId: result.lastSlotId,
     });
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_APPROVED,
       saved,
       ownerAccountId ?? null,
     );
-    try {
-      await this.processCheckoutPayroll(credited.assignmentId);
-    } catch {
-      this.logger.error(
-        `[WorkSupplement] Payslip not recomputed after crediting ${credited.assignmentId}`,
-      );
+    for (const credit of result.credited) {
+      try {
+        await this.processCheckoutPayroll(credit.assignmentId);
+      } catch {
+        this.logger.error(
+          `[WorkSupplement] Payslip not recomputed after crediting ${credit.assignmentId}`,
+        );
+      }
     }
     void this.notifyRequestDecision({
       employeeProfileId: request.employeeProfileId,
@@ -2822,14 +2998,271 @@ export class StoresRequestsPart {
       requestId: request.id,
       kind: 'SUPPLEMENT',
       approved: true,
-      assignmentId: credited.assignmentId,
-      workDate,
-      time: vnClockHHmm(credited.checkOut),
+      assignmentId: last.assignmentId,
+      workDate: date,
+      time: vnClockHHmm(last.checkOut),
     });
     return Object.assign(saved, {
-      creditedAssignmentId: credited.assignmentId,
-      creditedWorkedMinutes: credited.workedMinutes,
+      // Giữ trường cũ (ca cộng cuối) cho bản app cũ; thêm trường mới.
+      creditedAssignmentId: last.assignmentId,
+      creditedWorkedMinutes: last.workedMinutes,
+      creditedAssignmentIds: result.credited.map((credit) => credit.assignmentId),
+      createdAdHocShift: result.createdAdHocShift,
     });
+  }
+
+  /**
+   * Cộng công bổ sung vào một ca đã khoá: giờ vào / ra, trễ / sớm, giờ công
+   * (D2: phần SAU giờ tan ca trả như tăng ca qua `paidUntil`; phần TRƯỚC giờ bắt
+   * đầu ca — ở chế độ SHIFT — cộng thêm vì creditedWorkedMinutes chỉ tính từ giờ
+   * bắt đầu ca), rồi ghi AttendanceLog thủ công. Trả mốc / giờ công đã cộng.
+   */
+  async creditSupplementAssignment(
+    this: StoresService,
+    manager: EntityManager,
+    locked: ShiftAssignment,
+    slot: ShiftSlot,
+    from: Date,
+    to: Date,
+    rules: ReturnType<typeof resolveAttendanceRules>,
+    mode: Awaited<ReturnType<StoresService['workedTimeModeFor']>>,
+    storeId: string,
+    // D3: ca ad-hoc vừa tạo chưa commit — tra qua kết nối mặc định sẽ không thấy
+    // nó mà vẫn tốn truy vấn. Khung = A–B đúng nên không có phần sau giờ tan ca
+    // (paidUntil cục bộ = null). MINOR 4.
+    loadOvertime = true,
+  ): Promise<{
+    assignmentId: string;
+    slotId: string;
+    checkOut: Date;
+    workedMinutes: number;
+  }> {
+    const window = effectiveWindowOf({
+      adjustedStartAt: locked.adjustedStartAt,
+      adjustedEndAt: locked.adjustedEndAt,
+      shiftSlot: slot,
+    });
+    const oldIn = locked.checkInTime ? new Date(locked.checkInTime) : null;
+    const oldOut = locked.checkOutTime ? new Date(locked.checkOutTime) : null;
+    const checkIn = oldIn && oldIn.getTime() < from.getTime() ? oldIn : from;
+    const outWasMissing =
+      !oldOut ||
+      !!locked.isAutoCheckout ||
+      !!locked.autoCheckoutReason ||
+      locked.attendanceStatus === AttendanceStatus.FORGOT_CHECKOUT;
+    const checkOut = outWasMissing
+      ? to
+      : oldOut.getTime() > to.getTime()
+        ? oldOut
+        : to;
+    if (checkOut.getTime() <= checkIn.getTime()) {
+      throw new BadRequestException('Giờ ra phải sau giờ vào của ca');
+    }
+    const lateMinutes = applyGrace(
+      calculateLateMinutes(window.start, checkIn),
+      rules,
+      'late',
+    );
+    const earlyMinutes = applyGrace(
+      calculateEarlyMinutes(window.end, checkOut),
+      rules,
+      'early',
+    );
+    // D2: khung bổ sung kéo tới sau giờ tan ca → trả tới đó (max với tăng ca đã
+    // duyệt sẵn của ca). payroll xếp phần sau giờ tan ca vào bucket tăng ca.
+    const overtimeEnd = loadOvertime
+      ? await this.approvedOvertimeEnd(
+          locked.id,
+          window.end,
+          {
+            shiftSlotId: locked.shiftSlotId,
+            employeeId: locked.employeeId,
+          },
+          manager,
+        )
+      : null;
+    const paidUntil =
+      window.end && to.getTime() > window.end.getTime()
+        ? overtimeEnd && overtimeEnd.getTime() > to.getTime()
+          ? overtimeEnd
+          : to
+        : overtimeEnd;
+    let workedMinutes = creditedWorkedMinutes({
+      start: window.start,
+      end: window.end,
+      checkIn,
+      checkOut,
+      rules,
+      storedLateMinutes: lateMinutes,
+      paidUntil,
+      mode,
+    });
+    // D2 / R8: cộng phần khai TRƯỚC giờ bắt đầu ca (SHIFT mode bỏ phần đến sớm).
+    workedMinutes += supplementPreStartMinutes(mode, window.start, from, to);
+    const attendanceStatus =
+      lateMinutes > 0 && earlyMinutes > 0
+        ? AttendanceStatus.LATE_AND_EARLY
+        : lateMinutes > 0
+          ? AttendanceStatus.LATE
+          : earlyMinutes > 0
+            ? AttendanceStatus.EARLY
+            : AttendanceStatus.ON_TIME;
+    await manager.update(
+      ShiftAssignment,
+      { id: locked.id },
+      {
+        checkInTime: checkIn,
+        checkOutTime: checkOut,
+        lateMinutes,
+        earlyMinutes,
+        workedMinutes,
+        attendanceStatus,
+        status: ShiftAssignmentStatus.COMPLETED,
+        isAutoCheckout: false,
+        autoCheckoutReason: null,
+      } as any,
+    );
+    const logs: AttendanceLog[] = [];
+    if (!oldIn || oldIn.getTime() !== checkIn.getTime()) {
+      logs.push(
+        manager.create(AttendanceLog, {
+          shiftAssignmentId: locked.id,
+          employeeProfileId: locked.employeeId,
+          storeId,
+          type: AttendanceLogType.CHECK_IN,
+          timestamp: checkIn,
+          method: AttendanceMethod.MANUAL,
+        }),
+      );
+    }
+    if (!oldOut || oldOut.getTime() !== checkOut.getTime()) {
+      logs.push(
+        manager.create(AttendanceLog, {
+          shiftAssignmentId: locked.id,
+          employeeProfileId: locked.employeeId,
+          storeId,
+          type: AttendanceLogType.CHECK_OUT,
+          timestamp: checkOut,
+          method: AttendanceMethod.MANUAL,
+        }),
+      );
+    }
+    if (logs.length) await manager.save(AttendanceLog, logs);
+    return { assignmentId: locked.id, slotId: slot.id, checkOut, workedMinutes };
+  }
+
+  /**
+   * Tạo ca "Bổ sung công" tức thời cho đúng khung A–B ngày D (D3): một chu kỳ
+   * một-ngày (shape như persistShiftSchedule, recurrence_rule khác null), một
+   * WorkShift ẩn (isActive = false, R3: không hiện ở danh sách ca / cài đặt),
+   * một khung ca (maxStaff 1, ghi chú = lý do đơn) và một assignment APPROVED.
+   * KHÔNG lên lịch nhắc / tự chấm ra; chạy trong transaction của lượt duyệt.
+   */
+  async createAdHocSupplementShift(
+    this: StoresService,
+    manager: EntityManager,
+    request: BonusWorkRequest,
+    date: string,
+    from: Date,
+    to: Date,
+  ): Promise<{ assignment: ShiftAssignment; slot: ShiftSlot }> {
+    // Khoá cửa hàng SAU khoá nhân viên (đã giữ ở hàm gọi) để không đảo thứ tự.
+    await lockStoreShiftAvailability(manager, request.storeId);
+    const startClock = `${vnClockHHmm(from)}:00`;
+    const endClock = `${vnClockHHmm(to)}:00`;
+    const fields = singleDayCycleFields(date);
+    const cycle = await manager.save(
+      WorkCycle,
+      manager.create(WorkCycle, {
+        storeId: request.storeId,
+        name: 'Bổ sung công',
+        cycleType: fields.cycleType,
+        startDate: fields.startDate,
+        endDate: fields.endDate,
+        status: WorkCycleStatus.ACTIVE,
+        workShiftId: null,
+        recurrenceRule: fields.recurrenceRule,
+      }),
+    );
+    const shift = await manager.save(
+      WorkShift,
+      manager.create(WorkShift, {
+        storeId: request.storeId,
+        shiftName: 'Bổ sung công',
+        startTime: startClock,
+        endTime: endClock,
+        defaultMaxStaff: 1,
+        colorCode: '#21D4D4',
+        note: null,
+        isActive: false,
+      }),
+    );
+    await manager.update(WorkCycle, cycle.id, { workShiftId: shift.id });
+    const slot = await manager.save(
+      ShiftSlot,
+      manager.create(ShiftSlot, {
+        cycleId: cycle.id,
+        workShiftId: shift.id,
+        workDate: date,
+        startTime: startClock,
+        endTime: endClock,
+        maxStaff: 1,
+        note: request.reason?.trim() || null,
+        dayOfWeek: getWeekDayForDate(date),
+      }),
+    );
+    const assignment = await manager.save(
+      ShiftAssignment,
+      manager.create(ShiftAssignment, {
+        shiftSlotId: slot.id,
+        employeeId: request.employeeProfileId,
+        status: ShiftAssignmentStatus.APPROVED,
+        note: 'Bổ sung công',
+      }),
+    );
+    return { assignment, slot };
+  }
+
+  /**
+   * Chặn bổ sung công khi người này đã có đơn nghỉ cả ngày / theo giờ ĐÃ DUYỆT
+   * phủ khung A–B ngày D (R7). Chưa có ca nên không dùng
+   * isShiftCoveredByApprovedLeave (cần assignmentId) mà kiểm theo khoảng giờ,
+   * đúng luật của findEmployeeShiftConflicts (nghỉ cả ngày xét giờ bắt đầu ca).
+   */
+  async assertNoApprovedLeaveOverSupplement(
+    this: StoresService,
+    manager: EntityManager,
+    storeId: string,
+    employeeProfileId: string,
+    date: string,
+    from: Date,
+    to: Date,
+  ): Promise<void> {
+    const rangeStart = addDays(date, -1);
+    const rangeEnd = addDays(date, 1);
+    const leaves = await manager
+      .createQueryBuilder(EmployeeLeaveRequest, 'leave')
+      .where('leave.storeId = :storeId', { storeId })
+      .andWhere('leave.employeeProfileId = :employeeProfileId', {
+        employeeProfileId,
+      })
+      .andWhere('leave.status = :approved', {
+        approved: LeaveRequestStatus.APPROVED,
+      })
+      .andWhere('leave.type IN (:...types)', { types: BLOCKING_LEAVE_TYPE_VALUES })
+      .andWhere('leave.startDate <= :rangeEnd', { rangeEnd })
+      .andWhere('leave.endDate >= :rangeStart', { rangeStart })
+      .getMany();
+    const leaveIntervals: ShiftInterval[] = leaves.flatMap((leave) =>
+      toBlockingLeaveIntervals(leave, rangeStart, rangeEnd),
+    );
+    // Khung bổ sung dạng khoảng giờ (qua đêm thì +24h như ca).
+    const proposed = toShiftInterval(date, vnClockHHmm(from), vnClockHHmm(to));
+    if (leaveBlocksShifts([proposed], leaveIntervals)) {
+      throw new BadRequestException(
+        'Ca này đang có đơn nghỉ đã duyệt, không bổ sung công được',
+      );
+    }
   }
 
   /** Whether `id` is an overtime ("bổ sung công") request, not a leave row. */
@@ -2845,22 +3278,77 @@ export class StoresRequestsPart {
   }
 
   /**
-   * End of the approved overtime of an assignment, as an instant, or null.
-   * Only this extends paid time past the shift end.
+   * End of the paid time of an assignment past its shift end, as an instant, or
+   * null. Two sources extend it (R2):
+   *  - the assignment's own APPROVED overtime ("Xin tăng ca", gắn ca);
+   *  - APPROVED "Bổ sung công" rows (shiftAssignmentId NULL) that credited the
+   *    SAME slot for the SAME employee — the employee filter is MANDATORY
+   *    because a slot can be shared by several people.
+   * Returns the max. With neither, identical to before (null, or the overtime
+   * end), so every existing caller is unchanged for assignments without a
+   * supplement.
    */
   async approvedOvertimeEnd(
     this: StoresService,
     assignmentId: string,
     shiftEnd: Date | null,
+    // MINOR 3: caller đã có assignment thì truyền slot + nhân viên để bỏ findOne.
+    context?: { shiftSlotId: string | null; employeeId: string } | null,
+    // Lock-holding callers (creditSupplementAssignment) pass their manager so
+    // these reads stay on the transaction connection, not a new pooled one.
+    manager?: EntityManager,
   ): Promise<Date | null> {
-    const request = await this.bonusWorkRequestRepository.findOne({
+    const bonusRepo = manager
+      ? manager.getRepository(BonusWorkRequest)
+      : this.bonusWorkRequestRepository;
+    const assignmentRepo = manager
+      ? manager.getRepository(ShiftAssignment)
+      : this.shiftAssignmentRepository;
+    // Linked overtime of this assignment — unchanged query, so every existing
+    // caller without a supplement behaves exactly as before.
+    const linked = await bonusRepo.findOne({
       where: {
         shiftAssignmentId: assignmentId,
         status: BonusWorkRequestStatus.APPROVED,
       },
       order: { updatedAt: 'DESC' },
     });
-    return request ? overtimeEndAt(request, shiftEnd ?? undefined) : null;
+    let max: Date | null = linked
+      ? overtimeEndAt(linked, shiftEnd ?? undefined)
+      : null;
+    const consider = (end: Date | null) => {
+      if (end && (!max || end.getTime() > max.getTime())) max = end;
+    };
+    // APPROVED "Bổ sung công" (shiftAssignmentId NULL) that credited the SAME
+    // slot for the SAME employee also extend paid time (R2 / D2). The employee
+    // filter is MANDATORY: a slot can be shared by several people.
+    let shiftSlotId = context ? context.shiftSlotId : null;
+    let employeeId = context ? context.employeeId : null;
+    if (!context) {
+      const assignment = await assignmentRepo
+        .findOne({
+          where: { id: assignmentId },
+          select: ['id', 'shiftSlotId', 'employeeId'],
+        })
+        .catch(() => null);
+      shiftSlotId = assignment?.shiftSlotId ?? null;
+      employeeId = assignment?.employeeId ?? null;
+    }
+    if (shiftSlotId && employeeId) {
+      const supplements = await bonusRepo.find({
+        where: {
+          shiftAssignmentId: IsNull(),
+          shiftSlotId,
+          employeeProfileId: employeeId,
+          status: BonusWorkRequestStatus.APPROVED,
+        },
+      });
+      for (const row of supplements) {
+        const win = supplementWindow(row.requestDate, row.startTime, row.endTime);
+        consider(win ? win.to : null);
+      }
+    }
+    return max;
   }
 
   /**
@@ -2894,16 +3382,55 @@ export class StoresRequestsPart {
     const setting = storeId
       ? await this.timekeepingSettingRepository.findOne({ where: { storeId } })
       : null;
-    const workedMinutes = creditedWorkedMinutes({
+    const mode = await this.workedTimeModeFor(
+      storeId,
+      assignment.employeeId,
+      slot,
+    );
+    let workedMinutes = creditedWorkedMinutes({
       start,
       end,
       checkIn: new Date(assignment.checkInTime),
       checkOut: new Date(assignment.checkOutTime),
       rules: resolveAttendanceRules(setting),
       storedLateMinutes: assignment.lateMinutes,
-      paidUntil: await this.approvedOvertimeEnd(assignment.id, end),
-      mode: await this.workedTimeModeFor(storeId, assignment.employeeId, slot),
+      paidUntil: await this.approvedOvertimeEnd(assignment.id, end, {
+        shiftSlotId: assignment.shiftSlotId,
+        employeeId: assignment.employeeId,
+      }),
+      mode,
     });
+    // MODERATE 2 / R8: creditedWorkedMinutes (SHIFT mode) bỏ phần công TRƯỚC giờ
+    // bắt đầu ca mà một đơn bổ sung công đã cộng. Cộng lại theo đơn bổ sung công
+    // sớm nhất trên cùng khung + cùng nhân viên, để một lượt duyệt tăng ca sau
+    // này không âm thầm xoá phần công trước ca.
+    const supplements = await this.bonusWorkRequestRepository.find({
+      where: {
+        shiftAssignmentId: IsNull(),
+        shiftSlotId: assignment.shiftSlotId,
+        employeeProfileId: assignment.employeeId,
+        status: BonusWorkRequestStatus.APPROVED,
+      },
+    });
+    let earliest: { from: Date; to: Date } | null = null;
+    for (const supplement of supplements) {
+      const win = supplementWindow(
+        supplement.requestDate,
+        supplement.startTime,
+        supplement.endTime,
+      );
+      if (win && (!earliest || win.from.getTime() < earliest.from.getTime())) {
+        earliest = win;
+      }
+    }
+    if (earliest) {
+      workedMinutes += supplementPreStartMinutes(
+        mode,
+        start,
+        earliest.from,
+        earliest.to,
+      );
+    }
     if (workedMinutes === Number(assignment.workedMinutes)) return;
     await this.shiftAssignmentRepository.update(
       { id: assignment.id, status: ShiftAssignmentStatus.COMPLETED },

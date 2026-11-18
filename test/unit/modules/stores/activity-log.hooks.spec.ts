@@ -107,7 +107,11 @@ function attendanceService(assignment: any) {
   service.dataSource = { transaction: jest.fn(async (cb: any) => cb(manager)) };
   service.profileRepository = { update: jest.fn().mockResolvedValue({}) };
   // No approved overtime unless a test says so.
-  service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(null) };
+  service.bonusWorkRequestRepository = {
+    findOne: jest.fn().mockResolvedValue(null),
+    // approvedOvertimeEnd nay cũng xét "Bổ sung công" cùng khung ca (R2).
+    find: jest.fn().mockResolvedValue([]),
+  };
   service.appendToDailyReport = jest.fn();
   const afterAttendance = jest.fn().mockResolvedValue(undefined);
   service.ownerNotificationService = { afterAttendance };

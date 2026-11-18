@@ -61,7 +61,11 @@ function build(assignment: any, setting: Record<string, unknown> | null) {
   service.dataSource = { transaction: jest.fn(async (cb: any) => cb(manager)) };
   service.profileRepository = { update: jest.fn().mockResolvedValue({}) };
   // No approved overtime unless a test says so.
-  service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(null) };
+  service.bonusWorkRequestRepository = {
+    findOne: jest.fn().mockResolvedValue(null),
+    // approvedOvertimeEnd nay cũng xét "Bổ sung công" cùng khung ca (R2).
+    find: jest.fn().mockResolvedValue([]),
+  };
   service.appendToDailyReport = jest.fn();
   // Check-out hands payroll and the shift-end workflow off after commit.
   service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
@@ -344,7 +348,10 @@ describe('overtime decided after the employee checked out', () => {
       update: jest.fn().mockResolvedValue({ affected: 1 }),
     };
     service.timekeepingSettingRepository = { findOne: jest.fn().mockResolvedValue(null) };
-    service.bonusWorkRequestRepository = { findOne: jest.fn().mockResolvedValue(approved) };
+    service.bonusWorkRequestRepository = {
+      findOne: jest.fn().mockResolvedValue(approved),
+      find: jest.fn().mockResolvedValue([]),
+    };
     service.processCheckoutPayroll = jest.fn().mockResolvedValue(undefined);
     return service;
   };

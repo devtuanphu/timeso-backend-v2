@@ -91,6 +91,7 @@ import {
   getWeekDayForDate,
   matchesShiftRecurrence,
   parseDateOnly,
+  singleDayCycleFields,
 } from '../shift-schedule.utils';
 import { parseVietnamShiftStart } from '../shift-reminder.utils';
 import { AUTHORIZED_ABSENCE_LEAVE_TYPES } from '../leave-coverage.utils';
@@ -3634,21 +3635,32 @@ export class StoresSchedulingPart {
   }
 
   /**
-   * Chủ đổi giờ ca của MỘT nhân viên (Lịch làm → Chỉnh sửa ca), rồi báo cho
-   * người đó. Giờ ca nằm ở khung ca (slot) dùng chung: khung chỉ có người này
-   * thì sửa thẳng giờ khung; còn người khác cùng khung thì tách người này sang
-   * một khung mới cùng ngày, cùng mẫu ca, giờ mới (1 chỗ) và bớt 1 chỗ ở khung
-   * cũ, nên người còn lại giữ nguyên giờ. Mọi nơi đọc giờ ca (chấm công, trễ /
-   * sớm, lương, nhắc ca, lịch nhân viên) đều đọc giờ của khung nên không phải
-   * đổi gì thêm.
+   * Chủ đổi giờ — và/hoặc DỜI NGÀY — ca của MỘT nhân viên (Lịch làm → Chỉnh sửa
+   * ca), rồi báo cho người đó. Giờ / ngày ca nằm ở khung ca (slot) dùng chung:
+   * khung chỉ có người này thì sửa thẳng khung; còn người khác cùng khung thì
+   * tách người này sang một khung mới (ngày mới, 1 chỗ) và bớt 1 chỗ ở khung cũ,
+   * nên người còn lại giữ nguyên. Mọi nơi đọc giờ / ngày ca (chấm công, trễ /
+   * sớm, lương, nhắc ca, lịch nhân viên) đều đọc từ khung nên không phải đổi gì.
    *
-   * Chỉ cho ca chưa chấm công vào (đã chấm thì giờ đã tính trễ / lương theo
-   * giờ cũ). Trùng giờ với ca khác hoặc nghỉ đã duyệt của chính người đó → 409.
+   * Hợp đồng cộng thêm (bản app cũ chỉ gửi giờ nên chạy y như trước):
+   *  - `workDate` (tuỳ chọn): dời ca sang ngày đó. Bỏ trống = giữ ngày cũ.
+   *  - `note` (tuỳ chọn): ghi chú khung ca; chuỗi rỗng = xoá.
+   *
+   * Chỉ cho ca đã duyệt, chưa chấm công (đã chấm thì giờ đã tính trễ / lương).
+   * Không dời về ngày đã qua. Trùng giờ ca khác / nghỉ đã duyệt (ngày đích) → 409.
+   * Nếu ngày đích nằm NGOÀI phạm vi [startDate, endDate] của chu kỳ hiện tại thì
+   * khung chuyển sang một chu kỳ một-ngày mới (R4) để không rơi khỏi mọi bộ đọc
+   * lọc theo phạm vi chu kỳ và không bị cron hết-hạn / sinh-ca đụng tới.
    */
   async updateAssignmentTime(
     this: StoresService,
     assignmentId: string,
-    data: { startTime: string; endTime: string },
+    data: {
+      startTime: string;
+      endTime: string;
+      workDate?: string;
+      note?: string;
+    },
     ownerAccountId?: string,
   ) {
     if (!ownerAccountId) {
@@ -3668,6 +3680,12 @@ export class StoresSchedulingPart {
       throw new NotFoundException('Không tìm thấy ca của nhân viên');
     }
     await this.assertOwnerStoreAccess(storeId, ownerAccountId);
+
+    const noteProvided = data.note !== undefined;
+    // undefined = giữ ghi chú cũ; chuỗi rỗng (sau trim) = xoá.
+    const nextNote = noteProvided
+      ? String(data.note).trim() || null
+      : undefined;
 
     const result = await this.dataSource.transaction(async (manager) => {
       await lockStoreShiftAvailability(manager, storeId);
@@ -3704,13 +3722,21 @@ export class StoresSchedulingPart {
         lock: { mode: 'pessimistic_write' },
       });
       if (!slot) throw new NotFoundException('Không tìm thấy khung ca');
-      const workDate = String(slot.workDate).slice(0, 10);
+      const oldWorkDate = String(slot.workDate).slice(0, 10);
+      const targetDate = data.workDate ? data.workDate : oldWorkDate;
+      // Dời về ngày đã qua = chấm công ngược quá khứ: không cho. Chỉ xét khi
+      // ngày thật sự đổi: bản app cũ chỉ gửi giờ, đổi giờ một ca cũ vẫn chạy
+      // như trước.
+      if (targetDate !== oldWorkDate && targetDate < getTodayDateString()) {
+        throw new BadRequestException('Không chuyển ca về ngày đã qua');
+      }
+      const targetDow = getWeekDayForDate(targetDate);
 
       const conflicts = await this.findEmployeeShiftConflicts(
         manager,
         storeId,
         assignment.employeeId,
-        [workDate],
+        [targetDate],
         data.startTime,
         data.endTime,
         assignment.id,
@@ -3726,6 +3752,52 @@ export class StoresSchedulingPart {
         });
       }
 
+      // R4: ngày đích ngoài phạm vi chu kỳ → chuyển khung sang một chu kỳ
+      // một-ngày mới (ACTIVE, recurrence_rule khác null). Trong phạm vi → giữ.
+      let targetCycleId = slot.cycleId;
+      if (targetDate !== oldWorkDate) {
+        const cycle = await manager.findOne(WorkCycle, {
+          where: { id: slot.cycleId },
+        });
+        if (!cycle) throw new NotFoundException('Không tìm thấy chu kỳ ca');
+        // Chu kỳ do cron sinh ca quản lý thì không đổi ngày được: dời khung đi
+        // sẽ bị generateDailySlotsForAllCycles (chu kỳ recurrence_rule IS NULL)
+        // tạo lại khung trên ngày CŨ, còn chu kỳ INDEFINITE do
+        // generateDailySlotsForIndefiniteCycles sinh tiếp theo mẫu. Chỉ chặn đổi
+        // NGÀY; đổi giờ tại chỗ vẫn cho.
+        if (
+          cycle.recurrenceRule === null ||
+          cycle.cycleType === CycleType.INDEFINITE
+        ) {
+          throw new ConflictException({
+            code: 'ASSIGNMENT_DATE_LOCKED',
+            message:
+              'Ca thuộc lịch lặp tự động nên không đổi ngày được. Hãy xoá ca này rồi tạo ca mới vào ngày khác.',
+          });
+        }
+        const start = String(cycle.startDate).slice(0, 10);
+        const end = cycle.endDate ? String(cycle.endDate).slice(0, 10) : null;
+        const outsideRange =
+          targetDate < start || (end !== null && targetDate > end);
+        if (outsideRange) {
+          const fields = singleDayCycleFields(targetDate);
+          const newCycle = await manager.save(
+            WorkCycle,
+            manager.create(WorkCycle, {
+              storeId,
+              name: cycle?.name ?? 'Ca dời ngày',
+              cycleType: fields.cycleType,
+              startDate: fields.startDate,
+              endDate: fields.endDate,
+              status: WorkCycleStatus.ACTIVE,
+              workShiftId: slot.workShiftId,
+              recurrenceRule: fields.recurrenceRule,
+            }),
+          );
+          targetCycleId = newCycle.id;
+        }
+      }
+
       const others = await manager.count(ShiftAssignment, {
         where: {
           shiftSlotId: slot.id,
@@ -3734,27 +3806,37 @@ export class StoresSchedulingPart {
         },
       });
       // Sửa thẳng khung chỉ khi khung đúng một chỗ: khung còn chỗ trống thì
-      // người đăng ký sau sẽ nhận luôn giờ mới của riêng người này.
+      // người đăng ký sau sẽ nhận luôn giờ / ngày mới của riêng người này.
       if (others === 0 && Number(slot.maxStaff) === 1) {
         await manager.update(ShiftSlot, slot.id, {
+          workDate: targetDate,
+          dayOfWeek: targetDow,
           startTime: data.startTime,
           endTime: data.endTime,
+          ...(noteProvided ? { note: nextNote } : {}),
+          ...(targetCycleId !== slot.cycleId ? { cycleId: targetCycleId } : {}),
         });
-        return { slotId: slot.id, split: false };
+        return {
+          slotId: slot.id,
+          split: false,
+          workDate: targetDate,
+          note: noteProvided ? nextNote : (slot.note ?? null),
+        };
       }
 
       const created = await manager.save(
         ShiftSlot,
         manager.create(ShiftSlot, {
-          cycleId: slot.cycleId,
+          cycleId: targetCycleId,
           workShiftId: slot.workShiftId,
-          workDate: slot.workDate,
+          workDate: targetDate,
           startTime: data.startTime,
           endTime: data.endTime,
           maxStaff: 1,
-          note: slot.note,
+          // Khung tách: ghi chú mới nếu có, không thì theo khung cũ.
+          note: noteProvided ? nextNote : slot.note,
           location: slot.location,
-          dayOfWeek: slot.dayOfWeek,
+          dayOfWeek: targetDow,
         }),
       );
       await manager.update(ShiftAssignment, assignment.id, {
@@ -3768,7 +3850,12 @@ export class StoresSchedulingPart {
           maxStaff: Math.max(previousMax - 1, others, 1),
         });
       }
-      return { slotId: created.id, split: true };
+      return {
+        slotId: created.id,
+        split: true,
+        workDate: targetDate,
+        note: noteProvided ? nextNote : (slot.note ?? null),
+      };
     });
 
     try {
@@ -3776,6 +3863,8 @@ export class StoresSchedulingPart {
     } catch {
       this.logger.error('Failed to reschedule reminders after a time change');
     }
+    // notifyEmployeesOfNewShifts đọc lại khung đã cập nhật nên nội dung
+    // 'time_changed' nêu đúng ngày mới khi ngày đổi (builder dùng workDate).
     void this.notifyEmployeesOfNewShifts([assignmentId], 'time_changed').catch(
       () => undefined,
     );
@@ -3785,6 +3874,8 @@ export class StoresSchedulingPart {
       split: result.split,
       startTime: data.startTime,
       endTime: data.endTime,
+      workDate: result.workDate,
+      note: result.note,
     };
   }
 

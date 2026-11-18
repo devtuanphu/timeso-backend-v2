@@ -214,6 +214,42 @@ export function withinGraceMinutes(
   };
 }
 
+/**
+ * Khung giờ của một đơn "Bổ sung công" (ngày D, giờ vào A, giờ ra B theo giờ
+ * Việt Nam) thành hai mốc tuyệt đối {from, to}. B ≤ A được hiểu là qua đêm
+ * (cộng 24h), đúng quy ước giờ ca qua đêm ở `resolveShiftBoundaries`. Trả `null`
+ * khi ngày / giờ không hợp lệ.
+ *
+ * Dùng chung ở hai nơi để một đơn không bao giờ có khung giờ "hợp lệ lúc tạo
+ * nhưng lệch lúc duyệt": lúc tạo đơn (chặn khung giờ chưa qua) và lúc duyệt đơn
+ * / tính giờ được trả sau giờ tan ca.
+ */
+export function supplementWindow(
+  date: string | null | undefined,
+  start: string | null | undefined,
+  end: string | null | undefined,
+): { from: Date; to: Date } | null {
+  if (!date || !DATE_PATTERN.test(String(date).slice(0, 10))) return null;
+  const day = String(date).slice(0, 10);
+  const clock = (raw: string | null | undefined): string | null => {
+    const match = /^(\d{1,2}):([0-5]\d)(?::([0-5]\d))?$/.exec(
+      String(raw ?? '').trim(),
+    );
+    if (!match) return null;
+    const hour = Number(match[1]);
+    if (hour > 23) return null;
+    return `${match[1].padStart(2, '0')}:${match[2]}${match[3] ? `:${match[3]}` : ''}`;
+  };
+  const fromClock = clock(start);
+  const toClock = clock(end);
+  if (!fromClock || !toClock) return null;
+  const from = toInstant(day, fromClock);
+  let to = toInstant(day, toClock);
+  if (!from || !to) return null;
+  if (to.getTime() <= from.getTime()) to = new Date(to.getTime() + DAY_MS);
+  return { from, to };
+}
+
 /** 90 -> "1 giờ 30 phút", 120 -> "2 giờ", 45 -> "45 phút". */
 export const formatDurationVi = (minutes: number): string => {
   const total = Math.max(0, Math.round(minutes));

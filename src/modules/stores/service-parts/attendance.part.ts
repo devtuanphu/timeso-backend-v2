@@ -203,10 +203,16 @@ export class StoresAttendancePart {
   async loadWorkedTimeRules(
     this: StoresService,
     storeId: string | null | undefined,
+    // Inside a lock-holding transaction, pass the manager so this read uses the
+    // transaction connection instead of grabbing a new pooled one.
+    manager?: EntityManager,
   ): Promise<StoreWorkedTimeRule[]> {
-    if (!storeId || !this.workedTimeRuleRepository) return [];
+    const repository = manager
+      ? manager.getRepository(StoreWorkedTimeRule)
+      : this.workedTimeRuleRepository;
+    if (!storeId || !repository) return [];
     try {
-      return await this.workedTimeRuleRepository.find({
+      return await repository.find({
         where: { storeId },
         withDeleted: true,
         order: { createdAt: 'ASC' },
@@ -447,6 +453,9 @@ export class StoresAttendancePart {
         }
       | null
       | undefined,
+    // Inside a lock-holding transaction, pass the manager so the rule read runs
+    // on the transaction connection (threaded to loadWorkedTimeRules).
+    manager?: EntityManager,
   ): Promise<WorkedTimeMode> {
     const key = shiftStartKey(
       slot?.workDate,
@@ -455,7 +464,7 @@ export class StoresAttendancePart {
     // No work date: count strictly to the schedule.
     if (!key) return 'SHIFT';
     return resolveWorkedTimeMode(
-      await this.loadWorkedTimeRules(storeId),
+      await this.loadWorkedTimeRules(storeId, manager),
       employeeProfileId,
       key,
     );
@@ -1898,6 +1907,7 @@ export class StoresAttendancePart {
     const paidUntil = await this.approvedOvertimeEnd(
       assignmentId,
       effectiveWindowOf(assignment).end,
+      { shiftSlotId: assignment.shiftSlotId, employeeId: assignment.employeeId },
     );
     const mode = await this.workedTimeModeFor(
       storeId,
@@ -2337,6 +2347,10 @@ export class StoresAttendancePart {
       const paidUntil = await this.approvedOvertimeEnd(
         assignment.id,
         window.end,
+        {
+          shiftSlotId: assignment.shiftSlotId,
+          employeeId: assignment.employeeId,
+        },
       );
       // As the check-out pays it: a store that does not deduct late time
       // counts from the start anyway.
