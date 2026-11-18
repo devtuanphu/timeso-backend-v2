@@ -29,7 +29,12 @@ describe('application database configuration', () => {
     const options = createAppTypeOrmOptions(createConfigService());
 
     expect(options.synchronize).toBe(false);
-    expect(options.extra).toBeUndefined();
+    // Pool deadlock safety net: a bounded acquire timeout plus a server-side
+    // idle-in-transaction timeout are always present (pool max untouched).
+    expect(options.extra).toEqual({
+      connectionTimeoutMillis: 60000,
+      options: '-c idle_in_transaction_session_timeout=600000',
+    });
   });
 
   it('disables synchronization and makes PostgreSQL sessions read-only when opted in', () => {
@@ -38,8 +43,12 @@ describe('application database configuration', () => {
 
     expect(isAppReadOnlyMode(configService)).toBe(true);
     expect(options.synchronize).toBe(false);
+    // Read-only keeps its flag AND gains the idle-in-transaction timeout; both
+    // `-c` parameters must survive, alongside the acquire timeout.
     expect(options.extra).toEqual({
-      options: '-c default_transaction_read_only=on',
+      connectionTimeoutMillis: 60000,
+      options:
+        '-c default_transaction_read_only=on -c idle_in_transaction_session_timeout=600000',
     });
   });
 

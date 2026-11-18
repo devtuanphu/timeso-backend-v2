@@ -27,6 +27,21 @@ const resolveSchemaMode = (configService: ConfigService): SchemaMode => {
   throw new Error('DATABASE_SCHEMA_MODE must be managed or bootstrap');
 };
 
+/**
+ * A positive-integer env override, or the default when unset or invalid
+ * (empty, non-numeric, zero, negative, fractional, non-finite).
+ */
+const positiveIntEnv = (
+  configService: ConfigService,
+  key: string,
+  fallback: number,
+): number => {
+  const raw = configService.get<string | number>(key);
+  if (raw === undefined || raw === null || raw === '') return fallback;
+  const value = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+};
+
 const canBootstrapSchema = (configService: ConfigService): boolean => {
   const environment = normalizeEnvironment(
     configService.get<string>('NODE_ENV'),
@@ -52,6 +67,27 @@ export const createAppTypeOrmOptions = (
     );
   }
 
+  // Safety net for a future pool deadlock: cap how long a query waits for a
+  // free pooled connection, and let Postgres kill a connection left "idle in
+  // transaction". Without these the backend hangs for hours instead of
+  // self-healing (see the 2026-11-17 incident). Pool `max` is left untouched.
+  const acquireTimeoutMs = positiveIntEnv(
+    configService,
+    'DATABASE_POOL_ACQUIRE_TIMEOUT_MS',
+    60000,
+  );
+  const idleInTxTimeoutMs = positiveIntEnv(
+    configService,
+    'DATABASE_IDLE_IN_TX_TIMEOUT_MS',
+    600000,
+  );
+  // Both `-c` flags must survive in read-only mode, so compose `options` from
+  // the (optional) read-only flag plus the idle-in-transaction timeout.
+  const options = [
+    ...(readOnly ? ['-c default_transaction_read_only=on'] : []),
+    `-c idle_in_transaction_session_timeout=${idleInTxTimeoutMs}`,
+  ].join(' ');
+
   return {
     type: 'postgres',
     host: configService.get<string>('DATABASE_HOST'),
@@ -61,12 +97,9 @@ export const createAppTypeOrmOptions = (
     database: configService.get<string>('DATABASE_NAME'),
     autoLoadEntities: true,
     synchronize: schemaMode === 'bootstrap',
-    ...(readOnly
-      ? {
-          extra: {
-            options: '-c default_transaction_read_only=on',
-          },
-        }
-      : {}),
+    extra: {
+      connectionTimeoutMillis: acquireTimeoutMs,
+      options,
+    },
   };
 };

@@ -228,7 +228,12 @@ export class StoresAttendanceController {
         orientationNormalized: body.orientationNormalized === 'true',
       },
     );
-    if (result.matched) {
+    // A duplicate submit (`alreadyRecorded: true`) returns the SAME body as the
+    // first one but must NOT fan out background work again: one real check-in
+    // followed by a burst of retries used to fire N shift-end workflows and N
+    // payslip recomputes, each taking the per-(store, month) payroll advisory
+    // lock, which exhausted the DB pool and hung the whole backend.
+    if (result.matched && !(result as { alreadyRecorded?: boolean }).alreadyRecorded) {
       void this.shiftEndWorkflowService
         .scheduleForAssignment(id)
         .catch((error) =>
@@ -295,7 +300,10 @@ export class StoresAttendanceController {
       },
     );
 
-    if (result.matched) {
+    // Duplicate check-out submits (`alreadyRecorded: true`) echo the first
+    // body but must not re-run the shift-end workflow or re-enqueue payroll;
+    // same fan-out hazard as check-in above.
+    if (result.matched && !(result as { alreadyRecorded?: boolean }).alreadyRecorded) {
       // Unguarded, this was the only floating promise in the file without a
       // handler; an unhandled rejection terminates the process by default on
       // Node >= 15, on one of the hottest employee-facing routes.

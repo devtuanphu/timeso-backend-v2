@@ -42,6 +42,7 @@ import {
   PaymentType,
 } from '../entities/employee-contract.entity';
 import { MonthlyPayroll } from '../entities/monthly-payroll.entity';
+import { StoreProbationSetting } from '../entities/store-probation-setting.entity';
 import {
   PayslipBuiltinRow,
   PayslipRowSign,
@@ -1091,10 +1092,17 @@ export class StoresPayrollPart {
     this: StoresService,
     employeeProfileId: string,
     workDate: string,
+    // Callers inside a transaction holding a lock must pass their manager so
+    // this read stays on the transaction connection and never contends for a
+    // new pooled one (deadlock risk); other callers keep the default pool.
+    manager?: EntityManager,
   ) {
     const month = vnMonthOfDateString(workDate);
     if (!month) throw new BadRequestException('Ngày không hợp lệ');
-    const payslip = await this.employeeSalaryRepository.findOne({
+    const repository = manager
+      ? manager.getRepository(EmployeeSalary)
+      : this.employeeSalaryRepository;
+    const payslip = await repository.findOne({
       where: { employeeProfileId, month: toMonthMarker(month) },
     });
     if (payslip && this.isProtectedPayslip(payslip)) {
@@ -3124,14 +3132,19 @@ export class StoresPayrollPart {
     floor: Date | null,
     manager?: EntityManager,
   ): Promise<{ count: number; amount: number } | undefined> {
-    const setting = await this.probationSettingRepository.findOne({
+    // Deadlock fix: the probation read must run on the same connection as the
+    // career-events query below. Inside a payroll-lock transaction the default
+    // repository (this.probationSettingRepository) reaches for a NEW pooled
+    // connection; with the pool exhausted by the transactions queued on the
+    // advisory lock, the lock holder then waits forever for a connection.
+    const db = manager ?? this.dataSource.manager;
+    const setting = await db.getRepository(StoreProbationSetting).findOne({
       where: { storeId, isActive: true },
     });
     const amount = setting?.enableCompletionBonus
       ? Number(setting.completionBonus) || 0
       : 0;
     if (amount <= 0) return undefined;
-    const db = manager ?? this.dataSource.manager;
     const start = new Date(`${month.key}T00:00:00+07:00`);
     const from = floor && floor.getTime() > start.getTime() ? floor : start;
     const rows: Array<{ count: string }> = await db.query(
