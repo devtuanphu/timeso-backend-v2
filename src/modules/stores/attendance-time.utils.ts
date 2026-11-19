@@ -1,3 +1,4 @@
+import { ConflictException } from '@nestjs/common';
 import { vnDateString } from '../../common/utils/vn-calendar';
 /**
  * Absolute shift boundaries for attendance maths.
@@ -55,6 +56,66 @@ export function resolveShiftBoundaries(
     end = new Date(end.getTime() + DAY_MS);
   }
   return { start, end };
+}
+
+/**
+ * Normalises a `work_date` value (a plain 'YYYY-MM-DD' string, or a Date the
+ * driver parsed to local midnight) to 'YYYY-MM-DD'. Returns null when it cannot
+ * be read, so the ended guard below falls back to "cannot decide".
+ */
+function toWorkDateString(
+  workDate: string | Date | null | undefined,
+): string | null {
+  if (!workDate) return null;
+  if (workDate instanceof Date) {
+    if (Number.isNaN(workDate.getTime())) return null;
+    return [
+      workDate.getFullYear(),
+      String(workDate.getMonth() + 1).padStart(2, '0'),
+      String(workDate.getDate()).padStart(2, '0'),
+    ].join('-');
+  }
+  const day = String(workDate).slice(0, 10);
+  return DATE_PATTERN.test(day) ? day : null;
+}
+
+/**
+ * Whether a shift's planned end (slot override times, else the work-shift
+ * template's) is at or before `now`. Overnight shifts roll the end to the next
+ * day, anchored at +07:00 by `resolveShiftBoundaries`. An unknown work date or
+ * end time yields false — a boundary we cannot resolve is never treated as
+ * ended, so management of those slots is not accidentally blocked.
+ */
+export function isShiftEnded(
+  workDate: string | Date | null | undefined,
+  startTime?: string | null,
+  endTime?: string | null,
+  now: Date = new Date(),
+): boolean {
+  const day = toWorkDateString(workDate);
+  if (!day) return false;
+  const { end } = resolveShiftBoundaries(day, startTime, endTime);
+  return end != null && end.getTime() <= now.getTime();
+}
+
+/**
+ * Guards an owner management mutation against a shift whose planned end has
+ * already passed. A no-op when the work date / times are missing (cannot
+ * decide, so do not block). Throws a 409 with a stable code so the owner app
+ * can surface the reason.
+ */
+export function assertShiftNotEnded(
+  workDate: string | Date | null | undefined,
+  startTime?: string | null,
+  endTime?: string | null,
+  now: Date = new Date(),
+): void {
+  if (isShiftEnded(workDate, startTime, endTime, now)) {
+    throw new ConflictException({
+      code: 'SHIFT_ALREADY_ENDED',
+      message: 'Ca đã kết thúc, không thể chỉnh sửa',
+    });
+  }
 }
 
 /**

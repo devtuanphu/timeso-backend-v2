@@ -2637,7 +2637,9 @@ export class StoresAttendancePart {
         effectiveStartAt: window.start?.toISOString() ?? null,
         effectiveEndAt: window.end?.toISOString() ?? null,
         lateApproved: !!assignment.adjustedStartAt,
-        earlyLeaveApproved: !!assignment.adjustedEndAt,
+        // Giờ kết thúc riêng có thể do chủ kéo dài ca đang làm: chỉ là "về sớm
+        // đã duyệt" khi gắn với đơn về sớm.
+        earlyLeaveApproved: !!assignment.adjustedEndAt && !!assignment.earlyRequestId,
         workDate: slot?.workDate || todayStr,
         // Mới (cộng thêm): ca thuộc ngày mai (ca 00:00 đã mở check-in từ tối
         // nay) và mốc được check-in, để app ghi "Ca ngày mai, vào từ 23:45".

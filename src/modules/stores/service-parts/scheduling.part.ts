@@ -123,12 +123,23 @@ import { wageRateForShift } from '../wage-rates.utils';
 import { effectiveWindowOf } from '../attendance-time.utils';
 import { countWorkingDaysInMonth } from '../working-days.utils';
 import {
+  vnClockHHmm,
   vnDateString,
   vnMiddayInstant,
   vnMonthOfDateString,
 } from '../../../common/utils/vn-calendar';
-import { resolveShiftBoundaries } from '../attendance-time.utils';
+import {
+  BonusWorkRequest,
+  BonusWorkRequestStatus,
+} from '../entities/bonus-work-request.entity';
+import {
+  resolveShiftBoundaries,
+  assertShiftNotEnded,
+} from '../attendance-time.utils';
 import { DEFAULT_ANDROID_CHANNEL } from '../../push/push-capabilities';
+
+/** Ca đang làm đổi giờ kết thúc: dài nhất 16 giờ từ giờ bắt đầu đang áp dụng. */
+const MAX_CHECKED_IN_SHIFT_MS = 16 * 60 * 60 * 1000;
 import {
   isSlotRegistrationClosed,
   SHIFT_REGISTRATION_RANGE_PASSED_CODE,
@@ -3552,6 +3563,13 @@ export class StoresSchedulingPart {
           : await manager.findOne(WorkShift, {
               where: { id: lockedSlot.workShiftId },
             });
+      // Ca đã kết thúc (giờ dự kiến hiện tại của khung đã qua) thì không sửa
+      // được nữa — xét trên giờ / ngày CŨ, trước khi áp giờ mới.
+      assertShiftNotEnded(
+        lockedSlot.workDate,
+        lockedSlot.startTime ?? template?.startTime ?? null,
+        lockedSlot.endTime ?? template?.endTime ?? null,
+      );
       const nextStart =
         data.startTime ?? lockedSlot.startTime ?? template?.startTime ?? null;
       const nextEnd =
@@ -3696,12 +3714,31 @@ export class StoresSchedulingPart {
       if (!assignment) {
         throw new NotFoundException('Không tìm thấy ca của nhân viên');
       }
+      // Đã chấm công vào (đang làm): chỉ được đổi giờ kết thúc, xem
+      // changeCheckedInEnd. Đã chấm công ra thì không đổi gì nữa.
+      const checkedIn = !!assignment.checkInTime;
+      if (checkedIn) {
+        if (
+          assignment.checkOutTime ||
+          assignment.status !== ShiftAssignmentStatus.CONFIRMED
+        ) {
+          throw new ConflictException({
+            code: 'ASSIGNMENT_NOT_EDITABLE',
+            message: 'Đã chấm công ra, không đổi giờ ca được nữa',
+          });
+        }
+        // Giờ kết thúc đang thuộc đơn về sớm đã duyệt.
+        if (assignment.earlyRequestId) {
+          throw new ConflictException({
+            code: 'ASSIGNMENT_HAS_TIME_REQUEST',
+            message:
+              'Ca này có đơn về sớm đã duyệt. Huỷ đơn trước khi đổi giờ kết thúc.',
+          });
+        }
+      }
       // Chỉ ca đã duyệt, chưa chấm công: ca đang chờ duyệt mà bị tách khung rồi
       // bị từ chối sẽ để lại một khung riêng trống chỗ.
-      if (
-        assignment.status !== ShiftAssignmentStatus.APPROVED ||
-        assignment.checkInTime
-      ) {
+      if (!checkedIn && assignment.status !== ShiftAssignmentStatus.APPROVED) {
         throw new ConflictException({
           code: 'ASSIGNMENT_NOT_EDITABLE',
           message:
@@ -3710,7 +3747,7 @@ export class StoresSchedulingPart {
       }
       // Đơn đi trễ / về sớm đã duyệt lưu giờ hiệu lực tuyệt đối theo khung cũ:
       // đổi giờ khung thì trễ / sớm và giờ kết thúc ca sẽ tính sai.
-      if (assignment.adjustedStartAt || assignment.adjustedEndAt) {
+      if (!checkedIn && (assignment.adjustedStartAt || assignment.adjustedEndAt)) {
         throw new ConflictException({
           code: 'ASSIGNMENT_HAS_TIME_REQUEST',
           message:
@@ -3723,6 +3760,34 @@ export class StoresSchedulingPart {
       });
       if (!slot) throw new NotFoundException('Không tìm thấy khung ca');
       const oldWorkDate = String(slot.workDate).slice(0, 10);
+      // Ca đã kết thúc thì không đổi giờ / dời ngày được. Khung có thể dùng giờ
+      // của ca mẫu (startTime/endTime null) nên phải nạp mẫu để xét đúng (R1);
+      // xét trên giờ / ngày HIỆN TẠI của khung.
+      const endedTemplate =
+        slot.startTime && slot.endTime
+          ? null
+          : await manager.findOne(WorkShift, {
+              where: { id: slot.workShiftId },
+            });
+      // Người đang làm: "đã kết thúc" xét theo giờ kết thúc riêng của họ (đã
+      // kéo dài thì còn sửa được tới giờ mới) — xem changeCheckedInEnd.
+      if (checkedIn) {
+        return this.changeCheckedInEnd(manager, {
+          storeId,
+          assignment,
+          slot,
+          workDate: oldWorkDate,
+          slotStart: slot.startTime ?? endedTemplate?.startTime ?? null,
+          slotEnd: slot.endTime ?? endedTemplate?.endTime ?? null,
+          data,
+          note: noteProvided ? nextNote : undefined,
+        });
+      }
+      assertShiftNotEnded(
+        oldWorkDate,
+        slot.startTime ?? endedTemplate?.startTime ?? null,
+        slot.endTime ?? endedTemplate?.endTime ?? null,
+      );
       const targetDate = data.workDate ? data.workDate : oldWorkDate;
       // Dời về ngày đã qua = chấm công ngược quá khứ: không cho. Chỉ xét khi
       // ngày thật sự đổi: bản app cũ chỉ gửi giờ, đổi giờ một ca cũ vẫn chạy
@@ -3821,6 +3886,7 @@ export class StoresSchedulingPart {
           split: false,
           workDate: targetDate,
           note: noteProvided ? nextNote : (slot.note ?? null),
+          endOnly: false,
         };
       }
 
@@ -3855,13 +3921,18 @@ export class StoresSchedulingPart {
         split: true,
         workDate: targetDate,
         note: noteProvided ? nextNote : (slot.note ?? null),
+        endOnly: false,
       };
     });
 
-    try {
-      await this.shiftReminderService.scheduleAssignmentReminders([assignmentId]);
-    } catch {
-      this.logger.error('Failed to reschedule reminders after a time change');
+    // Ca đang làm đã qua giờ vào: không còn nhắc vào ca để xếp lại; nhắc /
+    // tự kết thúc ca do controller dời theo giờ mới (applyAdjustedEnd).
+    if (!result.endOnly) {
+      try {
+        await this.shiftReminderService.scheduleAssignmentReminders([assignmentId]);
+      } catch {
+        this.logger.error('Failed to reschedule reminders after a time change');
+      }
     }
     // notifyEmployeesOfNewShifts đọc lại khung đã cập nhật nên nội dung
     // 'time_changed' nêu đúng ngày mới khi ngày đổi (builder dùng workDate).
@@ -3876,6 +3947,141 @@ export class StoresSchedulingPart {
       endTime: data.endTime,
       workDate: result.workDate,
       note: result.note,
+      // Chỉ đổi giờ kết thúc của ca đang làm (đã chấm công vào).
+      endOnly: !!result.endOnly,
+    };
+  }
+
+  /**
+   * Ca đã chấm công vào, chưa chấm công ra: chủ chỉ được đổi GIỜ KẾT THÚC.
+   * Giờ mới lưu riêng trên lượt phân ca (adjustedEndAt — cùng chỗ đơn về sớm
+   * đã duyệt dùng), KHÔNG sửa / tách khung: khung còn người khác, và đơn "bổ
+   * sung công" / tăng ca gắn theo khung + nhân viên — tách ca người đang làm
+   * sang khung mới sẽ làm lệch các đơn đó. Mọi nơi tính giờ (tự kết thúc ca,
+   * giờ công khi chấm công ra, lương, tăng ca) đọc effectiveWindowOf nên theo
+   * giờ mới; lịch nhắc / tự kết thúc ca tạo lúc chấm công vào được controller
+   * dời bằng ShiftEndWorkflowService.applyAdjustedEnd.
+   */
+  async changeCheckedInEnd(
+    this: StoresService,
+    manager: EntityManager,
+    p: {
+      storeId: string;
+      assignment: ShiftAssignment;
+      slot: ShiftSlot;
+      workDate: string;
+      slotStart: string | null;
+      slotEnd: string | null;
+      data: { startTime: string; endTime: string; workDate?: string };
+      /** undefined = giữ ghi chú khung; null = xoá. */
+      note?: string | null;
+    },
+  ) {
+    const onlyEnd = (message: string) =>
+      new ConflictException({ code: 'ASSIGNMENT_CHECKED_IN', message });
+    if (p.data.workDate && p.data.workDate !== p.workDate) {
+      throw onlyEnd('Đã chấm công vào: chỉ đổi được giờ kết thúc');
+    }
+    const window = effectiveWindowOf({
+      adjustedStartAt: p.assignment.adjustedStartAt,
+      adjustedEndAt: p.assignment.adjustedEndAt,
+      shiftSlot: { workDate: p.workDate, startTime: p.slotStart, endTime: p.slotEnd },
+    });
+    // Giờ bắt đầu gửi lên phải là giờ đang có (của khung, hoặc giờ vào đã
+    // duyệt đi trễ): đổi giờ bắt đầu sau khi đã vào ca là không được.
+    const clock = (value: string | null | undefined) => String(value ?? '').slice(0, 5);
+    const startNow = [
+      clock(p.slotStart),
+      window.start ? vnClockHHmm(window.start) : '',
+    ];
+    if (!startNow.includes(clock(p.data.startTime))) {
+      throw onlyEnd('Đã chấm công vào: chỉ đổi được giờ kết thúc');
+    }
+    const nowMs = Date.now();
+    // Hết giờ kết thúc ĐANG ÁP DỤNG cho người này thì thôi (như ca đã qua). Ca đã
+    // kéo dài giữa chừng còn sửa được tới giờ mới; kéo dài sau khi giờ của khung
+    // đã qua (chưa đổi lần nào) thì đi đơn tăng ca như trước.
+    if (window.end && window.end.getTime() <= nowMs) {
+      throw new ConflictException({
+        code: 'SHIFT_ALREADY_ENDED',
+        message: 'Ca đã kết thúc, không thể chỉnh sửa',
+      });
+    }
+    // Giờ kết thúc mới theo khung (qua đêm nếu nhỏ hơn giờ bắt đầu khung).
+    const { end: newEnd } = resolveShiftBoundaries(
+      p.workDate,
+      p.slotStart,
+      p.data.endTime,
+    );
+    if (!newEnd) throw new BadRequestException('Giờ kết thúc không hợp lệ');
+    if (
+      newEnd.getTime() <= nowMs ||
+      (window.start && newEnd.getTime() <= window.start.getTime())
+    ) {
+      throw new BadRequestException(
+        'Giờ kết thúc phải sau thời điểm hiện tại',
+      );
+    }
+    // Giờ nhỏ hơn giờ bắt đầu khung được hiểu là sang hôm sau: gõ nhầm 07:00 cho
+    // ca 08:00–17:00 thành ca 23 giờ. Ca làm không dài quá 16 giờ.
+    if (
+      window.start &&
+      newEnd.getTime() - window.start.getTime() > MAX_CHECKED_IN_SHIFT_MS
+    ) {
+      throw new BadRequestException('Ca làm không được dài quá 16 giờ');
+    }
+    // Đơn tăng ca đang chờ / đã duyệt giữ giờ kết thúc riêng của nó (luồng
+    // kết thúc ca chuyển sang trạng thái tăng ca): đổi giờ lúc này sẽ lệch.
+    const overtime = await manager.count(BonusWorkRequest, {
+      where: {
+        shiftAssignmentId: p.assignment.id,
+        status: In([
+          BonusWorkRequestStatus.PENDING,
+          BonusWorkRequestStatus.APPROVED,
+        ]),
+      },
+    });
+    if (overtime > 0) {
+      throw new ConflictException({
+        code: 'ASSIGNMENT_HAS_OVERTIME',
+        message:
+          'Ca đang có đơn tăng ca, không đổi giờ kết thúc được.',
+      });
+    }
+    const conflicts = await this.findEmployeeShiftConflicts(
+      manager,
+      p.storeId,
+      p.assignment.employeeId,
+      [p.workDate],
+      clock(p.slotStart),
+      p.data.endTime,
+      p.assignment.id,
+    );
+    if (conflicts.length) {
+      throw new ConflictException({
+        code: 'ASSIGNMENT_TIME_CONFLICT',
+        message:
+          conflicts[0].reason === 'LEAVE'
+            ? 'Nhân viên có lịch nghỉ đã duyệt trùng khung giờ này'
+            : 'Nhân viên đã có ca khác trùng khung giờ này',
+        conflicts,
+      });
+    }
+    // Luôn ghi (kể cả khi trùng giờ kết thúc của khung) để applyAdjustedEnd
+    // dời lịch kết thúc ca về đúng giờ này.
+    await manager.update(ShiftAssignment, p.assignment.id, {
+      adjustedEndAt: newEnd,
+    });
+    // Ghi chú đi kèm (ghi chú là của khung, như "Chỉnh sửa ca" vẫn lưu).
+    if (p.note !== undefined) {
+      await manager.update(ShiftSlot, p.slot.id, { note: p.note });
+    }
+    return {
+      slotId: p.slot.id,
+      split: false,
+      workDate: p.workDate,
+      note: p.note !== undefined ? p.note : (p.slot.note ?? null),
+      endOnly: true,
     };
   }
 
@@ -3908,6 +4114,20 @@ export class StoresSchedulingPart {
         store.ownerAccountId !== ownerAccountId
       ) {
         throw new ForbiddenException('Bạn không có quyền xóa slot này');
+      }
+      // Ca đã kết thúc thì không xoá qua đường quản lý ca. Chỉ chặn ở đây, không
+      // chặn removeShiftSlotsWithin (cron hết hạn / nghỉ việc vẫn gọi trực
+      // tiếp). Không tìm thấy slot thì giữ nguyên hành vi cũ (xoá no-op).
+      const slot = await manager.findOne(ShiftSlot, {
+        where: { id: slotId },
+        relations: ['workShift'],
+      });
+      if (slot) {
+        assertShiftNotEnded(
+          slot.workDate,
+          slot.startTime ?? slot.workShift?.startTime ?? null,
+          slot.endTime ?? slot.workShift?.endTime ?? null,
+        );
       }
       await this.removeShiftSlotsWithin(manager, [slotId]);
     });
@@ -4544,7 +4764,8 @@ export class StoresSchedulingPart {
         }
 
         // Staff cannot sign up for a slot that already started or is in the
-        // past (VN time). The owner can still assign to fix records.
+        // past (VN time). The owner can still assign to fix records, but only
+        // until the shift has ended.
         if (
           !authorizedOwnerAssign &&
           isSlotRegistrationClosed(slot, workShift, now)
@@ -4553,6 +4774,16 @@ export class StoresSchedulingPart {
             code: SLOT_REGISTRATION_CLOSED_CODE,
             message: SLOT_REGISTRATION_CLOSED_MESSAGE,
           });
+        }
+        // Owner assign: allowed on a started / past slot (to fix records) but
+        // not once the shift has actually ended.
+        if (authorizedOwnerAssign) {
+          assertShiftNotEnded(
+            slot.workDate,
+            slot.startTime ?? workShift?.startTime ?? null,
+            slot.endTime ?? workShift?.endTime ?? null,
+            now,
+          );
         }
 
         // Check capacity (0 or null = unlimited)
@@ -4746,7 +4977,12 @@ export class StoresSchedulingPart {
         const shifts = list.map((a) => ({
           workDate: a.shiftSlot.workDate,
           startTime: a.shiftSlot.startTime || a.shiftSlot.workShift?.startTime,
-          endTime: a.shiftSlot.endTime || a.shiftSlot.workShift?.endTime,
+          // Đổi giờ kết thúc ca đang làm lưu riêng trên lượt phân ca
+          // (adjustedEndAt): thông báo nêu giờ kết thúc mới, không phải của khung.
+          endTime:
+            kind === 'time_changed' && a.adjustedEndAt
+              ? vnClockHHmm(new Date(a.adjustedEndAt))
+              : a.shiftSlot.endTime || a.shiftSlot.workShift?.endTime,
           shiftName: a.shiftSlot.workShift?.shiftName,
         }));
         const { title, content } = buildShiftNotification(kind, shifts);
@@ -4962,6 +5198,27 @@ export class StoresSchedulingPart {
           );
         }
         const previousStatus = current.status;
+        // Gỡ người khỏi ca ĐÃ DUYỆT (APPROVED → CANCELLED) chỉ khi ca chưa kết
+        // thúc. Duyệt / từ chối đơn đăng ký (PENDING → APPROVED / CANCELLED)
+        // vẫn cho sau khi ca qua, để chủ dọn tab duyệt.
+        if (
+          previousStatus === ShiftAssignmentStatus.APPROVED &&
+          nextStatus === ShiftAssignmentStatus.CANCELLED
+        ) {
+          // Đọc lại khung ca DƯỚI khoá (theo shiftSlotId hiện tại): một lần đổi
+          // giờ / dời ngày chạy trước có thể đã đổi giờ khung hoặc tách người
+          // này sang khung mới, nên không dùng `assignment.shiftSlot` nạp ngoài
+          // transaction.
+          const lockedSlot = await manager.findOne(ShiftSlot, {
+            where: { id: current.shiftSlotId },
+            relations: ['workShift'],
+          });
+          assertShiftNotEnded(
+            lockedSlot?.workDate,
+            lockedSlot?.startTime ?? lockedSlot?.workShift?.startTime ?? null,
+            lockedSlot?.endTime ?? lockedSlot?.workShift?.endTime ?? null,
+          );
+        }
         current.status = nextStatus;
         if (note !== undefined) current.note = note;
         const saved = await manager.save(ShiftAssignment, current);

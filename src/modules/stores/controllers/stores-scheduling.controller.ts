@@ -11,6 +11,8 @@ import {
   ParseUUIDPipe,
   Query,
   NotFoundException,
+  Logger,
+  Optional,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -20,6 +22,7 @@ import {
   ApiQuery,
 } from '@nestjs/swagger';
 import { StoresService } from '../stores.service';
+import { ShiftEndWorkflowService } from '../shift-end-workflow.service';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { StoreAccessGuard } from '../guards/store-access.guard';
 import { StoreResourceAccessGuard } from '../guards/store-resource-access.guard';
@@ -61,7 +64,15 @@ import { EstimateShiftSalariesDto } from '../dto/estimate-shift-salaries.dto';
   StoreOwnerOnlyGuard,
 )
 export class StoresSchedulingController {
-  constructor(private readonly storesService: StoresService) {}
+  private readonly logger = new Logger(StoresSchedulingController.name);
+
+  constructor(
+    private readonly storesService: StoresService,
+    // Dời nhắc / tự kết thúc ca khi chủ đổi giờ kết thúc ca đang làm. Tuỳ chọn
+    // để chỗ dựng controller không qua DI (test) vẫn chạy như trước.
+    @Optional()
+    private readonly shiftEndWorkflowService?: ShiftEndWorkflowService,
+  ) {}
 
   // Shift Registrations — MUST be BEFORE GET ':id' to avoid route conflict
   @Get('shift-registrations')
@@ -575,18 +586,32 @@ export class StoresSchedulingController {
   @ApiOperation({
     summary: 'Đổi giờ ca của một nhân viên',
     description:
-      'Chỉ ca chưa chấm công vào. Khung ca còn người khác thì tách nhân viên này sang khung mới cùng ngày; nhân viên nhận thông báo đổi giờ.',
+      'Ca chưa chấm công vào: đổi giờ / ngày; khung ca còn người khác thì tách nhân viên này sang khung mới cùng ngày. Ca đã chấm công vào (chưa ra): chỉ đổi giờ kết thúc, giờ bắt đầu / ngày giữ nguyên. Nhân viên nhận thông báo đổi giờ.',
   })
   async updateAssignmentTime(
     @Param('assignmentId') assignmentId: string,
     @Body() body: UpdateAssignmentTimeDto,
     @GetUser() user: any,
   ) {
-    return this.storesService.updateAssignmentTime(
+    const result = await this.storesService.updateAssignmentTime(
       assignmentId,
       body,
       user.userId,
     );
+    // Ca đang làm đổi giờ kết thúc: nhắc và tự kết thúc ca (đặt lúc chấm công
+    // vào theo giờ cũ) dời sang giờ mới — như đơn về sớm duyệt giữa ca.
+    if (result.endOnly && this.shiftEndWorkflowService) {
+      await this.shiftEndWorkflowService
+        .applyAdjustedEnd(assignmentId)
+        .catch((error) =>
+          this.logger.error(
+            `[updateAssignmentTime] could not move the end of assignment ${assignmentId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          ),
+        );
+    }
+    return result;
   }
 
   // ==================== SHIFT SWAP MANAGEMENT ====================

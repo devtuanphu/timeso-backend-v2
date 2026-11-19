@@ -268,6 +268,27 @@ export class ShiftEndWorkflowService {
       where: { shiftAssignmentId: assignmentId },
     });
     if (existing) {
+      // Chủ kéo dài giờ kết thúc ca đang làm (adjustedEndAt muộn hơn) mà lần dời
+      // sau khi lưu (applyAdjustedEnd) bị lỗi: cron đối soát dời theo, không để
+      // tự kết thúc ca ở giờ cũ làm mất phần giờ đã kéo dài. Chỉ dời MUỘN hơn —
+      // đơn về sớm luôn kết thúc sớm hơn và đã được applyAdjustedEnd xử lý.
+      const adjustedEnd = assignment.adjustedEndAt
+        ? new Date(assignment.adjustedEndAt)
+        : null;
+      if (
+        existing.state === ShiftEndWorkflowState.ACTIVE &&
+        adjustedEnd &&
+        adjustedEnd.getTime() > existing.effectiveEndAt.getTime()
+      ) {
+        await this.workflowRepository.update(existing.id, {
+          scheduledEndAt: adjustedEnd,
+          effectiveEndAt: adjustedEnd,
+          reminder0SentAt: null,
+          reminder5SentAt: null,
+          reminder10SentAt: null,
+        });
+        existing.effectiveEndAt = adjustedEnd;
+      }
       await this.scheduleJobs(
         assignmentId,
         existing.effectiveEndAt,
