@@ -871,7 +871,19 @@ export class AuthService {
 
       return this.login(user, resolvedAppType);
     } catch (e) {
-      throw new UnauthorizedException('Invalid refresh token');
+      // Chỉ token sai / hết hạn / đã thu hồi mới là 401 (app đăng xuất). Lỗi DB
+      // hay lỗi bất ngờ để nguyên (500): app giữ phiên và thử lại sau, không
+      // đăng xuất hàng loạt khi máy chủ trục trặc.
+      const name = (e as { name?: string } | null)?.name;
+      if (
+        e instanceof UnauthorizedException ||
+        name === 'TokenExpiredError' ||
+        name === 'JsonWebTokenError' ||
+        name === 'NotBeforeError'
+      ) {
+        throw new UnauthorizedException('Invalid refresh token');
+      }
+      throw e;
     }
   }
 }
