@@ -13,7 +13,7 @@ import {
   type ShiftRequestInfo,
 } from './shift-request-info.utils';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, LessThanOrEqual, MoreThanOrEqual, Repository } from 'typeorm';
+import { In, IsNull, LessThanOrEqual, MoreThan, MoreThanOrEqual, Not, Repository } from 'typeorm';
 import {
   ShiftSlot,
   ShiftAssignment,
@@ -37,6 +37,7 @@ import {
   StorePayrollRule,
   PayrollRuleCategory,
   PayrollCalcType,
+  PayrollRuleCode,
 } from './entities/store-payroll-rule.entity';
 import { Store } from './entities/store.entity';
 import { AttendanceLog, AttendanceLogType } from './entities/attendance-log.entity';
@@ -54,7 +55,12 @@ import {
   vnMonthOfDateString,
 } from '../../common/utils/vn-calendar';
 import { SalaryAdjustment } from './entities/salary-adjustment.entity';
-import { pickDayOwnerAssignmentIds, rulesApplyingTo } from './payroll-calculation.utils';
+import {
+  pickDayOwnerAssignmentIds,
+  rulesApplyingTo,
+  shiftExtraMinutes,
+} from './payroll-calculation.utils';
+import { estimateShiftOvertimePay } from './shift-overtime-pay.utils';
 import { stintFloor, stintStartVnDate } from './employment-stint.utils';
 import {
   computeAttendanceDeltas,
@@ -144,6 +150,13 @@ export interface ShiftSlotEmployee {
   earlyMinutes: number | null;
   workedMinutes: number | null;
   salary: number | null;
+  /**
+   * Estimated overtime pay of this one shift, the way the monthly payslip pays
+   * overtime (hourly base + the store's OVERTIME bonus rules). Null when the
+   * shift has no approved overtime request, the employee is on leave, or there
+   * is no active contract / rate. See estimateShiftOvertimePay.
+   */
+  overtimeSalary: number | null;
   assignmentId: string;
   /** Original registration state, kept separate from attendance status. */
   assignmentStatus?: ShiftAssignmentStatus;
@@ -164,6 +177,8 @@ export interface ShiftSummaryResponse {
   totalEmployees: number;
   totalRequiredEmployees: number | null;
   employeeChange: number;
+  /** Whole-people change vs the previous period (B2): current − prev. */
+  employeeDelta: number;
   totalHours: number;
   hoursChange: number;
   totalShifts: number;
@@ -368,6 +383,14 @@ const changedPlannedHours = (
     ? effect.plannedHours
     : undefined;
 
+/**
+ * Change in the number of employees with a shift between the current period
+ * and the previous one (B2): a whole-people delta, not a percent. Positive =
+ * more people this period, negative = fewer.
+ */
+export const computeEmployeeDelta = (current: number, prev: number): number =>
+  Math.round((Number(current) || 0) - (Number(prev) || 0));
+
 import { StoreWageRate } from './entities/store-wage-rate.entity';
 import {
   wageIntervalOf,
@@ -470,6 +493,7 @@ export class ShiftAggregationService {
     if (to) qb.andWhere('slot.workDate <= :to', { to });
 
     const rules = await this.loadActivePayrollRules(storeId);
+    const overtimeRules = await this.loadOvertimeRuleVersions(storeId, from);
     const daysOff = await this.loadDaysOff(storeId);
     const wageRules = await this.loadWageRules(storeId);
     // Derived staffing/type filters require hydrated slot data. Bound the
@@ -504,7 +528,15 @@ export class ShiftAggregationService {
     );
     const slots = rawSlots
       .map((slot) =>
-        this.mapSlotToResponse(slot, rules, daysOff, leavesByEmployee, effects, wageRules),
+        this.mapSlotToResponse(
+          slot,
+          rules,
+          daysOff,
+          leavesByEmployee,
+          effects,
+          wageRules,
+          overtimeRules,
+        ),
       )
       .filter((s) => !staffingStatus || s.staffingStatus === staffingStatus)
       .filter((s) => !type || s.shiftType === type);
@@ -547,6 +579,10 @@ export class ShiftAggregationService {
     if (!slot) return null;
 
     const rules = await this.loadActivePayrollRules(storeId);
+    const overtimeRules = await this.loadOvertimeRuleVersions(
+      storeId,
+      String(slot.workDate ?? '').slice(0, 10) || undefined,
+    );
     const daysOff = await this.loadDaysOff(storeId);
     const wageRules = await this.loadWageRules(storeId);
     // Same approved-request effects as the calendar (onLeave, "!", hours).
@@ -563,6 +599,7 @@ export class ShiftAggregationService {
       await this.loadApprovedLeavesForSlots([slot]),
       effects,
       wageRules,
+      overtimeRules,
     ) as ShiftDetailResponse;
     response.shiftName = slot.workShift?.shiftName || 'Ca làm việc';
     response.date = this.formatDateVn(slot.workDate);
@@ -678,6 +715,10 @@ export class ShiftAggregationService {
       totalEmployees: current.totalEmployees,
       totalRequiredEmployees: current.totalRequiredEmployees,
       employeeChange,
+      employeeDelta: computeEmployeeDelta(
+        current.totalEmployees,
+        prev.totalEmployees,
+      ),
       totalHours: Math.round(current.totalHours * 10) / 10,
       hoursChange,
       totalShifts: current.totalShifts,
@@ -1340,6 +1381,123 @@ export class ShiftAggregationService {
   }
 
   /**
+   * The wage rate and payment type `estimateAssignmentSalary` would use for an
+   * assignment — the active contract's rate, moved by the store's wage rates
+   * for the shift / position / time of day. Read-only sibling of that method
+   * (kept separate so it stays untouched), used to price one shift's overtime.
+   */
+  private assignmentWageRate(
+    a: ShiftAssignment,
+    slot: ShiftSlot | null | undefined,
+    wageRules: WageRateRule[] = [],
+  ): { rate: number; paymentType: string | null } {
+    const s = slot || a.shiftSlot;
+    const contract = (a.employee as any)?.contracts?.find(
+      (c: any) => c.isActive,
+    );
+    if (!contract) return { rate: 0, paymentType: null };
+    const base = Number(contract?.salaryAmount) || 0;
+    const unit = wageUnitOf(contract?.paymentType);
+    const rate =
+      unit && wageRules.length
+        ? wageRateForShift({
+            rules: wageRules,
+            unit,
+            fallbackRate: base,
+            shift: {
+              workShiftId: s?.workShiftId ?? null,
+              roleId: (a.employee as any)?.storeRoleId ?? null,
+              ...(() => {
+                const w = effectiveWindowOf({ ...a, shiftSlot: s ?? a.shiftSlot });
+                return { from: w.start, to: w.end };
+              })(),
+            },
+          })
+        : base;
+    return {
+      rate: Number(rate) || 0,
+      paymentType: contract.paymentType ?? null,
+    };
+  }
+
+  /**
+   * Overtime pay of one shift (B1), estimated the way the monthly payslip pays
+   * overtime. Null unless the shift has an approved overtime request that was
+   * actually worked / planned, the employee is not on leave, and there is an
+   * active contract with a rate. `rules` are the store's active payroll rules
+   * (loaded once per request); only the OVERTIME bonus versions in force on the
+   * shift's day and applying to the employee are used.
+   */
+  private assignmentOvertimeSalary(
+    a: ShiftAssignment,
+    slot: ShiftSlot,
+    effect: ShiftRequestEffects | undefined,
+    rules: StorePayrollRule[],
+    daysOff: WeekDay[] | null | undefined,
+    wageRules: WageRateRule[],
+  ): number | null {
+    const overtimeRequests = (effect?.requests ?? []).filter(
+      (r) => r.kind === 'OVERTIME',
+    );
+    const hasOvertime =
+      !!effect?.overtimeEndTime && overtimeRequests.length > 0 && !effect?.onLeave;
+    if (!hasOvertime) return null;
+
+    const { rate, paymentType } = this.assignmentWageRate(a, slot, wageRules);
+    if (rate <= 0) return null;
+
+    const window = effectiveWindowOf({ ...a, shiftSlot: slot });
+    const plannedMinutes =
+      window.start && window.end
+        ? Math.max(
+            0,
+            Math.round((window.end.getTime() - window.start.getTime()) / 60000),
+          )
+        : 0;
+
+    // Minutes of overtime M: after check-out, exactly what payroll credits
+    // (shiftExtraMinutes over the effective window, capped by worked minutes);
+    // before check-out, the approved overtime span (the last span, as
+    // plannedHours uses — never summed across spans).
+    let overtimeMinutes = 0;
+    if (a.checkInTime && a.checkOutTime) {
+      overtimeMinutes = shiftExtraMinutes(
+        {
+          checkInTime: a.checkInTime,
+          checkOutTime: a.checkOutTime,
+          windowStart: window.start,
+          windowEnd: window.end,
+        } as any,
+        Number(a.workedMinutes) || 0,
+      ).overtime;
+    } else {
+      const last = overtimeRequests[overtimeRequests.length - 1];
+      overtimeMinutes = Number(last?.minutes) || 0;
+    }
+
+    const workDate = String(slot.workDate ?? '').slice(0, 10);
+    const overtimeRules = rulesApplyingTo(
+      (rules ?? []).filter(
+        (r) =>
+          r.category === PayrollRuleCategory.BONUS &&
+          r.code === PayrollRuleCode.OVERTIME &&
+          (r.validFrom == null || String(r.validFrom).slice(0, 10) <= workDate) &&
+          (r.validTo == null || String(r.validTo).slice(0, 10) > workDate),
+      ),
+      a.employeeId,
+    );
+
+    return estimateShiftOvertimePay({
+      paymentType,
+      rate,
+      standardWorkingDays: this.workingDaysFor(workDate, daysOff),
+      plannedMinutes,
+      overtimeMinutes,
+      rules: overtimeRules,
+    });
+  }
+
+  /**
    * Approved, never checked in, not on approved leave, and either marked
    * ABSENT or past its end: payroll counts it absent and pays nothing.
    */
@@ -1524,6 +1682,44 @@ export class ShiftAggregationService {
     storeId: string,
   ): Promise<StorePayrollRule[]> {
     return this.payrollRuleRepo.find({ where: { storeId, isActive: true } });
+  }
+
+  /**
+   * Every version of the store's OVERTIME bonus rule that can be in force on a
+   * day from `from` on — the current one and the ones an edit retired (valid_to
+   * set + soft-deleted), read the way the monthly payslip reads them
+   * (loadPayrollRulesForMonth). Without the retired versions a shift dated
+   * before a coefficient change would find no rule (the new version starts
+   * later) and its overtime pay would drop to the hourly base or 0. Kept apart
+   * from loadActivePayrollRules: the FINE rules behind salaryDiff keep reading
+   * only the live rows. The per-day choice is made in assignmentOvertimeSalary.
+   */
+  private async loadOvertimeRuleVersions(
+    storeId: string,
+    from?: string,
+  ): Promise<StorePayrollRule[]> {
+    // Like loadWageRules: only an estimate rides on it, so a failed read
+    // leaves the overtime pay out instead of failing the whole calendar.
+    if (!this.payrollRuleRepo) return [];
+    const where = {
+      storeId,
+      isActive: true,
+      category: PayrollRuleCategory.BONUS,
+      code: PayrollRuleCode.OVERTIME,
+    };
+    try {
+      const rows = await this.payrollRuleRepo.find({
+        where: [
+          { ...where, deletedAt: IsNull() },
+          { ...where, validTo: from ? MoreThan(from) : Not(IsNull()) },
+        ],
+        withDeleted: true,
+      });
+      // An old soft-deleted row without valid_to was removed, not retired.
+      return (rows ?? []).filter((rule) => !(rule.deletedAt && !rule.validTo));
+    } catch {
+      return [];
+    }
   }
 
   private async assertOwnerStoreAccess(storeId: string, ownerAccountId: string): Promise<void> {
@@ -1772,6 +1968,8 @@ export class ShiftAggregationService {
     leavesByEmployee: Map<string, EmployeeLeaveRequest[]> = new Map(),
     effects: Map<string, ShiftRequestEffects> = new Map(),
     wageRules: WageRateRule[] = [],
+    /** Every OVERTIME rule version in force in the range (loadOvertimeRuleVersions). */
+    overtimeRules: StorePayrollRule[] = [],
   ): ShiftSlotResponse {
     // Approved absence: nothing planned; otherwise the hours in force.
     const plannedSalary = (a: ShiftAssignment) => {
@@ -1874,6 +2072,15 @@ export class ShiftAggregationService {
           // Lương dự kiến: đã check-out → thực nhận; chưa → ước tính từ hợp đồng.
           salary,
           salaryDiff,
+          // Tiền tăng ca ước tính của riêng ca này (theo bảng lương tháng).
+          overtimeSalary: this.assignmentOvertimeSalary(
+            a,
+            slot,
+            effect,
+            overtimeRules,
+            daysOff,
+            wageRules,
+          ),
           assignmentId: a.id,
           assignmentStatus: a.status,
           effectiveStartTime: effect?.effectiveStartTime ?? null,
