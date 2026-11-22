@@ -401,9 +401,10 @@ describe('JobApplicationService.accept', () => {
   });
 
   // N16: the accepted application is the newest thing the person told us, so
-  // gender, birthday and address replace what the account held. The name is
-  // still only filled when missing.
-  it('overwrites gender, birthday and address with the application values', async () => {
+  // gender and birthday replace what the account held. The name is still only
+  // filled when missing, and (decision 1a) an address the employee already set
+  // is never overwritten — only an empty one is filled.
+  it('overwrites gender and birthday but never an address the account already has', async () => {
     const t = build();
     employed(t);
     t.applicationRepository.findOne.mockResolvedValue({
@@ -426,7 +427,6 @@ describe('JobApplicationService.accept', () => {
     expect(t.accountsService.update).toHaveBeenCalledWith(APPLICANT, {
       gender: 'Nữ',
       birthday: '1999-03-02',
-      address: '12 Lê Lợi, Quận 1',
     });
   });
 

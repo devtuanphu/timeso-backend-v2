@@ -741,10 +741,14 @@ describe('routes', () => {
       (CustomShiftRequestController.prototype as any)[handler],
     ) !== undefined;
 
-  it('owner list/approve/reject are @StoreOwnerOnly; staff routes are not', () => {
+  it('owner list is @StoreOwnerOnly; approve/reject are delegated; staff routes are not', () => {
     expect(ownerOnly('listForOwner')).toBe(true);
-    expect(ownerOnly('approve')).toBe(true);
-    expect(ownerOnly('reject')).toBe(true);
+    // approve/reject are no longer @StoreOwnerOnly: they are delegated to the
+    // owner OR a scoped CUSTOM_SHIFT approver, enforced in the service by
+    // ApproverScopeService.assertCanApprove. StoreAccessGuard keeps the route
+    // scoped to a member of :storeId.
+    expect(ownerOnly('approve')).toBe(false);
+    expect(ownerOnly('reject')).toBe(false);
     expect(ownerOnly('create')).toBe(false);
     expect(ownerOnly('listMine')).toBe(false);
     expect(ownerOnly('cancel')).toBe(false);

@@ -36,7 +36,50 @@ import {
   BonusWorkRequest,
   BonusWorkRequestStatus,
 } from '../entities/bonus-work-request.entity';
-import { Store } from '../entities/store.entity';
+import { RequestApproverType } from '../entities/store-request-approver.entity';
+import { redactDecisionReasons } from '../approver-list-views';
+import {
+  APPROVER_INBOX_ROUTE,
+  OWNER_APPROVAL_ROUTE,
+} from '../owner-notification.utils';
+
+/** " ngày dd/mm" from a 'YYYY-MM-DD…' string, or '' when unparsable. */
+function ddmmFromDateString(value: string | null | undefined): string {
+  const [, m, d] = String(value || '')
+    .slice(0, 10)
+    .split('-');
+  return m && d ? ` ngày ${d}/${m}` : '';
+}
+
+/** The approver type a leave request belongs to (late / early / everything else). */
+function leaveApproverType(type: LeaveType): RequestApproverType {
+  if (type === LeaveType.LATE) return RequestApproverType.LATE;
+  if (type === LeaveType.EARLY) return RequestApproverType.EARLY;
+  return RequestApproverType.LEAVE;
+}
+
+/** The approver type that may decide an owner-notification kind, or null. */
+function approverTypeForOwnerKind(
+  kind: OwnerRequestKind,
+): RequestApproverType | null {
+  switch (kind) {
+    case 'LATE':
+      return RequestApproverType.LATE;
+    case 'EARLY':
+      return RequestApproverType.EARLY;
+    case 'SUDDEN':
+    case 'LEAVE':
+      return RequestApproverType.LEAVE;
+    case 'OVERTIME':
+    case 'SUPPLEMENT':
+      return RequestApproverType.BONUS_WORK;
+    case 'SALARY_ADVANCE':
+      return RequestApproverType.SALARY_ADVANCE;
+    case 'SALARY_INQUIRY':
+    default:
+      return null;
+  }
+}
 import {
   EMPLOYED_STATUSES,
   EmployeeProfile,
@@ -412,9 +455,15 @@ export class StoresRequestsPart {
       });
       if (!assignment)
         throw new NotFoundException('Không tìm thấy yêu cầu đăng ký');
-      await this.assertOwnerStoreAccess(
-        assignment.shiftSlot?.cycle?.storeId || '',
+      const registerStoreId = assignment.shiftSlot?.cycle?.storeId || '';
+      const {
+        asOwner: registerAsOwner,
+        canViewReasons: registerCanViewReasons,
+      } = await this.assertOwnerOrScopedApprover(
         accountId,
+        registerStoreId,
+        RequestApproverType.SHIFT_REGISTRATION,
+        assignment.employeeId,
       );
       if (assignment.status !== ShiftAssignmentStatus.PENDING) {
         throw new BadRequestException('Yêu cầu không còn chờ duyệt');
@@ -426,13 +475,19 @@ export class StoresRequestsPart {
           : ShiftAssignmentStatus.CANCELLED;
       const savedAssignment = await this.dataSource.transaction(
         async (manager) => {
-          const storeId = assignment.shiftSlot?.cycle?.storeId || '';
+          const storeId = registerStoreId;
           await lockStoreShiftAvailability(manager, storeId);
-          const store = await manager.findOne(Store, {
-            where: { id: storeId },
-            select: ['id', 'ownerAccountId'],
-          });
-          if (!store || store.ownerAccountId !== accountId) {
+          // R3: an approver removed/narrowed between the pre-check and this
+          // write is rejected under the lock; the owner path stays allowed.
+          if (
+            !(await this.stillOwnerOrScopedApprover(
+              registerAsOwner,
+              accountId,
+              storeId,
+              RequestApproverType.SHIFT_REGISTRATION,
+              assignment.employeeId,
+            ))
+          ) {
             throw new ForbiddenException(
               'Bạn không có quyền duyệt yêu cầu này',
             );
@@ -482,7 +537,16 @@ export class StoresRequestsPart {
         void this.notifyEmployeesOfNewShifts([savedAssignment.id], 'approved');
       }
 
-      return savedAssignment;
+      // A1/R2: the registration carries the employee's free-text `note`. On
+      // REJECT with a reason it was overwritten with the approver's own text
+      // (keep it); otherwise the note is the employee's and must be hidden from
+      // a scoped approver without can_view_reasons.
+      const registerNoteIsApprovers = status === 'REJECTED' && !!reason;
+      return redactDecisionReasons(
+        savedAssignment,
+        { asOwner: registerAsOwner, canViewReasons: registerCanViewReasons },
+        registerNoteIsApprovers ? [] : ['note'],
+      );
     } else if (type === 'SWAP') {
       const swap = await this.shiftSwapRepository.findOne({
         where: { id: requestId },
@@ -493,16 +557,17 @@ export class StoresRequestsPart {
         ],
       });
       if (!swap) throw new NotFoundException('Không tìm thấy yêu cầu đổi ca');
-      await this.assertOwnerStoreAccess(
-        swap.fromAssignment?.shiftSlot?.cycle?.storeId || '',
+      const sourceStoreId =
+        swap.fromAssignment?.shiftSlot?.cycle?.storeId || '';
+      const { asOwner: swapAsOwner } = await this.assertOwnerOrScopedApprover(
         accountId,
+        sourceStoreId,
+        RequestApproverType.SHIFT_CHANGE,
+        swap.requestedByEmployeeId,
       );
       if (swap.status !== ShiftSwapStatus.PENDING) {
         throw new BadRequestException('Yêu cầu không còn chờ duyệt');
       }
-
-      const sourceStoreId =
-        swap.fromAssignment?.shiftSlot?.cycle?.storeId || '';
       if (status === 'APPROVED') {
         const target = await this.profileRepository.findOne({
           where: {
@@ -520,11 +585,16 @@ export class StoresRequestsPart {
 
       return this.dataSource.transaction(async (manager) => {
         await lockStoreShiftAvailability(manager, sourceStoreId);
-        const store = await manager.findOne(Store, {
-          where: { id: sourceStoreId },
-          select: ['id', 'ownerAccountId'],
-        });
-        if (!store || store.ownerAccountId !== accountId) {
+        // R3: re-validate the approver under the lock (owner stays allowed).
+        if (
+          !(await this.stillOwnerOrScopedApprover(
+            swapAsOwner,
+            accountId,
+            sourceStoreId,
+            RequestApproverType.SHIFT_CHANGE,
+            swap.requestedByEmployeeId,
+          ))
+        ) {
           throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
         }
         if (status === 'APPROVED' && swap.fromAssignment) {
@@ -589,7 +659,14 @@ export class StoresRequestsPart {
         where: { id: requestId },
       });
       if (!leave) throw new NotFoundException('Không tìm thấy đơn nghỉ phép');
-      await this.assertOwnerStoreAccess(leave.storeId, accountId);
+      const leaveType = leaveApproverType(leave.type);
+      const { asOwner: leaveAsOwner, canViewReasons: leaveCanViewReasons } =
+        await this.assertOwnerOrScopedApprover(
+          accountId,
+          leave.storeId,
+          leaveType,
+          leave.employeeProfileId,
+        );
       if (leave.status !== LeaveRequestStatus.PENDING) {
         throw new BadRequestException('Yêu cầu không còn chờ duyệt');
       }
@@ -605,11 +682,16 @@ export class StoresRequestsPart {
           : LeaveRequestStatus.REJECTED;
       const processed = await this.dataSource.transaction(async (manager) => {
         await lockStoreShiftAvailability(manager, leave.storeId);
-        const store = await manager.findOne(Store, {
-          where: { id: leave.storeId },
-          select: ['id', 'ownerAccountId'],
-        });
-        if (!store || store.ownerAccountId !== accountId) {
+        // R3: re-validate the approver under the lock (owner stays allowed).
+        if (
+          !(await this.stillOwnerOrScopedApprover(
+            leaveAsOwner,
+            accountId,
+            leave.storeId,
+            leaveType,
+            leave.employeeProfileId,
+          ))
+        ) {
           throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
         }
         const result = await manager.update(
@@ -684,11 +766,17 @@ export class StoresRequestsPart {
               : leave.type === LeaveType.SUDDEN
                 ? 'SUDDEN'
                 : 'LEAVE';
+      const leaveApproverName = await this.resolveApproverName(
+        leaveAsOwner,
+        accountId,
+        leave.storeId,
+      );
       void this.notifyRequestDecision({
         employeeProfileId: leave.employeeProfileId,
         storeId: leave.storeId,
         requestId: leave.id,
         kind,
+        approverName: leaveApproverName,
         approved: nextStatus === LeaveRequestStatus.APPROVED,
         reason: status === 'REJECTED' ? reason : null,
         assignmentId: change?.assignmentId ?? leave.shiftAssignmentId ?? null,
@@ -707,7 +795,14 @@ export class StoresRequestsPart {
                 ? leave.endTime
                 : null,
       });
-      return processed;
+      // A1: strip the employee's free-text leave reason from the decision
+      // response for a scoped approver without can_view_reasons (the approver's
+      // own rejectionReason is kept).
+      return redactDecisionReasons(
+        processed,
+        { asOwner: leaveAsOwner, canViewReasons: leaveCanViewReasons },
+        ['reason'],
+      );
     }
 
     throw new BadRequestException('Loại yêu cầu không hợp lệ');
@@ -935,6 +1030,11 @@ export class StoresRequestsPart {
       time?: string | null;
       /** Scheduled end (HH:mm), for a refused overtime. */
       shiftEnd?: string | null;
+      /**
+       * The non-owner approver who decided it (N4). When set, the employee is
+       * told who decided; null (owner path) keeps the original wording.
+       */
+      approverName?: string | null;
     },
   ): Promise<void> {
     try {
@@ -963,28 +1063,34 @@ export class StoresRequestsPart {
         SUPPLEMENT: 'Đơn bổ sung công',
       }[input.kind];
       const title = `${label} ${input.approved ? 'đã được duyệt' : 'bị từ chối'}`;
+      // Owner path keeps the original "chủ cửa hàng" wording byte-identical; a
+      // scoped approver is named instead (N4).
+      const decider = input.approverName?.trim() || 'chủ cửa hàng';
+      const bySuffix = input.approverName?.trim()
+        ? ` Người duyệt: ${input.approverName.trim()}.`
+        : '';
       let content: string;
       if (!input.approved) {
         content =
           input.kind === 'OVERTIME' && input.shiftEnd
-            ? `Ca${on} vẫn kết thúc lúc ${String(input.shiftEnd).slice(0, 5)}.${reasonText}`
-            : `${label}${on} không được chấp nhận.${reasonText}`;
+            ? `Ca${on} vẫn kết thúc lúc ${String(input.shiftEnd).slice(0, 5)}.${reasonText}${bySuffix}`
+            : `${label}${on} không được chấp nhận.${reasonText}${bySuffix}`;
       } else if (input.kind === 'LATE' && clock) {
-        content = `Ca${on} bắt đầu lúc ${clock}. Đến trước ${clock} không bị tính trễ.`;
+        content = `Ca${on} bắt đầu lúc ${clock}. Đến trước ${clock} không bị tính trễ.${bySuffix}`;
       } else if (input.kind === 'EARLY' && clock) {
-        content = `Ca${on} kết thúc lúc ${clock}. Giờ làm được tính đến ${clock}.`;
+        content = `Ca${on} kết thúc lúc ${clock}. Giờ làm được tính đến ${clock}.${bySuffix}`;
       } else if (input.kind === 'OVERTIME' && clock) {
-        content = `Ca${on} được tăng ca đến ${clock}. Giờ làm được tính đến ${clock}.`;
+        content = `Ca${on} được tăng ca đến ${clock}. Giờ làm được tính đến ${clock}.${bySuffix}`;
       } else if (input.kind === 'SUPPLEMENT' && clock) {
-        content = `Công${on} đã được bổ sung, giờ làm tính đến ${clock}.`;
+        content = `Công${on} đã được bổ sung, giờ làm tính đến ${clock}.${bySuffix}`;
       } else if (input.kind === 'LEAVE') {
         const range =
           input.endDate && input.endDate !== input.workDate
             ? ` ${day(input.workDate)} – ${day(input.endDate)}`
             : on;
-        content = `Đơn nghỉ${range} đã được chủ cửa hàng chấp nhận.`;
+        content = `Đơn nghỉ${range} đã được ${decider} chấp nhận.`;
       } else {
-        content = `${label}${on} đã được chủ cửa hàng chấp nhận.`;
+        content = `${label}${on} đã được ${decider} chấp nhận.`;
       }
       const today = vnDateString();
       await this.notificationsService.create({
@@ -1048,6 +1154,12 @@ export class StoresRequestsPart {
       actorAccountId?: string | null;
     },
   ): Promise<void> {
+    // Hoisted so the approver fan-out below the catch can reuse the exact
+    // non-sensitive owner title/content without recomputing it. `ownerText`
+    // carries the reason; `ownerReasonFreeText` is the R2 variant for approvers
+    // without can_view_reasons (same title/amount, reason stripped).
+    let ownerText: { title: string; content: string } | null = null;
+    let ownerReasonFreeText: { title: string; content: string } | null = null;
     try {
       const [store, profile, assignment] = await Promise.all([
         this.storeRepository.findOne({
@@ -1065,9 +1177,12 @@ export class StoresRequestsPart {
             })
           : Promise.resolve(null),
       ]);
+      // R4: the genuine early return is only "no owner to anchor on". An
+      // owner-FILED request no longer returns here — the owner notification is
+      // suppressed below, but the approver fan-out still runs.
       if (!store?.ownerAccountId) return;
-      if (input.actorAccountId && input.actorAccountId === store.ownerAccountId)
-        return;
+      const actorIsOwner =
+        !!input.actorAccountId && input.actorAccountId === store.ownerAccountId;
       const slot = assignment?.shiftSlot;
       const window = assignment ? effectiveWindowOf(assignment) : null;
       const workDate =
@@ -1092,7 +1207,7 @@ export class StoresRequestsPart {
           minutes = Math.round((window.end.getTime() - at.getTime()) / 60_000);
         }
       }
-      const { title, content } = describeOwnerRequestNotification({
+      const describeArgs = {
         kind: input.kind,
         who: profile?.account?.fullName?.trim() || 'Một nhân viên',
         shiftName: slot?.workShift?.shiftName ?? null,
@@ -1104,39 +1219,55 @@ export class StoresRequestsPart {
         fromTime: input.fromTime ?? null,
         toTime: input.toTime ?? null,
         minutes,
-        reason: input.reason ?? null,
         amount: input.amount ?? null,
+      };
+      const { title, content } = describeOwnerRequestNotification({
+        ...describeArgs,
+        reason: input.reason ?? null,
         question: input.question ?? null,
       });
+      // R2: reason-free variant — same title and amount, the free-text reason
+      // and payslip question dropped — for approvers without can_view_reasons.
+      const reasonFree = describeOwnerRequestNotification({
+        ...describeArgs,
+        reason: null,
+        question: null,
+      });
+      ownerText = { title, content };
+      ownerReasonFreeText = { title: reasonFree.title, content: reasonFree.content };
       const isMoney =
         input.kind === 'SALARY_ADVANCE' || input.kind === 'SALARY_INQUIRY';
-      await this.notificationsService.create({
-        accountId: store.ownerAccountId,
-        storeId: input.storeId,
-        title,
-        content,
-        type: NotificationType.SYSTEM,
-        priority: NotificationPriority.HIGH,
-        // App chủ: đơn ca làm mở màn duyệt; ứng lương mở tab yêu cầu của
-        // màn lương; câu hỏi về bảng lương đọc ngay trong thông báo.
-        actionUrl:
-          input.kind === 'SALARY_ADVANCE'
-            ? '/(salary)?tab=yeu-cau'
-            : input.kind === 'SALARY_INQUIRY'
-              ? null
-              : '/(work-shift-v2)/approval',
-        metadata: {
-          type: OWNER_REQUEST_NOTIFICATION_TYPE[input.kind],
-          requestKind: input.kind,
-          requestId: input.requestId,
+      // R4: the owner is notified only when the request was NOT filed by the
+      // owner; the approver fan-out below always runs.
+      if (!actorIsOwner) {
+        await this.notificationsService.create({
+          accountId: store.ownerAccountId,
           storeId: input.storeId,
-          employeeProfileId: input.employeeProfileId,
-          ...(input.shiftAssignmentId
-            ? { assignmentId: input.shiftAssignmentId }
-            : {}),
-          ...(!isMoney && workDate ? { workDate, workDates: [workDate] } : {}),
-        },
-      } as any);
+          title,
+          content,
+          type: NotificationType.SYSTEM,
+          priority: NotificationPriority.HIGH,
+          // App chủ: đơn ca làm mở màn duyệt; ứng lương mở tab yêu cầu của
+          // màn lương; câu hỏi về bảng lương đọc ngay trong thông báo.
+          actionUrl:
+            input.kind === 'SALARY_ADVANCE'
+              ? '/(salary)?tab=yeu-cau'
+              : input.kind === 'SALARY_INQUIRY'
+                ? null
+                : '/(work-shift-v2)/approval',
+          metadata: {
+            type: OWNER_REQUEST_NOTIFICATION_TYPE[input.kind],
+            requestKind: input.kind,
+            requestId: input.requestId,
+            storeId: input.storeId,
+            employeeProfileId: input.employeeProfileId,
+            ...(input.shiftAssignmentId
+              ? { assignmentId: input.shiftAssignmentId }
+              : {}),
+            ...(!isMoney && workDate ? { workDate, workDates: [workDate] } : {}),
+          },
+        } as any);
+      }
     } catch (error) {
       // Fire-and-forget: this must never reject (it is not awaited).
       this.logger?.warn(
@@ -1144,6 +1275,207 @@ export class StoresRequestsPart {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+    }
+    // After the owner (unchanged above), fan the SAME request out to any scoped
+    // approver the owner delegated this type to (N3/N5). The owner text is kept;
+    // the approver gets the same non-sensitive title/content but is routed to
+    // their inbox. Never notifies the requester (actor) or the owner twice.
+    const approverType = approverTypeForOwnerKind(input.kind);
+    if (approverType && ownerText) {
+      await this.fanOutToApprovers({
+        storeId: input.storeId,
+        targetProfileId: input.employeeProfileId,
+        type: approverType,
+        actorAccountId: input.actorAccountId ?? null,
+        title: ownerText.title,
+        content: ownerText.content,
+        // R2: approvers without can_view_reasons get the reason-free content.
+        contentReasonFree: ownerReasonFreeText?.content ?? ownerText.content,
+        metadata: {
+          requestKind: input.kind,
+          requestId: input.requestId,
+          employeeProfileId: input.employeeProfileId,
+        },
+      });
+    }
+  }
+
+  /**
+   * Fans a new request out to the scoped approvers who may decide it. Best
+   * effort and self-contained: a notification failure never fails the request.
+   * Excludes the requester, the owner and the subject employee so no one is
+   * told of their own request. No-op without the approver collaborator
+   * (hand-built unit doubles) — prod always injects it.
+   */
+  async fanOutToApprovers(
+    this: StoresService,
+    input: {
+      storeId: string;
+      targetProfileId: string;
+      type: RequestApproverType;
+      actorAccountId?: string | null;
+      title: string;
+      content: string;
+      /** R2: content for approvers without can_view_reasons; defaults to
+       * `content` for types whose owner text never carries a reason. */
+      contentReasonFree?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    if (!this.approverScopeService) return;
+    try {
+      const [store, target] = await Promise.all([
+        this.storeRepository.findOne({
+          where: { id: input.storeId },
+          select: ['id', 'ownerAccountId'],
+        }),
+        this.profileRepository.findOne({
+          where: { id: input.targetProfileId },
+          select: ['id', 'accountId'],
+        }),
+      ]);
+      const exclude = [
+        input.actorAccountId ?? undefined,
+        store?.ownerAccountId ?? undefined,
+        target?.accountId ?? undefined,
+      ].filter((id): id is string => !!id);
+      const approvers = await this.approverScopeService.matchingApprovers(
+        input.storeId,
+        input.type,
+        input.targetProfileId,
+        exclude,
+      );
+      for (const { accountId, canViewReasons } of approvers) {
+        await this.notificationsService.create({
+          accountId,
+          storeId: input.storeId,
+          title: input.title,
+          // R2: honour the per-approver reason flag in the push itself.
+          content: canViewReasons
+            ? input.content
+            : input.contentReasonFree ?? input.content,
+          type: NotificationType.SYSTEM,
+          priority: NotificationPriority.HIGH,
+          actionUrl: APPROVER_INBOX_ROUTE,
+          metadata: {
+            type: 'APPROVER_REQUEST',
+            requestType: input.type,
+            storeId: input.storeId,
+            ...(input.metadata ?? {}),
+          },
+        } as any);
+      }
+    } catch (error) {
+      this.logger?.warn(
+        `[fanOutToApprovers] ${input.type} store ${input.storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * Notifies the owner of a brand-new request (types that notify no one today)
+   * AND fans it out to the scoped approvers. Owner is suppressed when the actor
+   * is the owner. Use `fanOutToApprovers` directly for a type whose owner
+   * notification already exists (shift self-registration, custom shift).
+   */
+  async notifyOwnerAndApprovers(
+    this: StoresService,
+    input: {
+      storeId: string;
+      targetProfileId: string;
+      type: RequestApproverType;
+      actorAccountId?: string | null;
+      owner: {
+        title: string;
+        content: string;
+        actionUrl?: string | null;
+        metadata?: Record<string, unknown>;
+      };
+      approver?: {
+        title?: string;
+        content?: string;
+        metadata?: Record<string, unknown>;
+      };
+    },
+  ): Promise<void> {
+    try {
+      const store = await this.storeRepository.findOne({
+        where: { id: input.storeId },
+        select: ['id', 'ownerAccountId'],
+      });
+      if (
+        store?.ownerAccountId &&
+        input.actorAccountId !== store.ownerAccountId
+      ) {
+        await this.notificationsService.create({
+          accountId: store.ownerAccountId,
+          storeId: input.storeId,
+          title: input.owner.title,
+          content: input.owner.content,
+          type: NotificationType.SYSTEM,
+          priority: NotificationPriority.HIGH,
+          actionUrl: input.owner.actionUrl ?? OWNER_APPROVAL_ROUTE,
+          metadata: {
+            storeId: input.storeId,
+            ...(input.owner.metadata ?? {}),
+          },
+        } as any);
+      }
+    } catch (error) {
+      this.logger?.warn(
+        `[notifyOwnerAndApprovers] owner ${input.type} store ${input.storeId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    await this.fanOutToApprovers({
+      storeId: input.storeId,
+      targetProfileId: input.targetProfileId,
+      type: input.type,
+      actorAccountId: input.actorAccountId ?? null,
+      title: input.approver?.title ?? input.owner.title,
+      content: input.approver?.content ?? input.owner.content,
+      metadata: input.approver?.metadata ?? input.owner.metadata,
+    });
+  }
+
+  /**
+   * The acting approver's display name, for a decision notification (N4). Null
+   * on the owner path (owner wording is kept) and best-effort otherwise.
+   */
+  /** An employee's display name for a notification, or a safe placeholder. */
+  async employeeDisplayName(
+    this: StoresService,
+    employeeProfileId: string,
+  ): Promise<string> {
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { id: employeeProfileId },
+        relations: ['account'],
+      });
+      return profile?.account?.fullName?.trim() || 'Một nhân viên';
+    } catch {
+      return 'Một nhân viên';
+    }
+  }
+
+  async resolveApproverName(
+    this: StoresService,
+    asOwner: boolean,
+    accountId: string | undefined,
+    storeId: string,
+  ): Promise<string | null> {
+    if (asOwner || !accountId) return null;
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { accountId, storeId },
+        relations: ['account'],
+      });
+      return profile?.account?.fullName?.trim() || null;
+    } catch {
+      return null;
     }
   }
 
@@ -1963,7 +2295,7 @@ export class StoresRequestsPart {
       }
     }
 
-    return this.dataSource.transaction(async (manager) => {
+    const saved = await this.dataSource.transaction(async (manager) => {
       // Serialize pending requests for this employee so the duplicate check
       // remains safe when two submissions arrive concurrently.
       const lockedEmployee = await manager.findOne(EmployeeProfile, {
@@ -2037,6 +2369,22 @@ export class StoresRequestsPart {
       });
       return saved;
     });
+
+    // Owner + scoped approver fan-out (A2: this request notified no one before).
+    const who = await this.employeeDisplayName(data.employeeProfileId);
+    const on = ddmmFromDateString(data.requestDate);
+    void this.notifyOwnerAndApprovers({
+      storeId: data.storeId,
+      targetProfileId: data.employeeProfileId,
+      type: RequestApproverType.SHIFT_CHANGE,
+      actorAccountId: accountId,
+      owner: {
+        title: 'Yêu cầu đổi ca',
+        content: `Nhân viên ${who} xin đổi ca${on}.`,
+        metadata: { type: 'SHIFT_CHANGE_REQUEST', requestId: saved.id },
+      },
+    });
+    return saved;
   }
 
   async getShiftChangeRequestsByEmployee(
@@ -2179,15 +2527,34 @@ export class StoresRequestsPart {
       where: { id },
     });
     if (!request) throw new NotFoundException('Không tìm thấy yêu cầu đổi ca');
-    await this.assertOwnerStoreAccess(request.storeId, ownerAccountId);
+    const { asOwner: changeAsOwner, canViewReasons: changeCanViewReasons } =
+      await this.assertOwnerOrScopedApprover(
+        ownerAccountId,
+        request.storeId,
+        RequestApproverType.SHIFT_CHANGE,
+        request.employeeProfileId,
+      );
 
-    // Store owners do not necessarily have an employee profile. Scope this
-    // optional lookup to the request store and persist null when absent.
+    // The owner or scoped approver may have no employee profile (owner) — scope
+    // this optional lookup to the request store and persist null when absent.
     const ownerProfile = await this.profileRepository.findOne({
       where: { accountId: ownerAccountId, storeId: request.storeId },
       select: ['id'],
     });
     const result = await this.dataSource.transaction(async (manager) => {
+      // H3: re-validate the approver in the same transaction as the conditional
+      // status update (owner path returns true without an extra read).
+      if (
+        !(await this.stillOwnerOrScopedApprover(
+          changeAsOwner,
+          ownerAccountId,
+          request.storeId,
+          RequestApproverType.SHIFT_CHANGE,
+          request.employeeProfileId,
+        ))
+      ) {
+        throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
+      }
       const updated = await manager.update(
         ShiftChangeRequest,
         {
@@ -2225,15 +2592,21 @@ export class StoresRequestsPart {
     if (!result.affected) {
       throw new BadRequestException('Yêu cầu không còn chờ duyệt');
     }
-    return {
-      ...request,
-      status,
-      approvedById: ownerProfile?.id ?? null,
-      rejectionReason:
-        status === ShiftChangeRequestStatus.REJECTED
-          ? (rejectionReason ?? null)
-          : null,
-    };
+    // A1: strip the employee's free-text change reason for a scoped approver
+    // without can_view_reasons (the approver's rejectionReason is kept).
+    return redactDecisionReasons(
+      {
+        ...request,
+        status,
+        approvedById: ownerProfile?.id ?? null,
+        rejectionReason:
+          status === ShiftChangeRequestStatus.REJECTED
+            ? (rejectionReason ?? null)
+            : null,
+      },
+      { asOwner: changeAsOwner, canViewReasons: changeCanViewReasons },
+      ['reason'],
+    );
   }
 
   async approveShiftChangeRequest(
@@ -2626,7 +2999,13 @@ export class StoresRequestsPart {
     });
     if (!request)
       throw new NotFoundException('Không tìm thấy yêu cầu bổ sung công');
-    await this.assertOwnerStoreAccess(request.storeId, ownerAccountId);
+    const { asOwner, canViewReasons } =
+      await this.assertOwnerOrScopedApprover(
+        ownerAccountId,
+        request.storeId,
+        RequestApproverType.BONUS_WORK,
+        request.employeeProfileId,
+      );
     // Withdrawn by the employee, or expired when the shift was auto-closed
     // before approval (never paid): no longer reviewable.
     if (request.status === BonusWorkRequestStatus.CANCELLED) {
@@ -2638,7 +3017,12 @@ export class StoresRequestsPart {
       where: { accountId: ownerAccountId, storeId: request.storeId },
       select: ['id'],
     });
-    return { request, approverProfileId: approverProfile?.id ?? null };
+    return {
+      request,
+      approverProfileId: approverProfile?.id ?? null,
+      asOwner,
+      canViewReasons,
+    };
   }
 
   /**
@@ -2650,6 +3034,7 @@ export class StoresRequestsPart {
     request: BonusWorkRequest,
     next: BonusWorkRequestStatus,
     changes: Partial<BonusWorkRequest>,
+    guard?: { asOwner: boolean; accountId: string | undefined },
   ): Promise<BonusWorkRequest> {
     if (request.status === next) {
       throw new BadRequestException(
@@ -2666,6 +3051,20 @@ export class StoresRequestsPart {
       throw new BadRequestException(
         'Chỉ duyệt được yêu cầu tăng ca đang chờ duyệt.',
       );
+    }
+    // H3: re-validate the approver immediately before the conditional update
+    // (owner path returns true without an extra read).
+    if (
+      guard &&
+      !(await this.stillOwnerOrScopedApprover(
+        guard.asOwner,
+        guard.accountId,
+        request.storeId,
+        RequestApproverType.BONUS_WORK,
+        request.employeeProfileId,
+      ))
+    ) {
+      throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
     }
     const result = await this.bonusWorkRequestRepository.update(
       { id: request.id, status: request.status },
@@ -2685,6 +3084,7 @@ export class StoresRequestsPart {
     request: BonusWorkRequest,
     approved: boolean,
     reason?: string | null,
+    approverName?: string | null,
   ) {
     let shiftEnd: string | null = null;
     if (!approved && request.shiftAssignmentId) {
@@ -2704,6 +3104,7 @@ export class StoresRequestsPart {
       kind: request.shiftAssignmentId ? 'OVERTIME' : 'SUPPLEMENT',
       approved,
       reason,
+      approverName: approverName ?? null,
       assignmentId: request.shiftAssignmentId,
       workDate: request.requestDate
         ? String(request.requestDate).slice(0, 10)
@@ -2719,15 +3120,22 @@ export class StoresRequestsPart {
     id: string,
     ownerAccountId: string | undefined,
   ) {
-    const { request, approverProfileId } =
+    const { request, approverProfileId, asOwner, canViewReasons } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
     if (!request.shiftAssignmentId) {
-      return this.approveWorkSupplement(request, approverProfileId, ownerAccountId);
+      return this.approveWorkSupplement(
+        request,
+        approverProfileId,
+        ownerAccountId,
+        asOwner,
+        canViewReasons,
+      );
     }
     const saved = await this.decideBonusWorkRequest(
       request,
       BonusWorkRequestStatus.APPROVED,
       { approvedById: approverProfileId },
+      { asOwner, accountId: ownerAccountId },
     );
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_APPROVED,
@@ -2735,8 +3143,15 @@ export class StoresRequestsPart {
       ownerAccountId ?? null,
     );
     await this.repriceCheckedOutOvertime(saved);
-    void this.notifyOvertimeDecision(saved, true);
-    return saved;
+    const approverName = await this.resolveApproverName(
+      asOwner,
+      ownerAccountId,
+      request.storeId,
+    );
+    void this.notifyOvertimeDecision(saved, true, null, approverName);
+    // A1: strip the employee's free-text bonus-work reason for a scoped approver
+    // without can_view_reasons.
+    return redactDecisionReasons(saved, { asOwner, canViewReasons }, ['reason']);
   }
 
   async rejectBonusWorkRequest(
@@ -2745,7 +3160,7 @@ export class StoresRequestsPart {
     ownerAccountId: string | undefined,
     reason?: string,
   ) {
-    const { request, approverProfileId } =
+    const { request, approverProfileId, asOwner, canViewReasons } =
       await this.loadBonusWorkRequestForOwner(id, ownerAccountId);
     // Bổ sung công đã duyệt thì giờ vào / ra của ca đã được ghi theo đơn:
     // từ chối lại không hoàn tác được chấm công, nên không cho.
@@ -2761,6 +3176,7 @@ export class StoresRequestsPart {
       request,
       BonusWorkRequestStatus.REJECTED,
       { approvedById: approverProfileId, rejectionReason: reason ?? null },
+      { asOwner, accountId: ownerAccountId },
     );
     await this.logBonusWorkActivity(
       ACTIVITY_ACTIONS.BONUS_WORK_REQUEST_REJECTED,
@@ -2768,8 +3184,15 @@ export class StoresRequestsPart {
       ownerAccountId ?? null,
     );
     await this.repriceCheckedOutOvertime(saved);
-    void this.notifyOvertimeDecision(saved, false, reason);
-    return saved;
+    const approverName = await this.resolveApproverName(
+      asOwner,
+      ownerAccountId,
+      request.storeId,
+    );
+    void this.notifyOvertimeDecision(saved, false, reason, approverName);
+    // A1: strip the employee's free-text bonus-work reason for a scoped approver
+    // without can_view_reasons (the rejectionReason is the approver's own).
+    return redactDecisionReasons(saved, { asOwner, canViewReasons }, ['reason']);
   }
 
   /**
@@ -2795,6 +3218,8 @@ export class StoresRequestsPart {
     request: BonusWorkRequest,
     approverProfileId: string | null,
     ownerAccountId: string | undefined,
+    asOwner = true,
+    canViewReasons = true,
   ) {
     if (request.status !== BonusWorkRequestStatus.PENDING) {
       throw new BadRequestException('Chỉ duyệt được đơn bổ sung công đang chờ duyệt.');
@@ -2992,23 +3417,35 @@ export class StoresRequestsPart {
         );
       }
     }
+    const supplementApproverName = await this.resolveApproverName(
+      asOwner,
+      ownerAccountId,
+      request.storeId,
+    );
     void this.notifyRequestDecision({
       employeeProfileId: request.employeeProfileId,
       storeId: request.storeId,
       requestId: request.id,
       kind: 'SUPPLEMENT',
       approved: true,
+      approverName: supplementApproverName,
       assignmentId: last.assignmentId,
       workDate: date,
       time: vnClockHHmm(last.checkOut),
     });
-    return Object.assign(saved, {
-      // Giữ trường cũ (ca cộng cuối) cho bản app cũ; thêm trường mới.
-      creditedAssignmentId: last.assignmentId,
-      creditedWorkedMinutes: last.workedMinutes,
-      creditedAssignmentIds: result.credited.map((credit) => credit.assignmentId),
-      createdAdHocShift: result.createdAdHocShift,
-    });
+    // A1: strip the employee's free-text supplement reason for a scoped approver
+    // without can_view_reasons.
+    return redactDecisionReasons(
+      Object.assign(saved, {
+        // Giữ trường cũ (ca cộng cuối) cho bản app cũ; thêm trường mới.
+        creditedAssignmentId: last.assignmentId,
+        creditedWorkedMinutes: last.workedMinutes,
+        creditedAssignmentIds: result.credited.map((credit) => credit.assignmentId),
+        createdAdHocShift: result.createdAdHocShift,
+      }),
+      { asOwner, canViewReasons },
+      ['reason'],
+    );
   }
 
   /**

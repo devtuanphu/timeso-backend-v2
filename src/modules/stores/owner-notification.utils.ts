@@ -53,6 +53,9 @@ export const OWNER_WORK_SHIFT_ROUTE = '/(work-shift)';
 /** Owner app approvals screen (timeso_owner/src/app/(work-shift-v2)/approval.tsx). */
 export const OWNER_APPROVAL_ROUTE = '/(work-shift-v2)/approval';
 
+/** Staff app scoped-approver inbox (timeso-staff/src/app/(approver)). */
+export const APPROVER_INBOX_ROUTE = '/(approver)';
+
 export const OWNER_SHIFT_ALERTS_QUEUE = 'owner-shift-alerts';
 
 export type OwnerAlertKind = 'pre_shift' | 'shift_ending';

@@ -23,6 +23,7 @@ import {
   Brackets,
 } from 'typeorm';
 import { isUUID } from 'class-validator';
+import { RequestApproverType } from '../entities/store-request-approver.entity';
 import { StopWorkCycleDto } from '../dto/stop-work-cycle.dto';
 import { join } from 'path';
 import { Store } from '../entities/store.entity';
@@ -4917,7 +4918,12 @@ export class StoresSchedulingPart {
     // shift they already know. Best effort: the registration has committed and
     // must not be rolled back because a notification failed.
     if (!isOwnerAssign) {
-      await this.notifyOwnerOfShiftRegistration(storeId, employeeId, slotId);
+      await this.notifyOwnerOfShiftRegistration(
+        storeId,
+        employeeId,
+        slotId,
+        ownerAccountId,
+      );
     } else if (savedAssignment.status === ShiftAssignmentStatus.APPROVED) {
       // Ngược lại, chủ xếp ca thì chính nhân viên mới là người chưa biết.
       void this.notifyEmployeesOfNewShifts([savedAssignment.id], 'assigned');
@@ -5033,7 +5039,9 @@ export class StoresSchedulingPart {
     storeId: string,
     employeeId: string,
     slotId: string,
+    actorAccountId?: string | null,
   ): Promise<void> {
+    let fanOut: { who: string; shiftName: string; when: string } | null = null;
     try {
       const [store, profile, slot] = await Promise.all([
         this.storeRepository.findOne({
@@ -5057,6 +5065,7 @@ export class StoresSchedulingPart {
       const workDate = slot?.workDate ? String(slot.workDate).slice(0, 10) : '';
       const dated = /^\d{4}-\d{2}-\d{2}$/.test(workDate);
       const when = dated ? ` ${describeWorkDate(workDate)}` : '';
+      fanOut = { who, shiftName, when };
 
       await this.notificationsService.create({
         accountId: store.ownerAccountId,
@@ -5082,6 +5091,23 @@ export class StoresSchedulingPart {
           error instanceof Error ? error.message : String(error)
         }`,
       );
+    }
+    // Owner already notified above (A2: single-register notifies the owner);
+    // add ONLY the scoped-approver fan-out so the owner is never told twice.
+    if (fanOut) {
+      await this.fanOutToApprovers({
+        storeId,
+        targetProfileId: employeeId,
+        type: RequestApproverType.SHIFT_REGISTRATION,
+        actorAccountId: actorAccountId ?? null,
+        title: 'Nhân viên đăng ký ca',
+        content: `${fanOut.who} vừa đăng ký ${fanOut.shiftName}${fanOut.when}.`,
+        metadata: {
+          event: 'SHIFT_REGISTRATION',
+          slotId,
+          employeeProfileId: employeeId,
+        },
+      });
     }
   }
 
@@ -5389,7 +5415,7 @@ export class StoresSchedulingPart {
       throw new BadRequestException('Assignment đã bị hủy');
     // Người nhận ca đã có ca khác trùng giờ (kể cả ca qua đêm ngày kề).
     await this.assertSwapTargetFree(this.dataSource.manager, source, target.id);
-    return this.dataSource.transaction(async (manager) => {
+    const savedSwap = await this.dataSource.transaction(async (manager) => {
       // Khoá hồ sơ người gửi: hai đơn gửi cùng lúc không cùng lọt giới hạn số lần.
       await manager.findOne(EmployeeProfile, {
         where: { id: requester.id },
@@ -5415,6 +5441,30 @@ export class StoresSchedulingPart {
       });
       return manager.save(ShiftSwap, swap);
     });
+
+    // Owner + scoped approver fan-out (A2: swap notified no one before). The
+    // helper suppresses the owner when the actor is the owner.
+    const swapWho = await this.employeeDisplayName(requester.id);
+    const swapOn = source.shiftSlot?.workDate
+      ? (() => {
+          const [, m, d] = String(source.shiftSlot.workDate)
+            .slice(0, 10)
+            .split('-');
+          return m && d ? ` ngày ${d}/${m}` : '';
+        })()
+      : '';
+    void this.notifyOwnerAndApprovers({
+      storeId,
+      targetProfileId: requester.id,
+      type: RequestApproverType.SHIFT_CHANGE,
+      actorAccountId: accountId,
+      owner: {
+        title: 'Yêu cầu đổi ca',
+        content: `Nhân viên ${swapWho} xin đổi ca${swapOn}.`,
+        metadata: { type: 'SHIFT_SWAP_REQUEST', swapId: savedSwap.id },
+      },
+    });
+    return savedSwap;
   }
 
   async updateShiftSwapStatus(
@@ -6069,7 +6119,7 @@ export class StoresSchedulingPart {
         String(ymdOf(left.workDate)).localeCompare(String(ymdOf(right.workDate))),
       );
 
-      return this.dataSource.transaction(async (manager) => {
+      const batchResult = await this.dataSource.transaction(async (manager) => {
         await lockStoreShiftAvailability(manager, data.storeId);
         let successCount = 0;
 
@@ -6250,10 +6300,33 @@ export class StoresSchedulingPart {
         // vì trùng giờ với ca khác của chính nhân viên.
         return {
           successCount,
+          shiftName: matchedSlots[0]?.workShift?.shiftName ?? 'ca làm việc',
           ...(skippedByWorkTerms ? { skippedByWorkTerms } : {}),
           ...(skippedByConflict ? { skippedByConflict } : {}),
         };
       });
+
+      // Fixed-shift batch registration notified no one before (A2): tell the
+      // owner AND the scoped approvers once for the whole batch.
+      if (batchResult.successCount > 0) {
+        const who = await this.employeeDisplayName(data.employeeProfileId);
+        void this.notifyOwnerAndApprovers({
+          storeId: data.storeId,
+          targetProfileId: data.employeeProfileId,
+          type: RequestApproverType.SHIFT_REGISTRATION,
+          actorAccountId: accountId,
+          owner: {
+            title: 'Nhân viên đăng ký ca',
+            content: `${who} vừa đăng ký ${batchResult.shiftName} (${batchResult.successCount} ca).`,
+            metadata: {
+              type: 'SHIFT_REGISTRATION',
+              employeeProfileId: data.employeeProfileId,
+            },
+          },
+        });
+      }
+      const { shiftName: _batchShiftName, ...batchSummary } = batchResult;
+      return batchSummary;
     }
 
     // Fallback for single shift registration by workShiftId + startDate (legacy compatibility)

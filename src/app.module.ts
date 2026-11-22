@@ -12,6 +12,7 @@ import { NotificationsModule } from './modules/notifications/notifications.modul
 import { DevicesModule } from './modules/devices/devices.module';
 import { ChatGroupsModule } from './modules/chat-groups/chat-groups.module';
 import { AiReportsModule } from './modules/ai-reports/ai-reports.module';
+import { ApproverIdentityChangeModule } from './modules/stores/approver-identity-change.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { BullModule } from '@nestjs/bullmq';
 import { join } from 'path';
@@ -53,6 +54,9 @@ import { getAppBullExtraOptions, getAppScheduleOptions } from './app-runtime.con
     NotificationsModule,
     DevicesModule,
     ChatGroupsModule,
+    // A4(b): global hook letting the accounts module report an approver's CCCD
+    // change to the store owner without a stores-module dependency cycle.
+    ApproverIdentityChangeModule,
   ],
   controllers: [AppController],
   providers: [AppService],

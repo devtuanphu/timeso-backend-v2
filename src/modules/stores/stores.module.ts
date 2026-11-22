@@ -156,6 +156,10 @@ import { CareerRequirement } from './entities/career-requirement.entity';
 import { EmployeeSkillProgress } from './entities/employee-skill-progress.entity';
 import { EmployeeSkillEvaluation } from './entities/employee-skill-evaluation.entity';
 import { StoreCareerSetting } from './entities/store-career-setting.entity';
+import { StoreRequestApprover } from './entities/store-request-approver.entity';
+import { ApproverScopeService } from './approver-scope.service';
+import { ApproverRequestsService } from './approver-requests.service';
+import { StoresApproversController } from './controllers/stores-approvers.controller';
 
 @Module({
   imports: [
@@ -255,6 +259,7 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
       OwnerNotificationLog,
       CustomShiftRequest,
       EmployeePersonalSchedule,
+      StoreRequestApprover,
     ]),
 
     AccountsModule,
@@ -289,9 +294,12 @@ import { StoreCareerSetting } from './entities/store-career-setting.entity';
     StoresCareerController,
     StoresWorkTypesController,
     StoresDocumentsController,
+    StoresApproversController,
   ],
   providers: [
     StoresService,
+    ApproverScopeService,
+    ApproverRequestsService,
     StoreDocumentsService,
     WorkTypesService,
     CareerLadderService,

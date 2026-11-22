@@ -112,4 +112,19 @@ export class JobApplication extends BaseEntity {
   /** Set when the contact fields were cleared by the retention job. */
   @Column({ name: 'contact_redacted_at', type: 'timestamptz', nullable: true })
   contactRedactedAt: Date | null;
+
+  /**
+   * R1: the store role the applicant applied for, snapshotted at submission.
+   * No FK (snapshot, parity with the scope arrays): a position moved between
+   * departments or hard-deleted does not re-scope or break a historical
+   * application. Null for applications filed before this field existed (and for
+   * stores with no active positions) — those stay owner-only, never shown to a
+   * scoped `job_application` approver.
+   */
+  @Column({ name: 'applied_position_id', type: 'uuid', nullable: true })
+  appliedPositionId: string | null;
+
+  /** R1: the role's department at apply time (snapshot, see above). */
+  @Column({ name: 'applied_department_id', type: 'uuid', nullable: true })
+  appliedDepartmentId: string | null;
 }

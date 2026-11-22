@@ -40,7 +40,15 @@ import {
   normalizeCustomShiftRequest,
   toHHmm,
 } from './custom-shift-request.utils';
-import { OWNER_APPROVAL_ROUTE } from './owner-notification.utils';
+import {
+  APPROVER_INBOX_ROUTE,
+  OWNER_APPROVAL_ROUTE,
+} from './owner-notification.utils';
+import {
+  ApproverScopeService,
+  RequestApproverType,
+} from './approver-scope.service';
+import { redactDecisionReasons } from './approver-list-views';
 import { lockStoreShiftAvailability } from './shift-availability-lock';
 import { loadBookedWorkDates, workTermError } from './work-terms.query';
 import { hasWorkTerms, workTermViolation, workTermsOf } from './work-terms.utils';
@@ -130,7 +138,42 @@ export class CustomShiftRequestService {
     private readonly storesService: StoresService,
     private readonly notificationsService: NotificationsService,
     @Optional() private readonly activityLogService?: ActivityLogService,
+    // Scoped approvers. Optional so the hand-built unit double keeps working;
+    // when absent the decision stays owner-only (the @StoreOwnerOnly guard — now
+    // removed in prod — used to be the only gate). Prod always injects it.
+    @Optional() private readonly approverScopeService?: ApproverScopeService,
   ) {}
+
+  /**
+   * Owner or scoped CUSTOM_SHIFT approver. Fail-closed when the collaborator is
+   * absent (hand-built unit doubles): fall back to OWNER-ONLY — never allow a
+   * non-owner — because the route no longer carries `@StoreOwnerOnly()`.
+   */
+  private async enforceCustomShiftApprover(
+    storeId: string,
+    accountId: string,
+    targetProfileId: string,
+  ): Promise<{ asOwner: boolean; canViewReasons: boolean }> {
+    if (this.approverScopeService) {
+      return this.approverScopeService.assertCanApprove(
+        accountId,
+        storeId,
+        RequestApproverType.CUSTOM_SHIFT,
+        targetProfileId,
+      );
+    }
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    if (!store || store.ownerAccountId !== accountId) {
+      throw new ForbiddenException({
+        code: 'APPROVER_FORBIDDEN',
+        message: 'Bạn không có quyền duyệt yêu cầu này',
+      });
+    }
+    return { asOwner: true, canViewReasons: true };
+  }
 
   // ── Staff ────────────────────────────────────────────────────────────
 
@@ -248,8 +291,26 @@ export class CustomShiftRequestService {
   async approve(storeId: string, requestId: string, ownerAccountId: string) {
     let createdAssignmentIds: string[] = [];
     let newlyApproved = false;
+    let asOwner = true;
+    let canViewReasons = true;
+    // R1: the shift is created through the owner-checked schedule path. Resolve
+    // the store's REAL owner account and pass THAT to createShiftFor, while the
+    // decision + activity actor stays the (possibly non-owner) approver.
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'ownerAccountId'],
+    });
+    const scheduleOwnerAccountId = store?.ownerAccountId ?? ownerAccountId;
     const request = await this.dataSource.transaction(async (manager) => {
       const row = await this.lockRequest(manager, storeId, requestId);
+      // M1: authorize FIRST (the row lock is already held), so the idempotent
+      // short-circuit below cannot leak a decided request's view (or its
+      // existence via 200/403/404) to a member who may not approve it.
+      ({ asOwner, canViewReasons } = await this.enforceCustomShiftApprover(
+        storeId,
+        ownerAccountId,
+        row.employeeProfileId,
+      ));
       if (row.status === CustomShiftRequestStatus.APPROVED) return row;
       this.assertPending(row);
 
@@ -320,7 +381,7 @@ export class CustomShiftRequestService {
         const created = await this.createShiftFor(
           manager,
           storeId,
-          ownerAccountId,
+          scheduleOwnerAccountId,
           {
             shiftName,
             startDate: date,
@@ -357,9 +418,18 @@ export class CustomShiftRequestService {
 
     if (newlyApproved) {
       this.storesService.scheduleRemindersForNewAssignments(createdAssignmentIds);
-      void this.notifyEmployeeOfDecision(request);
+      void this.notifyEmployeeOfDecision(request, {
+        asOwner,
+        actorAccountId: ownerAccountId,
+      });
     }
-    return this.toView(request, await this.loadProfile(request.employeeProfileId));
+    // A1: strip the employee's free-text note for a scoped approver without
+    // can_view_reasons (the approver's rejectionReason is kept).
+    return redactDecisionReasons(
+      this.toView(request, await this.loadProfile(request.employeeProfileId)),
+      { asOwner, canViewReasons },
+      ['note'],
+    );
   }
 
   async reject(
@@ -369,8 +439,16 @@ export class CustomShiftRequestService {
     dto: RejectCustomShiftRequestDto,
   ) {
     let newlyRejected = false;
+    let asOwner = true;
+    let canViewReasons = true;
     const request = await this.dataSource.transaction(async (manager) => {
       const row = await this.lockRequest(manager, storeId, requestId);
+      // M1: authorize FIRST (lock held) before the idempotent short-circuit.
+      ({ asOwner, canViewReasons } = await this.enforceCustomShiftApprover(
+        storeId,
+        ownerAccountId,
+        row.employeeProfileId,
+      ));
       if (row.status === CustomShiftRequestStatus.REJECTED) return row;
       this.assertPending(row);
       row.status = CustomShiftRequestStatus.REJECTED;
@@ -382,8 +460,19 @@ export class CustomShiftRequestService {
       newlyRejected = true;
       return saved;
     });
-    if (newlyRejected) void this.notifyEmployeeOfDecision(request);
-    return this.toView(request, await this.loadProfile(request.employeeProfileId));
+    if (newlyRejected) {
+      void this.notifyEmployeeOfDecision(request, {
+        asOwner,
+        actorAccountId: ownerAccountId,
+      });
+    }
+    // A1: strip the employee's free-text note for a scoped approver without
+    // can_view_reasons.
+    return redactDecisionReasons(
+      this.toView(request, await this.loadProfile(request.employeeProfileId)),
+      { asOwner, canViewReasons },
+      ['note'],
+    );
   }
 
   // ── Helpers ──────────────────────────────────────────────────────────
@@ -574,22 +663,23 @@ export class CustomShiftRequestService {
     request: CustomShiftRequest,
     profile: EmployeeProfile,
   ) {
+    const who = profile.account?.fullName?.trim() || 'Một nhân viên';
+    const startDate = dateOnly(request.startDate);
+    const endDate = dateOnly(request.endDate);
+    const content = `${who} xin làm ${toHHmm(request.startTime)}–${toHHmm(
+      request.endTime,
+    )} ${describeRange({ startDate, endDate })}.`;
     try {
       const store = await this.storeRepository.findOne({
         where: { id: request.storeId },
         select: ['id', 'ownerAccountId'],
       });
       if (!store?.ownerAccountId) return;
-      const who = profile.account?.fullName?.trim() || 'Một nhân viên';
-      const startDate = dateOnly(request.startDate);
-      const endDate = dateOnly(request.endDate);
       await this.notificationsService.create({
         accountId: store.ownerAccountId,
         storeId: request.storeId,
         title: 'Yêu cầu khung giờ khác',
-        content: `${who} xin làm ${toHHmm(request.startTime)}–${toHHmm(
-          request.endTime,
-        )} ${describeRange({ startDate, endDate })}.`,
+        content,
         type: NotificationType.SYSTEM,
         priority: NotificationPriority.NORMAL,
         actionUrl: OWNER_APPROVAL_ROUTE,
@@ -610,10 +700,86 @@ export class CustomShiftRequestService {
         }`,
       );
     }
+    // Owner created above (A2: custom shift already notifies the owner); add
+    // ONLY the scoped-approver fan-out so the owner is never told twice.
+    await this.fanOutCustomShiftApprovers(request, content);
+  }
+
+  /** CUSTOM_SHIFT approver fan-out; no-op without the collaborator. */
+  private async fanOutCustomShiftApprovers(
+    request: CustomShiftRequest,
+    content: string,
+  ) {
+    if (!this.approverScopeService) return;
+    try {
+      const [store, target] = await Promise.all([
+        this.storeRepository.findOne({
+          where: { id: request.storeId },
+          select: ['id', 'ownerAccountId'],
+        }),
+        this.profileRepository.findOne({
+          where: { id: request.employeeProfileId },
+          select: ['id', 'accountId'],
+        }),
+      ]);
+      const exclude = [store?.ownerAccountId, target?.accountId].filter(
+        (id): id is string => !!id,
+      );
+      const approverAccountIds =
+        await this.approverScopeService.matchingApproverAccountIds(
+          request.storeId,
+          RequestApproverType.CUSTOM_SHIFT,
+          request.employeeProfileId,
+          exclude,
+        );
+      for (const accountId of approverAccountIds) {
+        await this.notificationsService.create({
+          accountId,
+          storeId: request.storeId,
+          title: 'Yêu cầu khung giờ khác',
+          content,
+          type: NotificationType.SYSTEM,
+          priority: NotificationPriority.HIGH,
+          actionUrl: APPROVER_INBOX_ROUTE,
+          metadata: {
+            type: 'APPROVER_REQUEST',
+            requestType: RequestApproverType.CUSTOM_SHIFT,
+            storeId: request.storeId,
+            requestId: request.id,
+          },
+        });
+      }
+    } catch (error) {
+      this.logger.warn(
+        `[customShiftRequest] approver fan-out failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /** "Chủ cửa hàng" for the owner path, else the scoped approver's name (N4). */
+  private async resolveDeciderName(
+    storeId: string,
+    decided?: { asOwner: boolean; actorAccountId: string },
+  ): Promise<string> {
+    if (!decided || decided.asOwner) return 'Chủ cửa hàng';
+    try {
+      const profile = await this.profileRepository.findOne({
+        where: { storeId, accountId: decided.actorAccountId },
+        relations: ['account'],
+      });
+      return profile?.account?.fullName?.trim() || 'Người phê duyệt';
+    } catch {
+      return 'Người phê duyệt';
+    }
   }
 
   /** After commit, best effort: approved / rejected to the employee. */
-  private async notifyEmployeeOfDecision(request: CustomShiftRequest) {
+  private async notifyEmployeeOfDecision(
+    request: CustomShiftRequest,
+    decided?: { asOwner: boolean; actorAccountId: string },
+  ) {
     try {
       const profile = await this.loadProfile(request.employeeProfileId);
       if (!profile?.accountId) return;
@@ -623,6 +789,8 @@ export class CustomShiftRequestService {
       const window = `${toHHmm(request.startTime)}–${toHHmm(request.endTime)} ${describeRange(
         { startDate, endDate },
       )}`;
+      // Owner wording stays "Chủ cửa hàng …"; a scoped approver is named (N4).
+      const decider = await this.resolveDeciderName(request.storeId, decided);
       await this.notificationsService.create({
         accountId: profile.accountId,
         storeId: request.storeId,
@@ -630,8 +798,8 @@ export class CustomShiftRequestService {
           ? 'Yêu cầu khung giờ đã được duyệt'
           : 'Yêu cầu khung giờ bị từ chối',
         content: approved
-          ? `Chủ cửa hàng đã duyệt khung giờ ${window}. Ca đã có trong lịch làm việc của bạn.`
-          : `Chủ cửa hàng đã từ chối khung giờ ${window}.`,
+          ? `${decider} đã duyệt khung giờ ${window}. Ca đã có trong lịch làm việc của bạn.`
+          : `${decider} đã từ chối khung giờ ${window}.`,
         type: approved ? NotificationType.SHIFT_APPROVAL : NotificationType.SYSTEM,
         priority: NotificationPriority.NORMAL,
         actionUrl: STAFF_WORK_SHIFT_ROUTE,

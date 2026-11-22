@@ -20,6 +20,7 @@ import { DataSource } from 'typeorm';
 
 import { AccountStatus } from '../../../../src/modules/accounts/entities/account.entity';
 import { JwtAuthGuard } from '../../../../src/modules/auth/guards/jwt-auth.guard';
+import { StoreAccessGuard } from '../../../../src/modules/stores/guards/store-access.guard';
 import { JobApplicationStatus } from '../../../../src/modules/stores/entities/job-application.entity';
 import { StoreStatus } from '../../../../src/modules/stores/entities/store.entity';
 import {
@@ -176,6 +177,11 @@ describe('job application selfie (HTTP + filesystem)', () => {
           return true;
         },
       })
+      // The reject route now carries a method-level StoreAccessGuard (owner or a
+      // scoped approver). This suite exercises apply/getSelfie/withdraw, not
+      // reject, so a pass-through keeps the guard resolvable without its repos.
+      .overrideGuard(StoreAccessGuard)
+      .useValue({ canActivate: () => true })
       .compile();
 
     app = moduleRef.createNestApplication();

@@ -6,6 +6,7 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   Max,
   MaxLength,
@@ -119,6 +120,31 @@ export class CreateJobApplicationDto {
   @MinLength(2)
   @MaxLength(MAX_ADDRESS_LENGTH)
   address?: string;
+
+  /**
+   * R1 "Vị trí ứng tuyển". Optional so builds released before the field existed
+   * keep working; their applications are owner-only (null snapshot). A multipart
+   * form sends an empty string for an untouched input, so a blank value is
+   * treated as absent rather than refused. Validated server-side to belong to
+   * the store and be active.
+   */
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' && value.trim() === '' ? undefined : value,
+  )
+  @IsOptional()
+  @IsUUID()
+  appliedPositionId?: string;
+}
+
+/**
+ * R1: the applicant-facing position picker list. An explicit allowlist — never
+ * the StoreRole entity, which carries the salary coefficient and allowance.
+ */
+export interface StoreApplyPositionDto {
+  id: string;
+  name: string;
+  departmentId: string | null;
+  departmentName: string | null;
 }
 
 /** Owner inbox filter. */
@@ -173,6 +199,9 @@ export interface JobApplicationItemDto {
   reviewedAt: string | null;
   rejectionReason: string | null;
   avatarUrl: string | null;
+  /** R1: the applied position/department snapshot, resolved to names. */
+  appliedPositionName: string | null;
+  appliedDepartmentName: string | null;
   /** Null when not given or once redacted. */
   address: string | null;
   /**

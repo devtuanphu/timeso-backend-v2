@@ -4,6 +4,8 @@ import {
   ForbiddenException,
   ConflictException,
 } from '@nestjs/common';
+import { RequestApproverType } from '../entities/store-request-approver.entity';
+import { redactDecisionReasons } from '../approver-list-views';
 import {
   Between,
   In,
@@ -4779,6 +4781,32 @@ export class StoresPayrollPart {
       throw new NotFoundException('Không tìm thấy yêu cầu ứng lương');
     }
 
+    // Owner or scoped SALARY_ADVANCE approver. This route was guard-only before
+    // (StoreResourceAccessGuard + @StoreOwnerOnly); the decorator is removed, so
+    // the owner-or-approver decision now lives here. Resolve the store from the
+    // target employee's profile (the same hop the route guard uses).
+    const advanceTarget = await this.profileRepository.findOne({
+      where: { id: request.employeeProfileId },
+      select: ['id', 'storeId'],
+      withDeleted: true,
+    });
+    const advanceStoreId = advanceTarget?.storeId ?? '';
+    let advanceAsOwner = true;
+    let advanceCanViewReasons = true;
+    if (this.approverScopeService) {
+      ({ asOwner: advanceAsOwner, canViewReasons: advanceCanViewReasons } =
+        await this.approverScopeService.assertCanApprove(
+          reviewerId,
+          advanceStoreId,
+          RequestApproverType.SALARY_ADVANCE,
+          request.employeeProfileId,
+        ));
+    } else {
+      // H1: fail-closed when the collaborator is absent (unit doubles) — the
+      // route has no @StoreOwnerOnly() any more, so NEVER allow a non-owner.
+      await this.assertOwnerStoreAccess(advanceStoreId, reviewerId);
+    }
+
     if (request.status !== AdvanceRequestStatus.PENDING) {
       throw new BadRequestException('Yêu cầu này đã được xử lý');
     }
@@ -4788,19 +4816,38 @@ export class StoresPayrollPart {
       // `||` treated a deliberate 0 as "not supplied" and granted the full
       // request. `??` distinguishes "omitted" from "approved for nothing".
       approvedAmount = Number(data.approvedAmount ?? request.requestedAmount);
-      if (!Number.isFinite(approvedAmount) || approvedAmount < 0) {
+      // R5/A6: the approved amount is strictly within (0, requestedAmount].
+      // Reject NaN / Infinity / string garbage and 0 before the transaction.
+      if (!Number.isFinite(approvedAmount) || approvedAmount <= 0) {
         throw new BadRequestException({
-          code: 'VALIDATION_ERROR',
-          message: 'Số tiền duyệt không hợp lệ.',
+          code: 'SALARY_ADVANCE_AMOUNT_INVALID',
+          message: 'Số tiền duyệt phải lớn hơn 0.',
         });
       }
+      if (approvedAmount > Number(request.requestedAmount)) {
+        throw new BadRequestException({
+          code: 'SALARY_ADVANCE_AMOUNT_INVALID',
+          message: 'Số tiền duyệt không được vượt số tiền xin ứng.',
+        });
+      }
+    }
+    // A6: rejecting a salary advance requires a non-empty note. Backend is
+    // authoritative (the staff app already sends a reason on reject).
+    if (
+      data.status === AdvanceRequestStatus.REJECTED &&
+      !String(data.reviewNote ?? '').trim()
+    ) {
+      throw new BadRequestException({
+        code: 'SALARY_ADVANCE_REJECT_NOTE_REQUIRED',
+        message: 'Vui lòng nhập lý do từ chối.',
+      });
     }
 
     // One transaction with the payslip row locked, so a concurrent payroll
     // recalculation or a second review cannot interleave. `advancePayment` is
     // re-derived from the APPROVED requests (the source of truth) instead of
     // being incremented, so it can be neither lost nor doubled.
-    return this.dataSource.transaction(async (manager) => {
+    const saved = await this.dataSource.transaction(async (manager) => {
       const requestRepository = manager.getRepository(SalaryAdvanceRequest);
       const salaryRepository = manager.getRepository(EmployeeSalary);
 
@@ -4819,6 +4866,19 @@ export class StoresPayrollPart {
       }
       if (current.status !== AdvanceRequestStatus.PENDING) {
         throw new BadRequestException('Yêu cầu này đã được xử lý');
+      }
+      // H3: re-validate the scoped approver inside the locked section (owner
+      // path returns true without an extra read).
+      if (
+        !(await this.stillOwnerOrScopedApprover(
+          advanceAsOwner,
+          reviewerId,
+          advanceStoreId,
+          RequestApproverType.SALARY_ADVANCE,
+          request.employeeProfileId,
+        ))
+      ) {
+        throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
       }
 
       const payslip = lockedSalary ?? request.employeeSalary;
@@ -4895,6 +4955,14 @@ export class StoresPayrollPart {
 
       return saved;
     });
+    // A1: a scoped approver without can_view_reasons must see neither the
+    // employee's free-text requestReason nor the loaded payslip (net salary).
+    // The owner response is unchanged.
+    return redactDecisionReasons(
+      saved,
+      { asOwner: advanceAsOwner, canViewReasons: advanceCanViewReasons },
+      ['requestReason', 'employeeSalary'],
+    );
   }
 
   /** Only the employee who filed the advance request may cancel it. */

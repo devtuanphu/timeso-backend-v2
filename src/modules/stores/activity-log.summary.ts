@@ -67,6 +67,8 @@ export const ACTIVITY_ACTIONS = {
   CAREER_STRUCTURE_CHANGED: 'career.structure_changed',
 
   WORK_SHIFT_DELETED: 'work_shift.deleted',
+
+  APPROVER_IDENTITY_CHANGED: 'request_approver.identity_changed',
 } as const;
 
 export type ActivityAction =
@@ -428,6 +430,8 @@ export function renderActivitySummary(entry: ActivitySummaryInput): string {
     }
     case A.WORK_SHIFT_DELETED:
       return `${actor} xoá ${describeShift(p)}`;
+    case A.APPROVER_IDENTITY_CHANGED:
+      return `Người phê duyệt ${actor} vừa thay đổi số CCCD/CMND`;
     default:
       return `${actor} thực hiện một thao tác`;
   }

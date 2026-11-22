@@ -112,12 +112,14 @@ import { ShiftReminderService } from './shift-reminder.service';
 import { ActivityLogService, ActivityLogEntry } from './activity-log.service';
 import { ACTIVITY_ACTIONS, toActivityDate, toActivityHHmm } from './activity-log.summary';
 import { OwnerNotificationService } from './owner-notification.service';
+import { ApproverScopeService } from './approver-scope.service';
+import { RequestApproverType } from './entities/store-request-approver.entity';
 import { parseVnMonthInput, toDateMarker, toMonthMarker, vnDateString, vnMonthOf, vnMonthOfDateString } from '../../common/utils/vn-calendar';
 import { formatVnMoney } from '../../common/utils/money';
 import { effectiveWindowOf } from './attendance-time.utils';
 import { StoreWorkedTimeRule } from './entities/store-worked-time-rule.entity';
 import { randomBytes } from 'crypto';
-import { normalizeVietnamPhone } from '../../common/utils/account-identifier';
+import { normalizeEmail, normalizeVietnamPhone } from '../../common/utils/account-identifier';
 import { AddExistingEmployeeDto, EmployeeWorkAssignmentDto } from './dto/add-existing-employee.dto';
 import { StoreDiscoveryPageDto, StoreDiscoveryQueryDto } from './dto/store-discovery.dto';
 import {
@@ -452,6 +454,12 @@ export class StoresService {
     // Appended deliberately: this constructor is positional and long, so a new
     // dependency goes on the end where it cannot shift any existing argument.
     readonly notificationsService: NotificationsService,
+    // Scoped request approvers ("Cài đặt người phê duyệt"). Optional so the many
+    // tests that build this service by hand keep working; the enforcement helpers
+    // fall back to the legacy owner-only check when it is absent (prod always
+    // injects it via StoresModule).
+    @Optional()
+    readonly approverScopeService?: ApproverScopeService,
     // X1 activity log / X6 owner notifications. Optional so the many tests
     // that build this service by hand keep working; hooks no-op without them.
     @Optional()
@@ -930,6 +938,53 @@ export class StoresService {
     }
 
     return store;
+  }
+
+  /**
+   * Owner, or a scoped approver the owner delegated this request type to. The
+   * owner branch is byte-identical to the old `assertOwnerStoreAccess` decision
+   * (asOwner). When the approver collaborator is absent (hand-built unit
+   * doubles only — prod always injects it), it falls back to owner-only so the
+   * existing owner-path specs keep passing.
+   */
+  async assertOwnerOrScopedApprover(
+    accountId: string | undefined,
+    storeId: string,
+    type: RequestApproverType,
+    targetProfileId: string | null | undefined,
+  ): Promise<{ asOwner: boolean; canViewReasons: boolean }> {
+    if (this.approverScopeService) {
+      return this.approverScopeService.assertCanApprove(
+        accountId,
+        storeId,
+        type,
+        targetProfileId,
+      );
+    }
+    await this.assertOwnerStoreAccess(storeId, accountId as string);
+    // Fallback (unit doubles only): owner-only path sees everything.
+    return { asOwner: true, canViewReasons: true };
+  }
+
+  /**
+   * Under-lock re-validate (R3): a non-owner approver removed or narrowed
+   * between the pre-check and the conditional update is rejected. Returns true
+   * for the owner path and when the collaborator is absent (unit doubles).
+   */
+  async stillOwnerOrScopedApprover(
+    asOwner: boolean,
+    accountId: string | undefined,
+    storeId: string,
+    type: RequestApproverType,
+    targetProfileId: string | null | undefined,
+  ): Promise<boolean> {
+    if (asOwner || !this.approverScopeService) return true;
+    return this.approverScopeService.stillScopedApprover(
+      accountId,
+      storeId,
+      type,
+      targetProfileId,
+    );
   }
 
   /**
@@ -2123,6 +2178,53 @@ export class StoresService {
     }
   }
 
+  /**
+   * Fills an empty account email / address on a loaded employee profile from the
+   * applicant's own accepted application at this store (decision 1b). Mutates the
+   * in-memory `account` relation only — it never writes to the database — so the
+   * response shape is unchanged and both mobile apps benefit without a release.
+   * Preference: the application tied to this exact profile, else the latest
+   * accepted application of the same account at the same store. Redacted
+   * applications (contact cleared after 90 days) and soft-deleted ones are
+   * excluded. Runs one query, and only when a field is actually empty; it is
+   * deliberately never called from list endpoints (no N+1).
+   */
+  private async fillEmptyContactFromApplication(profile: EmployeeProfile): Promise<void> {
+    const account = profile.account;
+    if (!account) return;
+    const emailEmpty = !account.email || !account.email.trim();
+    const addressEmpty = !account.address || !account.address.trim();
+    if (!emailEmpty && !addressEmpty) return;
+    try {
+      const applications = await this.dataSource.getRepository(JobApplication).find({
+        where: {
+          accountId: profile.accountId,
+          storeId: profile.storeId,
+          status: JobApplicationStatus.ACCEPTED,
+          contactRedactedAt: IsNull(),
+        },
+        select: ['id', 'email', 'address', 'employeeProfileId', 'reviewedAt'],
+        order: { reviewedAt: 'DESC', id: 'DESC' },
+      });
+      if (!applications.length) return;
+      // The list is newest-first, so the first profile-tied row is the latest
+      // application of this stint; otherwise the latest accepted one wins.
+      const source =
+        applications.find((app) => app.employeeProfileId === profile.id) ?? applications[0];
+      if (emailEmpty && source.email && source.email.trim()) {
+        // Normalise exactly like setEmailIfEmpty (normalizeEmail = trim + lower)
+        // so the screen shows the same value before and after the backfill writes
+        // the account email for real. Address is only trimmed.
+        account.email = normalizeEmail(source.email);
+      }
+      if (addressEmpty && source.address && source.address.trim()) {
+        account.address = source.address.trim();
+      }
+    } catch {
+      // Best effort: a fallback lookup failure must never break the detail read.
+    }
+  }
+
   async getEmployeeById(profileId: string) {
     const profile = await this.profileRepository.findOne({
       where: { id: profileId },
@@ -2147,6 +2249,17 @@ export class StoresService {
     // contract comes first, so clients reading `contracts[0]` get it.
     const floor = stintFloor(profile.joinedAt);
     profile.contracts = currentStintContracts(profile.contracts, floor);
+
+    // Contact fallback (decision 1b): employees hired before the accept-time
+    // copy (JobApplicationService.recordApplicantDetails) have no email/address
+    // on their account, but their accepted application still holds what they
+    // typed. When the account value is empty, fill it in the RESPONSE ONLY (no
+    // DB write) from their latest ACCEPTED, non-redacted application at this
+    // store — preferring the one tied to this very profile. Both the owner and
+    // the employee themselves already see account.email/address on this
+    // endpoint, so this widens nothing. One query, only when a field is empty;
+    // never added to list endpoints.
+    await this.fillEmptyContactFromApplication(profile);
 
     // 1. Lấy thống kê tháng hiện tại (tháng Việt Nam)
     const currentMonth = toMonthMarker(vnMonthOf());
@@ -5059,7 +5172,8 @@ export class StoresService {
     // Idempotent: a KPI has at most one pending request. The KPI row lock
     // serializes concurrent submissions, so the second one sees the first
     // and gets it back instead of inserting a duplicate.
-    return this.dataSource.transaction(async (manager) => {
+    let createdNew = false;
+    const result = await this.dataSource.transaction(async (manager) => {
       const locked = await manager.getRepository(EmployeeKpi).findOne({
         where: { id: kpi.id },
         select: ['id'],
@@ -5082,8 +5196,29 @@ export class StoresService {
         note: data.note ?? null,
         status: KpiRequestStatus.PENDING,
       });
-      return requests.save(request);
+      const saved = await requests.save(request);
+      createdNew = true;
+      return saved;
     });
+
+    // New KPI approval request notified no one before (N3): tell the owner AND
+    // the scoped KPI approvers. The idempotent duplicate re-fetch does not.
+    if (createdNew) {
+      const who = await this.employeeDisplayName(kpi.employeeProfileId);
+      const kpiStoreId = await this.kpiStoreId(kpi.employeeProfileId);
+      void this.notifyOwnerAndApprovers({
+        storeId: kpiStoreId,
+        targetProfileId: kpi.employeeProfileId,
+        type: RequestApproverType.KPI,
+        actorAccountId: accountId ?? null,
+        owner: {
+          title: 'Yêu cầu duyệt KPI',
+          content: `Nhân viên ${who} gửi bảng KPI chờ duyệt.`,
+          metadata: { type: 'KPI_APPROVAL_REQUEST', requestId: result.id },
+        },
+      });
+    }
+    return result;
   }
 
   async getKpiApprovalRequests(
@@ -5208,10 +5343,16 @@ export class StoresService {
       throw new NotFoundException('Không tìm thấy yêu cầu duyệt KPI');
     }
 
-    // Only the owner of the KPI's store decides; a member approving their
-    // own KPI was possible before.
+    // The owner of the KPI's store, or a scoped KPI approver. The target for
+    // the scope is the rated employee (employeeKpi.employeeProfileId), never the
+    // account that POSTed (A3). Self-approval is blocked inside the resolver.
     const storeId = await this.kpiStoreId(request.employeeKpi.employeeProfileId);
-    await this.assertOwnerStoreAccess(storeId, reviewerAccountId);
+    const { asOwner: kpiAsOwner } = await this.assertOwnerOrScopedApprover(
+      reviewerAccountId,
+      storeId,
+      RequestApproverType.KPI,
+      request.employeeKpi.employeeProfileId,
+    );
     if (request.status !== KpiRequestStatus.PENDING) {
       throw new BadRequestException('Yêu cầu này đã được xử lý');
     }
@@ -5226,6 +5367,19 @@ export class StoresService {
     const note = data.note ?? null;
 
     return this.dataSource.transaction(async (manager) => {
+      // H3: re-validate the approver in the same transaction as the conditional
+      // status update (owner path returns true without an extra read).
+      if (
+        !(await this.stillOwnerOrScopedApprover(
+          kpiAsOwner,
+          reviewerAccountId,
+          storeId,
+          RequestApproverType.KPI,
+          request.employeeKpi.employeeProfileId,
+        ))
+      ) {
+        throw new ForbiddenException('Bạn không có quyền duyệt yêu cầu này');
+      }
       // Conditional on PENDING so two concurrent decisions cannot both apply.
       const result = await manager
         .getRepository(KpiApprovalRequest)

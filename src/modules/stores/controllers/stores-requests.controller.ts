@@ -125,7 +125,10 @@ export class StoresRequestsController {
     return [];
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped SHIFT_CHANGE approver (service `assertCanApprove`).
+  // `@StoreOwnerOnly()` removed; the controller chain keeps JwtAuthGuard +
+  // StoreAccessGuard + StoreResourceAccessGuard (family `shift-change-requests`
+  // → the request's store) scoping it to a member of that store.
   @Patch('shift-change-requests/:id/approve')
   @ApiOperation({ summary: 'Phê duyệt yêu cầu đổi ca' })
   async approveShiftChangeRequest(
@@ -138,7 +141,7 @@ export class StoresRequestsController {
     );
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped SHIFT_CHANGE approver (service `assertCanApprove`).
   @Patch('shift-change-requests/:id/reject')
   @ApiOperation({ summary: 'Từ chối yêu cầu đổi ca' })
   async rejectShiftChangeRequest(
@@ -245,7 +248,9 @@ export class StoresRequestsController {
       : own;
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped BONUS_WORK approver (service `assertCanApprove`).
+  // `@StoreOwnerOnly()` removed; family `bonus-work-requests` keeps it member-
+  // scoped via StoreResourceAccessGuard.
   @Patch('bonus-work-requests/:id/approve')
   @ApiOperation({ summary: 'Phê duyệt yêu cầu bổ sung công' })
   async approveBonusWorkRequest(@Param('id') id: string, @GetUser() user: any) {
@@ -257,7 +262,7 @@ export class StoresRequestsController {
     return request;
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped BONUS_WORK approver (service `assertCanApprove`).
   @Patch('bonus-work-requests/:id/reject')
   @ApiOperation({ summary: 'Từ chối yêu cầu bổ sung công' })
   async rejectBonusWorkRequest(
@@ -302,7 +307,10 @@ export class StoresRequestsController {
     return this.storesService.upsertApprovalSetting(id, body);
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped approver per request type (service `processRequest` /
+  // bonus-work path run `assertCanApprove`). `@StoreOwnerOnly()` removed; the
+  // polymorphic `approvals/:requestId` ROUTE_RULE keeps StoreResourceAccessGuard
+  // scoping it to a member of the addressed request's store.
   @Post('approvals/:requestId')
   @ApiOperation({
     summary: 'Duyệt/Từ chối yêu cầu (Đăng ký ca, Đổi ca, Nghỉ phép)',

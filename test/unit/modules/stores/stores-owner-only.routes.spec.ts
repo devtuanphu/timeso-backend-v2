@@ -46,7 +46,6 @@ describe('owner-only route metadata', () => {
     'generatePayroll', // POST :id/payrolls/generate
     'recalculatePayroll', // POST :id/payrolls/recalculate
     'payEmployeeSalary', // POST salaries/:id/pay
-    'reviewSalaryAdvanceRequest', // PATCH salary-advance-requests/:id/review
     'updateStoreLocation', // PUT :id/location
     'generateStoreQR', // POST :id/qr-code
     'createRole',
@@ -58,10 +57,7 @@ describe('owner-only route metadata', () => {
     'permanentDeleteEmployee', // DELETE employees/:profileId/permanent
     'restoreEmployee', // POST employees/:profileId/restore
     'deleteEmployee', // DELETE employees/:profileId
-    'approveBonusWorkRequest',
-    'rejectBonusWorkRequest',
     'getInventoryReports',
-    'processApproval',
     'updateSalaryConfig',
     'deleteSalaryConfig',
     'updateEmployeeKpiStatus', // PATCH employee-kpis/:id/status
@@ -79,6 +75,12 @@ describe('owner-only route metadata', () => {
 
   // Reads employees need for work, and actions on their own data, must stay
   // open to members; the guard would otherwise refuse the staff app.
+  //
+  // The request-decision handlers below are deliberately NOT @StoreOwnerOnly:
+  // they are delegated to the owner OR a scoped approver and enforced in the
+  // service by ApproverScopeService.assertCanApprove. Their controller chain
+  // still scopes them to a member of the addressed store (StoreAccessGuard /
+  // StoreResourceAccessGuard); the owner behaviour is byte-identical.
   it.each([
     'findById',
     'getApprovalSetting',
@@ -86,6 +88,12 @@ describe('owner-only route metadata', () => {
     'getWorkShifts',
     'cancelBonusWorkRequest',
     'cancelSalaryAdvanceRequest',
+    'reviewSalaryAdvanceRequest', // delegated: owner or scoped approver
+    'approveBonusWorkRequest', // delegated: owner or scoped approver
+    'rejectBonusWorkRequest', // delegated: owner or scoped approver
+    'processApproval', // delegated: owner or scoped approver
+    'approveShiftChangeRequest', // delegated: owner or scoped approver
+    'rejectShiftChangeRequest', // delegated: owner or scoped approver
     'getBonusHistory',
     'getPenaltyHistory',
     'getFeedbacksEarly',
@@ -138,11 +146,12 @@ describe('owner-only route metadata', () => {
     ]) {
       expect(isOwnerOnly(ShiftAggregationController, handler)).toBe(true);
     }
-    for (const handler of ['list', 'accept', 'reject']) {
+    for (const handler of ['list', 'accept']) {
       expect(isOwnerOnly(JobApplicationController, handler)).toBe(true);
     }
-    // Applicant and employee routes stay open.
-    for (const handler of ['listMine', 'apply', 'withdraw']) {
+    // Reject is delegated (owner OR a scoped job_application approver via the
+    // service); accept stays owner-only. Applicant/employee routes stay open.
+    for (const handler of ['reject', 'listMine', 'apply', 'withdraw']) {
       expect(isOwnerOnly(JobApplicationController, handler)).toBe(false);
     }
     expect(

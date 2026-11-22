@@ -755,7 +755,9 @@ export class StoresPayrollController {
     });
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped SALARY_ADVANCE approver (service `assertCanApprove`).
+  // `@StoreOwnerOnly()` removed; family `salary-advance-requests` (→ profile →
+  // store) keeps StoreResourceAccessGuard scoping it to a member of the store.
   @Patch('salary-advance-requests/:requestId/review')
   @ApiOperation({ summary: 'Duyệt/Từ chối yêu cầu ứng lương' })
   @ApiResponse({ status: 200, description: 'Xử lý yêu cầu thành công' })

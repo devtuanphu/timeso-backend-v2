@@ -24,6 +24,7 @@ import { createReadStream } from 'fs';
 
 import { GetUser } from '../auth/decorators/get-user.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { StoreAccessGuard } from './guards/store-access.guard';
 import { StoreOwnerOnly } from './guards/store-owner-only.decorator';
 import { StoreOwnerOnlyGuard } from './guards/store-owner-only.guard';
 import { JobApplicationService } from './job-application.service';
@@ -61,6 +62,24 @@ export class JobApplicationController {
   })
   async listMine(@GetUser() user: any) {
     return this.jobApplicationService.listMine(user?.userId);
+  }
+
+  /**
+   * R1: active positions of the store for the apply form's picker.
+   *
+   * Deliberately NOT `@StoreOwnerOnly()`: the applicant is not a member, so
+   * `StoreOwnerOnlyGuard` passes this route through — any authenticated user may
+   * read it, same as `apply`. The response is an allowlist (id / name /
+   * department) and never carries the role's coefficient or allowance. The route
+   * has three segments, so the `StoresController` catch-all `@Get(':id')` cannot
+   * shadow it.
+   */
+  @Get(':storeId/job-applications/positions')
+  @ApiOperation({
+    summary: 'Danh sách vị trí ứng tuyển của cửa hàng (cho người ứng tuyển)',
+  })
+  async positions(@Param('storeId', new ParseUUIDPipe()) storeId: string) {
+    return this.jobApplicationService.listApplyPositions(storeId);
   }
 
   /**
@@ -177,9 +196,13 @@ export class JobApplicationController {
     );
   }
 
-  @StoreOwnerOnly()
+  // Reject is delegated: the owner, OR a scoped `job_application` approver
+  // (the service `assertCanRejectApplication` decides). `@StoreOwnerOnly()` is
+  // removed; method-level StoreAccessGuard keeps the route scoped to a member
+  // of `:storeId` (the path starts with it), and accept stays owner-only above.
+  @UseGuards(StoreAccessGuard)
   @Post(':storeId/job-applications/:applicationId/reject')
-  @ApiOperation({ summary: 'Từ chối đơn ứng tuyển' })
+  @ApiOperation({ summary: 'Từ chối đơn ứng tuyển (chủ hoặc người phê duyệt)' })
   async reject(
     @Param('storeId', new ParseUUIDPipe()) storeId: string,
     @Param('applicationId', new ParseUUIDPipe()) applicationId: string,

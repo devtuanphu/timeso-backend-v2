@@ -78,7 +78,9 @@ export class CustomShiftRequestController {
     return this.service.listForOwner(storeId, query.status);
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped CUSTOM_SHIFT approver (service `assertCanApprove`).
+  // `@StoreOwnerOnly()` removed; the chain keeps JwtAuthGuard + StoreAccessGuard
+  // (the route starts with `:storeId`) scoping it to a member of that store.
   @HttpCode(200)
   @Post(':storeId/custom-shift-requests/:requestId/approve')
   @ApiOperation({
@@ -92,7 +94,7 @@ export class CustomShiftRequestController {
     return this.service.approve(storeId, requestId, user.userId);
   }
 
-  @StoreOwnerOnly()
+  // Owner or scoped CUSTOM_SHIFT approver (service `assertCanApprove`).
   @HttpCode(200)
   @Post(':storeId/custom-shift-requests/:requestId/reject')
   @ApiOperation({ summary: 'Từ chối yêu cầu khung giờ khác' })

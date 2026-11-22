@@ -12,6 +12,8 @@ import {
   Res,
   NotFoundException,
   ForbiddenException,
+  Optional,
+  Inject,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { createReadStream, existsSync } from 'fs';
@@ -33,6 +35,10 @@ import { AccountFinance } from './entities/account-finance.entity';
 import { Repository } from 'typeorm';
 import { AccountResponseDto, IdentityResponseDto, FinanceResponseDto } from './dto/account-response.dto';
 import { UpdateIdentityDto, UpdateFinanceDto } from './dto/update-profile.dto';
+import {
+  APPROVER_IDENTITY_CHANGE_HOOK,
+  ApproverIdentityChangeHook,
+} from '../stores/approver-identity-change.hook';
 
 @ApiTags('Thông tin tài khoản (Accounts)')
 @ApiBearerAuth()
@@ -45,6 +51,11 @@ export class AccountsController {
     private readonly identityRepository: Repository<AccountIdentityDocument>,
     @InjectRepository(AccountFinance)
     private readonly financeRepository: Repository<AccountFinance>,
+    // A4(b): optional so the accounts module stays independent — present in the
+    // running app (provided globally), absent in isolated unit doubles.
+    @Optional()
+    @Inject(APPROVER_IDENTITY_CHANGE_HOOK)
+    private readonly approverIdentityHook?: ApproverIdentityChangeHook,
   ) {}
 
   @Get('profile')
@@ -175,13 +186,32 @@ export class AccountsController {
 
     // Check if exists
     const existing = await this.identityRepository.findOne({ where: { accountId: user.userId } });
+    const previousNumber = existing?.documentNumber ?? null;
+    let result: AccountIdentityDocument | null;
     if (existing) {
       await this.identityRepository.update(existing.id, data);
-      return this.identityRepository.findOne({ where: { id: existing.id } });
+      result = await this.identityRepository.findOne({ where: { id: existing.id } });
     } else {
       const newIdentity = this.identityRepository.create(data);
-      return this.identityRepository.save(newIdentity);
+      result = (await this.identityRepository.save(newIdentity)) as unknown as AccountIdentityDocument;
     }
+
+    // A4(b): when an EXISTING document number is CHANGED, let the stores side
+    // warn any store owner whose active approver this account is. NOT on first
+    // upload (previous number empty) — there is no prior value to diverge from.
+    // Fire-and-forget: it must never affect this response. Same collation-safe
+    // normalization as the conflict rule (upper-case, keep ASCII [A-Z0-9]); it
+    // only decides "did it change" here.
+    const normalize = (value: string | null | undefined) =>
+      (value ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const prevNorm = normalize(previousNumber);
+    const nextNorm = normalize(
+      typeof body.documentNumber === 'string' ? body.documentNumber : null,
+    );
+    if (this.approverIdentityHook && prevNorm && nextNorm && prevNorm !== nextNorm) {
+      void this.approverIdentityHook.onIdentityDocumentChanged(user.userId);
+    }
+    return result;
   }
 
   @Post('finance')

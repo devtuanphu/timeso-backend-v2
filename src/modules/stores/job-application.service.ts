@@ -7,9 +7,10 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
+import { In, IsNull, LessThan, MoreThan, Not, Repository } from 'typeorm';
 
 import { Account, AccountStatus } from '../accounts/entities/account.entity';
 import { AccountsService } from '../accounts/accounts.service';
@@ -23,6 +24,12 @@ import {
   JobApplicationStatus,
 } from './entities/job-application.entity';
 import {
+  ApproverScopeService,
+  RequestApproverType,
+} from './approver-scope.service';
+import { jobApplicationApproverView } from './approver-list-views';
+import { ListApproverRequestsQueryDto } from './dto/store-request-approver.dto';
+import {
   EMPLOYED_STATUSES,
   EmployeeProfile,
   EmploymentStatus,
@@ -30,6 +37,8 @@ import {
 } from './entities/employee-profile.entity';
 import { EmployeeMonthlySummary } from './entities/employee-monthly-summary.entity';
 import { Store, StoreStatus } from './entities/store.entity';
+import { StoreRole } from './entities/store-role.entity';
+import { StoreDepartment } from './entities/store-department.entity';
 import { StoresService } from './stores.service';
 import { sanitizeDisplayName } from './job-application.text';
 import {
@@ -49,6 +58,7 @@ import {
   ListJobApplicationsQueryDto,
   MyJobApplicationDto,
   RejectJobApplicationDto,
+  StoreApplyPositionDto,
 } from './dto/job-application.dto';
 
 /** 'YYYY-MM-DD' of a `date` column value (string from the driver, or a Date). */
@@ -112,6 +122,9 @@ export class JobApplicationService {
     private readonly notificationsService: NotificationsService,
     private readonly storesService: StoresService,
     private readonly selfieStorage: JobApplicationSelfieStorage,
+    // Scoped approvers. Optional so the hand-built unit double keeps working;
+    // when absent `reject` stays owner-only (legacy). Prod always injects it.
+    @Optional() private readonly approverScopeService?: ApproverScopeService,
   ) {}
 
   // ─── shared guards ────────────────────────────────────────────────────────
@@ -155,6 +168,56 @@ export class JobApplicationService {
       throw new ForbiddenException('Bạn không có quyền truy cập cửa hàng này');
     }
     return store;
+  }
+
+  // R1: resolved through the application repo's manager rather than new
+  // constructor arguments — this service is wired positionally in several specs
+  // and widening the constructor has broken them before.
+  private storeRoleRepository(): Repository<StoreRole> {
+    return this.applicationRepository.manager.getRepository(StoreRole);
+  }
+
+  private departmentRepository(): Repository<StoreDepartment> {
+    return this.applicationRepository.manager.getRepository(StoreDepartment);
+  }
+
+  /**
+   * R1 applicant-facing position picker. Any authenticated user (the applicant
+   * is not a member); the store must be ACTIVE (404 otherwise). Built from an
+   * explicit allowlist — never the StoreRole entity, which carries the salary
+   * coefficient and the fixed allowance. Active roles only.
+   */
+  async listApplyPositions(storeId: string): Promise<StoreApplyPositionDto[]> {
+    const store = await this.storeRepository.findOne({
+      where: { id: storeId },
+      select: ['id', 'status'],
+    });
+    if (!store || store.status !== StoreStatus.ACTIVE) {
+      throw new NotFoundException('Cửa hàng không tồn tại');
+    }
+    const rows: Array<{
+      id: string;
+      name: string;
+      departmentId: string | null;
+      departmentName: string | null;
+    }> = await this.storeRoleRepository()
+      .createQueryBuilder('role')
+      .leftJoin(StoreDepartment, 'dept', 'dept.id = role.department_id')
+      .where('role.store_id = :storeId', { storeId })
+      .andWhere('role.is_active = true')
+      .select('role.id', 'id')
+      .addSelect('role.name', 'name')
+      .addSelect('role.department_id', 'departmentId')
+      .addSelect('dept.name', 'departmentName')
+      .orderBy('dept.name', 'ASC')
+      .addOrderBy('role.name', 'ASC')
+      .getRawMany();
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      departmentId: row.departmentId ?? null,
+      departmentName: row.departmentName ?? null,
+    }));
   }
 
   // ─── staff: submit ────────────────────────────────────────────────────────
@@ -274,6 +337,26 @@ export class JobApplicationService {
       });
     }
 
+    // R1: validate + snapshot the applied position. The department is snapshotted
+    // from the role AT APPLY TIME, never re-joined later: moving a role between
+    // departments must not silently re-scope a historical application.
+    let appliedPositionId: string | null = null;
+    let appliedDepartmentId: string | null = null;
+    if (dto.appliedPositionId) {
+      const role = await this.storeRoleRepository().findOne({
+        where: { id: dto.appliedPositionId, storeId, isActive: true },
+        select: ['id', 'departmentId'],
+      });
+      if (!role) {
+        throw new BadRequestException({
+          code: 'JOB_APPLICATION_POSITION_INVALID',
+          message: 'Vị trí ứng tuyển không hợp lệ.',
+        });
+      }
+      appliedPositionId = role.id;
+      appliedDepartmentId = role.departmentId ?? null;
+    }
+
     let saved: JobApplication;
     try {
       saved = await this.applicationRepository.save(
@@ -288,6 +371,8 @@ export class JobApplicationService {
           birthday: dto.birthday ?? null,
           address: dto.address ?? null,
           selfiePath,
+          appliedPositionId,
+          appliedDepartmentId,
           status: JobApplicationStatus.PENDING,
         }),
       );
@@ -390,17 +475,116 @@ export class JobApplicationService {
       [...new Set(page.map((row) => row.accountId))],
     );
 
+    // R1: resolve the applied position/department names for the page in one
+    // round-trip each (names only; the ids are snapshots, so a since-renamed or
+    // since-deleted role simply resolves to null).
+    const positionIds = [
+      ...new Set(page.map((row) => row.appliedPositionId).filter(Boolean)),
+    ] as string[];
+    const departmentIds = [
+      ...new Set(page.map((row) => row.appliedDepartmentId).filter(Boolean)),
+    ] as string[];
+    const [roles, departments] = await Promise.all([
+      positionIds.length
+        ? this.storeRoleRepository().find({
+            where: { id: In(positionIds) },
+            select: ['id', 'name'],
+          })
+        : Promise.resolve([] as StoreRole[]),
+      departmentIds.length
+        ? this.departmentRepository().find({
+            where: { id: In(departmentIds) },
+            select: ['id', 'name'],
+          })
+        : Promise.resolve([] as StoreDepartment[]),
+    ]);
+    const roleName = new Map(roles.map((r) => [r.id, r.name]));
+    const deptName = new Map(departments.map((d) => [d.id, d.name]));
+
     return {
       items: page.map((row) =>
         this.toItem(
           row,
           row.account?.avatar ?? null,
           history.get(row.accountId) ?? null,
+          row.appliedPositionId
+            ? roleName.get(row.appliedPositionId) ?? null
+            : null,
+          row.appliedDepartmentId
+            ? deptName.get(row.appliedDepartmentId) ?? null
+            : null,
         ),
       ),
       page: query.page,
       limit: query.limit,
       hasMore: rows.length > query.limit,
+    };
+  }
+
+  /**
+   * The scoped-approver inbox list (F): pending applications with MINIMAL PII
+   * (name + status + date only — the selfie and contact fields stay owner-only,
+   * A6). Job applications carry no applied department/position, so a
+   * `job_application` approver sees every pending application in the store
+   * (Q1). Owner also allowed. Honours `contact_redacted_at` implicitly: a
+   * redacted PENDING row simply has a null name.
+   */
+  async listForApprover(
+    storeId: string,
+    accountId: string | undefined,
+    query: ListApproverRequestsQueryDto,
+  ): Promise<{ items: ReturnType<typeof jobApplicationApproverView>[]; total: number; page: number; limit: number }> {
+    const scope = this.approverScopeService
+      ? await this.approverScopeService.scopeFilterFor(
+          accountId,
+          storeId,
+          RequestApproverType.JOB_APPLICATION,
+        )
+      : null;
+    if (!scope) {
+      throw new ForbiddenException({
+        code: 'APPROVER_FORBIDDEN',
+        message: 'Bạn không có quyền xem danh sách này',
+      });
+    }
+    const page = query.page && query.page > 0 ? query.page : 1;
+    const limit = query.limit && query.limit > 0 ? query.limit : 20;
+    // H2: approvers only ever see PENDING applications. Any `status` the client
+    // sends is ignored here; the owner uses `listForStore` for other statuses.
+    const qb = this.applicationRepository
+      .createQueryBuilder('application')
+      .where('application.storeId = :storeId', { storeId })
+      .andWhere('application.status = :status', {
+        status: JobApplicationStatus.PENDING,
+      });
+    // R1: a scoped approver (non-owner) only ever sees applications that carry a
+    // position AND match their department/position scope. A null-position
+    // application is owner-only. The owner scope has no extra filter.
+    if (!scope.isOwner) {
+      qb.andWhere('application.applied_position_id IS NOT NULL');
+      if (scope.departmentIds.length) {
+        qb.andWhere(
+          'application.applied_department_id::text IN (:...deptIds)',
+          { deptIds: scope.departmentIds },
+        );
+      }
+      if (scope.positionIds.length) {
+        qb.andWhere('application.applied_position_id::text IN (:...posIds)', {
+          posIds: scope.positionIds,
+        });
+      }
+    }
+    const [rows, total] = await qb
+      .orderBy('application.createdAt', 'DESC')
+      .addOrderBy('application.id', 'DESC')
+      .skip((page - 1) * limit)
+      .take(limit)
+      .getManyAndCount();
+    return {
+      items: rows.map((row) => jobApplicationApproverView(row)),
+      total,
+      page,
+      limit,
     };
   }
 
@@ -563,17 +747,29 @@ export class JobApplicationService {
   async reject(
     storeId: string,
     applicationId: string,
-    ownerAccountId: string,
+    accountId: string,
     dto: RejectJobApplicationDto,
   ): Promise<JobApplicationItemDto> {
-    await this.assertStoreOwner(storeId, ownerAccountId);
+    // A4: load the application bound to the store FIRST, then authorize against
+    // that exact entity. The resolver never re-fetches it without the storeId
+    // binding, so a scoped approver cannot be tricked across stores.
     const application = await this.loadPending(storeId, applicationId);
+    if (this.approverScopeService) {
+      await this.approverScopeService.assertCanRejectApplication(
+        accountId,
+        storeId,
+        application,
+      );
+    } else {
+      // Legacy owner-only (hand-built unit doubles); prod injects the resolver.
+      await this.assertStoreOwner(storeId, accountId);
+    }
 
     const claimed = await this.applicationRepository.update(
       { id: application.id, status: JobApplicationStatus.PENDING },
       {
         status: JobApplicationStatus.REJECTED,
-        reviewedById: ownerAccountId,
+        reviewedById: accountId,
         reviewedAt: new Date(),
         rejectionReason: dto.reason ?? null,
         // The decision is final, so the applicant's contact details serve no
@@ -988,9 +1184,10 @@ export class JobApplicationService {
   /**
    * On acceptance, records what the applicant entered on this application as
    * the employee's information (the latest application wins):
-   * - account: full name only when empty; gender, birthday and address are
+   * - account: full name and address only when empty; gender and birthday are
    *   overwritten with the application's non-empty values (gender compared by
-   *   meaning, so 'male' is not rewritten to 'Nam');
+   *   meaning, so 'male' is not rewritten to 'Nam'). Address never overwrites a
+   *   value the employee already set (decision 1a);
    * - email: only when the account has none and no other account uses it —
    *   it is the login identifier (AccountsService.setEmailIfEmpty);
    * - this store's employee profile: the introduction ("Giới thiệu bản thân").
@@ -1066,7 +1263,11 @@ export class JobApplicationService {
           patch.birthday = birthday as unknown as Date;
         }
         const address = application.address?.trim();
-        if (address && shouldWrite(address !== account.address, !account.address?.trim())) {
+        // Address only ever fills an empty account address, never overwrites one
+        // the employee already set — even for this accept's own hire (decision
+        // 1a). `shouldWrite` is kept for gender/birthday above, where the newest
+        // application still wins on a fresh hire.
+        if (address && !account.address?.trim()) {
           patch.address = address;
         }
         if (Object.keys(patch).length) {
@@ -1271,6 +1472,8 @@ export class JobApplicationService {
     row: JobApplication,
     avatarUrl: string | null,
     formerEmployment: FormerEmployment | null = null,
+    appliedPositionName: string | null = null,
+    appliedDepartmentName: string | null = null,
   ): JobApplicationItemDto {
     return {
       id: row.id,
@@ -1291,6 +1494,8 @@ export class JobApplicationService {
       selfieUrl: row.selfiePath
         ? jobApplicationSelfieUrl(row.storeId, row.id)
         : null,
+      appliedPositionName,
+      appliedDepartmentName,
       formerEmployment,
     };
   }

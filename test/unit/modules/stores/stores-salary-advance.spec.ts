@@ -49,6 +49,15 @@ function buildService() {
 
   service.salaryAdvanceRequestRepository = advanceRepo;
   service.employeeSalaryRepository = employeeSalaryRepo;
+  // The review now resolves the store from the target profile and (without the
+  // approver collaborator) falls back to the owner-only check: REVIEWER owns
+  // the store, so authorization passes and the arithmetic under test runs.
+  service.profileRepository = {
+    findOne: jest.fn(async () => ({ id: 'profile-1', storeId: 'store-1' })),
+  };
+  service.storeRepository = {
+    findOne: jest.fn(async () => ({ id: 'store-1', ownerAccountId: REVIEWER })),
+  };
   service.logger = { debug: jest.fn(), warn: jest.fn(), log: jest.fn(), error: jest.fn() };
   // Approval runs in one transaction; the shim hands out the same mocked
   // repositories through the manager.
@@ -89,20 +98,20 @@ function pendingRequest(over: Record<string, unknown> = {}) {
 }
 
 describe('reviewSalaryAdvanceRequest — approved amount', () => {
-  // Regression: `data.approvedAmount || request.requestedAmount` treated a
-  // deliberate 0 as "not supplied" and granted the whole request.
-  it('treats an explicit 0 as approving nothing, not the full amount', async () => {
+  // A6 (updated): an approved advance must be strictly > 0. A deliberate 0 is
+  // now REJECTED, never silently granted as the full request (the old `||` bug)
+  // nor approved as "nothing". The payslip must stay untouched.
+  it('rejects an explicit 0 approved amount', async () => {
     const t = buildService();
     t.advanceRepo.findOne.mockResolvedValue(pendingRequest());
 
-    await t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
-      status: AdvanceRequestStatus.APPROVED,
-      approvedAmount: 0,
-    });
-
-    const [, changes] = t.employeeSalaryRepo.update.mock.calls[0];
-    expect(changes.advancePayment).toBe(0);
-    expect(changes.netSalary).toBe(5_000_000);
+    await expect(
+      t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
+        status: AdvanceRequestStatus.APPROVED,
+        approvedAmount: 0,
+      }),
+    ).rejects.toThrow(BadRequestException);
+    expect(t.employeeSalaryRepo.update).not.toHaveBeenCalled();
   });
 
   it('still falls back to the requested amount when omitted', async () => {
@@ -250,6 +259,8 @@ describe('reviewSalaryAdvanceRequest — advancePayment source of truth', () => 
 
     await t.service.reviewSalaryAdvanceRequest('request-1', REVIEWER, {
       status: AdvanceRequestStatus.REJECTED,
+      // A6: rejecting now requires a non-empty note.
+      reviewNote: 'Không đủ điều kiện',
     });
 
     expect(t.employeeSalaryRepo.update).not.toHaveBeenCalled();
