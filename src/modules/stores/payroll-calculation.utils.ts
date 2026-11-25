@@ -886,8 +886,8 @@ const ymdOf = (value: unknown): string | null => {
  * cửa sổ [validFrom, validTo) chứa ngày đó. Phiên bản sớm nhất cũng áp cho mọi
  * ngày TRƯỚC validFrom của nó (ghi nhận lùi ngày về đầu kỳ) — đúng ngữ nghĩa
  * của versionedRuleInputs (recordFrom = đầu kỳ cho phiên bản sớm nhất). Dùng ở
- * createPayrollRecord để bốc / tính số tiền theo đúng phiên bản của ngày đó,
- * vì phiếu lương định giá theo cửa sổ ngày chứ không theo ruleId của bản ghi.
+ * createPayrollRecord để tính / định giá số tiền theo đúng phiên bản của ngày
+ * đó, vì phiếu lương định giá theo cửa sổ ngày chứ không theo ruleId của bản ghi.
  */
 export function ruleVersionOnDate<T extends { validFrom?: unknown; validTo?: unknown }>(
   versions: T[],
@@ -915,9 +915,9 @@ export function isPeriodLevelRule(rule: RuleWithName): boolean {
     const base = String((rule.calcConfig as Record<string, unknown>).base ?? '');
     if (kind === 'FIXED' || kind === 'UNIT_PRICE' || kind === 'SALARY_COEF') return false;
     if (kind === 'SALARY_BLOCK') return false;
-    // Phạt ngẫu nhiên: mỗi lần ghi nhận là một lần phát sinh (số tiền riêng đã
-    // bốc) → tính theo từng lần, để nhân viên thấy số đã bốc + ghi chú từng lần.
-    if (kind === 'RANDOM') return false;
+    // Phạt "Tuỳ chọn": mỗi lần ghi nhận là một lần phát sinh (số tiền riêng chủ
+    // nhập) → tính theo từng lần, để nhân viên thấy số tiền + ghi chú từng lần.
+    if (kind === 'MANUAL_AMOUNT') return false;
     if (kind === 'PERCENT') return base === 'MONTHLY' || base === 'REVENUE';
     // Bậc thang / luỹ tiến của khoản đo bằng phút (trễ, sớm, tăng ca…) tính
     // theo từng lần (evaluateRuleConfig); theo số lần / số lượng trong tháng
