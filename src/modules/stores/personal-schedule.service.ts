@@ -5,10 +5,17 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { InjectQueue } from '@nestjs/bullmq';
 import { InjectRepository } from '@nestjs/typeorm';
+import { Queue } from 'bullmq';
 import { MoreThanOrEqual, Repository } from 'typeorm';
 
 import { vnDateString, vnMonthOf } from '../../common/utils/vn-calendar';
+import {
+  NotificationPriority,
+  NotificationType,
+} from '../notifications/entities/notification.entity';
+import { NotificationsService } from '../notifications/notifications.service';
 import {
   CreatePersonalScheduleDto,
   UpdatePersonalScheduleDto,
@@ -23,6 +30,7 @@ import {
   EmployeeProfile,
   isEmployedStatus,
 } from './entities/employee-profile.entity';
+import { Store } from './entities/store.entity';
 import { stintFloor } from './employment-stint.utils';
 import {
   estimateFromPreferences,
@@ -74,6 +82,26 @@ const toDto = (schedule: EmployeePersonalSchedule) => ({
 const isUniqueViolation = (error: unknown) =>
   (error as { code?: string } | null)?.code === '23505';
 
+/** Chống spam: tối đa một thông báo đề xuất giờ cho mỗi hồ sơ nhân viên / 10 phút. */
+const PROPOSAL_NOTIFY_THROTTLE_MS = 10 * 60 * 1000;
+/** Chờ Redis tối đa chừng này rồi dùng mốc trong bộ nhớ (không treo vô hạn khi Redis mất). */
+const PROPOSAL_THROTTLE_REDIS_TIMEOUT_MS = 2000;
+
+/**
+ * Client ioredis của hàng đợi BullMQ. Kiểu công khai của BullMQ chỉ có tập lệnh
+ * chung, nhưng lúc chạy là ioredis nên có `SET key value PX ttl NX` (giống
+ * khoá mutation-lock ở shift-reminder.service.ts).
+ */
+type ThrottleRedisClient = {
+  set(
+    key: string,
+    value: string,
+    px: 'PX',
+    ttl: number,
+    nx: 'NX',
+  ): Promise<'OK' | null>;
+};
+
 /**
  * Lịch cá nhân (lịch trống / bận / học): nhân viên tự thêm, sửa, xoá lịch của
  * chính mình; chủ cửa hàng chỉ đọc. Chỉ lịch của đợt làm hiện tại (sau lần
@@ -83,12 +111,26 @@ const isUniqueViolation = (error: unknown) =>
 export class PersonalScheduleService {
   private readonly logger = new Logger(PersonalScheduleService.name);
 
+  /**
+   * Mốc dự phòng khi Redis lỗi / chậm: lần cuối đã báo đề xuất của mỗi hồ sơ
+   * (ms), chỉ trong tiến trình này. Nguồn chính là khoá Redis (xem
+   * `claimProposalNotifySlot`). Chỉ chặn push; đề xuất vẫn được lưu và chủ vẫn
+   * thấy trong màn lịch cá nhân.
+   */
+  private readonly proposalNotifiedAt = new Map<string, number>();
+
   constructor(
     @InjectRepository(EmployeePersonalSchedule)
     private readonly scheduleRepository: Repository<EmployeePersonalSchedule>,
     @InjectRepository(EmployeeProfile)
     private readonly profileRepository: Repository<EmployeeProfile>,
+    @InjectRepository(Store)
+    private readonly storeRepository: Repository<Store>,
     private readonly storesService: StoresService,
+    private readonly notificationsService: NotificationsService,
+    // Chỉ mượn kết nối Redis của hàng đợi (đã có sẵn trong module) cho khoá
+    // chống spam thông báo đề xuất; không thêm job nào vào hàng đợi này.
+    @InjectQueue('shift-reminders') private readonly redisQueue: Queue,
   ) {}
 
   /** Hồ sơ của người gọi ở cửa hàng này; chỉ người đang làm việc. */
@@ -126,6 +168,7 @@ export class PersonalScheduleService {
       AVAILABLE: 0,
       BUSY: 0,
       STUDY: 0,
+      PROPOSAL: 0,
     };
     for (const schedule of schedules) summary[schedule.kind] += 1;
     // Cột select: false — chỉ đọc ở đây (chính nhân viên hoặc chủ).
@@ -337,6 +380,13 @@ export class PersonalScheduleService {
           ...values,
         }),
       );
+      // Chỉ báo cho chủ khi một đề xuất MỚI vừa được lưu (không gọi lại ở các
+      // nhánh trả bản trùng clientRequestId ở trên / dưới). Bắn-và-quên: không
+      // chờ (NotificationsService.create gửi Expo push, timeout 10s mỗi kênh)
+      // để không kéo dài request; hàm tự nuốt mọi lỗi nên promise không reject.
+      if (saved.kind === PersonalScheduleKind.PROPOSAL) {
+        void this.notifyOwnerOfProposal(saved);
+      }
       return toDto(saved);
     } catch (error) {
       // Hai lần gửi cùng clientRequestId chạy song song: lần sau trả bản đã tạo.
@@ -347,6 +397,126 @@ export class PersonalScheduleService {
         if (existing) return toDto(existing);
       }
       throw error;
+    }
+  }
+
+  /** Dọn các mốc đã quá hạn để Map không phình vô hạn. */
+  private pruneProposalNotifyLog(now: number) {
+    for (const [profileId, at] of this.proposalNotifiedAt) {
+      if (now - at >= PROPOSAL_NOTIFY_THROTTLE_MS) this.proposalNotifiedAt.delete(profileId);
+    }
+  }
+
+  /** Kiểm và ghi mốc trong bộ nhớ, ĐỒNG BỘ (không await) nên hai lời gọi song song không cùng thắng. */
+  private claimProposalNotifySlotInMemory(profileId: string) {
+    const now = Date.now();
+    this.pruneProposalNotifyLog(now);
+    const last = this.proposalNotifiedAt.get(profileId);
+    if (last !== undefined && now - last < PROPOSAL_NOTIFY_THROTTLE_MS) return false;
+    this.proposalNotifiedAt.set(profileId, now);
+    return true;
+  }
+
+  private async claimProposalNotifySlotInRedis(profileId: string) {
+    const client = (await this.redisQueue.client) as unknown as
+      | Partial<ThrottleRedisClient>
+      | undefined;
+    if (!client || typeof client.set !== 'function') {
+      throw new Error('Redis client unavailable');
+    }
+    const key = this.redisQueue.toKey(`personal-schedule-proposal-notify:${profileId}`);
+    const result = await client.set(
+      key,
+      String(Date.now()),
+      'PX',
+      PROPOSAL_NOTIFY_THROTTLE_MS,
+      'NX',
+    );
+    return result === 'OK';
+  }
+
+  /**
+   * Giành quyền báo cho hồ sơ này trong 10 phút tới. Nguồn chính là Redis:
+   * `SET NX PX` nguyên tử giữa MỌI tiến trình / instance và sống qua pm2
+   * restart. Redis lỗi hoặc không trả lời trong 2s thì dùng mốc trong bộ nhớ
+   * (chỉ đúng trong một tiến trình) — thà báo thừa một lần còn hơn mất báo.
+   */
+  private async claimProposalNotifySlot(profileId: string): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const claimed = await Promise.race([
+        this.claimProposalNotifySlotInRedis(profileId),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('Redis timeout')),
+            PROPOSAL_THROTTLE_REDIS_TIMEOUT_MS,
+          );
+        }),
+      ]);
+      // Ghi cả mốc trong bộ nhớ để nếu Redis mất ngay sau đó, dự phòng vẫn nhớ.
+      if (claimed) this.proposalNotifiedAt.set(profileId, Date.now());
+      return claimed;
+    } catch (error) {
+      this.logger.warn(
+        `[PersonalSchedule] proposal throttle falls back to memory: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return this.claimProposalNotifySlotInMemory(profileId);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Báo cho chủ cửa hàng khi nhân viên GỬI một đề xuất giờ mới (chỉ hàng vừa
+   * tạo, không gọi khi gửi trùng clientRequestId; sửa / xoá đề xuất không báo).
+   * Best-effort và bắn-và-quên: toàn thân nằm trong try/catch nên promise không
+   * bao giờ reject. Chặn spam: tối đa một push cho mỗi hồ sơ / 10 phút, khoá ở
+   * Redis để đúng cả khi chạy nhiều tiến trình (xem `claimProposalNotifySlot`).
+   * Người nhận: chỉ chủ cửa hàng. Nội dung: tên nhân viên + số khung giờ — không
+   * kèm giờ, ngày hay ghi chú (push đi qua Expo / APNs / FCM).
+   */
+  private async notifyOwnerOfProposal(schedule: EmployeePersonalSchedule) {
+    try {
+      if (!(await this.claimProposalNotifySlot(schedule.employeeProfileId))) return;
+
+      const [store, profile] = await Promise.all([
+        this.storeRepository.findOne({
+          where: { id: schedule.storeId },
+          select: ['id', 'ownerAccountId'],
+        }),
+        // Chỉ cần tên: không tải cả hồ sơ / tài khoản (dữ liệu cá nhân khác).
+        this.profileRepository.findOne({
+          where: { id: schedule.employeeProfileId },
+          relations: { account: true },
+          select: { id: true, account: { id: true, fullName: true } },
+        }),
+      ]);
+      if (!store?.ownerAccountId) return;
+      const who = profile?.account?.fullName?.trim() || 'Một nhân viên';
+      const count = schedule.slots.length;
+      await this.notificationsService.create({
+        accountId: store.ownerAccountId,
+        storeId: schedule.storeId,
+        title: 'Đề xuất giờ làm mới',
+        content: `${who} đề xuất ${count} khung giờ mong muốn làm việc.`,
+        type: NotificationType.SYSTEM,
+        priority: NotificationPriority.NORMAL,
+        actionUrl: `/(employee)/${schedule.employeeProfileId}/personal-schedules?kind=PROPOSAL&storeId=${schedule.storeId}`,
+        metadata: {
+          type: 'PERSONAL_SCHEDULE_PROPOSAL',
+          storeId: schedule.storeId,
+          employeeProfileId: schedule.employeeProfileId,
+          scheduleId: schedule.id,
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        `[PersonalSchedule] proposal owner notification failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     }
   }
 

@@ -130,6 +130,7 @@ export const PERSONAL_SCHEDULE_LABELS: Record<PersonalScheduleKind, string> = {
   AVAILABLE: 'Lịch trống',
   BUSY: 'Lịch bận',
   STUDY: 'Lịch học',
+  PROPOSAL: 'Đề xuất giờ',
 };
 
 /** Lịch tối thiểu cần để tính khung giờ có hiệu lực. */
@@ -347,7 +348,12 @@ export function personalScheduleWarnings(
     let hasAvailable = false;
     let coveredByAvailable = false;
     for (const schedule of compiled) {
-      if (schedule.kind === PersonalScheduleKind.AVAILABLE) {
+      // PROPOSAL (đề xuất giờ) là khung giờ mong muốn làm: xếp ca coi như lịch
+      // trống, không bao giờ sinh cảnh báo "Trùng lịch bận/học".
+      if (
+        schedule.kind === PersonalScheduleKind.AVAILABLE ||
+        schedule.kind === PersonalScheduleKind.PROPOSAL
+      ) {
         const available = [
           ...intervalsOn(schedule.index, previous).filter(
             (slot) => slot.end > dayStart,

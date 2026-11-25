@@ -19,6 +19,8 @@ export enum PersonalScheduleKind {
   BUSY = 'BUSY',
   /** Lịch học ở trường. */
   STUDY = 'STUDY',
+  /** Đề xuất giờ: khung giờ nhân viên mong muốn làm; xếp ca tính như lịch trống. */
+  PROPOSAL = 'PROPOSAL',
 }
 
 export enum PersonalScheduleRepeat {

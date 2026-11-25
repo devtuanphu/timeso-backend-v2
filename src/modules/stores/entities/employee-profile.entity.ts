@@ -220,11 +220,13 @@ export class EmployeeProfile extends BaseEntity {
 
   /**
    * "Mong muốn được hỗ trợ" nhân viên ghi cho từng loại lịch cá nhân
-   * ({AVAILABLE|BUSY|STUDY: text}). `select: false`: chỉ chính nhân viên và
-   * chủ đọc (qua PersonalScheduleService), không theo mọi truy vấn hồ sơ.
+   * ({AVAILABLE|BUSY|STUDY|PROPOSAL: text}). `select: false`: chỉ chính nhân
+   * viên và chủ đọc (qua PersonalScheduleService), không theo mọi truy vấn hồ sơ.
    */
   @Column({ name: 'personal_schedule_wishes', type: 'jsonb', nullable: true, select: false })
-  personalScheduleWishes?: Partial<Record<'AVAILABLE' | 'BUSY' | 'STUDY', string>> | null;
+  personalScheduleWishes?: Partial<
+    Record<'AVAILABLE' | 'BUSY' | 'STUDY' | 'PROPOSAL', string>
+  > | null;
 
   /**
    * "Mong muốn số ngày làm (tham khảo)" 1–7 / tuần và "Mong muốn số giờ mỗi ca
