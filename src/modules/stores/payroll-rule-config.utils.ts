@@ -14,7 +14,8 @@ export type RuleCalcKind =
   | 'SALARY_BLOCK'
   | 'PROGRESSIVE'
   | 'TIERED'
-  | 'MILESTONE';
+  | 'MILESTONE'
+  | 'RANDOM';
 
 /** Đơn vị đo một lần phát sinh. */
 export type RuleUnit = 'MINUTE' | 'HOUR' | 'SHIFT' | 'OCCURRENCE' | 'DAY';
@@ -64,6 +65,12 @@ export interface RuleCalcConfig {
   metric?: RuleMetric;
   op?: 'GTE' | 'LTE';
   threshold?: number;
+  /**
+   * RANDOM (chỉ phạt tay): khoảng số tiền. Mỗi lần ghi nhận server bốc một số
+   * bội 10.000đ trong [min, max]. min/max là bội 10.000, từ 10.000đ.
+   */
+  min?: number;
+  max?: number;
 }
 
 /** Một lần phát sinh của khoản trong tháng. */
@@ -88,6 +95,24 @@ export interface RuleOccurrence {
    * trả / trừ đúng số này thay vì theo cách tính của khoản.
    */
   amount?: number | null;
+  /** Ghi chú / lý do chủ nhập cho lần ghi nhận tay (hiện cho nhân viên). */
+  note?: string | null;
+}
+
+/** Mã khoản PHẠT tay được phép dùng cách tính ngẫu nhiên (RANDOM). */
+export const RANDOM_ALLOWED_CODES: ReadonlySet<string> = new Set([
+  'RULE_VIOLATION',
+  'DAMAGE',
+  'CUSTOM',
+]);
+
+/**
+ * Cách tính ngẫu nhiên chỉ dành cho khoản PHẠT tay làm sai quy định / hư hao /
+ * tự thêm. Thuần: enforce ở server (nguồn chân lý), độc lập client. `category`
+ * là giá trị của PayrollRuleCategory ('fine' / 'bonus' / 'benefit').
+ */
+export function randomKindAllowed(code: string, category: string): boolean {
+  return category === 'fine' && RANDOM_ALLOWED_CODES.has(code);
 }
 
 /** Khoản đo bằng số phút của từng lần (miễn trừ, bậc phút, luỹ tiến phút…). */
@@ -120,6 +145,7 @@ const KINDS: ReadonlySet<string> = new Set([
   'PROGRESSIVE',
   'TIERED',
   'MILESTONE',
+  'RANDOM',
 ]);
 const UNITS: ReadonlySet<string> = new Set(['MINUTE', 'HOUR', 'SHIFT', 'OCCURRENCE', 'DAY']);
 const BASES: ReadonlySet<string> = new Set(['HOURLY', 'DAILY', 'MONTHLY', 'REVENUE']);
@@ -275,6 +301,27 @@ export function normalizeRuleCalcConfig(
       error = money('amount', true);
       break;
     }
+    case 'RANDOM': {
+      // Phạt ngẫu nhiên: khoảng [min, max] đều phải là bội 10.000đ, từ
+      // 10.000đ tới MAX_MONEY, và max ≥ min. Không chấp nhận 5.000 / 15.000.
+      const min = num(r.min);
+      const max = num(r.max);
+      const invalid = (v: number | null): boolean =>
+        v === null ||
+        Number.isNaN(v) ||
+        !Number.isInteger(v) ||
+        v < 10_000 ||
+        v > MAX_MONEY ||
+        v % 10_000 !== 0;
+      if (invalid(min) || invalid(max) || (max as number) < (min as number)) {
+        error = `Khoảng ngẫu nhiên của "${name}" không hợp lệ (bội 10.000đ, từ 10.000đ)`;
+        break;
+      }
+      out.min = min as number;
+      out.max = max as number;
+      out.unit = 'OCCURRENCE';
+      break;
+    }
   }
   if (error) return error;
 
@@ -336,6 +383,28 @@ export interface RuleConfigResult {
  */
 export function salaryCoefExtra(code: string, coef: number): number {
   return code === 'OVERTIME' || code === 'NIGHT_SHIFT' ? Math.max(0, coef - 1) : coef;
+}
+
+/** Bước tiền của phạt ngẫu nhiên: luôn bốc theo bội 10.000đ. */
+export const RANDOM_FINE_STEP = 10_000;
+
+/**
+ * Bốc số tiền của MỘT lần ghi nhận khoản RANDOM: một bội 10.000đ trong
+ * [min, max]. Thuần — nguồn ngẫu nhiên bơm vào qua `randInt` (crypto.randomInt
+ * ở nơi gọi) nên test được tất định; không I/O, không đồng hồ. `randInt(n)`
+ * phải trả số nguyên trong [0, n). Phòng thủ: kẹp min/max về bội 10.000 và
+ * min ≥ 10.000 kể cả khi cấu hình lạ.
+ */
+export function pickRandomFineAmount(
+  config: Pick<RuleCalcConfig, 'min' | 'max'>,
+  randInt: (maxExclusive: number) => number,
+): number {
+  const step = RANDOM_FINE_STEP;
+  const min = Math.max(step, Math.round((Number(config.min) || step) / step) * step);
+  const max = Math.max(min, Math.round((Number(config.max) || min) / step) * step);
+  const steps = Math.floor((max - min) / step);
+  const k = steps > 0 ? randInt(steps + 1) : 0;
+  return min + k * step;
 }
 
 const fmt = (value: number): string => {
@@ -548,6 +617,18 @@ export function evaluateRuleConfig(input: {
       const threshold = config.threshold ?? 0;
       const ok = config.op === 'LTE' ? value <= threshold : value >= threshold;
       return ok ? { exact: config.amount ?? 0, count: 1, label: name } : none;
+    }
+    case 'RANDOM': {
+      // Số của mỗi lần đã được server bốc và lưu ở occurrence.amount; tiền của
+      // khoản = tổng các số đã bốc. Lần không có amount → 0 (không suy ra tiền
+      // từ min/max). Trong đường pricedRecordsOf, case này chỉ thấy các lần
+      // KHÔNG amount (rest) nên trả 0; tiền thật cộng ở ruleRawLines.
+      const priced = list.filter((o) => o.amount != null && Number(o.amount) > 0);
+      return {
+        exact: priced.reduce((sum, o) => sum + Number(o.amount), 0),
+        count: priced.length,
+        label: name,
+      };
     }
     default:
       return none;

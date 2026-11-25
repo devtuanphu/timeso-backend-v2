@@ -688,6 +688,8 @@ export interface PayslipAdjustmentLine {
     recordId?: string;
     /** Số tiền riêng chủ nhập cho lần ghi nhận này (đồng). */
     amount?: number;
+    /** Ghi chú / lý do của lần ghi nhận tay (hiện cho nhân viên). */
+    note?: string;
   }>;
   /**
    * Đơn vị của một lần: MINUTE (đọc `minutes` — trễ, sớm, tăng ca…), HOUR /
@@ -879,6 +881,33 @@ const ymdOf = (value: unknown): string | null => {
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
 };
 
+/**
+ * Phiên bản của một khoản (lineage) áp dụng cho CHÍNH một ngày: phiên bản có
+ * cửa sổ [validFrom, validTo) chứa ngày đó. Phiên bản sớm nhất cũng áp cho mọi
+ * ngày TRƯỚC validFrom của nó (ghi nhận lùi ngày về đầu kỳ) — đúng ngữ nghĩa
+ * của versionedRuleInputs (recordFrom = đầu kỳ cho phiên bản sớm nhất). Dùng ở
+ * createPayrollRecord để bốc / tính số tiền theo đúng phiên bản của ngày đó,
+ * vì phiếu lương định giá theo cửa sổ ngày chứ không theo ruleId của bản ghi.
+ */
+export function ruleVersionOnDate<T extends { validFrom?: unknown; validTo?: unknown }>(
+  versions: T[],
+  date: string,
+): T | null {
+  if (!versions?.length) return null;
+  const sorted = [...versions].sort(
+    (a, b) => (ymdOf(a.validFrom) ?? '').localeCompare(ymdOf(b.validFrom) ?? ''),
+  );
+  const earliest = sorted[0];
+  for (const version of sorted) {
+    const from = ymdOf(version.validFrom);
+    const to = ymdOf(version.validTo);
+    const lowerOk = version === earliest || !from || date >= from;
+    const upperOk = !to || date < to;
+    if (lowerOk && upperOk) return version;
+  }
+  return earliest;
+}
+
 /** Lần phát sinh đếm cả tháng một lần (mốc, % lương tháng, thưởng tháng cũ). */
 export function isPeriodLevelRule(rule: RuleWithName): boolean {
   if (rule.calcConfig) {
@@ -886,6 +915,9 @@ export function isPeriodLevelRule(rule: RuleWithName): boolean {
     const base = String((rule.calcConfig as Record<string, unknown>).base ?? '');
     if (kind === 'FIXED' || kind === 'UNIT_PRICE' || kind === 'SALARY_COEF') return false;
     if (kind === 'SALARY_BLOCK') return false;
+    // Phạt ngẫu nhiên: mỗi lần ghi nhận là một lần phát sinh (số tiền riêng đã
+    // bốc) → tính theo từng lần, để nhân viên thấy số đã bốc + ghi chú từng lần.
+    if (kind === 'RANDOM') return false;
     if (kind === 'PERCENT') return base === 'MONTHLY' || base === 'REVENUE';
     // Bậc thang / luỹ tiến của khoản đo bằng phút (trễ, sớm, tăng ca…) tính
     // theo từng lần (evaluateRuleConfig); theo số lần / số lượng trong tháng
@@ -1218,6 +1250,7 @@ function ruleRawLines(
             ...(o.assignmentId ? { assignmentId: o.assignmentId } : {}),
             ...(o.recordId ? { recordId: o.recordId } : {}),
             ...(o.amount != null && o.amount > 0 ? { amount: Math.round(o.amount) } : {}),
+            ...(o.note ? { note: String(o.note).slice(0, 300) } : {}),
           }))
       : undefined;
     raw.push({

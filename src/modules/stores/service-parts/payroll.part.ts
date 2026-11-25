@@ -170,6 +170,10 @@ function fallbackCalcModeOf(config: RuleCalcConfig, code: string): {
           value: amount,
           threshold: Math.max(1, Number(config.threshold) || 0),
         };
+      case 'RANDOM':
+        // v2 chỉ hiển thị (không bao giờ tính tiền): lấy đáy khoảng làm số đại
+        // diện, tránh fallback mặc định ra value=1 vì RANDOM không có amount.
+        return { calcMode: 'AMOUNT_PER_SHIFT', value: Number(config.min) || 10_000, threshold: null };
       default:
         // FIXED / PROGRESSIVE
         return { calcMode: 'AMOUNT_PER_SHIFT', value: amount, threshold: null };
@@ -183,6 +187,64 @@ function fallbackCalcModeOf(config: RuleCalcConfig, code: string): {
     : Math.min(100_000_000, Math.max(1, Math.round(raw.value)));
   return { ...raw, value };
 }
+
+/**
+ * Đổi một khoản SANG cách tính Ngẫu nhiên: các lần đã ghi nhận trong cửa sổ
+ * của phiên bản RANDOM mới mà CHƯA có số tiền riêng (amount NULL) sẽ bị RANDOM
+ * tính 0đ (RANDOM chỉ cộng các lần có amount) — mất tiền âm thầm. Giữ nguyên
+ * tiền bằng cách chuyển số của cách tính cũ vào amount:
+ * - FIXED / UNIT_PRICE (tiền mỗi lần = amount × số lượng, xem evaluateRuleConfig)
+ *   → amount = round(amount cũ × số lượng), số lượng về 1; bỏ qua lần ≤ 0.
+ * - Cách tính cũ khác (hệ số / % / khối lương / luỹ tiến / bậc / mốc) không quy
+ *   ra một số cố định mỗi lần → chặn, yêu cầu chủ xoá các lần đó trước.
+ * `windowStart` do nơi gọi quyết định: sửa tại chỗ = đầu tháng (phiên bản phủ
+ * cả tháng); tạo phiên bản mới = hôm nay (chỉ các lần từ hôm nay thuộc cửa sổ
+ * RANDOM). Chạy trong cùng transaction lưu thiết lập; recompute sau đó giữ tiền
+ * y hệt vì các lần này giờ có amount = số cũ.
+ */
+export async function backfillRecordsIntoRandom(
+  manager: EntityManager,
+  storeId: string,
+  lineage: string,
+  oldConfig: RuleCalcConfig | null,
+  name: string,
+  windowStart: string,
+  endExclusive: string,
+): Promise<void> {
+  const versions = await manager.getRepository(StorePayrollRule).find({
+    where: [
+      { storeId, id: lineage },
+      { storeId, lineageId: lineage },
+    ],
+    withDeleted: true,
+    select: ['id'],
+  });
+  const versionIds = versions.map((version) => version.id);
+  if (!versionIds.length) return;
+  const recordRepo = manager.getRepository(EmployeePayrollRecord);
+  const records = await recordRepo
+    .createQueryBuilder('r')
+    .where('r.storeId = :storeId', { storeId })
+    .andWhere('r.ruleId IN (:...versionIds)', { versionIds })
+    .andWhere('r.amount IS NULL')
+    .andWhere('r.workDate >= :start', { start: windowStart })
+    .andWhere('r.workDate < :end', { end: endExclusive })
+    .getMany();
+  if (!records.length) return;
+  const oldKind = oldConfig?.kind;
+  if (oldKind !== 'FIXED' && oldKind !== 'UNIT_PRICE') {
+    throw new BadRequestException(
+      `Khoản "${name}" đã có ${records.length} lần ghi nhận trong tháng tính theo cách cũ. Xoá các lần đó trước khi đổi sang cách tính Ngẫu nhiên.`,
+    );
+  }
+  const oldAmount = Math.round(Number(oldConfig?.amount) || 0);
+  for (const record of records) {
+    const value = Math.round(oldAmount * (Number(record.quantity) || 0));
+    if (value <= 0) continue;
+    await recordRepo.update({ id: record.id }, { amount: value, quantity: 1 });
+  }
+}
+
 /** Một dòng thưởng / vi phạm vừa đổi so với lần tính trước. */
 export interface PayrollAdjustmentChange {
   kind: 'BONUS' | 'FINE';
@@ -226,6 +288,7 @@ import {
   computePayslip,
   computeRuleAdjustmentBreakdown,
   isPeriodLevelRule,
+  ruleVersionOnDate,
   payrollRulePricingChanged,
   sumAllowances,
   PayslipAdjustmentLine,
@@ -273,10 +336,13 @@ import {
 import type { NotificationsService } from '../../notifications/notifications.service';
 import {
   normalizeRuleCalcConfig,
+  pickRandomFineAmount,
+  randomKindAllowed,
   salaryCoefExtra,
   type RuleCalcConfig,
   type RuleOccurrence,
 } from '../payroll-rule-config.utils';
+import { randomInt } from 'crypto';
 import {
   parseVnMonthInput,
   shiftVnMonth,
@@ -844,6 +910,13 @@ export class StoresPayrollPart {
         // Khoản đang tắt nhập dở không chặn việc lưu: chỉ không giữ cấu hình.
         if (typeof config === 'string') {
           if (r.isActive !== false) throw new BadRequestException(config);
+        } else if (config.kind === 'RANDOM' && !randomKindAllowed(code, r.category)) {
+          // Phạt ngẫu nhiên chỉ cho khoản phạt tay (làm sai quy định / hư hao /
+          // tự thêm). Khoản khác đang bật mà chọn RANDOM → chặn; khoản tắt thì
+          // bỏ cấu hình (không set), như nhánh "nhập dở" ở trên.
+          if (r.isActive !== false) {
+            throw new BadRequestException(`Khoản "${r.name}" không dùng cách tính ngẫu nhiên được`);
+          }
         } else {
           configs.set(r, config);
         }
@@ -886,6 +959,7 @@ export class StoresPayrollPart {
     const used = new Set<string>();
     const toSave: StorePayrollRule[] = [];
     const today = vnDateString();
+    const month = vnMonthOf();
     for (const r of incoming) {
       const code =
         r.category === PayrollRuleCategory.BENEFIT ? null : r.code || PayrollRuleCode.CUSTOM;
@@ -956,6 +1030,28 @@ export class StoresPayrollPart {
           : (rule?.employeeProfileIds ?? null),
       };
       if (rule) {
+        // Đổi khoản SANG cách tính Ngẫu nhiên: giữ tiền của các lần đã ghi nhận
+        // trong cửa sổ phiên bản mới (xem backfillRecordsIntoRandom). Sửa tại
+        // chỗ (khoản tạo hôm nay) phủ cả tháng; tạo phiên bản mới chỉ phủ từ
+        // hôm nay. Trong transaction lưu thiết lập nên throw sẽ rollback.
+        const oldConfig = rule.calcConfig as RuleCalcConfig | null;
+        if (config?.kind === 'RANDOM' && oldConfig?.kind !== 'RANDOM') {
+          const since = rule.validFrom
+            ? String(rule.validFrom).slice(0, 10)
+            : rule.createdAt
+              ? vnDateString(new Date(rule.createdAt))
+              : today;
+          const windowStart = since >= today ? month.key : today;
+          await backfillRecordsIntoRandom(
+            manager,
+            storeId,
+            rule.lineageId || rule.id,
+            oldConfig,
+            r.name,
+            windowStart,
+            month.endExclusiveDate,
+          );
+        }
         used.add(rule.id);
         toSave.push(await this.nextPayrollRuleVersion(repo, rule, payload, today));
       } else {
@@ -1174,15 +1270,67 @@ export class StoresPayrollPart {
     ) {
       throw new BadRequestException('Chỉ ghi nhận được cho một ngày từ đầu tháng này đến hôm nay');
     }
-    if (dto.amount != null && !acceptsRecordAmount(rule)) {
-      throw new BadRequestException(
-        'Khoản này tính theo số lượng, không nhập số tiền riêng cho từng lần được',
-      );
+    // Phiếu lương định giá một lần ghi nhận theo PHIÊN BẢN của khoản áp dụng
+    // cho CHÍNH ngày ghi nhận (cửa sổ [validFrom, validTo)), không theo ruleId
+    // của bản ghi. Vì vậy phải bốc / nhận số tiền theo phiên bản của ngày đó:
+    // ghi nhận lùi ngày vào cửa sổ của một phiên bản RANDOM cũ (khoản nay đã
+    // đổi sang cách khác) vẫn phải bốc, nếu không RANDOM tính 0đ.
+    const currentConfig = normalizeRuleCalcConfig(rule.calcConfig, rule.name);
+    const currentIsRandom = typeof currentConfig !== 'string' && currentConfig.kind === 'RANDOM';
+    let dateConfig = currentConfig;
+    if (workDate < today) {
+      const lineage = rule.lineageId || rule.id;
+      const versions = await this.payrollRuleRepository.find({
+        where: [
+          { storeId: profile.storeId, id: lineage },
+          { storeId: profile.storeId, lineageId: lineage },
+        ],
+        withDeleted: true,
+      });
+      const onDate = ruleVersionOnDate(versions, workDate);
+      if (onDate) dateConfig = normalizeRuleCalcConfig(onDate.calcConfig, onDate.name);
+    }
+    const dateIsRandom = typeof dateConfig !== 'string' && dateConfig.kind === 'RANDOM';
+
+    if (dto.amount != null) {
+      // Khoản hiện tại RANDOM: số tiền do server bốc, client không nhập (C4).
+      if (currentIsRandom) {
+        throw new BadRequestException(
+          'Số tiền của khoản ngẫu nhiên do hệ thống bốc, không nhập được',
+        );
+      }
+      // Nhận số tiền riêng khi khoản hiện tại nhận (FIXED + lần), HOẶC ngày rơi
+      // vào cửa sổ RANDOM cũ (ghi đè, vẫn được tính đúng số đó).
+      if (!acceptsRecordAmount(rule) && !dateIsRandom) {
+        throw new BadRequestException(
+          'Khoản này tính theo số lượng, không nhập số tiền riêng cho từng lần được',
+        );
+      }
     }
     if (rule.code === PayrollRuleCode.DAMAGE && !dto.note?.trim()) {
       throw new BadRequestException(DAMAGE_REASON_REQUIRED);
     }
     await this.assertPayslipOpen(profile.id, workDate);
+    // Phạt ngẫu nhiên: server bốc số tiền (bội 10.000đ trong khoảng của phiên
+    // bản đúng ngày) đúng MỘT lần lúc ghi nhận, lưu vào amount với số lượng 1.
+    // Không bao giờ bốc lại — recompute đọc lại số đã lưu — và update không sửa.
+    let storedAmount: number | null;
+    let storedQuantity: number;
+    if (dto.amount == null && (currentIsRandom || dateIsRandom)) {
+      // Bốc theo cấu hình RANDOM của phiên bản đúng ngày (ưu tiên), nếu không
+      // thì khoản hiện tại. Cả hai nhánh đều là RANDOM trong trường hợp này.
+      const source = dateIsRandom ? dateConfig : currentConfig;
+      if (typeof source === 'string') throw new BadRequestException('Cấu hình khoản không hợp lệ');
+      storedAmount = pickRandomFineAmount(source, (n) => randomInt(n));
+      storedQuantity = 1;
+    } else if (dto.amount != null) {
+      // Số tiền riêng là tiền của cả lần đó: số lượng luôn là 1.
+      storedAmount = Math.round(Number(dto.amount));
+      storedQuantity = 1;
+    } else {
+      storedAmount = null;
+      storedQuantity = Math.round(Number(dto.quantity) * 100) / 100;
+    }
     const repo = this.dataSource.getRepository(EmployeePayrollRecord);
     const saved = await repo.save(
       repo.create({
@@ -1192,9 +1340,8 @@ export class StoresPayrollPart {
         ruleName: rule.name,
         category: rule.category,
         workDate,
-        // Số tiền riêng là tiền của cả lần đó: số lượng luôn là 1.
-        quantity: dto.amount != null ? 1 : Math.round(Number(dto.quantity) * 100) / 100,
-        amount: dto.amount != null ? Math.round(Number(dto.amount)) : null,
+        quantity: storedQuantity,
+        amount: storedAmount,
         note: dto.note?.trim() || null,
         createdByAccountId: ownerAccountId,
       }),
@@ -1204,7 +1351,9 @@ export class StoresPayrollPart {
       storeId: profile.storeId,
       workDate,
     });
-    return { id: saved.id };
+    // Trả thêm số đã bốc (additive): app chủ hiện cho chủ sau khi ghi nhận
+    // RANDOM; app cũ bỏ qua trường này.
+    return { id: saved.id, amount: storedAmount };
   }
 
   /**
@@ -1227,6 +1376,16 @@ export class StoresPayrollPart {
     if (!record) throw new NotFoundException('Không tìm thấy ghi nhận');
     const before = String(record.workDate).slice(0, 10);
     await this.assertPayslipOpen(record.employeeProfileId, before);
+    // Nạp khoản của bản ghi MỘT lần (kể cả phiên bản đã hết hạn) để biết kiểu
+    // tính và kiểm hư hao, tránh truy vấn lại. Khoản RANDOM có số tiền do
+    // server bốc: không bao giờ được sửa / xoá / nhân số qua đây.
+    const rule = record.ruleId
+      ? await this.payrollRuleRepository.findOne({
+          where: { id: record.ruleId },
+          withDeleted: true,
+        })
+      : null;
+    const isRandom = (rule?.calcConfig as RuleCalcConfig | null | undefined)?.kind === 'RANDOM';
     const changes: {
       workDate?: string;
       quantity?: number;
@@ -1247,16 +1406,18 @@ export class StoresPayrollPart {
       await this.assertPayslipOpen(record.employeeProfileId, dto.workDate);
       changes.workDate = dto.workDate;
     }
-    if (dto.quantity !== undefined) {
+    // Khoản RANDOM: số lượng do app chủ (kể cả bản cũ) gửi kèm {quantity:1}
+    // khi chỉ sửa ghi chú — bỏ qua hoàn toàn để không đụng số đã bốc.
+    if (dto.quantity !== undefined && !isRandom) {
       changes.quantity = Math.round(Number(dto.quantity) * 100) / 100;
     }
     if (dto.amount != null) {
-      const rule = record.ruleId
-        ? await this.payrollRuleRepository.findOne({
-            where: { id: record.ruleId },
-            withDeleted: true,
-          })
-        : null;
+      // RANDOM: số tiền do server bốc, không sửa được.
+      if (isRandom) {
+        throw new BadRequestException(
+          'Số tiền của khoản ngẫu nhiên do hệ thống bốc, không sửa được',
+        );
+      }
       if (!acceptsRecordAmount(rule)) {
         throw new BadRequestException(
           'Khoản này tính theo số lượng, không nhập số tiền riêng cho từng lần được',
@@ -1266,22 +1427,23 @@ export class StoresPayrollPart {
       // Tiền của cả lần đó: số lượng về 1 (không nhân thêm).
       changes.quantity = 1;
     } else if (dto.amount === null) {
+      // RANDOM: không cho xoá số đã bốc (đưa phạt về 0).
+      if (isRandom) {
+        throw new BadRequestException(
+          'Số tiền của khoản ngẫu nhiên do hệ thống bốc, không sửa được',
+        );
+      }
       changes.amount = null;
-    } else if (dto.quantity !== undefined && record.amount != null) {
+    } else if (dto.quantity !== undefined && record.amount != null && !isRandom) {
       // App chủ bản cũ chỉ biết số lượng: sửa số lượng của lần đang có số tiền
       // riêng thì bỏ số tiền riêng, để tiền theo đúng số lượng nó hiển thị.
+      // Không áp cho RANDOM (số đã bốc phải giữ nguyên).
       changes.amount = null;
     }
     if (dto.note !== undefined) changes.note = dto.note?.trim() || null;
     // Hư hao / bể vỡ: không xoá trắng lý do của lần đã ghi.
-    if (changes.note === null && dto.note !== undefined && record.ruleId) {
-      const ruleOfRecord = await this.payrollRuleRepository.findOne({
-        where: { id: record.ruleId },
-        withDeleted: true,
-      });
-      if (ruleOfRecord?.code === PayrollRuleCode.DAMAGE) {
-        throw new BadRequestException(DAMAGE_REASON_REQUIRED);
-      }
+    if (changes.note === null && dto.note !== undefined && rule?.code === PayrollRuleCode.DAMAGE) {
+      throw new BadRequestException(DAMAGE_REASON_REQUIRED);
     }
     if (!Object.keys(changes).length) return { id: record.id };
     await repo.update({ id: record.id }, changes as any);
@@ -2842,6 +3004,7 @@ export class StoresPayrollPart {
       workDate: string;
       quantity: string;
       amount: string | null;
+      note: string | null;
     }> =
       await (manager ?? this.dataSource.manager)
         .getRepository(EmployeePayrollRecord)
@@ -2851,6 +3014,7 @@ export class StoresPayrollPart {
         .addSelect(`to_char(r.workDate, 'YYYY-MM-DD')`, 'workDate')
         .addSelect('r.quantity', 'quantity')
         .addSelect('r.amount', 'amount')
+        .addSelect('r.note', 'note')
         .where('r.employeeProfileId = :employeeProfileId', { employeeProfileId })
         .andWhere('r.ruleId IS NOT NULL')
         .andWhere('r.workDate >= :start', { start: month.key })
@@ -2867,6 +3031,7 @@ export class StoresPayrollPart {
         quantity,
         ...(row.id ? { recordId: String(row.id) } : {}),
         ...(amount != null && amount > 0 ? { amount } : {}),
+        ...(row.note ? { note: String(row.note).slice(0, 300) } : {}),
       });
     }
     return out;
