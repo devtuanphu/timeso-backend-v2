@@ -112,6 +112,11 @@ export class NotificationsService {
     for (const [channelId, channelTokens] of byChannel) {
       await this.expoPushService.sendToMultiple(channelTokens, {
         ...notification,
+        // Thiếu priority thì Expo gửi Android ở mức "normal": FCM hoãn hoặc bỏ
+        // tin khi máy đang ngủ (Doze) nên thông báo lúc tới lúc không. Mọi push
+        // ở đây đều hiện cho người dùng xem nên mặc định 'high' (iOS vốn đã là
+        // mức cao). Nơi gọi vẫn chọn được 'normal' / 'default' nếu cần.
+        priority: notification.priority ?? 'high',
         channelId,
       });
     }
